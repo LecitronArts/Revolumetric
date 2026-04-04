@@ -4,3 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0"
+ash = "0.38"
+ash-window = "0.13"
+bytemuck = { version = "1.24", features = ["derive"] }
+crossbeam = "0.8"
+glam = { version = "0.30", features = ["bytemuck", "serde"] }
+gpu-allocator = "0.28"
+parking_lot = "0.12"
+raw-window-handle = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+slotmap = "1.0"
+thiserror = "2.0"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+winit = "0.30"

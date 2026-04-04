@@ -8,6 +8,16 @@ use winit::window::Window;
 use crate::render::frame::FrameContext;
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
 
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
+
+struct FrameResources {
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
+    image_available_semaphore: vk::Semaphore,
+    render_finished_semaphore: vk::Semaphore,
+    in_flight_fence: vk::Fence,
+}
+
 pub struct RenderDevice {
     entry: Entry,
     instance: Instance,
@@ -23,6 +33,8 @@ pub struct RenderDevice {
     physical_device_name: String,
     backend_name: &'static str,
     frame_index: u64,
+    current_frame: usize,
+    frames: Vec<FrameResources>,
     swapchain: SwapchainManager,
 }
 
@@ -141,6 +153,8 @@ impl RenderDevice {
             size.height.max(1),
         )?;
 
+        let frames = create_frame_resources(&device, selection.graphics_queue_family_index)?;
+
         Ok(Self {
             entry,
             instance,
@@ -156,6 +170,8 @@ impl RenderDevice {
             physical_device_name: selection.device_name,
             backend_name: "vulkan-bootstrap",
             frame_index: 0,
+            current_frame: 0,
+            frames,
             swapchain,
         })
     }
@@ -182,6 +198,10 @@ impl RenderDevice {
 
     pub fn swapchain_image_count(&self) -> usize {
         self.swapchain.images.len()
+    }
+
+    pub fn swapchain_extent(&self) -> vk::Extent2D {
+        self.swapchain.extent
     }
 
     pub fn handle_resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -217,6 +237,168 @@ impl RenderDevice {
         Ok(())
     }
 
+    pub fn render_frame(&mut self) -> Result<FrameContext> {
+        let frame_slot = self.current_frame;
+        let frame_resources = &self.frames[frame_slot];
+        let command_pool = frame_resources.command_pool;
+        let command_buffer = frame_resources.command_buffer;
+        let image_available_semaphore = frame_resources.image_available_semaphore;
+        let render_finished_semaphore = frame_resources.render_finished_semaphore;
+        let in_flight_fence = frame_resources.in_flight_fence;
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[in_flight_fence], true, u64::MAX)
+                .context("failed to wait for Vulkan in-flight fence")?;
+            self.device
+                .reset_fences(&[in_flight_fence])
+                .context("failed to reset Vulkan in-flight fence")?;
+            self.device
+                .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+                .context("failed to reset Vulkan command pool")?;
+        }
+
+        let (image_index, suboptimal) = match unsafe {
+            self.swapchain_loader.acquire_next_image(
+                self.swapchain.handle,
+                u64::MAX,
+                image_available_semaphore,
+                vk::Fence::null(),
+            )
+        } {
+            Ok(result) => result,
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                self.recreate_swapchain()?;
+                return Ok(FrameContext {
+                    frame_index: self.frame_index,
+                    should_render: false,
+                });
+            }
+            Err(error) => {
+                return Err(anyhow!("failed to acquire Vulkan swapchain image: {error:?}"));
+            }
+        };
+
+        let image_index = image_index as usize;
+        let image_fence = self.swapchain.in_flight_fences[image_index];
+        if image_fence != vk::Fence::null() && image_fence != in_flight_fence {
+            unsafe {
+                self.device
+                    .wait_for_fences(&[image_fence], true, u64::MAX)
+                    .context("failed to wait for Vulkan swapchain image fence")?;
+            }
+        }
+        self.swapchain.in_flight_fences[image_index] = in_flight_fence;
+
+        unsafe {
+            let command_buffer_begin_info = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            self.device
+                .begin_command_buffer(command_buffer, &command_buffer_begin_info)
+                .context("failed to begin Vulkan command buffer")?;
+
+            transition_swapchain_image(
+                &self.device,
+                command_buffer,
+                self.swapchain.images[image_index],
+                self.swapchain.image_layouts[image_index],
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::AccessFlags::empty(),
+                vk::AccessFlags::TRANSFER_WRITE,
+            );
+
+            let clear_value = vk::ClearColorValue {
+                float32: [0.02, 0.03, 0.05, 1.0],
+            };
+            let clear_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1);
+            self.device.cmd_clear_color_image(
+                command_buffer,
+                self.swapchain.images[image_index],
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_value,
+                &[clear_range],
+            );
+
+            transition_swapchain_image(
+                &self.device,
+                command_buffer,
+                self.swapchain.images[image_index],
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::PRESENT_SRC_KHR,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::AccessFlags::TRANSFER_WRITE,
+                vk::AccessFlags::empty(),
+            );
+
+            self.device
+                .end_command_buffer(command_buffer)
+                .context("failed to end Vulkan command buffer")?;
+
+            let wait_semaphores = [image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
+            let command_buffers = [command_buffer];
+            let signal_semaphores = [render_finished_semaphore];
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&command_buffers)
+                .signal_semaphores(&signal_semaphores);
+            self.device
+                .queue_submit(self.graphics_queue, &[submit_info], in_flight_fence)
+                .context("failed to submit Vulkan command buffer")?;
+
+            let present_wait_semaphores = [render_finished_semaphore];
+            let swapchains = [self.swapchain.handle];
+            let image_indices = [image_index as u32];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&present_wait_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+            match self
+                .swapchain_loader
+                .queue_present(self.present_queue, &present_info)
+            {
+                Ok(is_suboptimal) => {
+                    if is_suboptimal || suboptimal {
+                        self.recreate_swapchain()?;
+                    }
+                }
+                Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                    self.recreate_swapchain()?;
+                }
+                Err(error) => {
+                    return Err(anyhow!("failed to present Vulkan swapchain image: {error:?}"));
+                }
+            }
+        }
+
+        self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+        self.frame_index += 1;
+        let frame = FrameContext::begin(self.frame_index);
+        tracing::trace!(
+            frame_index = frame.frame_index,
+            frame_slot,
+            image_index,
+            width = self.swapchain.width,
+            height = self.swapchain.height,
+            image_count = self.swapchain.images.len(),
+            swapchain_format = ?self.swapchain.format,
+            command_buffer = ?command_buffer,
+            graphics_queue_family_index = self.graphics_queue_family_index,
+            present_queue_family_index = self.present_queue_family_index,
+            "executed Vulkan bootstrap frame"
+        );
+        self.current_frame = (self.current_frame + 1) % self.frames.len();
+        Ok(frame)
+    }
 
     pub fn surface(&self) -> vk::SurfaceKHR {
         self.surface
@@ -243,10 +425,106 @@ impl Drop for RenderDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            destroy_frame_resources(&self.device, &mut self.frames);
+            self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+    }
+}
+
+fn create_frame_resources(device: &Device, queue_family_index: u32) -> Result<Vec<FrameResources>> {
+    (0..MAX_FRAMES_IN_FLIGHT)
+        .map(|_| create_single_frame_resources(device, queue_family_index))
+        .collect()
+}
+
+fn create_single_frame_resources(device: &Device, queue_family_index: u32) -> Result<FrameResources> {
+    let command_pool_info = vk::CommandPoolCreateInfo::default()
+        .queue_family_index(queue_family_index)
+        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let command_pool = unsafe { device.create_command_pool(&command_pool_info, None) }
+        .context("failed to create Vulkan command pool")?;
+
+    let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
+        .command_pool(command_pool)
+        .level(vk::CommandBufferLevel::PRIMARY)
+        .command_buffer_count(1);
+    let command_buffer = unsafe { device.allocate_command_buffers(&command_buffer_allocate_info) }
+        .context("failed to allocate Vulkan command buffer")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("Vulkan returned no command buffers"))?;
+
+    let semaphore_info = vk::SemaphoreCreateInfo::default();
+    let image_available_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+        .context("failed to create Vulkan image-available semaphore")?;
+    let render_finished_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
+        .context("failed to create Vulkan render-finished semaphore")?;
+
+    let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
+    let in_flight_fence = unsafe { device.create_fence(&fence_info, None) }
+        .context("failed to create Vulkan in-flight fence")?;
+
+    Ok(FrameResources {
+        command_pool,
+        command_buffer,
+        image_available_semaphore,
+        render_finished_semaphore,
+        in_flight_fence,
+    })
+}
+
+fn destroy_frame_resources(device: &Device, frames: &mut Vec<FrameResources>) {
+    unsafe {
+        for frame in frames.drain(..) {
+            device.destroy_fence(frame.in_flight_fence, None);
+            device.destroy_semaphore(frame.render_finished_semaphore, None);
+            device.destroy_semaphore(frame.image_available_semaphore, None);
+            device.destroy_command_pool(frame.command_pool, None);
+        }
+    }
+}
+
+fn transition_swapchain_image(
+    device: &Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    old_layout: vk::ImageLayout,
+    new_layout: vk::ImageLayout,
+    src_stage_mask: vk::PipelineStageFlags,
+    dst_stage_mask: vk::PipelineStageFlags,
+    src_access_mask: vk::AccessFlags,
+    dst_access_mask: vk::AccessFlags,
+) {
+    let barrier = vk::ImageMemoryBarrier::default()
+        .old_layout(old_layout)
+        .new_layout(new_layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(
+            vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .base_mip_level(0)
+                .level_count(1)
+                .base_array_layer(0)
+                .layer_count(1),
+        )
+        .src_access_mask(src_access_mask)
+        .dst_access_mask(dst_access_mask);
+
+    unsafe {
+        device.cmd_pipeline_barrier(
+            command_buffer,
+            src_stage_mask,
+            dst_stage_mask,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[barrier],
+        );
     }
 }
 
@@ -340,6 +618,29 @@ fn query_queue_families(
             "physical device is missing required graphics/present queue families"
         )),
     }
+}
+
+fn query_swapchain_support(
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    physical_device: vk::PhysicalDevice,
+) -> Result<SwapchainSupport> {
+    let capabilities = unsafe {
+        surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
+    }
+    .context("failed to query Vulkan surface capabilities")?;
+    let formats = unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+        .context("failed to query Vulkan surface formats")?;
+    let present_modes = unsafe {
+        surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
+    }
+    .context("failed to query Vulkan present modes")?;
+
+    Ok(SwapchainSupport {
+        capabilities,
+        formats,
+        present_modes,
+    })
 }
 
 fn ensure_required_device_extensions(

@@ -69,7 +69,7 @@ impl RevolumetricApp {
         self.schedule.run_stage(Stage::PrepareRender, &mut self.world)?;
 
         if let Some(renderer) = self.renderer.as_mut() {
-            let _frame = renderer.render_frame();
+            let _frame = renderer.render_frame()?;
         }
 
         self.schedule.run_stage(Stage::ExecuteRender, &mut self.world)?;
@@ -106,6 +106,9 @@ impl ApplicationHandler for RevolumetricApp {
             physical_device = %renderer.physical_device_name(),
             graphics_queue_family = renderer.graphics_queue_family_index(),
             present_queue_family = renderer.present_queue_family_index(),
+            swapchain_format = ?renderer.swapchain_format(),
+            swapchain_extent = ?renderer.swapchain_extent(),
+            swapchain_images = renderer.swapchain_image_count(),
             surface = ?renderer.surface(),
             "initialized renderer bootstrap"
         );

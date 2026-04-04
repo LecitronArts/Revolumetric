@@ -15,6 +15,8 @@ pub struct SwapchainManager {
     pub extent: vk::Extent2D,
     pub images: Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
+    pub image_layouts: Vec<vk::ImageLayout>,
+    pub in_flight_fences: Vec<vk::Fence>,
     pub width: u32,
     pub height: u32,
 }
@@ -31,6 +33,8 @@ impl Default for SwapchainManager {
             },
             images: Vec::new(),
             image_views: Vec::new(),
+            image_layouts: Vec::new(),
+            in_flight_fences: Vec::new(),
             width: 1280,
             height: 720,
         }
@@ -87,6 +91,8 @@ impl SwapchainManager {
             .copied()
             .map(|image| create_image_view(device, image, surface_format.format))
             .collect::<Result<Vec<_>>>()?;
+        let image_layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
+        let in_flight_fences = vec![vk::Fence::null(); images.len()];
 
         Ok(Self {
             handle,
@@ -95,6 +101,8 @@ impl SwapchainManager {
             extent,
             images,
             image_views,
+            image_layouts,
+            in_flight_fences,
             width: extent.width,
             height: extent.height,
         })
@@ -120,6 +128,8 @@ impl SwapchainManager {
             }
         }
         self.images.clear();
+        self.image_layouts.clear();
+        self.in_flight_fences.clear();
     }
 }
 
