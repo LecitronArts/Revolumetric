@@ -1,3 +1,4 @@
+pub mod brick;
 pub mod chunk;
 pub mod grid;
 pub mod material;
