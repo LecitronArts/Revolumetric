@@ -62,7 +62,6 @@ impl RevolumetricApp {
         schedule.add_stage(Stage::ExecuteRender);
 
         schedule.add_system(Stage::Startup, systems::bootstrap_scene);
-        schedule.add_system(Stage::PreUpdate, systems::tick_time);
 
         Self {
             world,
