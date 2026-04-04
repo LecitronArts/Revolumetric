@@ -20,6 +20,13 @@ Based on Shadertoy M3ycWt — a 6-pass volumetric Radiance Cascades implementati
 - Visibility-weighted trilinear interpolation merging
 - DDA voxel ray tracing, directional shadow map
 
+Alternative GI reference: Shadertoy WdlyWs — Voxel Cone Tracing with:
+- 64×45×64 voxel grid, 6-level radiance mipmap chain stored in cubemap
+- Temporal mipmap construction (LOD 2+ read previous frame to avoid cascade dependency)
+- 5-cone diffuse (60° hemisphere, 7 steps) + variable-aperture specular cone
+- Front-to-back alpha compositing, clamped boundary sampling
+- ACES tonemapping, SDF sphere tracing for primary rays
+
 ### 1.3 Key Insight: UCVH
 
 Traditional approach: separate voxel storage + separate RC probe storage + mapping layer.
@@ -352,6 +359,50 @@ For each probe at level N, merge with level N+1 using visibility-weighted trilin
 **e) Ambient occlusion**:
 - Derived from Level-0 probe ray hit distances: `AO = 1 - avg(clamp(hit_dist / ao_radius, 0, 1))`
 - Nearly free — data already exists in probe storage
+
+### 4.5 Alternative GI: Voxel Cone Tracing (Optional)
+
+An alternative GI approach based on cone marching through a voxel mipmap chain. Can be used instead of or alongside Radiance Cascades. Reference: Shadertoy WdlyWs.
+
+**Core idea**: Build a 3D radiance mipmap (color+alpha at each LOD) from the occupancy hierarchy, then march cones of varying aperture through it. Wider cones step through coarser mipmaps, narrower cones stay at fine LODs.
+
+**Radiance mipmap construction** (compute pass):
+- LOD 0: Each occupied voxel stores `vec4(color * weight, weight)` where weight = occupancy fraction
+- LOD N+1: 2×2×2 box-average of LOD N — stores aggregate `(radiance, opacity)` per node
+- Reuses the CascadedOccupancy hierarchy levels; adds a parallel `Vec<[f32; 4]>` radiance buffer per level
+- Only dirty subtrees need re-averaging (dirty tracking from Ucvh)
+
+**Cone tracing** (per-pixel):
+```slang
+float4 cone_trace(float3 origin, float3 dir, float cone_ratio) {
+    float4 acc = 0;
+    float t = 1.0;
+    for (int i = 0; i < 64 && acc.w < 0.95; i++) {
+        float diameter = max(1.0, t * cone_ratio);
+        float lod = log2(diameter);
+        float4 sample = radiance_mipmap_fetch(origin + dir * t, lod);
+        acc += sample * (1.0 - acc.w);  // front-to-back compositing
+        t += diameter;                   // step = cone diameter (no overlap/gap)
+    }
+    return acc;
+}
+```
+
+**Diffuse GI**: 5 cones in TBN-space hemisphere (normal + 4 diagonal at ~60°), 7 steps each = 35 samples/pixel
+**Specular**: 1 cone in reflect(V, N) direction, cone_ratio = roughness² (tight cone → mirror, wide → diffuse)
+**Boundary handling**: Clamp + fade at volume edges using Box SDF to prevent out-of-bounds artifacts
+
+**Tradeoffs vs Radiance Cascades**:
+| | VCT | Radiance Cascades |
+|---|-----|-------------------|
+| Quality | Good diffuse, limited angular resolution | Superior, more rays per probe |
+| Performance | Very fast (35 samples/px diffuse) | Heavier (probe trace + merge) |
+| Multi-bounce | Needs temporal feedback loop | Natural via cascade merge |
+| Specular | Elegant (cone_ratio = roughness) | Requires GGX importance sampling |
+| Memory | Low (just radiance mipmaps) | Higher (probe storage per level) |
+| Best for | Fast preview, low-end fallback | Final quality rendering |
+
+**Integration plan**: Implement as `VctGiPass` compute shader, selectable at runtime alongside `CascadeTracePass`. Both share the same occupancy hierarchy and material data. CompositePass reads from whichever GI source is active.
 
 ---
 

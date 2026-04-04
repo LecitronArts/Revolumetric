@@ -16,6 +16,7 @@ Each phase produces working, testable software. Later phases build on earlier on
 | 10 | Polish | Hot reload + debug views + perf tuning + visual regression tests | Phase 6 |
 | 11 | Voxel Physics & Automata | GPU cellular automata: liquid, sand, gravity simulation | Phase 2 |
 | 12 | Advanced AO & Shading | Per-face vertex AO with UV interpolation + improved material shading | Phase 3 |
+| 13 | Voxel Cone Tracing GI | Radiance mipmap + cone trace diffuse/specular — optional alternative to RC | Phase 3 |
 
 Phase 1 plan: `2026-04-05-phase1-render-foundation.md`
 
@@ -81,3 +82,48 @@ Per-face vertex ambient occlusion and enhanced material shading.
 - AO computation lives in `PrimaryRayPass` or a dedicated `AOPass`
 - Can replace or augment the RC-derived AO from Phase 5 (faster, lower quality)
 - Useful as fallback when RC probes haven't converged yet (first few frames)
+
+---
+
+## Phase 13: Voxel Cone Tracing GI (Future, Optional)
+
+Lightweight alternative GI via cone marching through radiance mipmaps. Reference: Shadertoy WdlyWs.
+
+### Architecture
+
+**Radiance mipmap chain** — parallel to CascadedOccupancy, stores `vec4(color * opacity, opacity)` per node:
+- LOD 0: Per-brick average color/opacity from occupied voxels
+- LOD 1-4: 2×2×2 box-average of child level (reuses hierarchy dimensions)
+- Only dirty subtrees re-averaged (dirty tracking from Ucvh)
+- New compute pass: `RadianceMipmapPass` runs after `VoxelUploadPass`
+
+**Cone tracing** — per-pixel compute in `VctGiPass`:
+- **Diffuse**: 5 cones at 60° in TBN hemisphere, 7 steps each (step = 2^LOD, covering all mipmap levels)
+- **Specular**: 1 cone in reflect direction, `cone_ratio = roughness²`
+- Front-to-back alpha compositing: `acc += sample * (1 - acc.w)`
+- Boundary fade via Box SDF clamp (prevents out-of-bounds artifacts)
+
+### Techniques (from Shadertoy WdlyWs)
+
+**Temporal mipmap construction**:
+- LOD 1 downsamples LOD 0 in same frame (direct read)
+- LOD 2+ read previous frame's LOD N-1 (avoids cascade dependency within frame)
+- Converges in ~3 frames; acceptable for slowly changing scenes
+
+**Cone ratio as material parameter**:
+- `cone_ratio ∈ [0, 1]` maps 0=mirror → 1=fully diffuse
+- Single `cone_trace()` function handles entire glossy continuum
+- No separate specular/diffuse code paths needed
+
+**Clamped mipmap sampling**:
+- Clamp sample coordinates to valid range per LOD level
+- Multiply by `clamp(2 - Box(p, bounds) * 2, 0, 1)` at boundary
+- Eliminates edge bleeding artifacts common in naive VCT
+
+### Implementation Notes
+
+- New GPU buffers: `radiance_mipmap_l0..l4` (vec4 per node, same count as hierarchy levels)
+- `VctGiPass` outputs to same GI texture format as `CascadeTracePass`
+- Runtime toggle: `gi_mode = VCT | RadianceCascades | Off`
+- `CompositePass` reads GI from whichever source is active
+- VCT is ~3x faster than RC but lower quality — good for preview / low-end / debugging
