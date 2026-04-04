@@ -1,0 +1,381 @@
+use anyhow::{Context, Result, anyhow};
+use ash::{Device, Entry, Instance, vk};
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use std::collections::BTreeSet;
+use std::ffi::{CStr, CString};
+use winit::window::Window;
+
+use crate::render::frame::FrameContext;
+use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
+
+pub struct RenderDevice {
+    entry: Entry,
+    instance: Instance,
+    surface_loader: ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    physical_device: vk::PhysicalDevice,
+    device: Device,
+    swapchain_loader: ash::khr::swapchain::Device,
+    graphics_queue: vk::Queue,
+    present_queue: vk::Queue,
+    graphics_queue_family_index: u32,
+    present_queue_family_index: u32,
+    physical_device_name: String,
+    backend_name: &'static str,
+    frame_index: u64,
+    swapchain: SwapchainManager,
+}
+
+impl RenderDevice {
+    pub fn new(window: &Window) -> Result<Self> {
+        let entry = unsafe { Entry::load() }.context("failed to load Vulkan entry")?;
+        let app_name = CString::new("Revolumetric")?;
+        let engine_name = CString::new("Revolumetric")?;
+
+        let app_info = vk::ApplicationInfo::default()
+            .application_name(&app_name)
+            .application_version(vk::make_api_version(0, 0, 1, 0))
+            .engine_name(&engine_name)
+            .engine_version(vk::make_api_version(0, 0, 1, 0))
+            .api_version(vk::API_VERSION_1_3);
+
+        let display_handle = window
+            .display_handle()
+            .context("failed to acquire raw display handle")?;
+        let window_handle = window
+            .window_handle()
+            .context("failed to acquire raw window handle")?;
+
+        let extension_names = ash_window::enumerate_required_extensions(display_handle.as_raw())
+            .context("failed to enumerate required Vulkan surface extensions")?;
+
+        let layer_name = CString::new("VK_LAYER_KHRONOS_validation")?;
+        let available_layers = unsafe { entry.enumerate_instance_layer_properties() }
+            .context("failed to enumerate Vulkan instance layers")?;
+        let enabled_layers = if has_layer(&available_layers, layer_name.as_c_str()) {
+            vec![layer_name.as_ptr()]
+        } else {
+            Vec::new()
+        };
+
+        let create_info = vk::InstanceCreateInfo::default()
+            .application_info(&app_info)
+            .enabled_extension_names(extension_names)
+            .enabled_layer_names(&enabled_layers);
+
+        let instance = unsafe { entry.create_instance(&create_info, None) }
+            .context("failed to create Vulkan instance")?;
+
+        let surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                display_handle.as_raw(),
+                window_handle.as_raw(),
+                None,
+            )
+        }
+        .context("failed to create Vulkan surface")?;
+
+        let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
+        let size = window.inner_size();
+
+        let device_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
+        let selection = pick_physical_device(
+            &instance,
+            &surface_loader,
+            surface,
+            &device_extension_names,
+        )?;
+
+        let queue_family_indices = if selection.graphics_queue_family_index
+            == selection.present_queue_family_index
+        {
+            vec![selection.graphics_queue_family_index]
+        } else {
+            vec![
+                selection.graphics_queue_family_index,
+                selection.present_queue_family_index,
+            ]
+        };
+
+        let queue_priorities = [1.0_f32];
+        let queue_create_infos = queue_family_indices
+            .iter()
+            .map(|&queue_family_index| {
+                vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .queue_priorities(&queue_priorities)
+            })
+            .collect::<Vec<_>>();
+
+        let device_create_info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queue_create_infos)
+            .enabled_extension_names(&device_extension_names);
+
+        let device = unsafe {
+            instance.create_device(selection.physical_device, &device_create_info, None)
+        }
+        .context("failed to create logical Vulkan device")?;
+
+        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
+        let graphics_queue = unsafe {
+            device.get_device_queue(selection.graphics_queue_family_index, 0)
+        };
+        let present_queue = unsafe {
+            device.get_device_queue(selection.present_queue_family_index, 0)
+        };
+        let swapchain_support = query_swapchain_support(
+            &surface_loader,
+            surface,
+            selection.physical_device,
+        )?;
+        let swapchain = SwapchainManager::new(
+            &device,
+            &swapchain_loader,
+            surface,
+            &swapchain_support,
+            selection.graphics_queue_family_index,
+            selection.present_queue_family_index,
+            size.width.max(1),
+            size.height.max(1),
+        )?;
+
+        Ok(Self {
+            entry,
+            instance,
+            surface_loader,
+            surface,
+            physical_device: selection.physical_device,
+            device,
+            swapchain_loader,
+            graphics_queue,
+            present_queue,
+            graphics_queue_family_index: selection.graphics_queue_family_index,
+            present_queue_family_index: selection.present_queue_family_index,
+            physical_device_name: selection.device_name,
+            backend_name: "vulkan-bootstrap",
+            frame_index: 0,
+            swapchain,
+        })
+    }
+
+    pub fn backend_name(&self) -> &'static str {
+        self.backend_name
+    }
+
+    pub fn physical_device_name(&self) -> &str {
+        &self.physical_device_name
+    }
+
+    pub fn graphics_queue_family_index(&self) -> u32 {
+        self.graphics_queue_family_index
+    }
+
+    pub fn present_queue_family_index(&self) -> u32 {
+        self.present_queue_family_index
+    }
+
+    pub fn swapchain_format(&self) -> vk::Format {
+        self.swapchain.format
+    }
+
+    pub fn swapchain_image_count(&self) -> usize {
+        self.swapchain.images.len()
+    }
+
+    pub fn handle_resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.swapchain.resize(width, height);
+        self.recreate_swapchain()
+    }
+
+    fn recreate_swapchain(&mut self) -> Result<()> {
+        unsafe {
+            self.device
+                .device_wait_idle()
+                .context("failed to idle Vulkan device before swapchain recreation")?;
+        }
+
+        self.swapchain.destroy(&self.device, &self.swapchain_loader);
+
+        let support = query_swapchain_support(
+            &self.surface_loader,
+            self.surface,
+            self.physical_device,
+        )?;
+        self.swapchain = SwapchainManager::new(
+            &self.device,
+            &self.swapchain_loader,
+            self.surface,
+            &support,
+            self.graphics_queue_family_index,
+            self.present_queue_family_index,
+            self.swapchain.width,
+            self.swapchain.height,
+        )?;
+
+        Ok(())
+    }
+
+
+    pub fn surface(&self) -> vk::SurfaceKHR {
+        self.surface
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    pub fn graphics_queue(&self) -> vk::Queue {
+        self.graphics_queue
+    }
+
+    pub fn present_queue(&self) -> vk::Queue {
+        self.present_queue
+    }
+}
+
+impl Drop for RenderDevice {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+            self.device.destroy_device(None);
+            self.surface_loader.destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
+        }
+    }
+}
+
+struct PhysicalDeviceSelection {
+    physical_device: vk::PhysicalDevice,
+    graphics_queue_family_index: u32,
+    present_queue_family_index: u32,
+    device_name: String,
+}
+
+fn pick_physical_device(
+    instance: &Instance,
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    required_extensions: &[*const i8],
+) -> Result<PhysicalDeviceSelection> {
+    let physical_devices = unsafe { instance.enumerate_physical_devices() }
+        .context("failed to enumerate Vulkan physical devices")?;
+
+    physical_devices
+        .into_iter()
+        .find_map(|physical_device| {
+            let properties = unsafe { instance.get_physical_device_properties(physical_device) };
+            let device_name = vk_cstr_to_string(&properties.device_name);
+
+            match query_queue_families(instance, surface_loader, surface, physical_device)
+                .and_then(|queue_families| {
+                    ensure_required_device_extensions(instance, physical_device, required_extensions)?;
+                    Ok(PhysicalDeviceSelection {
+                        physical_device,
+                        graphics_queue_family_index: queue_families.graphics_queue_family_index,
+                        present_queue_family_index: queue_families.present_queue_family_index,
+                        device_name,
+                    })
+                }) {
+                Ok(selection) => Some(selection),
+                Err(error) => {
+                    tracing::debug!(%error, "skipping unsupported Vulkan physical device");
+                    None
+                }
+            }
+        })
+        .ok_or_else(|| anyhow!("failed to find a Vulkan physical device with graphics+present support"))
+}
+
+struct QueueFamilySelection {
+    graphics_queue_family_index: u32,
+    present_queue_family_index: u32,
+}
+
+fn query_queue_families(
+    instance: &Instance,
+    surface_loader: &ash::khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    physical_device: vk::PhysicalDevice,
+) -> Result<QueueFamilySelection> {
+    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+
+    let mut graphics_queue_family_index = None;
+    let mut present_queue_family_index = None;
+
+    for (index, queue_family) in queue_families.iter().enumerate() {
+        let index = index as u32;
+
+        if queue_family.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+            graphics_queue_family_index.get_or_insert(index);
+        }
+
+        let supports_present = unsafe {
+            surface_loader.get_physical_device_surface_support(physical_device, index, surface)
+        }
+        .context("failed to query present support for queue family")?;
+
+        if supports_present {
+            present_queue_family_index.get_or_insert(index);
+        }
+
+        if graphics_queue_family_index.is_some() && present_queue_family_index.is_some() {
+            break;
+        }
+    }
+
+    match (graphics_queue_family_index, present_queue_family_index) {
+        (Some(graphics_queue_family_index), Some(present_queue_family_index)) => {
+            Ok(QueueFamilySelection {
+                graphics_queue_family_index,
+                present_queue_family_index,
+            })
+        }
+        _ => Err(anyhow!(
+            "physical device is missing required graphics/present queue families"
+        )),
+    }
+}
+
+fn ensure_required_device_extensions(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+    required_extensions: &[*const i8],
+) -> Result<()> {
+    let available_extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .context("failed to enumerate Vulkan device extensions")?;
+
+    let available_extension_names = available_extensions
+        .iter()
+        .map(|extension| unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) })
+        .collect::<BTreeSet<_>>();
+
+    for &required_extension in required_extensions {
+        let required_extension = unsafe { CStr::from_ptr(required_extension) };
+        if !available_extension_names.contains(required_extension) {
+            return Err(anyhow!(
+                "missing required Vulkan device extension: {}",
+                required_extension.to_string_lossy()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn has_layer(available_layers: &[vk::LayerProperties], target: &CStr) -> bool {
+    available_layers.iter().any(|layer| {
+        let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
+        name == target
+    })
+}
+
+fn vk_cstr_to_string(raw_name: &[i8]) -> String {
+    let name = unsafe { CStr::from_ptr(raw_name.as_ptr()) };
+    name.to_string_lossy().into_owned()
+}
