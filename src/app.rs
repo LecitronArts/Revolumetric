@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ash::vk;
 use tracing_subscriber::{fmt, EnvFilter};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -10,6 +11,10 @@ use crate::ecs::world::World;
 use crate::platform::time::Time;
 use crate::platform::window::WindowDescriptor;
 use crate::render::device::RenderDevice;
+use crate::render::graph::RenderGraph;
+use crate::render::passes::blit_to_swapchain;
+use crate::render::passes::test_pattern::TestPatternPass;
+use crate::render::resource::QueueType;
 use crate::scene::systems;
 
 pub fn run() -> Result<()> {
@@ -27,10 +32,12 @@ struct RevolumetricApp {
     world: World,
     schedule: Schedule,
     renderer: Option<RenderDevice>,
+    test_pattern_pass: Option<TestPatternPass>,
     window_descriptor: WindowDescriptor,
     window: Option<Window>,
     window_id: Option<WindowId>,
     initialized: bool,
+    start_time: std::time::Instant,
 }
 
 impl RevolumetricApp {
@@ -54,10 +61,12 @@ impl RevolumetricApp {
             world,
             schedule,
             renderer: None,
+            test_pattern_pass: None,
             window_descriptor: WindowDescriptor::default(),
             window: None,
             window_id: None,
             initialized: false,
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -71,29 +80,55 @@ impl RevolumetricApp {
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = renderer.begin_frame()?;
             if frame.should_render {
-                // TODO: Record render passes via RenderGraph here.
-                // For now, transition swapchain image to PRESENT_SRC directly.
-                let barrier = ash::vk::ImageMemoryBarrier::default()
-                    .old_layout(ash::vk::ImageLayout::UNDEFINED)
-                    .new_layout(ash::vk::ImageLayout::PRESENT_SRC_KHR)
-                    .src_access_mask(ash::vk::AccessFlags::empty())
-                    .dst_access_mask(ash::vk::AccessFlags::empty())
-                    .image(frame.swapchain_image)
-                    .subresource_range(
-                        ash::vk::ImageSubresourceRange::default()
-                            .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
+                let time = self.start_time.elapsed().as_secs_f32();
+                let mut graph = RenderGraph::new();
+
+                if let Some(pass) = &self.test_pattern_pass {
+                    let output_extent = pass.output_image.extent;
+                    let output_img = pass.output_image.handle;
+
+                    let test_pattern_writes = graph.add_pass(
+                        "test_pattern",
+                        QueueType::Compute,
+                        |builder| {
+                            let _output = builder.create_image(
+                                frame.swapchain_extent.width,
+                                frame.swapchain_extent.height,
+                                vk::Format::R8G8B8A8_UNORM,
+                                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+                            );
+                            Box::new(move |ctx| {
+                                pass.record(ctx.device, ctx.command_buffer, time);
+                            })
+                        },
                     );
-                unsafe {
-                    renderer.device().cmd_pipeline_barrier(
-                        frame.command_buffer,
-                        ash::vk::PipelineStageFlags::TOP_OF_PIPE,
-                        ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                        ash::vk::DependencyFlags::empty(),
-                        &[], &[], &[barrier],
+
+                    let src_image = output_img;
+                    let src_extent = output_extent;
+                    let dst_image = frame.swapchain_image;
+                    let dst_extent = frame.swapchain_extent;
+                    let dep_handle = test_pattern_writes[0];
+                    graph.add_pass(
+                        "blit_to_swapchain",
+                        QueueType::Graphics,
+                        |builder| {
+                            builder.read(dep_handle);
+                            Box::new(move |ctx| {
+                                blit_to_swapchain::record_blit(
+                                    ctx.device,
+                                    ctx.command_buffer,
+                                    src_image,
+                                    src_extent,
+                                    dst_image,
+                                    dst_extent,
+                                );
+                            })
+                        },
                     );
                 }
+
+                graph.compile();
+                graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
                 renderer.end_frame(frame)?;
             }
         }
@@ -143,6 +178,36 @@ impl ApplicationHandler for RevolumetricApp {
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.window_id = Some(window_id);
+
+        // Initialize test pattern pass
+        if self.test_pattern_pass.is_none() {
+            let renderer = self.renderer.as_ref().unwrap();
+            let extent = renderer.swapchain_extent();
+            let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/test_pattern.spv"));
+            if spirv.is_empty() {
+                tracing::warn!("test_pattern.spv is empty — slangc may not be installed");
+            } else {
+                match TestPatternPass::new(
+                    renderer.device(),
+                    renderer.allocator(),
+                    extent.width,
+                    extent.height,
+                    spirv,
+                ) {
+                    Ok(pass) => {
+                        tracing::info!(
+                            width = extent.width,
+                            height = extent.height,
+                            "initialized test pattern pass"
+                        );
+                        self.test_pattern_pass = Some(pass);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to create test pattern pass");
+                    }
+                }
+            }
+        }
 
         if !self.initialized {
             if let Err(error) = self.schedule.run_stage(Stage::Startup, &mut self.world) {
