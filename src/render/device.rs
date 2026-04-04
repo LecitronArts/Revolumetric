@@ -161,7 +161,11 @@ impl RenderDevice {
             size.height.max(1),
         )?;
 
-        let frames = create_frame_resources(&device, selection.graphics_queue_family_index)?;
+        let frames = create_frame_resources(
+            &device,
+            selection.graphics_queue_family_index,
+            swapchain.images.len(),
+        )?;
 
         Ok(Self {
             entry,
@@ -427,8 +431,8 @@ impl Drop for RenderDevice {
     }
 }
 
-fn create_frame_resources(device: &Device, queue_family_index: u32) -> Result<Vec<FrameResources>> {
-    (0..MAX_FRAMES_IN_FLIGHT)
+fn create_frame_resources(device: &Device, queue_family_index: u32, count: usize) -> Result<Vec<FrameResources>> {
+    (0..count)
         .map(|_| create_single_frame_resources(device, queue_family_index))
         .collect()
 }
