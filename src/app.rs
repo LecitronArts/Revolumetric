@@ -138,6 +138,18 @@ impl RevolumetricApp {
     }
 }
 
+impl Drop for RevolumetricApp {
+    fn drop(&mut self) {
+        // Destroy GPU passes before the renderer (which owns the device/allocator).
+        if let Some(renderer) = &self.renderer {
+            unsafe { renderer.device().device_wait_idle().ok() };
+            if let Some(pass) = self.test_pattern_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
+        }
+    }
+}
+
 impl ApplicationHandler for RevolumetricApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
