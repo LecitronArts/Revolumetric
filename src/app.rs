@@ -13,7 +13,8 @@ use crate::platform::window::WindowDescriptor;
 use crate::render::device::RenderDevice;
 use crate::render::graph::RenderGraph;
 use crate::render::passes::blit_to_swapchain;
-use crate::render::passes::test_pattern::TestPatternPass;
+use crate::render::camera::{compute_pixel_to_ray, PrimaryRayPushConstants};
+use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::resource::QueueType;
 use crate::scene::systems;
 use crate::voxel::ucvh::{Ucvh, UcvhConfig};
@@ -35,7 +36,7 @@ struct RevolumetricApp {
     world: World,
     schedule: Schedule,
     renderer: Option<RenderDevice>,
-    test_pattern_pass: Option<TestPatternPass>,
+    primary_ray_pass: Option<PrimaryRayPass>,
     ucvh: Option<Ucvh>,
     ucvh_gpu: Option<UcvhGpuResources>,
     ucvh_uploaded: bool,
@@ -67,7 +68,7 @@ impl RevolumetricApp {
             world,
             schedule,
             renderer: None,
-            test_pattern_pass: None,
+            primary_ray_pass: None,
             ucvh: None,
             ucvh_gpu: None,
             ucvh_uploaded: false,
@@ -98,15 +99,32 @@ impl RevolumetricApp {
                     }
                 }
 
-                let time = self.start_time.elapsed().as_secs_f32();
                 let mut graph = RenderGraph::new();
 
-                if let Some(pass) = &self.test_pattern_pass {
+                if let Some(pass) = &self.primary_ray_pass {
+                    // Hardcoded camera (Phase 9 adds FPS controller)
+                    let camera_pos = glam::Vec3::new(64.0, 80.0, -40.0);
+                    let camera_target = glam::Vec3::new(64.0, 64.0, 64.0);
+                    let camera_forward = (camera_target - camera_pos).normalize();
+                    let camera_up = glam::Vec3::Y;
+                    let fov_y = std::f32::consts::FRAC_PI_4; // 45° FOV
+
+                    let pixel_to_ray = compute_pixel_to_ray(
+                        camera_pos, camera_forward, camera_up, fov_y,
+                        frame.swapchain_extent.width, frame.swapchain_extent.height,
+                    );
+
+                    let pc = PrimaryRayPushConstants {
+                        pixel_to_ray: pixel_to_ray.to_cols_array_2d(),
+                        resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
+                        _pad: [0; 2],
+                    };
+
                     let output_extent = pass.output_image.extent;
                     let output_img = pass.output_image.handle;
 
-                    let test_pattern_writes = graph.add_pass(
-                        "test_pattern",
+                    let primary_ray_writes = graph.add_pass(
+                        "primary_ray",
                         QueueType::Compute,
                         |builder| {
                             let _output = builder.create_image(
@@ -116,7 +134,7 @@ impl RevolumetricApp {
                                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                             );
                             Box::new(move |ctx| {
-                                pass.record(ctx.device, ctx.command_buffer, time);
+                                pass.record(ctx.device, ctx.command_buffer, &pc);
                             })
                         },
                     );
@@ -125,7 +143,7 @@ impl RevolumetricApp {
                     let src_extent = output_extent;
                     let dst_image = frame.swapchain_image;
                     let dst_extent = frame.swapchain_extent;
-                    let dep_handle = test_pattern_writes[0];
+                    let dep_handle = primary_ray_writes[0];
                     graph.add_pass(
                         "blit_to_swapchain",
                         QueueType::Graphics,
@@ -133,12 +151,8 @@ impl RevolumetricApp {
                             builder.read(dep_handle);
                             Box::new(move |ctx| {
                                 blit_to_swapchain::record_blit(
-                                    ctx.device,
-                                    ctx.command_buffer,
-                                    src_image,
-                                    src_extent,
-                                    dst_image,
-                                    dst_extent,
+                                    ctx.device, ctx.command_buffer,
+                                    src_image, src_extent, dst_image, dst_extent,
                                 );
                             })
                         },
@@ -161,7 +175,7 @@ impl Drop for RevolumetricApp {
         // Destroy GPU passes before the renderer (which owns the device/allocator).
         if let Some(renderer) = &self.renderer {
             unsafe { renderer.device().device_wait_idle().ok() };
-            if let Some(pass) = self.test_pattern_pass.take() {
+            if let Some(pass) = self.primary_ray_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
             }
             if let Some(gpu) = self.ucvh_gpu.take() {
@@ -212,36 +226,6 @@ impl ApplicationHandler for RevolumetricApp {
         self.window = Some(window);
         self.window_id = Some(window_id);
 
-        // Initialize test pattern pass
-        if self.test_pattern_pass.is_none() {
-            let renderer = self.renderer.as_ref().unwrap();
-            let extent = renderer.swapchain_extent();
-            let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/test_pattern.spv"));
-            if spirv.is_empty() {
-                tracing::warn!("test_pattern.spv is empty — slangc may not be installed");
-            } else {
-                match TestPatternPass::new(
-                    renderer.device(),
-                    renderer.allocator(),
-                    extent.width,
-                    extent.height,
-                    spirv,
-                ) {
-                    Ok(pass) => {
-                        tracing::info!(
-                            width = extent.width,
-                            height = extent.height,
-                            "initialized test pattern pass"
-                        );
-                        self.test_pattern_pass = Some(pass);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "failed to create test pattern pass");
-                    }
-                }
-            }
-        }
-
         // Generate UCVH demo scene
         if self.ucvh.is_none() {
             let config = UcvhConfig::new(glam::UVec3::splat(128));
@@ -263,6 +247,39 @@ impl ApplicationHandler for RevolumetricApp {
                 Err(e) => tracing::error!(%e, "failed to create UCVH GPU resources"),
             }
             self.ucvh = Some(ucvh);
+        }
+
+        // Initialize primary ray pass (requires UCVH GPU resources)
+        if self.primary_ray_pass.is_none() {
+            if let Some(ucvh_gpu) = &self.ucvh_gpu {
+                let renderer = self.renderer.as_ref().unwrap();
+                let extent = renderer.swapchain_extent();
+                let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/primary_ray.spv"));
+                if spirv.is_empty() {
+                    tracing::warn!("primary_ray.spv is empty — slangc may not be installed");
+                } else {
+                    match PrimaryRayPass::new(
+                        renderer.device(),
+                        renderer.allocator(),
+                        extent.width,
+                        extent.height,
+                        spirv,
+                        ucvh_gpu,
+                    ) {
+                        Ok(pass) => {
+                            tracing::info!(
+                                width = extent.width,
+                                height = extent.height,
+                                "initialized primary ray pass"
+                            );
+                            self.primary_ray_pass = Some(pass);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "failed to create primary ray pass");
+                        }
+                    }
+                }
+            }
         }
 
         if !self.initialized {
