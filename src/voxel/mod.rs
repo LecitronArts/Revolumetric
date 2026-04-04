@@ -1,5 +1,6 @@
 pub mod brick;
 pub mod brick_pool;
+pub mod generator;
 pub mod material;
 pub mod morton;
 pub mod occupancy;
