@@ -1,4 +1,5 @@
 pub mod brick;
+pub mod brick_pool;
 pub mod chunk;
 pub mod grid;
 pub mod material;
