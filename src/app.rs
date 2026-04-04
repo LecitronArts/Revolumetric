@@ -4,7 +4,11 @@ use tracing_subscriber::{fmt, EnvFilter};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
+
+use crate::platform::input::InputState;
+use crate::scene::components::CameraRig;
 
 use crate::ecs::schedule::{Schedule, Stage};
 use crate::ecs::world::World;
@@ -44,7 +48,8 @@ struct RevolumetricApp {
     window: Option<Window>,
     window_id: Option<WindowId>,
     initialized: bool,
-    start_time: std::time::Instant,
+    last_cursor_pos: Option<(f64, f64)>,
+    last_frame_time: Option<std::time::Instant>,
 }
 
 impl RevolumetricApp {
@@ -75,7 +80,8 @@ impl RevolumetricApp {
             window: None,
             window_id: None,
             initialized: false,
-            start_time: std::time::Instant::now(),
+            last_cursor_pos: None,
+            last_frame_time: None,
         }
     }
 
@@ -322,6 +328,64 @@ impl ApplicationHandler for RevolumetricApp {
                     }
                 }
                 tracing::debug!(width = size.width, height = size.height, "window resized");
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.repeat {
+                    return; // ignore key repeat
+                }
+                let pressed = event.state == winit::event::ElementState::Pressed;
+                let value = if pressed { 1.0_f32 } else { -1.0 };
+
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    if let Some(input) = self.world.resource_mut::<InputState>() {
+                        match key {
+                            KeyCode::KeyW => input.move_forward += value,
+                            KeyCode::KeyS => input.move_forward -= value,
+                            KeyCode::KeyD => input.move_right += value,
+                            KeyCode::KeyA => input.move_right -= value,
+                            KeyCode::Space => input.move_up += value,
+                            KeyCode::ShiftLeft => input.move_up -= value,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == winit::event::MouseButton::Right {
+                    let pressed = state == winit::event::ElementState::Pressed;
+                    if let Some(input) = self.world.resource_mut::<InputState>() {
+                        input.right_mouse_held = pressed;
+                    }
+                    if !pressed {
+                        self.last_cursor_pos = None; // prevent jump on re-press
+                    }
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    if input.right_mouse_held {
+                        if let Some((last_x, last_y)) = self.last_cursor_pos {
+                            input.mouse_dx += (position.x - last_x) as f32;
+                            input.mouse_dy += (position.y - last_y) as f32;
+                        }
+                        self.last_cursor_pos = Some((position.x, position.y));
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let scroll = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 120.0,
+                };
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    input.scroll_delta += scroll;
+                }
+            }
+            WindowEvent::Focused(false) => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    input.reset_axes();
+                }
+                self.last_cursor_pos = None;
             }
             _ => {}
         }
