@@ -4,6 +4,9 @@ use glam::{Mat4, Vec3, Vec4};
 
 /// Push constants for the primary ray pass.
 /// Sent to GPU each frame — must match the Slang `PrimaryRayPC` layout exactly.
+/// NOTE: Slang emits RowMajor for float4x4 push constants, so the driver
+/// transposes on load. Callers must store `mat.transpose().to_cols_array_2d()`
+/// so that SPIR-V columns arrive as the original glam columns.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct PrimaryRayPushConstants {

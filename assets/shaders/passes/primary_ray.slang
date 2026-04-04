@@ -66,11 +66,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     // Generate ray from pixel_to_ray matrix.
     // Rust side stores column-major via glam Mat4::from_cols + to_cols_array_2d.
-    // Slang float4x4 is ROW-major by default, so m[i] = row i.
-    // When Rust writes column-major data, Slang reads it transposed:
-    //   Slang m[i] = Rust column i.
-    // So: origin = m[3].xyz (Slang row 3 = Rust col 3 = camera position) ✓
-    //     dir = m * (px, py, 1, 0) applies the 3×3 correctly.
+    // In memory: [col0, col1, col2, col3]. Slang float4x4 reads m[i] as i-th
+    // group of 4 floats = Rust column i.
+    // origin = m[3].xyz = Rust col 3 = camera position.
+    // direction = col0*px + col1*py + col2*1 = mul(vec, mat) in Slang
+    //   because mul(v, M) computes v[0]*row0 + v[1]*row1 + v[2]*row2
+    //   and our "rows" are actually Rust columns.
     float2 pixel = float2(tid.xy);
     float3 origin = pc.pixel_to_ray[3].xyz;
     float3x3 dir_mat = float3x3(
@@ -78,7 +79,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         pc.pixel_to_ray[1].xyz,
         pc.pixel_to_ray[2].xyz
     );
-    float3 dir = normalize(mul(dir_mat, float3(pixel, 1.0)));
+    float3 dir = normalize(mul(float3(pixel, 1.0), dir_mat));
 
     Ray ray = make_ray(origin, dir);
     HitResult hit = trace_primary_ray(ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials);

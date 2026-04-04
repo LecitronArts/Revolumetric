@@ -115,7 +115,9 @@ impl RevolumetricApp {
                     );
 
                     let pc = PrimaryRayPushConstants {
-                        pixel_to_ray: pixel_to_ray.to_cols_array_2d(),
+                        // Slang float4x4 uses RowMajor in SPIR-V: driver reads memory as rows
+                        // and transposes into columns. Pre-transpose so columns arrive correctly.
+                        pixel_to_ray: pixel_to_ray.transpose().to_cols_array_2d(),
                         resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
                         _pad: [0; 2],
                     };

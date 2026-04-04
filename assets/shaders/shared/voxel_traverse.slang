@@ -43,15 +43,14 @@ bool brick_dda(
     int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
     int3 step_dir = int3(sign(ray_dir));
 
-    // Determine entry face normal from which axis boundary the ray crossed
-    float3 t_entry = (float3(coord) - ray_origin) * inv_dir;
-    if (step_dir.x > 0) t_entry.x = (float(coord.x) - ray_origin.x) * inv_dir.x;
-    if (step_dir.y > 0) t_entry.y = (float(coord.y) - ray_origin.y) * inv_dir.y;
-    if (step_dir.z > 0) t_entry.z = (float(coord.z) - ray_origin.z) * inv_dir.z;
-    // Entry normal: the axis with the largest t_entry was crossed last (= entry face)
-    if (t_entry.x > t_entry.y && t_entry.x > t_entry.z)
+    // Entry face normal: use brick AABB slab intersection to find which face was entered.
+    // The axis with the largest t_near is the entry face (last axis to "enter").
+    float3 t_lo = -ray_origin * inv_dir;          // t to reach face at 0
+    float3 t_hi = (float3(8) - ray_origin) * inv_dir; // t to reach face at 8
+    float3 t_near = min(t_lo, t_hi);
+    if (t_near.x >= t_near.y && t_near.x >= t_near.z)
         hit_normal = float3(-float(step_dir.x), 0, 0);
-    else if (t_entry.y > t_entry.z)
+    else if (t_near.y >= t_near.z)
         hit_normal = float3(0, -float(step_dir.y), 0);
     else
         hit_normal = float3(0, 0, -float(step_dir.z));
