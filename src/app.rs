@@ -16,6 +16,9 @@ use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::test_pattern::TestPatternPass;
 use crate::render::resource::QueueType;
 use crate::scene::systems;
+use crate::voxel::ucvh::{Ucvh, UcvhConfig};
+use crate::voxel::generator;
+use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub fn run() -> Result<()> {
     init_tracing();
@@ -33,6 +36,9 @@ struct RevolumetricApp {
     schedule: Schedule,
     renderer: Option<RenderDevice>,
     test_pattern_pass: Option<TestPatternPass>,
+    ucvh: Option<Ucvh>,
+    ucvh_gpu: Option<UcvhGpuResources>,
+    ucvh_uploaded: bool,
     window_descriptor: WindowDescriptor,
     window: Option<Window>,
     window_id: Option<WindowId>,
@@ -62,6 +68,9 @@ impl RevolumetricApp {
             schedule,
             renderer: None,
             test_pattern_pass: None,
+            ucvh: None,
+            ucvh_gpu: None,
+            ucvh_uploaded: false,
             window_descriptor: WindowDescriptor::default(),
             window: None,
             window_id: None,
@@ -80,6 +89,15 @@ impl RevolumetricApp {
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = renderer.begin_frame()?;
             if frame.should_render {
+                // Upload UCVH data to GPU (first frame only)
+                if !self.ucvh_uploaded {
+                    if let (Some(ucvh), Some(gpu)) = (&self.ucvh, &self.ucvh_gpu) {
+                        gpu.upload_all(renderer.device(), frame.command_buffer, ucvh);
+                        self.ucvh_uploaded = true;
+                        tracing::info!("uploaded UCVH data to GPU");
+                    }
+                }
+
                 let time = self.start_time.elapsed().as_secs_f32();
                 let mut graph = RenderGraph::new();
 
@@ -145,6 +163,9 @@ impl Drop for RevolumetricApp {
             unsafe { renderer.device().device_wait_idle().ok() };
             if let Some(pass) = self.test_pattern_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
+            }
+            if let Some(gpu) = self.ucvh_gpu.take() {
+                gpu.destroy(renderer.device(), renderer.allocator());
             }
         }
     }
@@ -219,6 +240,29 @@ impl ApplicationHandler for RevolumetricApp {
                     }
                 }
             }
+        }
+
+        // Generate UCVH demo scene
+        if self.ucvh.is_none() {
+            let config = UcvhConfig::new(glam::UVec3::splat(128));
+            let mut ucvh = Ucvh::new(config);
+            let brick_count = generator::generate_demo_scene(&mut ucvh);
+            ucvh.rebuild_hierarchy();
+            tracing::info!(
+                bricks = brick_count,
+                total_voxels = ucvh.pool.allocated_count() as u64 * 512,
+                "generated demo sphere scene"
+            );
+
+            let renderer = self.renderer.as_ref().unwrap();
+            match UcvhGpuResources::new(renderer.device(), renderer.allocator(), &ucvh) {
+                Ok(gpu) => {
+                    tracing::info!("created UCVH GPU resources");
+                    self.ucvh_gpu = Some(gpu);
+                }
+                Err(e) => tracing::error!(%e, "failed to create UCVH GPU resources"),
+            }
+            self.ucvh = Some(ucvh);
         }
 
         if !self.initialized {
