@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use winit::window::Window;
 
+use crate::render::allocator::GpuAllocator;
 use crate::render::frame::FrameContext;
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
 
@@ -25,6 +26,7 @@ pub struct RenderDevice {
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
     device: Device,
+    allocator: Option<GpuAllocator>,
     swapchain_loader: ash::khr::swapchain::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
@@ -121,14 +123,20 @@ impl RenderDevice {
             })
             .collect::<Vec<_>>();
 
+        let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+            .buffer_device_address(true);
+
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&device_extension_names);
+            .enabled_extension_names(&device_extension_names)
+            .push_next(&mut bda_features);
 
         let device = unsafe {
             instance.create_device(selection.physical_device, &device_create_info, None)
         }
         .context("failed to create logical Vulkan device")?;
+
+        let allocator = GpuAllocator::new(&instance, &device, selection.physical_device)?;
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
         let graphics_queue = unsafe {
@@ -162,6 +170,7 @@ impl RenderDevice {
             surface,
             physical_device: selection.physical_device,
             device,
+            allocator: Some(allocator),
             swapchain_loader,
             graphics_queue,
             present_queue,
@@ -408,6 +417,14 @@ impl RenderDevice {
         &self.device
     }
 
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    pub fn allocator(&self) -> &GpuAllocator {
+        self.allocator.as_ref().expect("allocator already dropped")
+    }
+
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
     }
@@ -425,6 +442,8 @@ impl Drop for RenderDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Allocator must be dropped before the device is destroyed
+            drop(self.allocator.take());
             destroy_frame_resources(&self.device, &mut self.frames);
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.device.destroy_device(None);
