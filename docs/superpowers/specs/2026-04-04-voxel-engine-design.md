@@ -49,8 +49,9 @@ struct VoxelCell {
 **GPU storage**: Single `VkBuffer` with buffer device address. Free-list allocator (GPU-side atomic ring buffer) for dynamic allocation/deallocation.
 
 ```
-Capacity: 131,072 bricks (covers 512^3 at ~30% fill with headroom)
-Size: 131,072 * 4,096 = 512 MB
+Capacity: 81,920 bricks (512^3 * 30% / 512 ≈ 78K, rounded up with ~5% headroom)
+Size: 81,920 * 4,096 = 320 MB
+Note: If fill rate exceeds 30%, the pool can be resized via reallocation + copy.
 ```
 
 ### 2.2 Cascaded Occupancy Hierarchy
@@ -161,11 +162,14 @@ Frame N:
   │  2. OccupancyUpdatePass (rebuild hierarchy)  │
   └──────────────────────────────────────────────┘
            │
-  ┌─ Compute ──────────────────────────────────┐
-  │  3. ShadowTracePass     (directional SM)    │
-  │  4. CascadeTracePass    (RC ray tracing)    │  ← most expensive
-  │  5. CascadeMergePass    (inter-level merge) │
-  │  6. ProbeCompactPass    (prefix-sum compact) │
+  ┌─ Compute (prepare) ───────────────────────┐
+  │  3. ProbeCompactPass    (prefix-sum compact) │  ← builds indirect dispatch table
+  │  4. ShadowTracePass     (directional SM)    │     for CascadeTracePass
+  └──────────────────────────────────────────────┘
+           │
+  ┌─ Compute (GI) ────────────────────────────┐
+  │  5. CascadeTracePass    (RC ray tracing)    │  ← most expensive, uses dispatch table
+  │  6. CascadeMergePass    (inter-level merge) │
   └──────────────────────────────────────────────┘
            │
   ┌─ Graphics ─────────────────────────────────┐
@@ -176,6 +180,10 @@ Frame N:
   └──────────────────────────────────────────────┘
            │
         Present
+
+Bootstrap (Frame 0): ProbeCompactPass runs on the initial occupancy from
+OccupancyUpdatePass. No double-buffering needed — compact always runs
+before trace within the same frame.
 ```
 
 ### 3.3 Temporal Strategy
