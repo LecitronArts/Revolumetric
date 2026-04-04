@@ -114,3 +114,58 @@ impl Default for RenderGraph<'_> {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::render::resource::QueueType;
+
+    #[test]
+    fn empty_graph_compiles() {
+        let mut graph = RenderGraph::new();
+        graph.compile();
+        assert_eq!(graph.pass_count(), 0);
+    }
+
+    #[test]
+    fn single_pass_executes() {
+        let mut graph = RenderGraph::new();
+        graph.add_pass("test", QueueType::Compute, |_builder| {
+            Box::new(|_ctx| {
+                // no-op — just verify the closure runs
+            })
+        });
+        graph.compile();
+        assert_eq!(graph.pass_count(), 1);
+        // Can't call execute without a real device/command buffer,
+        // but compile + pass_count verifies the graph logic.
+    }
+
+    #[test]
+    fn dependency_ordering() {
+        let mut graph = RenderGraph::new();
+
+        let writes = graph.add_pass("producer", QueueType::Compute, |builder| {
+            let _img = builder.create_image(
+                100, 100,
+                ash::vk::Format::R8G8B8A8_UNORM,
+                ash::vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        });
+
+        assert_eq!(writes.len(), 1);
+        let dep = writes[0];
+
+        graph.add_pass("consumer", QueueType::Graphics, |builder| {
+            builder.read(dep);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile();
+        assert_eq!(graph.pass_count(), 2);
+        // Producer should come before consumer in sorted_order
+        assert_eq!(graph.sorted_order[0], 0); // producer
+        assert_eq!(graph.sorted_order[1], 1); // consumer
+    }
+}
