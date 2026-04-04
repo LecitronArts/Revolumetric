@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod buffer;
+pub mod camera;
 pub mod descriptor;
 pub mod device;
 pub mod frame;
