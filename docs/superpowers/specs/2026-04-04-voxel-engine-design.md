@@ -32,27 +32,67 @@ UCVH approach: the voxel spatial hierarchy IS the cascade hierarchy. One tree tr
 
 ### 2.1 Brick Pool
 
-The atomic storage unit is an **8^3 Brick** (512 voxels).
+The atomic storage unit is an **8^3 Brick** (512 voxels), stored as a **two-tier structure** that separates fast-path occupancy data from material data.
+
+#### Tier 1: Occupancy Bitmask (traversal-hot path)
+
+Each brick has a 512-bit occupancy bitmask — one bit per voxel (solid=1, air=0).
+
+```rust
+#[repr(C)]
+struct BrickOccupancy {
+    bits: [u32; 16],  // 16 × 32 = 512 bits
+}
+// sizeof(BrickOccupancy) = 64 bytes
+```
+
+**GPU layout**: Packed as 4 × `uvec4` (matching `rgba32ui` texel format). Within each `uvec4`, the 128 bits map to a **4×4×8 sub-block** following the packing from [voxel_ray_traversal](https://github.com/DeadlockCode/voxel_ray_traversal):
+
+```glsl
+// Read a single voxel occupancy (1 bit) with texel caching
+bool readBrickVoxel(uvec3 local, inout uvec4 texel, inout ivec3 texel_coord) {
+    ivec3 new_coord = ivec3(local.x / 4, local.y / 4, local.z / 8);
+    if (new_coord != texel_coord) {
+        texel_coord = new_coord;
+        texel = brickOccupancy[brickId].blocks[new_coord.x + new_coord.y * 2];
+    }
+    return bool(texel[local.x % 4] >> ((local.y % 4) + (local.z % 8) * 4) & 1u);
+}
+```
+
+This texel-caching pattern (from voxel_ray_traversal) means a single 16-byte load serves multiple consecutive DDA steps within the same 4×4×8 sub-block, dramatically reducing memory bandwidth during traversal.
+
+#### Tier 2: Material Data (shading-cold path)
+
+Full voxel material data, read only when a ray hits and needs shading.
 
 ```rust
 #[repr(C)]
 struct VoxelCell {
-    material: u16,    // material palette index (0 = air)
-    flags: u16,       // solid, emissive, transparent, etc.
+    material: u16,      // material palette index (0 = air)
+    flags: u16,         // solid, emissive, transparent, etc.
     emissive: [u16; 3], // HDR emissive color (half-float)
     _pad: u16,
 }
 // sizeof(VoxelCell) = 8 bytes
-// sizeof(Brick) = 512 * 8 = 4096 bytes
+// sizeof(BrickMaterials) = 512 * 8 = 4096 bytes
 ```
 
-**GPU storage**: Single `VkBuffer` with buffer device address. Free-list allocator (GPU-side atomic ring buffer) for dynamic allocation/deallocation.
+#### GPU Storage
+
+Two separate `VkBuffer`s with buffer device address, sharing a free-list allocator (GPU-side atomic ring buffer). Brick IDs index into both buffers at the same slot.
 
 ```
 Capacity: 81,920 bricks (512^3 * 30% / 512 ≈ 78K, rounded up with ~5% headroom)
-Size: 81,920 * 4,096 = 320 MB
-Note: If fill rate exceeds 30%, the pool can be resized via reallocation + copy.
+
+Occupancy Pool:  81,920 * 64    =   5 MB   ← fits in GPU L2, hot during DDA
+Material Pool:   81,920 * 4,096 = 320 MB   ← cold, read only on hit for shading
+Total:                            325 MB
+
+Note: If fill rate exceeds 30%, pools can be resized via reallocation + copy.
 ```
+
+**Performance rationale**: DDA traversal reads ~10-50 voxels per ray step but only hits ~1. The 5 MB occupancy pool fits comfortably in GPU L2 cache (~4-6 MB on RTX 30xx), while the 320 MB material pool is only accessed for the single hit voxel per ray. This separation turns a bandwidth-bound DDA into a compute-bound one.
 
 ### 2.2 Cascaded Occupancy Hierarchy
 
@@ -67,6 +107,22 @@ Five levels, each a flat 3D grid stored as an SSBO. Index: `x + y * dim_x + z * 
 | 4     | 4^3      | 2^3 L3 nodes  | `child_mask: u8`, `flags: u8`      | 128 B   |
 
 `child_mask` is a bitmask of which of the 8 children (2^3) contain any solid voxels. Used for hierarchical DDA ray skip.
+
+#### Binary Face Culling (from binary_greedy_mesher)
+
+During `OccupancyUpdatePass`, surface detection uses bit-column operations instead of per-voxel neighbor checks. For each brick, along each axis, build a u64 column from the occupancy bitmask and apply:
+
+```glsl
+// For each axis (X, Y, Z), for each column through the brick:
+uint64_t col = extractColumn(brickOccupancy, axis, col_x, col_z);
+uint64_t surfaceNeg = col & ~(col << 1);  // faces where solid meets air (descending)
+uint64_t surfacePos = col & ~(col >> 1);  // faces where solid meets air (ascending)
+```
+
+This finds all exposed surfaces in a single bitwise operation per column, compared to 6 neighbor checks per voxel in the naive approach. The surface masks are used for:
+- **Probe placement**: probes are placed near exposed surfaces, not buried inside solid regions
+- **Occupancy propagation**: `child_mask` at parent levels is derived from `col != 0` across all columns
+- **AO hint generation**: count of exposed faces per voxel informs ambient occlusion strength
 
 ### 2.3 RC Probe Storage
 
@@ -109,15 +165,20 @@ Store as `probe_offset: [i8; 3]` per node (3 bytes).
 
 ### 2.5 Memory Budget Summary
 
-| Component            | Size     |
-|----------------------|----------|
-| Brick Pool           | ~320 MB  |
-| Occupancy Hierarchy  | ~1.6 MB  |
-| RC Probe Buffers     | ~229 MB  |
-| Shadow Map (2048^2)  | ~16 MB   |
-| Staging / Scratch    | ~64 MB   |
-| Swapchain + Targets  | ~32 MB   |
-| **Total**            | **~663 MB** |
+| Component                | Size     |
+|--------------------------|----------|
+| Brick Occupancy Pool     | ~5 MB    |
+| Brick Material Pool      | ~320 MB  |
+| Occupancy Hierarchy      | ~1.6 MB  |
+| RC Probe Buffers         | ~229 MB  |
+| Shadow Map (2048^2)      | ~16 MB   |
+| Staging / Scratch        | ~64 MB   |
+| Swapchain + Targets      | ~32 MB   |
+| **Total**                | **~668 MB** |
+
+Note: The brick occupancy pool (5 MB) is the hot-path data during DDA traversal
+and fits in GPU L2 cache. The brick material pool (320 MB) is cold-path data
+read only for shading on ray hit.
 
 Note: Probe distance fields (for probe placement) are computed transiently
 during VoxelUploadPass and discarded after writing the 3-byte probe_offset
@@ -258,7 +319,29 @@ For each probe at level N, merge with level N+1 using visibility-weighted trilin
 
 ## 5. Voxel Ray Tracing
 
-### 5.1 Hierarchical DDA
+### 5.1 pixelToRay Matrix
+
+Primary rays use a single 4×4 `pixelToRay` matrix (technique from [voxel_ray_traversal](https://github.com/DeadlockCode/voxel_ray_traversal)) that combines pixel center offset, aspect correction, FOV tangent, camera rotation, and world-space translation into one matrix multiply:
+
+```slang
+// In PrimaryRayPass:
+float3 origin = pixel_to_ray[3].xyz;
+float3 direction = mul(float3x3(pixel_to_ray), float3(pixel_coord, 1.0));
+```
+
+The matrix is computed CPU-side each frame:
+```
+pixelToRay = translate(camera_pos)
+           * rotate(camera_rot)
+           * swap_yz
+           * scale(tan(fov/2) * aspect, tan(fov/2), 1)
+           * pixel_to_ndc(2/width, -2/height, -1, 1)
+           * center_pixel(+0.5, +0.5)
+```
+
+This replaces the traditional `inv_view_proj` approach with a single matrix, reducing FrameUniforms size and simplifying the shader.
+
+### 5.2 Hierarchical DDA
 
 ```
 trace(origin, direction):
@@ -273,10 +356,12 @@ trace(origin, direction):
             t = exit_distance(node_bounds)
             advance to next sibling at this level
         else if level == 0:
-            // DDA through 8^3 brick
-            brick = brick_pool[node.brick_id]
-            result = brick_dda(brick, origin, direction, t)
-            if hit: return result
+            // Texel-cached DDA through 8^3 brick (see 5.3)
+            brick = brick_occupancy[node.brick_id]
+            result = brick_dda_cached(brick, origin, direction, t)
+            if hit:
+                material = brick_material[node.brick_id][hit_local]
+                return (result, material)
             t = exit_distance(brick_bounds)
             level = ascend_to_next_sibling()
         else:
@@ -284,10 +369,44 @@ trace(origin, direction):
             level -= 1
 ```
 
-### 5.2 Acceleration
+### 5.3 Texel-Cached Brick DDA
+
+Inside the 8^3 brick, DDA reads from the 64-byte occupancy bitmask using the texel-caching pattern (from [voxel_ray_traversal](https://github.com/DeadlockCode/voxel_ray_traversal)). Each 4×4×8 sub-block is loaded once and serves up to 128 consecutive bit queries:
+
+```slang
+bool brick_dda_cached(uint brick_id, float3 origin, float3 dir, inout float t) {
+    uvec4 texel;
+    ivec3 texel_coord = ivec3(-1);  // force first load
+
+    uvec3 coord = entry_voxel(origin, dir, t);
+    // ... standard Amanatides-Woo DDA setup ...
+
+    for (int i = 0; i < 24; i++) {  // max 8+8+8 steps through 8^3
+        if (readBrickVoxel(coord, texel, texel_coord))
+            return true;  // hit! material lookup deferred to caller
+
+        // Classic branching DDA (faster than branchless per DeadlockCode's tests)
+        if (t.x < t.y) {
+            if (t.x < t.z) { coord.x += step.x; t.x += delta.x; }
+            else            { coord.z += step.z; t.z += delta.z; }
+        } else {
+            if (t.y < t.z) { coord.y += step.y; t.y += delta.y; }
+            else            { coord.z += step.z; t.z += delta.z; }
+        }
+
+        if (any(coord >= uvec3(8))) break;  // exited brick
+    }
+    return false;
+}
+```
+
+Key: material data (`BrickMaterials[brick_id]`) is only read on hit — the DDA loop itself touches only the 64-byte occupancy bitmask, not the 4096-byte material array. This reduces DDA bandwidth by ~64x.
+
+### 5.4 Acceleration
 
 - **Occupancy skip**: at each level, `child_mask` tells us which octants are empty. DDA only visits non-empty octants.
-- **Brick-internal DDA**: standard 3D-DDA within the 8^3 grid (same algorithm as Shadertoy's `ABoxfarNormal` traversal).
+- **Texel caching**: within a brick, loading a 4×4×8 sub-block (128 bits) amortizes texture fetches across ~8-10 DDA steps on average.
+- **Branching DDA**: the classic `if/else` traversal outperforms branchless alternatives by ~5% on modern GPUs (empirically validated by voxel_ray_traversal).
 - **Early termination**: for shadow rays, return on first hit (no shading needed).
 
 ---
@@ -373,8 +492,7 @@ Slang parameter blocks map to Vulkan descriptor sets:
 ```slang
 // Set 0: per-frame global data
 struct FrameUniforms {
-    float4x4 view_proj;
-    float4x4 inv_view_proj;
+    float4x4 pixel_to_ray;  // single matrix: pixel coord → world ray (origin in col 3)
     float3 camera_pos;
     float3 sun_dir;
     float3 sun_color;
@@ -385,7 +503,8 @@ struct FrameUniforms {
 
 // Set 1: UCVH data (persistent, rarely changes layout)
 struct VolumeData {
-    StructuredBuffer<VoxelCell> brick_pool;  // buffer device address
+    StructuredBuffer<BrickOccupancy> brick_occupancy;  // 64 bytes/brick, hot DDA path
+    StructuredBuffer<VoxelCell> brick_materials;        // 4096 bytes/brick, cold shading path
     StructuredBuffer<NodeL0> occupancy_l0;
     StructuredBuffer<NodeL1> occupancy_l1;
     // ... l2, l3, l4
@@ -435,7 +554,7 @@ src/
 │       ├── tonemap.rs
 │       └── debug_views.rs
 ├── voxel/
-│   ├── brick.rs                — BrickData, BrickPool, free-list
+│   ├── brick.rs                — BrickOccupancy, BrickMaterials, pools, free-list
 │   ├── occupancy.rs            — CascadedOccupancy (5-level hierarchy)
 │   ├── probes.rs               — ProbeStorage (per-level buffers)
 │   ├── ucvh.rs                 — UCVH facade (unified access)
@@ -461,7 +580,8 @@ src/
 ```rust
 // voxel/ucvh.rs — the unified facade
 pub struct Ucvh {
-    pub bricks: BrickPool,
+    pub brick_occupancy: BrickOccupancyPool,  // 64 bytes/brick, hot path
+    pub brick_materials: BrickMaterialPool,    // 4096 bytes/brick, cold path
     pub occupancy: CascadedOccupancy,
     pub probes: ProbeStorage,
     pub materials: MaterialPalette,
