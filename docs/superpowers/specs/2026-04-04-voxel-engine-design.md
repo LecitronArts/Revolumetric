@@ -83,14 +83,18 @@ struct RayResult {
 
 Per hemisphere ray counts follow the Shadertoy pattern: `(3x3) * 4^N`:
 
-| Level | Probe Size | Rays/Hemisphere | Bytes/Probe (6 hemispheres) | Grid  | Total (30% fill) |
-|-------|------------|-----------------|----------------------------|-------|-------------------|
-| 0     | 3          | 9               | 864 B                      | 64^3  | 68 MB             |
-| 1     | 6          | 36              | 3,456 B                    | 32^3  | 34 MB             |
-| 2     | 12         | 144             | 13,824 B                   | 16^3  | 17 MB             |
-| 3     | 24         | 576             | 55,296 B                   | 8^3   | 8.5 MB            |
-| 4     | 48         | 2304            | 221,184 B                  | 4^3   | 4.2 MB            |
-| **Total** |       |                 |                            |       | **~132 MB**       |
+| Level | Probe Size | Rays/Hemisphere | Bytes/Probe (6 hemispheres) | Grid  | Fill Est. | Total        |
+|-------|------------|-----------------|----------------------------|-------|-----------|--------------|
+| 0     | 3          | 9               | 864 B                      | 64^3  | 30%       | 68 MB        |
+| 1     | 6          | 36              | 3,456 B                    | 32^3  | 60%       | 68 MB        |
+| 2     | 12         | 144             | 13,824 B                   | 16^3  | 90%       | 51 MB        |
+| 3     | 24         | 576             | 55,296 B                   | 8^3   | 100%      | 28 MB        |
+| 4     | 48         | 2304            | 221,184 B                  | 4^3   | 100%      | 14 MB        |
+| **Total** |       |                 |                            |       |           | **~229 MB**  |
+
+Note: Fill rate propagates upward — a parent node is occupied if ANY child is.
+L0 fill of 30% yields L1 ~60%, L2 ~90%, L3-L4 ~100% in worst case.
+Budget uses these conservative per-level estimates.
 
 **Sparse allocation**: Probes for empty nodes are not allocated. A parallel prefix-sum compaction pass builds an indirect dispatch table mapping only occupied nodes to probe buffer offsets.
 
@@ -109,14 +113,18 @@ Store as `probe_offset: [i8; 3]` per node (3 bytes).
 |----------------------|----------|
 | Brick Pool           | ~320 MB  |
 | Occupancy Hierarchy  | ~1.6 MB  |
-| RC Probe Buffers     | ~132 MB  |
-| Probe Distance Fields| ~10 MB   |
+| RC Probe Buffers     | ~229 MB  |
 | Shadow Map (2048^2)  | ~16 MB   |
 | Staging / Scratch    | ~64 MB   |
 | Swapchain + Targets  | ~32 MB   |
-| **Total**            | **~576 MB** |
+| **Total**            | **~663 MB** |
 
-Target GPU: 6 GB+ VRAM (GTX 1060 class minimum).
+Note: Probe distance fields (for probe placement) are computed transiently
+during VoxelUploadPass and discarded after writing the 3-byte probe_offset
+per node. They live in the Staging/Scratch budget, not as persistent storage.
+
+Target GPU: 8 GB+ VRAM recommended (RTX 3060 class). 6 GB GPUs can work with
+reduced probe resolution or smaller world size.
 
 ---
 
@@ -507,7 +515,7 @@ impl RenderGraph {
 
 | Metric | Target | Notes |
 |--------|--------|-------|
-| Frame time | < 16.6 ms (60 FPS) | at 1080p, 512^3, RTX 3060 class |
+| Frame time | < 16.6 ms (60 FPS) | at 1080p, 512^3, RTX 3060 class (8 GB) |
 | Cascade trace | < 8 ms | with 1/4 probe update per frame |
 | Primary ray | < 2 ms | hierarchical DDA |
 | Shadow trace | < 1 ms | 2048^2 shadow map |
