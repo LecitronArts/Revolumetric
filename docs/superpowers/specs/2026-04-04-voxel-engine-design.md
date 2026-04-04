@@ -42,9 +42,12 @@ Each brick has a 512-bit occupancy bitmask — one bit per voxel (solid=1, air=0
 #[repr(C)]
 struct BrickOccupancy {
     bits: [u32; 16],  // 16 × 32 = 512 bits
+    count: u32,       // number of solid voxels (0 = brick empty, skip instantly)
 }
-// sizeof(BrickOccupancy) = 64 bytes
+// sizeof(BrickOccupancy) = 68 bytes (padded to 80 bytes for 16-byte GPU alignment)
 ```
+
+The `count` field (inspired by GDVoxelPlayground's `occupancy_count`) enables instant empty-brick detection without scanning the 512-bit mask. During DDA traversal, `if (brick.count == 0) skip;` saves the texel load entirely for empty bricks. Updated atomically during `OccupancyUpdatePass` via `atomicAdd`/`atomicSub`.
 
 **GPU layout**: Packed as 4 × `uvec4` (matching `rgba32ui` texel format). Within each `uvec4`, the 128 bits map to a **4×4×8 sub-block** following the packing from [voxel_ray_traversal](https://github.com/DeadlockCode/voxel_ray_traversal):
 
@@ -64,7 +67,7 @@ This texel-caching pattern (from voxel_ray_traversal) means a single 16-byte loa
 
 #### Tier 2: Material Data (shading-cold path)
 
-Full voxel material data, read only when a ray hits and needs shading.
+Full voxel material data, read only when a ray hits and needs shading. Voxels within each brick are stored in **Morton (Z-curve) order** for cache-coherent DDA traversal — neighboring voxels in 3D space remain close in memory, improving L1/L2 hit rates during brick-internal DDA.
 
 ```rust
 #[repr(C)]
@@ -78,6 +81,38 @@ struct VoxelCell {
 // sizeof(BrickMaterials) = 512 * 8 = 4096 bytes
 ```
 
+**Morton order indexing** (from GDVoxelPlayground): local position `(x,y,z)` within the 8^3 brick maps to a Morton index via interleaved bit expansion:
+
+```slang
+uint mortonIndex(uint3 local) {
+    uint m = 0;
+    m |= ((local.x >> 0) & 1u) << 0 | ((local.y >> 0) & 1u) << 1 | ((local.z >> 0) & 1u) << 2;
+    m |= ((local.x >> 1) & 1u) << 3 | ((local.y >> 1) & 1u) << 4 | ((local.z >> 1) & 1u) << 5;
+    m |= ((local.x >> 2) & 1u) << 6 | ((local.y >> 2) & 1u) << 7 | ((local.z >> 2) & 1u) << 8;
+    return m;  // 0..511
+}
+```
+
+Both Tier 1 (occupancy bitmask bits) and Tier 2 (material data) use the same Morton index so that occupancy bit N corresponds to material slot N.
+
+#### Compact Material Format: 16-bit HSV Color
+
+For scenes that don't require full material palettes, an alternative compact format packs color directly into 16 bits using HSV encoding (from GDVoxelPlayground):
+
+```rust
+#[repr(C)]
+struct VoxelCellCompact {
+    packed: u32,
+    // bits [31:24] — voxel type (8 bits: air, solid, water, lava, sand, ...)
+    // bits [23:8]  — 16-bit HSV color (7H + 4S + 5V)
+    // bits [7:0]   — flags / aux data (direction, fluid level, etc.)
+}
+// sizeof(VoxelCellCompact) = 4 bytes
+// sizeof(BrickMaterialsCompact) = 512 * 4 = 2048 bytes (half bandwidth)
+```
+
+HSV compression: H=7 bits (128 hues), S=4 bits (16 saturation levels), V=5 bits (32 brightness levels). Sufficient for stylized/voxel art aesthetics. The engine supports both formats selectable at brick pool creation time — full `VoxelCell` (8 bytes) for production, `VoxelCellCompact` (4 bytes) for prototyping or bandwidth-constrained scenarios.
+
 #### GPU Storage
 
 Two separate `VkBuffer`s with buffer device address, sharing a free-list allocator (GPU-side atomic ring buffer). Brick IDs index into both buffers at the same slot.
@@ -85,9 +120,11 @@ Two separate `VkBuffer`s with buffer device address, sharing a free-list allocat
 ```
 Capacity: 81,920 bricks (512^3 * 30% / 512 ≈ 78K, rounded up with ~5% headroom)
 
-Occupancy Pool:  81,920 * 64    =   5 MB   ← fits in GPU L2, hot during DDA
-Material Pool:   81,920 * 4,096 = 320 MB   ← cold, read only on hit for shading
-Total:                            325 MB
+Occupancy Pool:  81,920 * 80    = 6.25 MB  ← fits in GPU L2, hot during DDA (80 bytes = 64 bits + count, padded)
+Material Pool:   81,920 * 4,096 = 320 MB   ← cold, read only on hit for shading (full VoxelCell)
+ (or Compact):   81,920 * 2,048 = 160 MB   ← compact mode (VoxelCellCompact, half bandwidth)
+Total (full):                     326 MB
+Total (compact):                  166 MB
 
 Note: If fill rate exceeds 30%, pools can be resized via reallocation + copy.
 ```
@@ -167,14 +204,15 @@ Store as `probe_offset: [i8; 3]` per node (3 bytes).
 
 | Component                | Size     |
 |--------------------------|----------|
-| Brick Occupancy Pool     | ~5 MB    |
-| Brick Material Pool      | ~320 MB  |
+| Brick Occupancy Pool     | ~6 MB    |
+| Brick Material Pool      | ~320 MB (full) / ~160 MB (compact) |
 | Occupancy Hierarchy      | ~1.6 MB  |
 | RC Probe Buffers         | ~229 MB  |
 | Shadow Map (2048^2)      | ~16 MB   |
 | Staging / Scratch        | ~64 MB   |
 | Swapchain + Targets      | ~32 MB   |
-| **Total**                | **~668 MB** |
+| **Total (full)**         | **~669 MB** |
+| **Total (compact)**      | **~509 MB** |
 
 Note: The brick occupancy pool (5 MB) is the hot-path data during DDA traversal
 and fits in GPU L2 cache. The brick material pool (320 MB) is cold-path data
