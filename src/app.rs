@@ -85,10 +85,70 @@ impl RevolumetricApp {
         }
     }
 
+    fn update_camera(&mut self, dt: f32) {
+        // Clone InputState (it's Copy) to avoid borrow conflicts
+        let input = match self.world.resource::<InputState>() {
+            Some(input) => *input,
+            None => return,
+        };
+
+        let rig = match self.world.resource_mut::<CameraRig>() {
+            Some(rig) => rig,
+            None => return,
+        };
+        let ctrl = &mut rig.controller;
+        let cam = &mut rig.camera;
+
+        // Scroll → adjust speed
+        if input.scroll_delta != 0.0 {
+            ctrl.move_speed *= ctrl.scroll_multiplier.powf(input.scroll_delta);
+            ctrl.move_speed = ctrl.move_speed.clamp(ctrl.min_speed, ctrl.max_speed);
+        }
+
+        // Mouse → yaw/pitch
+        let sens_rad = ctrl.mouse_sensitivity * std::f32::consts::PI / 180.0;
+        ctrl.yaw += input.mouse_dx * sens_rad;
+        ctrl.pitch -= input.mouse_dy * sens_rad;
+        ctrl.pitch = ctrl.pitch.clamp(-1.553, 1.553); // ±89°
+
+        // Recompute forward from yaw/pitch
+        cam.forward = glam::Vec3::new(
+            ctrl.pitch.cos() * ctrl.yaw.sin(),
+            ctrl.pitch.sin(),
+            ctrl.pitch.cos() * ctrl.yaw.cos(),
+        );
+
+        // Horizontal movement
+        let hz_forward = glam::Vec3::new(ctrl.yaw.sin(), 0.0, ctrl.yaw.cos());
+        let hz_right = glam::Vec3::Y.cross(hz_forward);
+
+        let mut velocity = hz_forward * input.move_forward
+            + hz_right * input.move_right
+            + glam::Vec3::Y * input.move_up;
+        if velocity.length_squared() > 0.0 {
+            velocity = velocity.normalize();
+        }
+
+        cam.position += velocity * ctrl.move_speed * dt;
+    }
+
     fn tick_frame(&mut self) -> Result<()> {
+        // Real delta time
+        let now = std::time::Instant::now();
+        let dt = match self.last_frame_time {
+            Some(last) => now.duration_since(last).as_secs_f32().min(0.1),
+            None => 0.0,
+        };
+        self.last_frame_time = Some(now);
+
+        if let Some(time) = self.world.resource_mut::<Time>() {
+            time.advance(dt);
+        }
+
         self.schedule.run_stage(Stage::PreUpdate, &mut self.world)?;
         self.schedule.run_stage(Stage::Update, &mut self.world)?;
         self.schedule.run_stage(Stage::PostUpdate, &mut self.world)?;
+        self.update_camera(dt);
         self.schedule.run_stage(Stage::ExtractRender, &mut self.world)?;
         self.schedule.run_stage(Stage::PrepareRender, &mut self.world)?;
 
@@ -107,15 +167,26 @@ impl RevolumetricApp {
                 let mut graph = RenderGraph::new();
 
                 if let Some(pass) = &self.primary_ray_pass {
-                    // Hardcoded camera (Phase 9 adds FPS controller)
-                    let camera_pos = glam::Vec3::new(64.0, 80.0, -40.0);
-                    let camera_target = glam::Vec3::new(64.0, 64.0, 64.0);
-                    let camera_forward = (camera_target - camera_pos).normalize();
-                    let camera_up = glam::Vec3::Y;
-                    let fov_y = std::f32::consts::FRAC_PI_4; // 45° FOV
+                    let (cam_pos, cam_forward, cam_up, fov_y) = {
+                        let rig = self.world.resource::<CameraRig>();
+                        match rig {
+                            Some(rig) => (
+                                rig.camera.position,
+                                rig.camera.forward,
+                                rig.camera.up,
+                                rig.camera.fov_y_radians,
+                            ),
+                            None => (
+                                glam::Vec3::new(64.0, 80.0, -40.0),
+                                glam::Vec3::Z,
+                                glam::Vec3::Y,
+                                std::f32::consts::FRAC_PI_4,
+                            ),
+                        }
+                    };
 
                     let pixel_to_ray = compute_pixel_to_ray(
-                        camera_pos, camera_forward, camera_up, fov_y,
+                        cam_pos, cam_forward, cam_up, fov_y,
                         frame.swapchain_extent.width, frame.swapchain_extent.height,
                     );
 
@@ -170,6 +241,10 @@ impl RevolumetricApp {
                 graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
                 renderer.end_frame(frame)?;
             }
+        }
+
+        if let Some(input) = self.world.resource_mut::<InputState>() {
+            input.clear_per_frame();
         }
 
         self.schedule.run_stage(Stage::ExecuteRender, &mut self.world)?;
