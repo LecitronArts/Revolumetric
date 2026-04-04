@@ -246,7 +246,7 @@ impl RenderDevice {
         Ok(())
     }
 
-    pub fn render_frame(&mut self) -> Result<FrameContext> {
+    pub fn begin_frame(&mut self) -> Result<FrameContext> {
         let frame_slot = self.current_frame;
         let frame_resources = &self.frames[frame_slot];
         let command_pool = frame_resources.command_pool;
@@ -278,10 +278,7 @@ impl RenderDevice {
             Ok(result) => result,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
-                return Ok(FrameContext {
-                    frame_index: self.frame_index,
-                    should_render: false,
-                });
+                return Ok(FrameContext::skip(self.frame_index));
             }
             Err(error) => {
                 return Err(anyhow!("failed to acquire Vulkan swapchain image: {error:?}"));
@@ -305,68 +302,54 @@ impl RenderDevice {
             self.device
                 .begin_command_buffer(command_buffer, &command_buffer_begin_info)
                 .context("failed to begin Vulkan command buffer")?;
+        }
 
-            transition_swapchain_image(
-                &self.device,
-                command_buffer,
-                self.swapchain.images[image_index],
-                self.swapchain.image_layouts[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            );
+        self.frame_index += 1;
+        self.current_frame = (self.current_frame + 1) % self.frames.len();
 
-            let clear_value = vk::ClearColorValue {
-                float32: [0.02, 0.03, 0.05, 1.0],
-            };
-            let clear_range = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1);
-            self.device.cmd_clear_color_image(
-                command_buffer,
-                self.swapchain.images[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear_value,
-                &[clear_range],
-            );
+        Ok(FrameContext {
+            frame_index: self.frame_index,
+            should_render: true,
+            command_buffer,
+            swapchain_image: self.swapchain.images[image_index],
+            swapchain_image_index: image_index,
+            swapchain_extent: self.swapchain.extent,
+            swapchain_format: self.swapchain.format,
+            image_available_semaphore,
+            render_finished_semaphore,
+            in_flight_fence,
+            suboptimal,
+        })
+    }
 
-            transition_swapchain_image(
-                &self.device,
-                command_buffer,
-                self.swapchain.images[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::empty(),
-            );
+    pub fn end_frame(&mut self, ctx: FrameContext) -> Result<()> {
+        if !ctx.should_render {
+            return Ok(());
+        }
 
+        unsafe {
             self.device
-                .end_command_buffer(command_buffer)
+                .end_command_buffer(ctx.command_buffer)
                 .context("failed to end Vulkan command buffer")?;
 
-            let wait_semaphores = [image_available_semaphore];
-            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-            let command_buffers = [command_buffer];
-            let signal_semaphores = [render_finished_semaphore];
+            let wait_semaphores = [ctx.image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::TRANSFER];
+            let command_buffers = [ctx.command_buffer];
+            let signal_semaphores = [ctx.render_finished_semaphore];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&command_buffers)
                 .signal_semaphores(&signal_semaphores);
             self.device
-                .queue_submit(self.graphics_queue, &[submit_info], in_flight_fence)
+                .queue_submit(self.graphics_queue, &[submit_info], ctx.in_flight_fence)
                 .context("failed to submit Vulkan command buffer")?;
 
-            let present_wait_semaphores = [render_finished_semaphore];
+            let present_wait_semaphores = [ctx.render_finished_semaphore];
             let swapchains = [self.swapchain.handle];
-            let image_indices = [image_index as u32];
+            let image_indices = [ctx.swapchain_image_index as u32];
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&present_wait_semaphores)
                 .swapchains(&swapchains)
@@ -376,7 +359,7 @@ impl RenderDevice {
                 .queue_present(self.present_queue, &present_info)
             {
                 Ok(is_suboptimal) => {
-                    if is_suboptimal || suboptimal {
+                    if is_suboptimal || ctx.suboptimal {
                         self.recreate_swapchain()?;
                     }
                 }
@@ -389,24 +372,15 @@ impl RenderDevice {
             }
         }
 
-        self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
-        self.frame_index += 1;
-        let frame = FrameContext::begin(self.frame_index);
+        self.swapchain.image_layouts[ctx.swapchain_image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+
         tracing::trace!(
-            frame_index = frame.frame_index,
-            frame_slot,
-            image_index,
-            width = self.swapchain.width,
-            height = self.swapchain.height,
-            image_count = self.swapchain.images.len(),
-            swapchain_format = ?self.swapchain.format,
-            command_buffer = ?command_buffer,
-            graphics_queue_family_index = self.graphics_queue_family_index,
-            present_queue_family_index = self.present_queue_family_index,
-            "executed Vulkan bootstrap frame"
+            frame_index = ctx.frame_index,
+            image_index = ctx.swapchain_image_index,
+            "completed frame"
         );
-        self.current_frame = (self.current_frame + 1) % self.frames.len();
-        Ok(frame)
+
+        Ok(())
     }
 
     pub fn surface(&self) -> vk::SurfaceKHR {

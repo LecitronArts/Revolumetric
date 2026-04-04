@@ -69,7 +69,33 @@ impl RevolumetricApp {
         self.schedule.run_stage(Stage::PrepareRender, &mut self.world)?;
 
         if let Some(renderer) = self.renderer.as_mut() {
-            let _frame = renderer.render_frame()?;
+            let frame = renderer.begin_frame()?;
+            if frame.should_render {
+                // TODO: Record render passes via RenderGraph here.
+                // For now, transition swapchain image to PRESENT_SRC directly.
+                let barrier = ash::vk::ImageMemoryBarrier::default()
+                    .old_layout(ash::vk::ImageLayout::UNDEFINED)
+                    .new_layout(ash::vk::ImageLayout::PRESENT_SRC_KHR)
+                    .src_access_mask(ash::vk::AccessFlags::empty())
+                    .dst_access_mask(ash::vk::AccessFlags::empty())
+                    .image(frame.swapchain_image)
+                    .subresource_range(
+                        ash::vk::ImageSubresourceRange::default()
+                            .aspect_mask(ash::vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    );
+                unsafe {
+                    renderer.device().cmd_pipeline_barrier(
+                        frame.command_buffer,
+                        ash::vk::PipelineStageFlags::TOP_OF_PIPE,
+                        ash::vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                        ash::vk::DependencyFlags::empty(),
+                        &[], &[], &[barrier],
+                    );
+                }
+                renderer.end_frame(frame)?;
+            }
         }
 
         self.schedule.run_stage(Stage::ExecuteRender, &mut self.world)?;
