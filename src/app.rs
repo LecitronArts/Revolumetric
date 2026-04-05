@@ -20,6 +20,7 @@ use crate::render::passes::blit_to_swapchain;
 use crate::render::camera::compute_pixel_to_ray;
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::scene::light::DirectionalLight;
+use crate::render::passes::lighting::LightingPass;
 use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::resource::QueueType;
 use crate::scene::systems;
@@ -43,6 +44,7 @@ struct RevolumetricApp {
     schedule: Schedule,
     renderer: Option<RenderDevice>,
     primary_ray_pass: Option<PrimaryRayPass>,
+    lighting_pass: Option<LightingPass>,
     ucvh: Option<Ucvh>,
     ucvh_gpu: Option<UcvhGpuResources>,
     ucvh_uploaded: bool,
@@ -76,6 +78,7 @@ impl RevolumetricApp {
             schedule,
             renderer: None,
             primary_ray_pass: None,
+            lighting_pass: None,
             ucvh: None,
             ucvh_gpu: None,
             ucvh_uploaded: false,
@@ -225,9 +228,6 @@ impl RevolumetricApp {
                         ubo.update(frame.frame_slot, &scene_data);
                     }
 
-                    let gbuffer_pos_img = pass.gbuffer_pos.handle;
-                    let gbuffer_pos_extent = pass.gbuffer_pos.extent;
-
                     let primary_ray_writes = graph.add_pass(
                         "primary_ray",
                         QueueType::Compute,
@@ -257,26 +257,79 @@ impl RevolumetricApp {
                         },
                     );
 
-                    // For now, blit gbuffer_pos directly (lighting pass added in Task 5).
-                    // This will show raw position data, confirming G-buffer pipeline works.
-                    let src_image = gbuffer_pos_img;
-                    let src_extent = gbuffer_pos_extent;
-                    let dst_image = frame.swapchain_image;
-                    let dst_extent = frame.swapchain_extent;
-                    let dep_handle = primary_ray_writes[0];
-                    graph.add_pass(
-                        "blit_to_swapchain",
-                        QueueType::Graphics,
-                        |builder| {
-                            builder.read(dep_handle);
-                            Box::new(move |ctx| {
-                                blit_to_swapchain::record_blit(
-                                    ctx.device, ctx.command_buffer,
-                                    src_image, src_extent, dst_image, dst_extent,
+                    // Lighting pass
+                    if let Some(lighting) = &self.lighting_pass {
+                        let gbuf_images = [
+                            pass.gbuffer_pos.handle,
+                            pass.gbuffer0.handle,
+                            pass.gbuffer1.handle,
+                        ];
+                        let lighting_output = lighting.output_image.handle;
+                        let lighting_extent = lighting.output_image.extent;
+                        let dep0 = primary_ray_writes[0];
+                        let dep1 = primary_ray_writes[1];
+                        let dep2 = primary_ray_writes[2];
+                        let slot = frame.frame_slot;
+
+                        let lighting_writes = graph.add_pass(
+                            "lighting",
+                            QueueType::Compute,
+                            |builder| {
+                                builder.read(dep0);
+                                builder.read(dep1);
+                                builder.read(dep2);
+                                let _out = builder.create_image(
+                                    frame.swapchain_extent.width,
+                                    frame.swapchain_extent.height,
+                                    vk::Format::R8G8B8A8_UNORM,
+                                    vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                                 );
-                            })
-                        },
-                    );
+                                Box::new(move |ctx| {
+                                    lighting.record(ctx.device, ctx.command_buffer, slot, gbuf_images);
+                                })
+                            },
+                        );
+
+                        // Blit lighting output to swapchain
+                        let src_image = lighting_output;
+                        let src_extent = lighting_extent;
+                        let dst_image = frame.swapchain_image;
+                        let dst_extent = frame.swapchain_extent;
+                        let dep_handle = lighting_writes[0];
+                        graph.add_pass(
+                            "blit_to_swapchain",
+                            QueueType::Graphics,
+                            |builder| {
+                                builder.read(dep_handle);
+                                Box::new(move |ctx| {
+                                    blit_to_swapchain::record_blit(
+                                        ctx.device, ctx.command_buffer,
+                                        src_image, src_extent, dst_image, dst_extent,
+                                    );
+                                })
+                            },
+                        );
+                    } else {
+                        // Fallback: blit raw G-buffer if lighting pass not ready
+                        let src_image = pass.gbuffer0.handle;
+                        let src_extent = pass.gbuffer0.extent;
+                        let dst_image = frame.swapchain_image;
+                        let dst_extent = frame.swapchain_extent;
+                        let dep_handle = primary_ray_writes[0];
+                        graph.add_pass(
+                            "blit_to_swapchain",
+                            QueueType::Graphics,
+                            |builder| {
+                                builder.read(dep_handle);
+                                Box::new(move |ctx| {
+                                    blit_to_swapchain::record_blit(
+                                        ctx.device, ctx.command_buffer,
+                                        src_image, src_extent, dst_image, dst_extent,
+                                    );
+                                })
+                            },
+                        );
+                    }
                 }
 
                 graph.compile();
@@ -299,6 +352,9 @@ impl Drop for RevolumetricApp {
         // Destroy GPU passes before the renderer (which owns the device/allocator).
         if let Some(renderer) = &self.renderer {
             unsafe { renderer.device().device_wait_idle().ok() };
+            if let Some(pass) = self.lighting_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
             if let Some(pass) = self.primary_ray_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
             }
@@ -420,6 +476,43 @@ impl ApplicationHandler for RevolumetricApp {
                         }
                         Err(error) => {
                             tracing::error!(%error, "failed to create primary ray pass");
+                        }
+                    }
+                }
+            }
+        }
+
+        // Initialize lighting pass (requires primary ray pass + scene UBO)
+        if self.lighting_pass.is_none() {
+            if let (Some(primary), Some(ucvh_gpu), Some(scene_ubo_ref)) =
+                (&self.primary_ray_pass, &self.ucvh_gpu, &self.scene_ubo)
+            {
+                let renderer = self.renderer.as_ref().unwrap();
+                let extent = renderer.swapchain_extent();
+                let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/lighting.spv"));
+                if spirv.is_empty() {
+                    tracing::warn!("lighting.spv is empty — slangc may not be installed");
+                } else {
+                    match LightingPass::new(
+                        renderer.device(),
+                        renderer.allocator(),
+                        extent.width,
+                        extent.height,
+                        spirv,
+                        primary,
+                        ucvh_gpu,
+                        scene_ubo_ref,
+                    ) {
+                        Ok(pass) => {
+                            tracing::info!(
+                                width = extent.width,
+                                height = extent.height,
+                                "initialized lighting pass"
+                            );
+                            self.lighting_pass = Some(pass);
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "failed to create lighting pass");
                         }
                     }
                 }
