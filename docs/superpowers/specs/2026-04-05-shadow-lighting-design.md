@@ -76,8 +76,8 @@ Size: 144 bytes. Static assert in tests.
 ### Scene UBO Management
 
 New struct `SceneUniformBuffer` in `src/render/scene_ubo.rs`:
-- Owns a GPU buffer (144 bytes, `UNIFORM_BUFFER` usage, host-visible + `HOST_COHERENT` — no manual flush needed)
-- `update(&self, device, data: &GpuSceneUniforms)` — memcpy via persistent mapped pointer each frame
+- Owns **one GPU buffer per frame-in-flight** (2 × 144 bytes, `UNIFORM_BUFFER` usage, host-visible + `HOST_COHERENT` — no manual flush needed). Double-buffering prevents the CPU from overwriting a buffer the GPU is still reading from the previous frame's command buffer.
+- `update(&self, device, frame_index: usize, data: &GpuSceneUniforms)` — memcpy via persistent mapped pointer to the buffer for the current frame slot
 - `destroy(device, allocator)` — cleanup
 
 Created once at renderer init. Each pass has a **single descriptor set** (set 0) with all bindings — Scene UBO at binding 0, pass-specific resources at subsequent bindings. This matches the existing `PrimaryRayPass` pattern. The Scene UBO descriptor is written to both passes' descriptor sets (same buffer, different VkDescriptorSet instances).
@@ -231,6 +231,13 @@ Added to `voxel_common.slang` alongside existing helpers.
 
 ### Shader: `assets/shaders/passes/lighting.slang`
 
+Required includes:
+```slang
+#include "scene_common.slang"       // SceneUniforms
+#include "voxel_traverse.slang"     // trace_primary_ray (for shadow rays)
+#include "lighting_common.slang"    // ACES tonemap, sky_color_for_dir
+```
+
 Full-screen compute shader. For each pixel:
 
 1. Read `gbuffer_pos` — if `w < 0` (miss), reconstruct ray direction and output sky gradient:
@@ -297,13 +304,13 @@ New file. Structure mirrors `PrimaryRayPass`:
 
 ```
 1. Upload UCVH (first frame)
-2. Update Scene UBO
+2. Update Scene UBO (write to current frame slot)
 3. Primary Ray Pass → writes gbuffer_pos, gbuffer0, gbuffer1
-4. Memory barrier: SHADER_WRITE → SHADER_READ on all G-buffer images
-5. Lighting Pass → reads gbuffer + UCVH, writes output_image
-6. Memory barrier: SHADER_WRITE → TRANSFER_READ on output_image
-7. Blit output_image → swapchain
+4. Lighting Pass → (inserts SHADER_WRITE→SHADER_READ barriers on G-buffer) → reads gbuffer + UCVH, writes output_image
+5. Blit to Swapchain → (inserts SHADER_WRITE→TRANSFER_READ barrier on output_image) → copies to swapchain
 ```
+
+Each pass's `record()` method inserts input barriers for its read resources before binding and dispatching, following the existing `PrimaryRayPass`/`BlitToSwapchain` pattern.
 
 ### Render Graph Wiring
 
@@ -313,7 +320,7 @@ let primary_writes = graph.add_pass("primary_ray", Compute, |builder| {
     ...
 });
 
-graph.add_pass("lighting", Compute, |builder| {
+let lighting_writes = graph.add_pass("lighting", Compute, |builder| {
     // depends on ALL primary ray outputs
     builder.read(primary_writes[0]); // gbuffer_pos
     builder.read(primary_writes[1]); // gbuffer0
@@ -331,7 +338,8 @@ graph.add_pass("blit_to_swapchain", Graphics, |builder| {
 
 | File | Change |
 |------|--------|
-| `src/render/scene_ubo.rs` | **New** — GpuSceneUniforms struct + SceneUniformBuffer management |
+| `src/render/scene_ubo.rs` | **New** — GpuSceneUniforms struct + SceneUniformBuffer management (double-buffered) |
+| `src/render/device.rs` | Enable `shaderStorageImageExtendedFormats` in `VkPhysicalDeviceFeatures` (required for `R8G8B8A8_UINT` as storage image) |
 | `src/render/passes/primary_ray.rs` | **Refactor** — remove push constants, add Scene UBO binding, output G-buffer (3 images) |
 | `src/render/passes/lighting.rs` | **New** — shadow ray + Lambert + hemisphere ambient + ACES tonemap |
 | `src/render/passes/composite.rs` | **Delete** — empty stub, replaced by `lighting.rs` |
@@ -344,12 +352,13 @@ graph.add_pass("blit_to_swapchain", Graphics, |builder| {
 | `assets/shaders/passes/primary_ray.slang` | Remove push constant, read Scene UBO via ConstantBuffer, output G-buffer |
 | `assets/shaders/passes/lighting.slang` | **New** — full lighting compute shader |
 | `assets/shaders/shared/voxel_common.slang` | Add `encode_normal_id()` helper |
-| `assets/shaders/shared/lighting.slang` | Add ACES tonemap, hemisphere ambient helpers (replace placeholder) |
+| `assets/shaders/shared/lighting_common.slang` | Add ACES tonemap, hemisphere ambient helpers (replace placeholder `lighting.slang`); renamed to avoid collision with `passes/lighting.slang` |
 
 ## Implementation Notes
 
 - **L1-L4 hierarchy bindings removed**: The current `primary_ray.slang` binds `hierarchy_l1` through `hierarchy_l4` at bindings 5-8 for forward compatibility. These are intentionally dropped — only L0 is used. The old bindings 5-8 are reclaimed for UCVH buffers.
-- **`shaderStorageImageExtendedFormats`**: G-buffer uses `R8G8B8A8_UNORM` and `R8G8B8A8_UINT` as storage images (`RWTexture2D`). Verify this Vulkan device feature is enabled. The existing output image already uses `R8G8B8A8_UNORM` as a storage image, so it's likely already enabled.
+- **UCVH binding order changed**: Current shader binds UCVH as config(1), occupancy(2), materials(3), l0(4). New order matches `trace_primary_ray()` parameter order: config, l0, occupancy, materials. This affects both passes.
+- **`shaderStorageImageExtendedFormats`**: Must be explicitly enabled in `device.rs` (see Files Changed). The existing output image already uses `R8G8B8A8_UNORM` as a storage image, but adding `R8G8B8A8_UINT` for `gbuffer1` may require the feature to be formally enabled.
 - **RowMajor matrix layout validation**: After implementing, verify with `spirv-dis` that the `pixel_to_ray` field in the `ConstantBuffer` SPIR-V output has `RowMajor` decoration, matching the existing `PushConstant` behavior. If not, adjust the Rust-side transpose accordingly.
 
 ## Out of Scope
