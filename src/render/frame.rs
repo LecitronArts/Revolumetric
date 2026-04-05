@@ -2,6 +2,7 @@ use ash::vk;
 
 pub struct FrameContext {
     pub frame_index: u64,
+    pub frame_slot: usize,
     pub should_render: bool,
     pub command_buffer: vk::CommandBuffer,
     pub swapchain_image: vk::Image,
@@ -19,6 +20,7 @@ impl FrameContext {
     pub fn skip(frame_index: u64) -> Self {
         Self {
             frame_index,
+            frame_slot: 0,
             should_render: false,
             command_buffer: vk::CommandBuffer::null(),
             swapchain_image: vk::Image::null(),

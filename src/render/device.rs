@@ -126,9 +126,13 @@ impl RenderDevice {
         let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
             .buffer_device_address(true);
 
+        let physical_features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true);
+
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&device_extension_names)
+            .enabled_features(&physical_features)
             .push_next(&mut bda_features);
 
         let device = unsafe {
@@ -313,6 +317,7 @@ impl RenderDevice {
 
         Ok(FrameContext {
             frame_index: self.frame_index,
+            frame_slot,
             should_render: true,
             command_buffer,
             swapchain_image: self.swapchain.images[image_index],
