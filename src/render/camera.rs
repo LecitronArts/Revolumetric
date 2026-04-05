@@ -1,27 +1,10 @@
 // src/render/camera.rs
-use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3, Vec4};
-
-/// Push constants for the primary ray pass.
-/// Sent to GPU each frame — must match the Slang `PrimaryRayPC` layout exactly.
-/// NOTE: Slang emits RowMajor for float4x4 push constants, so the driver
-/// transposes on load. Callers must store `mat.transpose().to_cols_array_2d()`
-/// so that SPIR-V columns arrive as the original glam columns.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct PrimaryRayPushConstants {
-    /// Column-major 4×4 matrix.
-    /// - Columns 0-2 (3×3): maps (pixel_x, pixel_y, 1) → unnormalized world-space ray direction
-    /// - Column 3 (xyz):   camera world position (ray origin)
-    pub pixel_to_ray: [[f32; 4]; 4],
-    pub resolution: [u32; 2],
-    pub _pad: [u32; 2],
-}
 
 /// Compute the pixel_to_ray matrix for a pinhole camera.
 ///
 /// Convention: Y-up, camera looks along its `forward` direction.
-/// The shader normalizes the direction, so the 3×3 part need not produce unit vectors.
+/// The shader normalizes the direction, so the 3x3 part need not produce unit vectors.
 pub fn compute_pixel_to_ray(
     camera_pos: Vec3,
     camera_forward: Vec3,
@@ -35,9 +18,9 @@ pub fn compute_pixel_to_ray(
     let aspect = w / h;
     let t = (fov_y_rad * 0.5).tan();
 
-    // Build orthonormal camera basis (right-handed, forward=+Z, up=+Y → right=+X)
-    // right = up × forward  (Y × Z = +X)
-    // up    = forward × right (Z × X = +Y)
+    // Build orthonormal camera basis (right-handed, forward=+Z, up=+Y -> right=+X)
+    // right = up x forward  (Y x Z = +X)
+    // up    = forward x right (Z x X = +Y)
     let forward = camera_forward.normalize();
     let right = camera_up.cross(forward).normalize();
     let up = forward.cross(right);
@@ -102,10 +85,5 @@ mod tests {
         let left = (mat3 * Vec3::new(0.0, 300.0, 1.0)).normalize();
         let right = (mat3 * Vec3::new(799.0, 300.0, 1.0)).normalize();
         assert!(left.x < right.x, "left.x={} < right.x={}", left.x, right.x);
-    }
-
-    #[test]
-    fn push_constants_size() {
-        assert_eq!(std::mem::size_of::<PrimaryRayPushConstants>(), 80);
     }
 }

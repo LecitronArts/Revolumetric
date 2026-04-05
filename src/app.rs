@@ -17,7 +17,9 @@ use crate::platform::window::WindowDescriptor;
 use crate::render::device::RenderDevice;
 use crate::render::graph::RenderGraph;
 use crate::render::passes::blit_to_swapchain;
-use crate::render::camera::{compute_pixel_to_ray, PrimaryRayPushConstants};
+use crate::render::camera::compute_pixel_to_ray;
+use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
+use crate::scene::light::DirectionalLight;
 use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::resource::QueueType;
 use crate::scene::systems;
@@ -44,6 +46,7 @@ struct RevolumetricApp {
     ucvh: Option<Ucvh>,
     ucvh_gpu: Option<UcvhGpuResources>,
     ucvh_uploaded: bool,
+    scene_ubo: Option<SceneUniformBuffer>,
     window_descriptor: WindowDescriptor,
     window: Option<Window>,
     window_id: Option<WindowId>,
@@ -76,6 +79,7 @@ impl RevolumetricApp {
             ucvh: None,
             ucvh_gpu: None,
             ucvh_uploaded: false,
+            scene_ubo: None,
             window_descriptor: WindowDescriptor::default(),
             window: None,
             window_id: None,
@@ -190,35 +194,73 @@ impl RevolumetricApp {
                         frame.swapchain_extent.width, frame.swapchain_extent.height,
                     );
 
-                    let pc = PrimaryRayPushConstants {
-                        // Slang float4x4 uses RowMajor in SPIR-V: driver reads memory as rows
-                        // and transposes into columns. Pre-transpose so columns arrive correctly.
-                        pixel_to_ray: pixel_to_ray.transpose().to_cols_array_2d(),
-                        resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
-                        _pad: [0; 2],
+                    // Read DirectionalLight from World
+                    let (sun_dir, sun_intensity) = {
+                        let light = self.world.resource::<DirectionalLight>();
+                        match light {
+                            Some(l) => (l.direction, l.intensity),
+                            None => (
+                                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                                glam::Vec3::new(2.0, 1.5, 1.25),
+                            ),
+                        }
                     };
 
-                    let output_extent = pass.output_image.extent;
-                    let output_img = pass.output_image.handle;
+                    // Fill and upload Scene UBO
+                    let scene_data = GpuSceneUniforms {
+                        pixel_to_ray: pixel_to_ray.transpose().to_cols_array_2d(),
+                        resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
+                        _pad0: [0; 2],
+                        sun_direction: sun_dir.to_array(),
+                        _pad1: 0.0,
+                        sun_intensity: sun_intensity.to_array(),
+                        _pad2: 0.0,
+                        sky_color: [0.4, 0.5, 0.7],
+                        _pad3: 0.0,
+                        ground_color: [0.15, 0.1, 0.08],
+                        time: self.world.resource::<Time>().map_or(0.0, |t| t.elapsed_seconds),
+                    };
+
+                    if let Some(ubo) = &self.scene_ubo {
+                        ubo.update(frame.frame_slot, &scene_data);
+                    }
+
+                    let gbuffer_pos_img = pass.gbuffer_pos.handle;
+                    let gbuffer_pos_extent = pass.gbuffer_pos.extent;
 
                     let primary_ray_writes = graph.add_pass(
                         "primary_ray",
                         QueueType::Compute,
                         |builder| {
-                            let _output = builder.create_image(
+                            let _gbp = builder.create_image(
+                                frame.swapchain_extent.width,
+                                frame.swapchain_extent.height,
+                                vk::Format::R32G32B32A32_SFLOAT,
+                                vk::ImageUsageFlags::STORAGE,
+                            );
+                            let _gb0 = builder.create_image(
                                 frame.swapchain_extent.width,
                                 frame.swapchain_extent.height,
                                 vk::Format::R8G8B8A8_UNORM,
-                                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+                                vk::ImageUsageFlags::STORAGE,
                             );
+                            let _gb1 = builder.create_image(
+                                frame.swapchain_extent.width,
+                                frame.swapchain_extent.height,
+                                vk::Format::R8G8B8A8_UINT,
+                                vk::ImageUsageFlags::STORAGE,
+                            );
+                            let slot = frame.frame_slot;
                             Box::new(move |ctx| {
-                                pass.record(ctx.device, ctx.command_buffer, &pc);
+                                pass.record(ctx.device, ctx.command_buffer, slot);
                             })
                         },
                     );
 
-                    let src_image = output_img;
-                    let src_extent = output_extent;
+                    // For now, blit gbuffer_pos directly (lighting pass added in Task 5).
+                    // This will show raw position data, confirming G-buffer pipeline works.
+                    let src_image = gbuffer_pos_img;
+                    let src_extent = gbuffer_pos_extent;
                     let dst_image = frame.swapchain_image;
                     let dst_extent = frame.swapchain_extent;
                     let dep_handle = primary_ray_writes[0];
@@ -262,6 +304,9 @@ impl Drop for RevolumetricApp {
             }
             if let Some(gpu) = self.ucvh_gpu.take() {
                 gpu.destroy(renderer.device(), renderer.allocator());
+            }
+            if let Some(ubo) = self.scene_ubo.take() {
+                ubo.destroy(renderer.device(), renderer.allocator());
             }
         }
     }
@@ -308,6 +353,22 @@ impl ApplicationHandler for RevolumetricApp {
         self.window = Some(window);
         self.window_id = Some(window_id);
 
+        // Create Scene UBO
+        if self.scene_ubo.is_none() {
+            let renderer = self.renderer.as_ref().unwrap();
+            match SceneUniformBuffer::new(
+                renderer.device(),
+                renderer.allocator(),
+                renderer.swapchain_image_count(),
+            ) {
+                Ok(ubo) => {
+                    tracing::info!(frame_count = renderer.swapchain_image_count(), "created scene UBO");
+                    self.scene_ubo = Some(ubo);
+                }
+                Err(e) => tracing::error!(%e, "failed to create scene UBO"),
+            }
+        }
+
         // Generate UCVH demo scene
         if self.ucvh.is_none() {
             let config = UcvhConfig::new(glam::UVec3::splat(128));
@@ -331,9 +392,9 @@ impl ApplicationHandler for RevolumetricApp {
             self.ucvh = Some(ucvh);
         }
 
-        // Initialize primary ray pass (requires UCVH GPU resources)
+        // Initialize primary ray pass (requires UCVH GPU resources + Scene UBO)
         if self.primary_ray_pass.is_none() {
-            if let Some(ucvh_gpu) = &self.ucvh_gpu {
+            if let (Some(ucvh_gpu), Some(scene_ubo_ref)) = (&self.ucvh_gpu, &self.scene_ubo) {
                 let renderer = self.renderer.as_ref().unwrap();
                 let extent = renderer.swapchain_extent();
                 let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/primary_ray.spv"));
@@ -347,6 +408,7 @@ impl ApplicationHandler for RevolumetricApp {
                         extent.height,
                         spirv,
                         ucvh_gpu,
+                        scene_ubo_ref,
                     ) {
                         Ok(pass) => {
                             tracing::info!(
