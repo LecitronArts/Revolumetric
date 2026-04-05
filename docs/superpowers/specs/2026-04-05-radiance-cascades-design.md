@@ -99,32 +99,43 @@ static const float3 MATERIAL_ALBEDO[6] = {
 
 ### 2.4 HitResult Extension
 
-`voxel_traverse.slang` `HitResult` gains material data:
+`ray.slang` `HitResult` adds a `VoxelCell` field while **keeping all existing fields** (`brick_id`, `local`):
 
 ```slang
 struct HitResult {
-    bool hit;
+    bool  hit;
+    float t;
     float3 position;
     float3 normal;
-    float t;
-    VoxelCell cell;  // NEW: material + emissive from brick_materials
+    uint  brick_id;
+    uint3 local;
+    VoxelCell cell;  // NEW: material + emissive data
 };
+
+static const HitResult NO_HIT = { false, 1e30, float3(0), float3(0), 0xFFFFFFFFu, uint3(0), {0, 0} };
+```
+
+`trace_primary_ray` populates the new field on hit:
+```slang
+result.cell = brick_materials[result.brick_id * 512 + morton_encode(result.local)];
 ```
 
 ### 2.5 G-Buffer Changes
 
-`primary_ray.slang` writes real albedo and emissive:
+`primary_ray.slang` writes real albedo and emissive using existing `voxel_common.slang` accessors:
 
 ```slang
 // Hit path:
-uint mat_id = hit.cell.material;
+uint mat_id = voxel_material(hit.cell);
 float3 albedo = MATERIAL_ALBEDO[min(mat_id, 5u)];
 gbuffer0[tid.xy] = float4(albedo, 1.0);
+float3 emissive = voxel_emissive(hit.cell);
+uint3 emissive_raw = uint3(emissive * 255.0);
 gbuffer1[tid.xy] = uint4(
     encode_normal_id(hit.normal),
-    hit.cell.emissive_r,
-    hit.cell.emissive_g,
-    hit.cell.emissive_b
+    emissive_raw.r,
+    emissive_raw.g,
+    emissive_raw.b
 );
 ```
 
@@ -183,7 +194,7 @@ Compute shader `assets/shaders/passes/rc_trace.slang`.
 1. Decode thread ID → (cascade_level, probe_xyz, face, dir_index)
 2. Compute probe world position = probe_xyz * probe_spacing + spacing/2
 3. If LOD > 0: apply GeoOffset (find nearest empty voxel near probe center)
-   If LOD == 0: offset by -normal * 0.25
+   If LOD == 0: offset by -face_normal * 0.25 (the hemisphere face axis, NOT surface hit normal)
 4. Check OutsideGeo — if probe is inside solid, write (0,0,0,-1) and return
 5. Compute ray direction via ComputeDir, transform by face TBN
 6. Trace ray through UCVH (trace_primary_ray)
@@ -219,6 +230,10 @@ Frame N: rc_trace reads Frame N-1 probe buffer, writes Frame N probe buffer
 This requires double-buffering the probe buffer (2 × 6.2 MB = 12.4 MB total), but eliminates all intra-frame cascade barriers and allows a single dispatch per level with no ordering constraint.
 
 **Final decision: Double-buffered temporal approach.**
+
+**Convergence note**: Since each cascade level reads from the previous frame's buffer (not the current frame's higher cascade), multi-bounce light propagation across cascade levels takes N frames to converge through N cascade levels. For static scenes this is imperceptible (converges in 3-4 frames). For dynamic emissives, there is a subtle 2-3 frame GI latency — matching M3ycWt's temporal behavior.
+
+**Probe buffer initialization**: Both probe buffers must be **zero-initialized** at creation time. On the first few frames, indirect lighting will ramp up from zero as cascades converge. This produces a natural fade-in rather than garbage artifacts.
 
 ### 3.5 rc_merge Pass
 
@@ -295,28 +310,80 @@ Bindings: probe buffer (read-write), push constants (cascade level, grid sizes, 
 
 ### 4.1 integrate_probe Function
 
-New function in `lighting_common.slang` or `rc_common.slang`:
+New function in `rc_common.slang`. Uses **visibility-weighted trilinear interpolation** across 8 neighboring C0 probes (matching the `TrilinearCS` pattern from rc_merge):
 
 ```slang
-float3 integrate_probe(float3 world_pos, float3 normal,
-                       StructuredBuffer<float4> rc_probes,
-                       uint c0_offset, uint3 c0_grid_size) {
-    // Convert world position to C0 probe grid coordinate
-    uint3 probe_coord = uint3(floor(world_pos / 8.0));
-    probe_coord = clamp(probe_coord, uint3(0), c0_grid_size - 1);
+// Canonical face ordering for RC probe system (matches encode_normal_id):
+//   0 = +X, 1 = -X, 2 = +Y, 3 = -Y, 4 = +Z, 5 = -Z
+uint normal_to_face(float3 n) {
+    return encode_normal_id(n);  // reuse existing function
+}
 
-    // Select face from normal (same as NORMAL_TABLE mapping)
-    uint face = normal_to_face(normal);
-
-    // Accumulate 9 direction samples for this face
-    float3 total = float3(0.0);
+// Read 9 direction samples for one probe/face, return accumulated radiance
+float3 read_probe_face(uint3 probe_coord, uint face, uint3 grid_size,
+                       uint c0_offset, StructuredBuffer<float4> rc_probes) {
     uint base = c0_offset +
-        ((probe_coord.z * c0_grid_size.y + probe_coord.y) * c0_grid_size.x + probe_coord.x)
+        ((probe_coord.z * grid_size.y + probe_coord.y) * grid_size.x + probe_coord.x)
         * 6 * 9 + face * 9;
+    float3 total = float3(0.0);
     for (uint i = 0; i < 9; i++) {
         total += rc_probes[base + i].xyz;
     }
     return total;
+}
+
+// Visibility test: check if probe can "see" the query point
+float probe_visibility(uint3 probe_coord, float3 world_pos, uint face,
+                       uint3 grid_size, uint c0_offset, float probe_spacing,
+                       StructuredBuffer<float4> rc_probes) {
+    float3 probe_world = (float3(probe_coord) + 0.5) * probe_spacing;
+    float3 rel = world_pos - probe_world;
+    float dist = length(rel);
+    // Find closest ray direction in this face and check ray_dist
+    // Simplified: use center direction (index 4 of 9) for visibility
+    uint center_idx = c0_offset +
+        ((probe_coord.z * grid_size.y + probe_coord.y) * grid_size.x + probe_coord.x)
+        * 6 * 9 + face * 9 + 4;
+    float ray_dist = rc_probes[center_idx].w;
+    return (ray_dist < dist - 0.5) ? 0.00001 : 1.0;
+}
+
+float3 integrate_probe(float3 world_pos, float3 normal,
+                       StructuredBuffer<float4> rc_probes,
+                       uint c0_offset, uint3 c0_grid_size) {
+    uint face = normal_to_face(normal);
+    float spacing = 8.0;  // C0 probe spacing
+
+    // Trilinear interpolation position
+    float3 grid_pos = world_pos / spacing - 0.5;
+    int3 base_coord = int3(floor(grid_pos));
+    float3 frac_pos = grid_pos - float3(base_coord);
+
+    float3 total_radiance = float3(0.0);
+    float total_weight = 0.0;
+
+    // 8 trilinear neighbors
+    for (uint i = 0; i < 8; i++) {
+        int3 offset = int3(i & 1, (i >> 1) & 1, (i >> 2) & 1);
+        int3 coord = base_coord + offset;
+
+        // Clamp to grid
+        uint3 clamped = uint3(clamp(coord, int3(0), int3(c0_grid_size) - 1));
+
+        // Trilinear weight
+        float3 w = lerp(1.0 - frac_pos, frac_pos, float3(offset));
+        float trilinear_w = w.x * w.y * w.z;
+
+        // Visibility weight
+        float vis_w = probe_visibility(clamped, world_pos, face,
+                                       c0_grid_size, c0_offset, spacing, rc_probes);
+
+        float weight = trilinear_w * vis_w;
+        total_radiance += read_probe_face(clamped, face, c0_grid_size, c0_offset, rc_probes) * weight;
+        total_weight += weight;
+    }
+
+    return (total_weight > 0.0001) ? total_radiance / total_weight : float3(0.0);
 }
 ```
 
@@ -345,15 +412,27 @@ if (emissive_raw.x + emissive_raw.y + emissive_raw.z > 0) {
 
 ### 4.3 SceneUniforms Extension
 
-Add RC-related uniforms to `GpuSceneUniforms`:
+Add RC-related uniforms to `GpuSceneUniforms`. Concrete padded layout (std140 aligned):
 
 ```rust
-pub rc_c0_offset: u32,
-pub rc_c0_grid: [u32; 3],  // 16, 16, 16
-pub rc_enabled: u32,        // 0 or 1, for fallback
+// After existing ground_color (offset 112) + time (offset 128) + _pad3 (offset 132):
+// Current size: 144 bytes
+pub rc_c0_grid: [u32; 3],   // offset 144, 12B (uint3 requires 16-byte alignment — OK at 144)
+pub rc_c0_offset: u32,      // offset 156, 4B  (packs into uvec3 tail padding)
+pub rc_enabled: u32,         // offset 160, 4B
+pub _pad4: [u32; 3],        // offset 164, 12B (pad to 176B, 16-byte aligned)
+// New total: 176 bytes
 ```
 
-This grows the UBO. Needs padding review to stay 16-byte aligned.
+Corresponding Slang update in `scene_common.slang`:
+```slang
+uint3 rc_c0_grid;       // 16B (std140 uvec3 = 16B)
+uint  rc_c0_offset;     // 4B
+uint  rc_enabled;        // 4B
+uint  _pad4[3];         // 12B
+```
+
+Update `.range(144)` → `.range(176)` in all descriptor writes referencing the scene UBO.
 
 ## 5. Render Graph
 
@@ -364,29 +443,29 @@ voxel_upload
     ↓
 primary_ray  ──→  gbuffer_pos, gbuffer0, gbuffer1
     ↓
-rc_trace C2  ──→  probe_buffer[current] (C2 region)
-    ↓ barrier        reads: UCVH, scene UBO, probe_buffer[previous]
-rc_trace C1  ──→  probe_buffer[current] (C1 region)
+rc_trace C2  ┐
+rc_trace C1  ├──→  probe_buffer[current] (no barriers needed between — write non-overlapping regions, read probe_buffer[previous])
+rc_trace C0  ┘
+    ↓ barrier (all rc_trace writes visible)
+rc_merge C1  ──→  probe_buffer[current] (C1 region, in-place; reads C2 region)
     ↓ barrier
-rc_trace C0  ──→  probe_buffer[current] (C0 region)
+rc_merge C0  ──→  probe_buffer[current] (C0 region, in-place; reads C1 region)
     ↓ barrier
-rc_merge C1  ──→  probe_buffer[current] (C1 region, in-place)
-    ↓ barrier        reads: probe_buffer[current] C2 region
-rc_merge C0  ──→  probe_buffer[current] (C0 region, in-place)
-    ↓ barrier        reads: probe_buffer[current] C1 region
 lighting     ──→  output_image
     ↓               reads: gbuffers, UCVH, scene UBO, probe_buffer[current]
 blit_to_swapchain
 ```
 
-Note: rc_trace reads previous frame's buffer (temporal), rc_merge reads current frame's buffer (just written by rc_trace). After all passes, swap current/previous index.
+Note: All rc_trace dispatches can run concurrently — they write non-overlapping regions of probe_buffer[current] and only read probe_buffer[previous] (read-only). rc_merge dispatches must be sequential (C1 before C0) because C0 merge reads the C1 region just written. After all passes, swap current/previous index.
+
+Note: rc_trace and primary_ray could theoretically run concurrently (both read UCVH read-only, write different outputs), but are sequenced for simplicity.
 
 ### 5.2 Synchronization
 
-- Between rc_trace dispatches: `COMPUTE_SHADER → COMPUTE_SHADER` buffer memory barrier on probe_buffer[current]
-- Between rc_trace and rc_merge: `COMPUTE_SHADER → COMPUTE_SHADER` barrier
-- Between rc_merge dispatches: `COMPUTE_SHADER → COMPUTE_SHADER` barrier
-- rc_merge → lighting: `COMPUTE_SHADER → COMPUTE_SHADER` barrier on probe_buffer[current]
+Only 3 barriers required:
+- After ALL rc_trace dispatches, before rc_merge C1: `COMPUTE_SHADER → COMPUTE_SHADER` buffer memory barrier on probe_buffer[current]
+- Between rc_merge C1 and rc_merge C0: `COMPUTE_SHADER → COMPUTE_SHADER` barrier (C0 reads C1 region just written)
+- After rc_merge C0, before lighting: `COMPUTE_SHADER → COMPUTE_SHADER` barrier on probe_buffer[current]
 
 ### 5.3 Double Buffer Swap
 
@@ -410,24 +489,63 @@ Future optimization (not in Phase 5): sub-brick cascade (1-voxel spacing) for hi
 ```
 assets/shaders/
   shared/
-    rc_common.slang              ← ComputeDir, ProjectDir, probe indexing, integrate_probe
-    scene_common.slang           ← SceneUniforms (extended with RC fields)
-    voxel_traverse.slang         ← HitResult gains VoxelCell
-    lighting_common.slang        ← unchanged
+    radiance_cascade.slang         ← ComputeDir, ProjectDir, probe indexing, integrate_probe (existing placeholder file)
+    scene_common.slang             ← SceneUniforms (extended with RC fields, 176B)
+    ray.slang                      ← HitResult gains VoxelCell field
+    voxel_common.slang             ← unchanged (already has voxel_material/voxel_emissive)
+    lighting_common.slang          ← unchanged
   passes/
-    primary_ray.slang            ← material LUT, real albedo/emissive output
-    rc_trace.slang               ← probe ray tracing compute shader
-    rc_merge.slang               ← cascade merging compute shader
-    lighting.slang               ← integrate_probe replaces hemisphere_ambient
+    primary_ray.slang              ← material LUT, real albedo/emissive output
+    rc_trace.slang                 ← probe ray tracing compute shader
+    rc_merge.slang                 ← cascade merging compute shader
+    lighting.slang                 ← integrate_probe replaces hemisphere_ambient
 
 src/render/
-    rc_probe_buffer.rs           ← RcProbeBuffer (double-buffered GPU storage)
+    rc_probe_buffer.rs             ← RcProbeBuffer (double-buffered GPU storage)
   passes/
-    radiance_cascade_trace.rs    ← RcTracePass
-    radiance_cascade_merge.rs    ← RcMergePass
-    primary_ray.rs               ← unchanged (G-buffer formats stay same)
-    lighting.rs                  ← add RC buffer binding (binding 9)
+    radiance_cascade_trace.rs      ← RcTracePass
+    radiance_cascade_merge.rs      ← RcMergePass
+    primary_ray.rs                 ← unchanged (G-buffer formats stay same)
+    lighting.rs                    ← add RC buffer binding (binding 9)
 
 src/voxel/
-    generator.rs                 ← add SponzaGenerator
+    generator.rs                   ← add SponzaGenerator
+```
+
+### 7.1 Dispatch Workgroup Counts
+
+With `[numthreads(64, 1, 1)]`:
+
+| Dispatch | Total Invocations | Workgroups |
+|----------|------------------|------------|
+| rc_trace C2 | 64 × 6 × 144 = 55,296 | 864 |
+| rc_trace C1 | 512 × 6 × 36 = 110,592 | 1,728 |
+| rc_trace C0 | 4,096 × 6 × 9 = 221,184 | 3,456 |
+| rc_merge C1 | 512 × 6 × 36 = 110,592 | 1,728 |
+| rc_merge C0 | 4,096 × 6 × 9 = 221,184 | 3,456 |
+
+### 7.2 Push Constant Layouts
+
+**rc_trace push constants** (16 bytes):
+```slang
+struct RcTracePush {
+    uint cascade_level;     // 0, 1, or 2
+    uint probe_grid_dim;    // 16, 8, or 4
+    uint probe_size;        // 3, 6, or 12 (directions per face edge)
+    uint buffer_offset;     // offset into probe buffer for this cascade
+};
+```
+
+**rc_merge push constants** (32 bytes):
+```slang
+struct RcMergePush {
+    uint cascade_level;        // 0 or 1 (level being merged INTO)
+    uint own_grid_dim;         // 16 or 8
+    uint own_probe_size;       // 3 or 6
+    uint own_offset;           // buffer offset for this cascade
+    uint higher_grid_dim;      // 8 or 4
+    uint higher_probe_size;    // 6 or 12
+    uint higher_offset;        // buffer offset for higher cascade
+    uint _pad;
+};
 ```
