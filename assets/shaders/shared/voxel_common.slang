@@ -78,3 +78,18 @@ bool read_occupancy_bit(BrickOccupancy brick, uint3 local) {
     uint bit = m % 32u;
     return (brick.bits[word] & (1u << bit)) != 0u;
 }
+
+// Encodes an axis-aligned normal to a 0-5 ID.
+// Assumes input is a unit axis-aligned vector from DDA face normals.
+// Fallback to -Z (5) for degenerate zero normals (should not occur in practice).
+//   0 = +X    1 = -X
+//   2 = +Y    3 = -Y
+//   4 = +Z    5 = -Z
+uint encode_normal_id(float3 n) {
+    if (n.x >  0.5) return 0;
+    if (n.x < -0.5) return 1;
+    if (n.y >  0.5) return 2;
+    if (n.y < -0.5) return 3;
+    if (n.z >  0.5) return 4;
+    return 5; // -Z
+}
