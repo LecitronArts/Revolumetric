@@ -178,7 +178,7 @@ Ported from M3ycWt's `ComputeDir` / `ComputeDirEven` / `ProjectDir` (common.glsl
 - **ComputeDirEven(uv, probeSize)**: Concentric square → hemisphere mapping with theta/phi parameterization. Ensures uniform solid angle coverage.
 - **ProjectDir(dir, probeSize)**: Inverse of ComputeDir — maps a 3D direction to the nearest probe direction index. Used during merge for visibility lookup.
 
-These go in `assets/shaders/shared/rc_common.slang`.
+These go in `assets/shaders/shared/radiance_cascade.slang` (existing placeholder file).
 
 ### 3.4 rc_trace Pass
 
@@ -310,7 +310,7 @@ Bindings: probe buffer (read-write), push constants (cascade level, grid sizes, 
 
 ### 4.1 integrate_probe Function
 
-New function in `rc_common.slang`. Uses **visibility-weighted trilinear interpolation** across 8 neighboring C0 probes (matching the `TrilinearCS` pattern from rc_merge):
+New function in `radiance_cascade.slang`. Uses **visibility-weighted trilinear interpolation** across 8 neighboring C0 probes (matching the `TrilinearCS` pattern from rc_merge):
 
 ```slang
 // Canonical face ordering for RC probe system (matches encode_normal_id):
@@ -426,10 +426,10 @@ pub _pad4: [u32; 3],        // offset 164, 12B (pad to 176B, 16-byte aligned)
 
 Corresponding Slang update in `scene_common.slang`:
 ```slang
-uint3 rc_c0_grid;       // 16B (std140 uvec3 = 16B)
-uint  rc_c0_offset;     // 4B
+uint3 rc_c0_grid;       // 12B data; next uint packs into remaining 4B of this 16B row
+uint  rc_c0_offset;     // 4B (packed into rc_c0_grid row tail)
 uint  rc_enabled;        // 4B
-uint  _pad4[3];         // 12B
+uint3 _pad4;            // 12B (pad to 176B, 16-byte aligned)
 ```
 
 Update `.range(144)` → `.range(176)` in all descriptor writes referencing the scene UBO.
