@@ -1,6 +1,7 @@
 pub mod allocator;
 pub mod buffer;
 pub mod camera;
+pub mod scene_ubo;
 pub mod descriptor;
 pub mod device;
 pub mod frame;
