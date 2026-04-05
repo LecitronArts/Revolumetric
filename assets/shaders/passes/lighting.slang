@@ -13,9 +13,11 @@ ConstantBuffer<SceneUniforms> scene_ubo;
 RWTexture2D<float4> gbuffer_pos;
 
 [[vk::binding(2, 0)]]
+[[vk::image_format("rgba8")]]
 RWTexture2D<float4> gbuffer0;
 
 [[vk::binding(3, 0)]]
+[[vk::image_format("rgba8ui")]]
 RWTexture2D<uint4> gbuffer1;
 
 // Binding 4: output image

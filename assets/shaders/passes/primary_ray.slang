@@ -14,9 +14,11 @@ ConstantBuffer<SceneUniforms> scene_ubo;
 RWTexture2D<float4> gbuffer_pos;    // RGBA32F: xyz = voxel center, w = hit_t (-1 = miss)
 
 [[vk::binding(2, 0)]]
+[[vk::image_format("rgba8")]]
 RWTexture2D<float4> gbuffer0;       // RGBA8_UNORM: rgb = base_color, a = ao
 
 [[vk::binding(3, 0)]]
+[[vk::image_format("rgba8ui")]]
 RWTexture2D<uint4> gbuffer1;        // RGBA8_UINT: r = normal_id, g = roughness, b = metallic, a = flags
 
 // Binding 4-7: UCVH buffers (order matches trace_primary_ray parameter order)
