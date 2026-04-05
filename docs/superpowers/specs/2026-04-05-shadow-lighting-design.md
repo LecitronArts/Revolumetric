@@ -76,11 +76,11 @@ Size: 144 bytes. Static assert in tests.
 ### Scene UBO Management
 
 New struct `SceneUniformBuffer` in `src/render/scene_ubo.rs`:
-- Owns **one GPU buffer per frame-in-flight** (2 × 144 bytes, `UNIFORM_BUFFER` usage, host-visible + `HOST_COHERENT` — no manual flush needed). Double-buffering prevents the CPU from overwriting a buffer the GPU is still reading from the previous frame's command buffer.
+- Owns **one GPU buffer per frame slot** (N × 144 bytes, where N = `swapchain.images.len()`, `UNIFORM_BUFFER` usage, host-visible + `HOST_COHERENT`). One buffer per frame slot prevents CPU overwriting a buffer the GPU is still reading.
 - `update(&self, device, frame_index: usize, data: &GpuSceneUniforms)` — memcpy via persistent mapped pointer to the buffer for the current frame slot
 - `destroy(device, allocator)` — cleanup
 
-Created once at renderer init. Each pass has a **single descriptor set** (set 0) with all bindings — Scene UBO at binding 0, pass-specific resources at subsequent bindings. This matches the existing `PrimaryRayPass` pattern. The Scene UBO descriptor is written to both passes' descriptor sets (same buffer, different VkDescriptorSet instances).
+Created once at renderer init. Each pass owns **N descriptor sets** (one per frame slot, where N = `swapchain.images.len()`). Descriptor set `k` has binding 0 permanently pointing to UBO buffer `k`. At record time, bind the descriptor set for the current frame slot. This avoids `vkUpdateDescriptorSets` on in-flight descriptor sets. Pass-specific bindings (G-buffer images, UCVH buffers) are identical across all N sets since those resources are not double-buffered.
 
 ### Filling Per Frame (app.rs)
 
