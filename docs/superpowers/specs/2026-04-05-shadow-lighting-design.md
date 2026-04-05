@@ -76,11 +76,11 @@ Size: 144 bytes. Static assert in tests.
 ### Scene UBO Management
 
 New struct `SceneUniformBuffer` in `src/render/scene_ubo.rs`:
-- Owns a GPU buffer (144 bytes, `UNIFORM_BUFFER` usage, host-visible)
-- `update(&self, device, data: &GpuSceneUniforms)` — memcpy each frame
+- Owns a GPU buffer (144 bytes, `UNIFORM_BUFFER` usage, host-visible + `HOST_COHERENT` — no manual flush needed)
+- `update(&self, device, data: &GpuSceneUniforms)` — memcpy via persistent mapped pointer each frame
 - `destroy(device, allocator)` — cleanup
 
-Created once at renderer init. All passes bind it at a shared binding slot (binding 0 in a dedicated descriptor set, or binding 0 of each pass's descriptor set).
+Created once at renderer init. Each pass has a **single descriptor set** (set 0) with all bindings — Scene UBO at binding 0, pass-specific resources at subsequent bindings. This matches the existing `PrimaryRayPass` pattern. The Scene UBO descriptor is written to both passes' descriptor sets (same buffer, different VkDescriptorSet instances).
 
 ### Filling Per Frame (app.rs)
 
@@ -99,9 +99,9 @@ Each frame in `tick_frame`, after `update_camera`:
 
 | Image | Format | Content | Size/px |
 |-------|--------|---------|---------|
-| `gbuffer_pos` | `RGBA32_SFLOAT` | xyz = voxel center position, w = hit_t (negative = miss) | 16B |
-| `gbuffer0` | `RGBA8_UNORM` | rgb = base_color, a = ao | 4B |
-| `gbuffer1` | `RGBA8_UINT` | r = normal_id (0-5), g = roughness_u8, b = metallic_u8, a = flags | 4B |
+| `gbuffer_pos` | `R32G32B32A32_SFLOAT` | xyz = voxel center position, w = hit_t (negative = miss) | 16B |
+| `gbuffer0` | `R8G8B8A8_UNORM` | rgb = base_color, a = ao | 4B |
+| `gbuffer1` | `R8G8B8A8_UINT` | r = normal_id (0-5), g = roughness_u8, b = metallic_u8, a = flags | 4B |
 
 Total: 24 bytes/pixel.
 
@@ -233,7 +233,19 @@ Added to `voxel_common.slang` alongside existing helpers.
 
 Full-screen compute shader. For each pixel:
 
-1. Read `gbuffer_pos` — if `w < 0`, output sky color (use ray direction for gradient)
+1. Read `gbuffer_pos` — if `w < 0` (miss), reconstruct ray direction and output sky gradient:
+   ```slang
+   // Reconstruct ray direction for sky gradient (same math as primary ray pass)
+   float2 pixel = float2(tid.xy);
+   float3x3 dir_mat = float3x3(
+       scene.pixel_to_ray[0].xyz,
+       scene.pixel_to_ray[1].xyz,
+       scene.pixel_to_ray[2].xyz
+   );
+   float3 ray_dir = normalize(mul(float3(pixel, 1.0), dir_mat));
+   output_image[tid.xy] = float4(sky_color_for_dir(ray_dir, scene), 1.0);
+   return;
+   ```
 2. Read voxel center position from `gbuffer_pos.xyz`
 3. Read normal_id from `gbuffer1.r`, lookup normal vector via `NORMAL_TABLE`
 4. Read base_color from `gbuffer0.rgb`
@@ -245,7 +257,7 @@ Full-screen compute shader. For each pixel:
    - `ambient = base_color * lerp(ground_color, sky_color, normal.y * 0.5 + 0.5)`
    - `hdr_color = diffuse + ambient`
 7. Tonemap (ACES Filmic):
-   - `mapped = (hdr_color * (2.51 * hdr_color + 0.03)) / (hdr_color * (2.43 * hdr_color + 0.59) + 0.14)`
+   - `mapped = saturate((hdr_color * (2.51 * hdr_color + 0.03)) / (hdr_color * (2.43 * hdr_color + 0.59) + 0.14))`
 8. Gamma correction: `output = pow(mapped, 1.0/2.2)`
 9. Write to output_image
 
@@ -274,9 +286,9 @@ float3 sky_color_for_dir(float3 dir, SceneUniforms scene) {
 
 ### Rust Side: `src/render/passes/lighting.rs`
 
-New file (replaces empty `composite.rs` stub or standalone). Structure mirrors `PrimaryRayPass`:
+New file. Structure mirrors `PrimaryRayPass`:
 - `LightingPass::new(device, allocator, width, height, spirv, ...)` — creates pipeline, descriptor set, output image
-- `LightingPass::record(device, cmd)` — barrier + bind + dispatch
+- `LightingPass::record(device, cmd)` — insert input barriers (SHADER_WRITE → SHADER_READ on all 3 G-buffer images) + bind + dispatch. Each pass owns its input barriers, following the existing `PrimaryRayPass::record()` pattern.
 - `LightingPass::destroy(device, allocator)` — cleanup
 
 ## Render Pipeline in app.rs
@@ -321,7 +333,10 @@ graph.add_pass("blit_to_swapchain", Graphics, |builder| {
 |------|--------|
 | `src/render/scene_ubo.rs` | **New** — GpuSceneUniforms struct + SceneUniformBuffer management |
 | `src/render/passes/primary_ray.rs` | **Refactor** — remove push constants, add Scene UBO binding, output G-buffer (3 images) |
-| `src/render/passes/lighting.rs` | **New** (replaces empty composite.rs stub) — shadow ray + Lambert + hemisphere ambient + ACES tonemap |
+| `src/render/passes/lighting.rs` | **New** — shadow ray + Lambert + hemisphere ambient + ACES tonemap |
+| `src/render/passes/composite.rs` | **Delete** — empty stub, replaced by `lighting.rs` |
+| `src/render/passes/shadow_trace.rs` | **Delete** — empty stub, shadow tracing is inlined in `lighting.slang` |
+| `src/render/passes/mod.rs` | Replace `pub mod composite;` / `pub mod shadow_trace;` with `pub mod lighting;` |
 | `src/render/camera.rs` | Remove `PrimaryRayPushConstants` struct (replaced by GpuSceneUniforms) |
 | `src/render/mod.rs` | Add `pub mod scene_ubo;` |
 | `src/app.rs` | Create SceneUniformBuffer at init; fill per-frame; wire primary_ray → lighting → blit; remove push constant code; recreate G-buffer images on resize |
@@ -330,6 +345,12 @@ graph.add_pass("blit_to_swapchain", Graphics, |builder| {
 | `assets/shaders/passes/lighting.slang` | **New** — full lighting compute shader |
 | `assets/shaders/shared/voxel_common.slang` | Add `encode_normal_id()` helper |
 | `assets/shaders/shared/lighting.slang` | Add ACES tonemap, hemisphere ambient helpers (replace placeholder) |
+
+## Implementation Notes
+
+- **L1-L4 hierarchy bindings removed**: The current `primary_ray.slang` binds `hierarchy_l1` through `hierarchy_l4` at bindings 5-8 for forward compatibility. These are intentionally dropped — only L0 is used. The old bindings 5-8 are reclaimed for UCVH buffers.
+- **`shaderStorageImageExtendedFormats`**: G-buffer uses `R8G8B8A8_UNORM` and `R8G8B8A8_UINT` as storage images (`RWTexture2D`). Verify this Vulkan device feature is enabled. The existing output image already uses `R8G8B8A8_UNORM` as a storage image, so it's likely already enabled.
+- **RowMajor matrix layout validation**: After implementing, verify with `spirv-dis` that the `pixel_to_ray` field in the `ConstantBuffer` SPIR-V output has `RowMajor` decoration, matching the existing `PushConstant` behavior. If not, adjust the Rust-side transpose accordingly.
 
 ## Out of Scope
 
