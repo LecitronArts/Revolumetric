@@ -1,3 +1,4 @@
+#pragma once
 // Scene-wide uniforms shared by all passes.
 // Must match Rust GpuSceneUniforms in src/render/scene_ubo.rs exactly (144 bytes).
 

@@ -1,3 +1,4 @@
+#pragma once
 // Shared math utilities for voxel ray tracing.
 
 // Axis-aligned bounding box.

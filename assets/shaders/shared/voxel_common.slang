@@ -1,3 +1,4 @@
+#pragma once
 // GPU struct definitions for UCVH data — must match Rust repr(C) layouts exactly.
 // Consumed by all voxel shader passes via #include "voxel_common.slang"
 

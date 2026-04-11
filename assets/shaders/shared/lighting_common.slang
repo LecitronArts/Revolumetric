@@ -1,3 +1,4 @@
+#pragma once
 // Lighting helper functions shared across passes.
 // Includes: ACES tonemap, sky gradient, hemisphere ambient.
 

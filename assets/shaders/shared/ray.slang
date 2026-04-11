@@ -1,3 +1,4 @@
+#pragma once
 // Ray tracing shared utilities.
 #include "math.slang"
 
