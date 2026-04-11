@@ -5,7 +5,7 @@ use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::platform::input::InputState;
 use crate::scene::components::CameraRig;
@@ -747,8 +747,19 @@ impl ApplicationHandler for RevolumetricApp {
                     if let Some(input) = self.world.resource_mut::<InputState>() {
                         input.right_mouse_held = pressed;
                     }
+                    // Grab/release cursor for FPS camera
+                    if let Some(window) = &self.window {
+                        if pressed {
+                            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                            window.set_cursor_visible(false);
+                        } else {
+                            let _ = window.set_cursor_grab(CursorGrabMode::None);
+                            window.set_cursor_visible(true);
+                            self.last_cursor_pos = None;
+                        }
+                    }
                     if !pressed {
-                        self.last_cursor_pos = None; // prevent jump on re-press
+                        self.last_cursor_pos = None;
                     }
                 }
             }
@@ -775,8 +786,13 @@ impl ApplicationHandler for RevolumetricApp {
             WindowEvent::Focused(false) => {
                 if let Some(input) = self.world.resource_mut::<InputState>() {
                     input.reset_axes();
+                    input.right_mouse_held = false;
                 }
                 self.last_cursor_pos = None;
+                if let Some(window) = &self.window {
+                    let _ = window.set_cursor_grab(CursorGrabMode::None);
+                    window.set_cursor_visible(true);
+                }
             }
             _ => {}
         }
