@@ -21,6 +21,15 @@ RWTexture2D<float4> gbuffer0;       // RGBA8_UNORM: rgb = base_color, a = ao
 [[vk::image_format("rgba8ui")]]
 RWTexture2D<uint4> gbuffer1;        // RGBA8_UINT: r = normal_id, g = roughness, b = metallic, a = flags
 
+static const float3 MATERIAL_ALBEDO[6] = {
+    float3(1.0, 1.0, 1.0),       // 0: default white
+    float3(0.95, 0.925, 0.9),    // 1: stone
+    float3(0.99, 0.4, 0.4),      // 2: red cloth
+    float3(0.4, 0.99, 0.4),      // 3: green cloth
+    float3(0.5, 0.6, 0.9),       // 4: blue
+    float3(0.75, 0.65, 0.5),     // 5: brick
+};
+
 // Binding 4-7: UCVH buffers (order matches trace_primary_ray parameter order)
 [[vk::binding(4, 0)]]
 StructuredBuffer<UcvhConfig> ucvh_config;
@@ -56,8 +65,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     if (hit.hit) {
         gbuffer_pos[tid.xy] = float4(hit.position, hit.t);
-        gbuffer0[tid.xy] = float4(1.0, 1.0, 1.0, 1.0);  // white albedo, no AO
-        gbuffer1[tid.xy] = uint4(encode_normal_id(hit.normal), 128, 0, 0x01);
+        uint mat_id = voxel_material(hit.cell);
+        float3 albedo = MATERIAL_ALBEDO[min(mat_id, 5u)];
+        gbuffer0[tid.xy] = float4(albedo, 1.0);
+        float3 emissive = voxel_emissive(hit.cell);
+        uint3 emissive_raw = uint3(emissive * 255.0);
+        gbuffer1[tid.xy] = uint4(encode_normal_id(hit.normal), emissive_raw.r, emissive_raw.g, emissive_raw.b);
     } else {
         gbuffer_pos[tid.xy] = float4(0, 0, 0, -1.0);  // w < 0 = miss
         gbuffer0[tid.xy] = float4(0, 0, 0, 0);
