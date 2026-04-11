@@ -40,6 +40,36 @@
 
 ## Sub-Phase 5A: Material System + Demo Scene
 
+### Task 0: Add `#pragma once` to all shared Slang headers
+
+**Files:**
+- Modify: `assets/shaders/shared/math.slang`
+- Modify: `assets/shaders/shared/voxel_common.slang`
+- Modify: `assets/shaders/shared/ray.slang`
+- Modify: `assets/shaders/shared/scene_common.slang`
+- Modify: `assets/shaders/shared/lighting_common.slang`
+- Modify: `assets/shaders/shared/radiance_cascade.slang`
+
+- [ ] **Step 1: Add `#pragma once` as the first line of every shared Slang file**
+
+Later tasks introduce cross-includes (e.g. `ray.slang` → `voxel_common.slang`, `radiance_cascade.slang` → `voxel_common.slang`) that overlap with existing include chains in `voxel_traverse.slang`. Without include guards, struct redefinition errors will occur.
+
+Add `#pragma once` as the very first line (before any comments) to each of the 6 files listed above. For `radiance_cascade.slang` (currently a placeholder), the `#pragma once` will be part of the full replacement in Task 8.
+
+- [ ] **Step 2: Build and verify**
+
+Run: `cargo build 2>&1 | head -30`
+Expected: Compiles identically — `#pragma once` is a no-op when each file is included only once.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add assets/shaders/shared/math.slang assets/shaders/shared/voxel_common.slang assets/shaders/shared/ray.slang assets/shaders/shared/scene_common.slang assets/shaders/shared/lighting_common.slang assets/shaders/shared/radiance_cascade.slang
+git commit -m "chore(shader): add #pragma once to all shared Slang headers"
+```
+
+---
+
 ### Task 1: Extend HitResult with VoxelCell
 
 **Files:**
@@ -144,37 +174,9 @@ git commit -m "feat(shader): material LUT + real albedo/emissive in G-buffer"
 
 ---
 
-### Task 3: Emissive handling in lighting.slang
+### ~~Task 3: Emissive handling in lighting.slang~~ (REMOVED — consolidated into Task 13)
 
-**Files:**
-- Modify: `assets/shaders/passes/lighting.slang:67-92`
-
-- [ ] **Step 1: Add emissive early-out in lighting shader**
-
-In `assets/shaders/passes/lighting.slang`, after reading the G-buffer data (after line 72 `float3 normal = NORMAL_TABLE[min(normal_id, 5u)];`), add emissive handling:
-
-```slang
-    // Emissive early-out: if any emissive channel is non-zero, output it directly
-    uint3 emissive_raw = uint3(gb1.g, gb1.b, gb1.a);
-    if (emissive_raw.x + emissive_raw.y + emissive_raw.z > 0u) {
-        float3 emissive = float3(emissive_raw) / 255.0;
-        // Apply gamma only (emissive is already HDR-ish from raw values)
-        output_image[tid.xy] = float4(pow(emissive, float3(1.0 / 2.2)), 1.0);
-        return;
-    }
-```
-
-- [ ] **Step 2: Build and verify**
-
-Run: `cargo build 2>&1 | head -30`
-Expected: Compiles. No emissive voxels in current scene yet, so behavior is unchanged.
-
-- [ ] **Step 3: Commit**
-
-```bash
-git add assets/shaders/passes/lighting.slang
-git commit -m "feat(shader): emissive voxel early-out in lighting pass"
-```
+> Emissive early-out is now added as part of Task 13 (Sub-Phase 5C) alongside the RC integration, avoiding duplicate edits to `lighting.slang`.
 
 ---
 
@@ -614,8 +616,10 @@ struct SceneUniforms {
     uint3    rc_c0_grid;      // 12B — next uint packs into remaining 4B of this 16B row
     uint     rc_c0_offset;    // 4B
     uint     rc_enabled;      // 4B
-    uint3    _pad4;           // 12B — pad to 176B
-};                            // total: 176B, 16-byte aligned
+    uint     _pad4a;          // 4B — separate uints to avoid uint3 16-byte alignment in std140
+    uint     _pad4b;          // 4B
+    uint     _pad4c;          // 4B
+};                            // total: 176B, matches Rust repr(C) layout exactly
 ```
 
 - [ ] **Step 3: Update UBO range in descriptor writes**
@@ -1521,13 +1525,15 @@ impl RcTracePass {
         Ok(Self { pipeline, descriptor_set_layout, descriptor_pool, descriptor_sets })
     }
 
-    /// Update descriptor sets when probe buffer swaps (call each frame before record).
+    /// Update descriptor sets when probe buffer swaps.
+    /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
     pub fn update_probe_descriptors(
         &self,
         device: &ash::Device,
         rc_probes: &RcProbeBuffer,
+        frame_slot: usize,
     ) {
-        for &ds in &self.descriptor_sets {
+        let ds = self.descriptor_sets[frame_slot];
             let read_info = vk::DescriptorBufferInfo::default()
                 .buffer(rc_probes.read_buffer())
                 .offset(0)
@@ -1549,7 +1555,6 @@ impl RcTracePass {
                 .buffer_info(std::slice::from_ref(&write_info));
 
             unsafe { device.update_descriptor_sets(&[read_write, write_write], &[]) };
-        }
     }
 
     /// Record all 3 cascade trace dispatches. No barriers needed between them.
@@ -1735,8 +1740,9 @@ impl RcMergePass {
     }
 
     /// Update descriptor to point to current frame's write buffer.
-    pub fn update_probe_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer) {
-        for &ds in &self.descriptor_sets {
+    /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
+    pub fn update_probe_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer, frame_slot: usize) {
+        let ds = self.descriptor_sets[frame_slot];
             let buf_info = vk::DescriptorBufferInfo::default()
                 .buffer(rc_probes.write_buffer())
                 .offset(0)
@@ -1747,7 +1753,6 @@ impl RcMergePass {
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&buf_info));
             unsafe { device.update_descriptor_sets(&[write], &[]) };
-        }
     }
 
     /// Record merge dispatches: C2→C1 barrier C1→C0. Inserts barrier between.
@@ -1948,8 +1953,9 @@ In `src/render/passes/lighting.rs`, modify `new()`:
 5. Add a method to update the RC descriptor each frame (since buffer swaps):
 
 ```rust
-    pub fn update_rc_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer) {
-        for &ds in &self.descriptor_sets {
+    /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
+    pub fn update_rc_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer, frame_slot: usize) {
+        let ds = self.descriptor_sets[frame_slot];
             let rc_info = vk::DescriptorBufferInfo::default()
                 .buffer(rc_probes.write_buffer())
                 .offset(0)
@@ -1960,7 +1966,6 @@ In `src/render/passes/lighting.rs`, modify `new()`:
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&rc_info));
             unsafe { device.update_descriptor_sets(&[rc_write], &[]) };
-        }
     }
 ```
 
@@ -2138,11 +2143,11 @@ In `tick_frame()`, after the `primary_ray` render graph pass and before the `lig
                             self.rc_cleared = true;
                         }
 
-                        // Update descriptors for swapped buffers
-                        rc_trace.update_probe_descriptors(renderer.device(), rc_probes);
-                        rc_merge.update_probe_descriptor(renderer.device(), rc_probes);
+                        // Update descriptors for swapped buffers (only current frame_slot)
+                        rc_trace.update_probe_descriptors(renderer.device(), rc_probes, frame.frame_slot);
+                        rc_merge.update_probe_descriptor(renderer.device(), rc_probes, frame.frame_slot);
                         if let Some(lighting) = &self.lighting_pass {
-                            lighting.update_rc_descriptor(renderer.device(), rc_probes);
+                            lighting.update_rc_descriptor(renderer.device(), rc_probes, frame.frame_slot);
                         }
 
                         // RC trace (all 3 cascades, no inter-dispatch barriers)
@@ -2188,7 +2193,13 @@ In `tick_frame()`, after the `primary_ray` render graph pass and before the `lig
                     }
 ```
 
-Note: The RC passes record directly to the command buffer (not through the RenderGraph) because they need fine-grained buffer barriers. Place this code after the graph is compiled but before end_frame. Alternatively, integrate into the graph system — implementer's judgment.
+Note: The RC passes record directly to the command buffer (not through the RenderGraph) because they need fine-grained buffer barriers. Place this block **after primary_ray but before the lighting pass** in the command buffer. The resulting command buffer order is:
+
+```
+primary_ray → RC trace (all 3 cascades) → barrier → RC merge (C2→C1, barrier, C1→C0) → barrier → lighting → blit
+```
+
+RC trace does not read the G-buffer — it traces its own rays through UCVH. Lighting reads both G-buffer (from primary_ray barriers) and the probe buffer (from the post-merge barrier). This ordering is correct.
 
 - [ ] **Step 5: Swap probe buffer at end of frame**
 
