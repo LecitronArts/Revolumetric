@@ -103,6 +103,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
             else if (mat_id == 3u) albedo = float3(0.4, 0.99, 0.4);
             else if (mat_id == 4u) albedo = float3(0.5, 0.6, 0.9);
             else if (mat_id == 5u) albedo = float3(0.75, 0.65, 0.5);
+            else if (mat_id == 6u) albedo = float3(0.55, 0.52, 0.48);
+            else if (mat_id == 7u) albedo = float3(0.6, 0.4, 0.25);
 
             float3 hit_normal = hit.normal;
             float ndotl = max(dot(hit_normal, scene.sun_direction), 0.0);
