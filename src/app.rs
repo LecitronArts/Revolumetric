@@ -425,16 +425,16 @@ impl ApplicationHandler for RevolumetricApp {
             }
         }
 
-        // Generate UCVH demo scene
+        // Generate UCVH sponza demo scene
         if self.ucvh.is_none() {
             let config = UcvhConfig::new(glam::UVec3::splat(128));
             let mut ucvh = Ucvh::new(config);
-            let brick_count = generator::generate_demo_scene(&mut ucvh);
+            let brick_count = generator::generate_sponza_scene(&mut ucvh);
             ucvh.rebuild_hierarchy();
             tracing::info!(
                 bricks = brick_count,
                 total_voxels = ucvh.pool.allocated_count() as u64 * 512,
-                "generated demo sphere scene"
+                "generated sponza demo scene"
             );
 
             let renderer = self.renderer.as_ref().unwrap();
