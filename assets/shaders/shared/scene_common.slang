@@ -1,17 +1,24 @@
 #pragma once
 // Scene-wide uniforms shared by all passes.
-// Must match Rust GpuSceneUniforms in src/render/scene_ubo.rs exactly (144 bytes).
+// Must match Rust GpuSceneUniforms in src/render/scene_ubo.rs exactly (176 bytes).
 
 struct SceneUniforms {
-    float4x4 pixel_to_ray;   // 64B — col 0-2: direction matrix, col 3: camera origin
+    float4x4 pixel_to_ray;   // 64B
     uint2    resolution;      // 8B
     uint2    _pad0;           // 8B
-    float3   sun_direction;   // 12B — normalized, world space, points TOWARD sun
+    float3   sun_direction;   // 12B
     float    _pad1;           // 4B
-    float3   sun_intensity;   // 12B — HDR color * intensity
+    float3   sun_intensity;   // 12B
     float    _pad2;           // 4B
-    float3   sky_color;       // 12B — hemisphere ambient upper
+    float3   sky_color;       // 12B
     float    _pad3;           // 4B
-    float3   ground_color;    // 12B — hemisphere ambient lower
+    float3   ground_color;    // 12B
     float    time;            // 4B
-};                            // total: 144B, 16-byte aligned
+    // --- RC fields ---
+    uint3    rc_c0_grid;      // 12B
+    uint     rc_c0_offset;    // 4B
+    uint     rc_enabled;      // 4B
+    uint     _pad4a;          // 4B — separate uints to avoid uint3 16-byte alignment in std140
+    uint     _pad4b;          // 4B
+    uint     _pad4c;          // 4B
+};                            // total: 176B, matches Rust repr(C) layout exactly

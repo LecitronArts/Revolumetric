@@ -222,6 +222,10 @@ impl RevolumetricApp {
                         _pad3: 0.0,
                         ground_color: [0.15, 0.1, 0.08],
                         time: self.world.resource::<Time>().map_or(0.0, |t| t.elapsed_seconds),
+                        rc_c0_grid: [16, 16, 16],
+                        rc_c0_offset: 0,
+                        rc_enabled: 0,  // disabled until RC passes are wired up
+                        _pad4: [0; 3],
                     };
 
                     if let Some(ubo) = &self.scene_ubo {

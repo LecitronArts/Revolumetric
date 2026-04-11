@@ -88,7 +88,7 @@ impl PrimaryRayPass {
             let ubo_info = vk::DescriptorBufferInfo::default()
                 .buffer(scene_ubo.buffer_handle(set_idx))
                 .offset(0)
-                .range(144);
+                .range(176);
 
             let ubo_write = vk::WriteDescriptorSet::default()
                 .dst_set(ds)

@@ -7,7 +7,7 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 
 /// GPU-side scene uniforms. Must match Slang `SceneUniforms` in scene_common.slang exactly.
-/// 144 bytes, std140-compatible (all float3 fields padded to 16-byte alignment).
+/// 176 bytes, std140-compatible (all float3 fields padded to 16-byte alignment).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct GpuSceneUniforms {
@@ -22,6 +22,11 @@ pub struct GpuSceneUniforms {
     pub _pad3: f32,                  // 4B
     pub ground_color: [f32; 3],      // 12B — hemisphere ambient lower
     pub time: f32,                   // 4B
+    // --- RC fields (new) ---
+    pub rc_c0_grid: [u32; 3],       // 12B
+    pub rc_c0_offset: u32,          // 4B
+    pub rc_enabled: u32,             // 4B
+    pub _pad4: [u32; 3],            // 12B — pad to 176B
 }
 
 /// Manages per-frame-slot uniform buffers for SceneUniforms.
@@ -89,8 +94,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gpu_scene_uniforms_size_is_144_bytes() {
-        assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 144);
+    fn gpu_scene_uniforms_size_is_176_bytes() {
+        assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 176);
     }
 
     #[test]
