@@ -5,4 +5,5 @@ pub mod gpu_upload;
 pub mod material;
 pub mod morton;
 pub mod occupancy;
+pub mod sponza_generator;
 pub mod ucvh;

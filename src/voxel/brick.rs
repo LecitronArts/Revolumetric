@@ -57,6 +57,10 @@ pub struct VoxelCell {
 impl VoxelCell {
     pub const AIR: Self = Self { material: 0, flags: 0, emissive: [0; 3], _pad: 0 };
     pub fn is_air(&self) -> bool { self.material == 0 }
+
+    pub fn new(material: u16, flags: u16, emissive: [u8; 3]) -> Self {
+        Self { material, flags, emissive, _pad: 0 }
+    }
 }
 
 /// Complete brick data: occupancy + 512 materials in Morton order.

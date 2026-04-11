@@ -46,6 +46,24 @@ impl VoxelGenerator for SphereGenerator {
     }
 }
 
+/// Generate a Sponza-inspired architectural scene.
+pub fn generate_sponza_scene(ucvh: &mut Ucvh) -> u32 {
+    let generator = crate::voxel::sponza_generator::SponzaGenerator;
+    let bgs = ucvh.config.brick_grid_size;
+    let mut count = 0u32;
+    for bz in 0..bgs.z {
+        for by in 0..bgs.y {
+            for bx in 0..bgs.x {
+                let bp = UVec3::new(bx, by, bz);
+                if let Some(data) = generator.generate_brick(bp, &ucvh.config) {
+                    if ucvh.write_brick(bp, &data) { count += 1; }
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Generate a demo scene: solid sphere in center of world.
 pub fn generate_demo_scene(ucvh: &mut Ucvh) -> u32 {
     let world = ucvh.config.world_size.as_vec3();
