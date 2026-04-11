@@ -169,6 +169,7 @@ HitResult trace_primary_ray(
                     result.normal = hit_normal;
                     result.brick_id = node.brick_id;
                     result.local = hit_local;
+                    result.cell = material_buf[node.brick_id * 512u + morton_encode(hit_local)];
                     return result;
                 }
             }

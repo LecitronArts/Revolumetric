@@ -1,6 +1,7 @@
 #pragma once
 // Ray tracing shared utilities.
 #include "math.slang"
+#include "voxel_common.slang"
 
 struct Ray {
     float3 origin;
@@ -28,6 +29,7 @@ struct HitResult {
     float3 normal;   // face normal at hit (axis-aligned, from DDA step)
     uint  brick_id;  // which brick was hit
     uint3 local;     // local voxel coordinate within brick [0,7]³
+    VoxelCell cell;  // material + emissive data for the hit voxel
 };
 
-static const HitResult NO_HIT = { false, 1e30, float3(0), float3(0), 0xFFFFFFFFu, uint3(0) };
+static const HitResult NO_HIT = { false, 1e30, float3(0), float3(0), 0xFFFFFFFFu, uint3(0), {0, 0} };
