@@ -22,6 +22,9 @@ use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::scene::light::DirectionalLight;
 use crate::render::passes::lighting::LightingPass;
 use crate::render::passes::primary_ray::PrimaryRayPass;
+use crate::render::passes::radiance_cascade_trace::RcTracePass;
+use crate::render::passes::radiance_cascade_merge::RcMergePass;
+use crate::render::rc_probe_buffer::RcProbeBuffer;
 use crate::render::resource::QueueType;
 use crate::scene::systems;
 use crate::voxel::ucvh::{Ucvh, UcvhConfig};
@@ -45,6 +48,10 @@ struct RevolumetricApp {
     renderer: Option<RenderDevice>,
     primary_ray_pass: Option<PrimaryRayPass>,
     lighting_pass: Option<LightingPass>,
+    rc_probes: Option<RcProbeBuffer>,
+    rc_trace_pass: Option<RcTracePass>,
+    rc_merge_pass: Option<RcMergePass>,
+    rc_cleared: bool,
     ucvh: Option<Ucvh>,
     ucvh_gpu: Option<UcvhGpuResources>,
     ucvh_uploaded: bool,
@@ -79,6 +86,10 @@ impl RevolumetricApp {
             renderer: None,
             primary_ray_pass: None,
             lighting_pass: None,
+            rc_probes: None,
+            rc_trace_pass: None,
+            rc_merge_pass: None,
+            rc_cleared: false,
             ucvh: None,
             ucvh_gpu: None,
             ucvh_uploaded: false,
@@ -224,7 +235,7 @@ impl RevolumetricApp {
                         time: self.world.resource::<Time>().map_or(0.0, |t| t.elapsed_seconds),
                         rc_c0_grid: [16, 16, 16],
                         rc_c0_offset: 0,
-                        rc_enabled: 0,  // disabled until RC passes are wired up
+                        rc_enabled: if self.rc_trace_pass.is_some() { 1 } else { 0 },
                         _pad4: [0; 3],
                     };
 
@@ -260,6 +271,85 @@ impl RevolumetricApp {
                             })
                         },
                     );
+
+                    // RC trace + merge passes (between primary_ray and lighting)
+                    if let (Some(rc_trace), Some(rc_merge), Some(rc_probes)) =
+                        (&self.rc_trace_pass, &self.rc_merge_pass, &self.rc_probes)
+                    {
+                        // Zero-init on first frame
+                        if !self.rc_cleared {
+                            rc_probes.record_clear(renderer.device(), frame.command_buffer);
+                            // Barrier: TRANSFER → COMPUTE
+                            let barrier = vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                                .buffer(rc_probes.write_buffer())
+                                .size(vk::WHOLE_SIZE);
+                            let barrier2 = vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                                .buffer(rc_probes.read_buffer())
+                                .size(vk::WHOLE_SIZE);
+                            unsafe {
+                                renderer.device().cmd_pipeline_barrier(
+                                    frame.command_buffer,
+                                    vk::PipelineStageFlags::TRANSFER,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::DependencyFlags::empty(),
+                                    &[], &[barrier, barrier2], &[],
+                                );
+                            }
+                            self.rc_cleared = true;
+                        }
+
+                        // Update descriptors for swapped buffers (only current frame_slot)
+                        rc_trace.update_probe_descriptors(renderer.device(), rc_probes, frame.frame_slot);
+                        rc_merge.update_probe_descriptor(renderer.device(), rc_probes, frame.frame_slot);
+                        if let Some(lighting) = &self.lighting_pass {
+                            lighting.update_rc_descriptor(renderer.device(), rc_probes, frame.frame_slot);
+                        }
+
+                        // RC trace (all 3 cascades, no inter-dispatch barriers)
+                        rc_trace.record(renderer.device(), frame.command_buffer, frame.frame_slot);
+
+                        // Barrier: rc_trace writes → rc_merge reads
+                        let barrier = vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                            .buffer(rc_probes.write_buffer())
+                            .size(vk::WHOLE_SIZE);
+                        unsafe {
+                            renderer.device().cmd_pipeline_barrier(
+                                frame.command_buffer,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &[], &[barrier], &[],
+                            );
+                        }
+
+                        // RC merge (C2→C1, barrier, C1→C0)
+                        rc_merge.record(
+                            renderer.device(), frame.command_buffer,
+                            frame.frame_slot, rc_probes.write_buffer(),
+                        );
+
+                        // Barrier: rc_merge writes → lighting reads
+                        let barrier = vk::BufferMemoryBarrier::default()
+                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                            .buffer(rc_probes.write_buffer())
+                            .size(vk::WHOLE_SIZE);
+                        unsafe {
+                            renderer.device().cmd_pipeline_barrier(
+                                frame.command_buffer,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::PipelineStageFlags::COMPUTE_SHADER,
+                                vk::DependencyFlags::empty(),
+                                &[], &[barrier], &[],
+                            );
+                        }
+                    }
 
                     // Lighting pass
                     if let Some(lighting) = &self.lighting_pass {
@@ -339,6 +429,10 @@ impl RevolumetricApp {
                 graph.compile();
                 graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
                 renderer.end_frame(frame)?;
+
+                if let Some(rc_probes) = &mut self.rc_probes {
+                    rc_probes.swap();
+                }
             }
         }
 
@@ -356,6 +450,15 @@ impl Drop for RevolumetricApp {
         // Destroy GPU passes before the renderer (which owns the device/allocator).
         if let Some(renderer) = &self.renderer {
             unsafe { renderer.device().device_wait_idle().ok() };
+            if let Some(pass) = self.rc_merge_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
+            if let Some(pass) = self.rc_trace_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
+            if let Some(buf) = self.rc_probes.take() {
+                buf.destroy(renderer.device(), renderer.allocator());
+            }
             if let Some(pass) = self.lighting_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
             }
@@ -486,10 +589,22 @@ impl ApplicationHandler for RevolumetricApp {
             }
         }
 
-        // Initialize lighting pass (requires primary ray pass + scene UBO)
+        // Create RC probe buffer (before lighting pass, since lighting needs it)
+        if self.rc_probes.is_none() {
+            let renderer = self.renderer.as_ref().unwrap();
+            match RcProbeBuffer::new(renderer.device(), renderer.allocator()) {
+                Ok(buf) => {
+                    tracing::info!("created RC probe buffer (double-buffered, ~12 MB)");
+                    self.rc_probes = Some(buf);
+                }
+                Err(e) => tracing::error!(%e, "failed to create RC probe buffer"),
+            }
+        }
+
+        // Initialize lighting pass (requires primary ray pass + scene UBO + rc_probes)
         if self.lighting_pass.is_none() {
-            if let (Some(primary), Some(ucvh_gpu), Some(scene_ubo_ref)) =
-                (&self.primary_ray_pass, &self.ucvh_gpu, &self.scene_ubo)
+            if let (Some(primary), Some(ucvh_gpu), Some(scene_ubo_ref), Some(rc_probes)) =
+                (&self.primary_ray_pass, &self.ucvh_gpu, &self.scene_ubo, &self.rc_probes)
             {
                 let renderer = self.renderer.as_ref().unwrap();
                 let extent = renderer.swapchain_extent();
@@ -506,6 +621,7 @@ impl ApplicationHandler for RevolumetricApp {
                         primary,
                         ucvh_gpu,
                         scene_ubo_ref,
+                        rc_probes,
                     ) {
                         Ok(pass) => {
                             tracing::info!(
@@ -518,6 +634,47 @@ impl ApplicationHandler for RevolumetricApp {
                         Err(error) => {
                             tracing::error!(%error, "failed to create lighting pass");
                         }
+                    }
+                }
+            }
+        }
+
+        // Create RC trace pass
+        if self.rc_trace_pass.is_none() {
+            if let (Some(ucvh_gpu), Some(scene_ubo_ref), Some(rc_probes)) =
+                (&self.ucvh_gpu, &self.scene_ubo, &self.rc_probes)
+            {
+                let renderer = self.renderer.as_ref().unwrap();
+                let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rc_trace.spv"));
+                if !spirv.is_empty() {
+                    match RcTracePass::new(
+                        renderer.device(), renderer.allocator(), spirv,
+                        ucvh_gpu, scene_ubo_ref, rc_probes,
+                    ) {
+                        Ok(pass) => {
+                            tracing::info!("initialized RC trace pass");
+                            self.rc_trace_pass = Some(pass);
+                        }
+                        Err(e) => tracing::error!(%e, "failed to create RC trace pass"),
+                    }
+                }
+            }
+        }
+
+        // Create RC merge pass
+        if self.rc_merge_pass.is_none() {
+            if let (Some(rc_probes), Some(scene_ubo_ref)) = (&self.rc_probes, &self.scene_ubo) {
+                let renderer = self.renderer.as_ref().unwrap();
+                let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rc_merge.spv"));
+                if !spirv.is_empty() {
+                    match RcMergePass::new(
+                        renderer.device(), spirv, rc_probes, scene_ubo_ref.frame_count(),
+                    ) {
+                        Ok(pass) => {
+                            tracing::info!("initialized RC merge pass");
+                            self.rc_merge_pass = Some(pass);
+                        }
+                        Err(e) => tracing::error!(%e, "failed to create RC merge pass"),
                     }
                 }
             }
