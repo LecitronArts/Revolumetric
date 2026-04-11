@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod buffer;
+pub mod rc_probe_buffer;
 pub mod camera;
 pub mod scene_ubo;
 pub mod descriptor;
