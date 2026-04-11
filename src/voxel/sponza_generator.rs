@@ -76,7 +76,7 @@ impl SponzaGenerator {
             // Left wall (x < 3): brick pattern with mortar lines
             if v.x < 3.0 {
                 // Window openings (2 rows, every 20 z-units)
-                let wz = ((v.z - 10.0) % 20.0);
+                let wz = (v.z - 10.0) % 20.0;
                 let is_window = wz > 4.0 && wz < 14.0;
                 let is_lower_window = is_window && v.y > 16.0 && v.y < 36.0;
                 let is_upper_window = is_window && v.y > 54.0 && v.y < 74.0;
@@ -93,7 +93,7 @@ impl SponzaGenerator {
             }
             // Right wall (x > 93): stone with window openings
             if v.x > 93.0 {
-                let wz = ((v.z - 10.0) % 20.0);
+                let wz = (v.z - 10.0) % 20.0;
                 let is_window = wz > 4.0 && wz < 14.0;
                 let is_lower_window = is_window && v.y > 16.0 && v.y < 36.0;
                 let is_upper_window = is_window && v.y > 54.0 && v.y < 74.0;
