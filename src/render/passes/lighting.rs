@@ -9,6 +9,7 @@ use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::pipeline::{create_shader_module, ComputePipeline};
 use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::rc_probe_buffer::RcProbeBuffer;
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct LightingPass {
@@ -29,6 +30,7 @@ impl LightingPass {
         primary_ray: &PrimaryRayPass,
         ucvh_gpu: &UcvhGpuResources,
         scene_ubo: &SceneUniformBuffer,
+        rc_probes: &RcProbeBuffer,
     ) -> Result<Self> {
         // Descriptor layout: 1 UBO + 3 G-buffer (storage image) + 1 output (storage image) + 4 UCVH (SSBO)
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
@@ -41,13 +43,14 @@ impl LightingPass {
             .add_binding(6, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
             .add_binding(7, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
             .add_binding(8, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
+            .add_binding(9, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
         let pool_sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: frame_count as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 4 * frame_count as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 4 * frame_count as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * frame_count as u32 },
         ];
         let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
@@ -126,6 +129,19 @@ impl LightingPass {
             let mut all_writes = vec![ubo_write];
             all_writes.extend(image_writes);
             all_writes.extend(buffer_writes);
+
+            // Binding 9: RC probe buffer (read current frame's merged data)
+            let rc_info = vk::DescriptorBufferInfo::default()
+                .buffer(rc_probes.write_buffer())
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
+            let rc_write = vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(9)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&rc_info));
+            all_writes.push(rc_write);
+
             unsafe { device.update_descriptor_sets(&all_writes, &[]) };
         }
 
@@ -217,6 +233,21 @@ impl LightingPass {
         let groups_x = (extent.width + 7) / 8;
         let groups_y = (extent.height + 7) / 8;
         unsafe { device.cmd_dispatch(cmd, groups_x, groups_y, 1) };
+    }
+
+    /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
+    pub fn update_rc_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer, frame_slot: usize) {
+        let ds = self.descriptor_sets[frame_slot];
+        let rc_info = vk::DescriptorBufferInfo::default()
+            .buffer(rc_probes.write_buffer())
+            .offset(0)
+            .range(vk::WHOLE_SIZE);
+        let rc_write = vk::WriteDescriptorSet::default()
+            .dst_set(ds)
+            .dst_binding(9)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&rc_info));
+        unsafe { device.update_descriptor_sets(&[rc_write], &[]) };
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
