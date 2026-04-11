@@ -3,6 +3,7 @@
 
 #include "voxel_traverse.slang"
 #include "lighting_common.slang"
+#include "radiance_cascade.slang"
 
 // Binding 0: Scene UBO
 [[vk::binding(0, 0)]]
@@ -36,6 +37,10 @@ StructuredBuffer<BrickOccupancy> brick_occupancy;
 
 [[vk::binding(8, 0)]]
 StructuredBuffer<VoxelCell> brick_materials;
+
+// Binding 9: RC probe buffer (read-only for indirect lighting)
+[[vk::binding(9, 0)]]
+StructuredBuffer<float4> rc_probes;
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -71,6 +76,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint normal_id = gb1.r;
     float3 normal = NORMAL_TABLE[min(normal_id, 5u)];
 
+    // Emissive early-out
+    uint3 emissive_raw = uint3(gb1.g, gb1.b, gb1.a);
+    if (emissive_raw.x + emissive_raw.y + emissive_raw.z > 0u) {
+        float3 emissive = float3(emissive_raw) / 255.0;
+        output_image[tid.xy] = float4(pow(emissive, float3(1.0 / 2.2)), 1.0);
+        return;
+    }
+
     // Shadow ray: offset from voxel center along normal to exit the solid voxel
     float3 shadow_origin = position + normal * 0.51;
     Ray shadow_ray = make_ray(shadow_origin, scene.sun_direction);
@@ -82,7 +95,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float shadow = shadow_hit.hit ? 0.0 : 1.0;
     float ndotl = max(dot(normal, scene.sun_direction), 0.0);
     float3 diffuse = base_color * scene.sun_intensity * ndotl * shadow;
-    float3 ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
+    float3 ambient;
+    if (scene.rc_enabled > 0u) {
+        float3 indirect = integrate_probe(position, normal, rc_probes, scene.rc_c0_offset, scene.rc_c0_grid);
+        ambient = base_color * indirect;
+    } else {
+        ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
+    }
     float3 hdr_color = diffuse + ambient;
 
     // Tonemap (ACES Filmic) + gamma correction
