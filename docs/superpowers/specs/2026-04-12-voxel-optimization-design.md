@@ -266,35 +266,62 @@ float3 jittered_sun = normalize(scene.sun_direction + sun_tangent * (xi.x - 0.5)
 
 **Temporal accumulation (new history buffer):**
 - New **R16F** texture: `shadow_history` (single-channel — shadow is a scalar 0/1 value)
-- Blend: `shadow_out = lerp(shadow_history[tid.xy], current_shadow, 0.1)`
-- On camera move: increase blend factor to 0.3 (faster convergence)
-- Reprojection strategy: use `prev_view_proj` matrix to find previous screen position. If previous pixel is invalid (off-screen or depth mismatch > threshold), reset with blend factor 1.0 (no history).
+- Blend: `shadow_out = lerp(shadow_history[prev_uv], current_shadow, blend)`
+- Reprojection: use `prev_view_proj` matrix to find previous screen position
+- If previous pixel is off-screen, reset with blend factor 1.0 (no history)
+- If `scene.shadow_reset == 1` (set CPU-side on large camera motion), use blend factor 1.0
+- Otherwise, use blend factor 0.1 (90% history, 10% new)
 
 **Reprojection detail:**
 ```slang
-// In lighting.slang:
 float4 prev_clip = mul(scene.prev_view_proj, float4(position, 1.0));
 float2 prev_uv = prev_clip.xy / prev_clip.w * 0.5 + 0.5;
-bool valid = all(prev_uv >= 0.0) && all(prev_uv <= 1.0);
+bool valid = all(prev_uv >= 0.0) && all(prev_uv <= 1.0) && (scene.shadow_reset == 0u);
 float blend = valid ? 0.1 : 1.0;
-// On large camera motion (detected CPU-side), set scene.shadow_reset = 1 → blend = 1.0
 ```
 
 ### 4.3 SceneUniforms Extension
 
 **New fields added to SceneUniforms (Rust + Slang must match):**
-- `frame_count: u32` (for hash seed)
-- `shadow_reset: u32` (1 = force reset temporal history)
-- `prev_view_proj: float4x4` (64 bytes, for shadow reprojection)
-- `sun_tangent: float3` + pad (16 bytes, for jitter basis)
-- `sun_bitangent: float3` + pad (16 bytes, for jitter basis)
 
-**UBO size change:** 176B → 176 + 4 + 4 + 64 + 16 + 16 = **280B** (padded to 288B for 16-byte alignment).
+Field order is chosen to avoid std140/repr(C) alignment mismatches. `prev_view_proj` (`float4x4`) requires 16-byte column alignment in std140; placing it first at offset 176 (= 11×16, already 16-byte aligned) avoids internal padding.
 
-**All files referencing UBO size that must be updated:**
-- `src/render/scene_ubo.rs` — struct definition + size test (`gpu_scene_uniforms_size_is_176_bytes` → 288)
+```
+Offset  Size  Field
+------  ----  -----
+  0     176B  (existing fields, unchanged)
+176      64B  prev_view_proj: float4x4     (shadow reprojection)
+240      12B  sun_tangent: float3          (jitter basis)
+252       4B  _pad_st: float              (std140 pad)
+256      12B  sun_bitangent: float3        (jitter basis)
+268       4B  _pad_sb: float              (std140 pad)
+272       4B  frame_count: u32             (hash seed)
+276       4B  shadow_reset: u32            (1 = force reset temporal history)
+280       8B  _pad5: [u32; 2]             (pad to 288B, 16-byte struct alignment)
+------  ----
+Total:  288B
+```
+
+Rust `repr(C)` layout matches std140 exactly with this ordering — no hidden padding gaps.
+
+**sun_tangent/sun_bitangent computation (in `app.rs`):**
+```rust
+let tangent = sun_direction.cross(Vec3::Y).normalize_or_zero();
+// Degenerate case: sun directly up/down → use X as fallback
+let tangent = if tangent.length() < 0.001 { Vec3::X } else { tangent };
+let bitangent = sun_direction.cross(tangent);
+```
+
+**UBO size change:** 176B → **288B**.
+
+**All files that must be updated for the new size:**
+- `src/render/scene_ubo.rs` — struct definition + size test (`assert_eq!(size, 176)` → `288`)
 - `assets/shaders/shared/scene_common.slang` — struct definition + size comment
-- Any descriptor set layout that specifies UBO range (verify in `src/render/passes/*.rs`)
+- `src/render/passes/primary_ray.rs:91` — `.range(176)` → `.range(std::mem::size_of::<GpuSceneUniforms>() as u64)`
+- `src/render/passes/lighting.rs:81` — `.range(176)` → `.range(std::mem::size_of::<GpuSceneUniforms>() as u64)`
+- `src/render/passes/radiance_cascade_trace.rs:81` — `.range(176)` → `.range(std::mem::size_of::<GpuSceneUniforms>() as u64)`
+
+Replace all hardcoded `176` with `std::mem::size_of::<GpuSceneUniforms>() as u64` to prevent future size-mismatch bugs.
 
 ### 4.4 Files
 
@@ -303,7 +330,8 @@ float blend = valid ? 0.1 : 1.0;
 - Modified: `src/render/scene_ubo.rs` (new fields, updated size, updated test)
 - Modified: `src/app.rs` (compute prev_view_proj, sun_tangent/bitangent, frame_count, shadow_reset)
 - New: shadow history texture allocation in `LightingPass` (R16F, same resolution as output)
-- New: `hash22()` utility function in `lighting_common.slang`
+- New: `hash22()` in `lighting_common.slang` — PCG-family hash, takes `uint2` seed, returns `float2` in [0,1]²
+- Modified: `assets/shaders/shared/voxel_traverse.slang` (store ray-surface intersection in `result.position` instead of voxel center — prerequisite for P5 vertex AO)
 
 ## 5. Phase P4: Performance Optimization
 
@@ -346,7 +374,7 @@ float blend = 0.15;  // 85% old, 15% new
 probe_write[idx] = lerp(prev, result, blend);
 ```
 
-Skip blending for inside-geo probes (w=-1) and first frame.
+Skip blending for inside-geo probes (w=-1) and the first frame. First-frame detection: if `probe_read[idx].w == 0.0` and `probe_read[idx].xyz == float3(0)` (zero-initialized buffer), skip the lerp and write raw result.
 
 ### 6.2 Multi-Bounce Enhancement
 
@@ -363,23 +391,42 @@ Cheap screen-space AO from occupancy lookups:
 - Bilinear interpolate across the face using hit position within voxel
 - Apply as multiplier on ambient term
 
-**Hit UV computation (no extra G-buffer channel needed):**
-The hit position within the voxel is derived in `lighting.slang` from `gbuffer_pos` and the normal:
+**Hit UV computation (requires gbuffer_pos change in P2):**
+
+Currently `gbuffer_pos.xyz` stores the **voxel center** (`brick_origin + float3(hit_local) + 0.5`, see `voxel_traverse.slang:168`). `fract()` always returns `(0.5, 0.5, 0.5)`, which is useless for AO interpolation.
+
+**Fix (applied in P2 as a prerequisite):** Change `trace_primary_ray` in `voxel_traverse.slang` to store the actual ray-surface intersection:
 ```slang
-float3 frac_pos = fract(position);  // position within voxel [0,1)^3
+// Before: result.position = brick_origin + float3(hit_local) + 0.5;
+// After:
+result.position = ray.origin + ray.direction * hit_t;
+```
+
+This also requires updating `lighting.slang`'s gradient normal computation to use an inward offset:
+```slang
+// Before: int3 ip = int3(floor(position));
+// After: offset into the hit voxel (surface point may be on integer boundary)
+int3 ip = int3(floor(position - normal * 0.01));
+```
+
+Shadow ray origin (`position + normal * 0.51`) and RC probe integration remain correct — both tolerate surface-point vs voxel-center positions.
+
+With the actual surface intersection point, AO UV is computed in `lighting.slang`:
+```slang
+float3 frac_pos = position - floor(position - normal * 0.01);  // [0,1] within voxel
 // Project onto hit face based on normal_id to get 2D UV:
 // +X/-X face: uv = (frac_pos.z, frac_pos.y)
 // +Y/-Y face: uv = (frac_pos.x, frac_pos.z)
 // +Z/-Z face: uv = (frac_pos.x, frac_pos.y)
 ```
-No additional G-buffer channel required — `gbuffer_pos.xyz` already contains sub-voxel precision positions from the DDA ray intersection.
+No additional G-buffer channel required.
 
 **Cost:** 8 voxel lookups + 4 interpolations per pixel. Negligible vs current shadow ray cost.
 
 ### 6.4 Files
 
 - Modified: `assets/shaders/passes/rc_trace.slang` (temporal blend, smooth normal for bounce)
-- Modified: `assets/shaders/passes/lighting.slang` (vertex AO with computed hit UV)
+- Modified: `assets/shaders/passes/lighting.slang` (vertex AO with computed hit UV, gradient normal inward offset)
 
 ## 7. Success Criteria
 
