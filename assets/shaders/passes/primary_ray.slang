@@ -22,14 +22,14 @@ RWTexture2D<float4> gbuffer0;       // RGBA8_UNORM: rgb = base_color, a = ao
 RWTexture2D<uint4> gbuffer1;        // RGBA8_UINT: r = normal_id, g = roughness, b = metallic, a = flags
 
 static const float3 MATERIAL_ALBEDO[8] = {
-    float3(1.0, 1.0, 1.0),       // 0: default white
-    float3(0.95, 0.925, 0.9),    // 1: stone
-    float3(0.99, 0.4, 0.4),      // 2: red cloth
-    float3(0.4, 0.99, 0.4),      // 3: green cloth
-    float3(0.5, 0.6, 0.9),       // 4: blue
-    float3(0.75, 0.65, 0.5),     // 5: brick
-    float3(0.55, 0.52, 0.48),    // 6: dark stone
-    float3(0.6, 0.4, 0.25),      // 7: wood
+    float3(0.7, 0.7, 0.7),       // 0: default
+    float3(0.65, 0.63, 0.60),    // 1: stone
+    float3(0.70, 0.20, 0.20),    // 2: red cloth
+    float3(0.20, 0.70, 0.20),    // 3: green cloth
+    float3(0.35, 0.42, 0.65),    // 4: blue
+    float3(0.55, 0.40, 0.30),    // 5: brick
+    float3(0.40, 0.37, 0.34),    // 6: dark stone
+    float3(0.45, 0.30, 0.18),    // 7: wood
 };
 
 // Binding 4-7: UCVH buffers (order matches trace_primary_ray parameter order)

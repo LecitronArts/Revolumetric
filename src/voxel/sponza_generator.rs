@@ -41,9 +41,13 @@ impl SponzaGenerator {
             };
         }
 
-        // === CEILING (y 88-92): stone slab ===
+        // === CEILING (y 88-92): stone slab with courtyard opening ===
         if v.y > 88.0 && v.y < 92.0 {
-            return Some((MAT_STONE, [0; 3]));
+            if v.x > 30.0 && v.x < 66.0 && v.z > 20.0 && v.z < 100.0 {
+                // Open to sky — no ceiling here
+            } else {
+                return Some((MAT_STONE, [0; 3]));
+            }
         }
 
         // === SECOND FLOOR (y 44-46): wood planks, full width ===

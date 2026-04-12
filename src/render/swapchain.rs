@@ -134,12 +134,22 @@ impl SwapchainManager {
 }
 
 fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::SurfaceFormatKHR> {
+    // Prefer UNORM over SRGB: the lighting shader already applies manual gamma
+    // correction (pow(x, 1/2.2)), so using SRGB would double-apply the gamma
+    // curve during blit, causing a washed-out image with low contrast.
     formats
         .iter()
         .copied()
         .find(|format| {
-            format.format == vk::Format::B8G8R8A8_SRGB
+            format.format == vk::Format::B8G8R8A8_UNORM
                 && format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+        })
+        .or_else(|| {
+            // Fallback: any UNORM format
+            formats.iter().copied().find(|format| {
+                matches!(format.format,
+                    vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM)
+            })
         })
         .or_else(|| formats.first().copied())
 }

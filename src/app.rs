@@ -2,7 +2,7 @@ use anyhow::Result;
 use ash::vk;
 use tracing_subscriber::{fmt, EnvFilter};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -100,6 +100,28 @@ impl RevolumetricApp {
             initialized: false,
             last_cursor_pos: None,
             last_frame_time: None,
+        }
+    }
+
+    fn resize_render_passes(&mut self, width: u32, height: u32) {
+        // Extract device (Clone) and allocator (raw ptr) to avoid borrow conflicts
+        // with pass fields. Safe because allocator lives in self.renderer and isn't
+        // moved or dropped during this method.
+        let (device, allocator) = match self.renderer.as_ref() {
+            Some(r) => (r.device().clone(), r.allocator() as *const crate::render::allocator::GpuAllocator),
+            None => return,
+        };
+        let allocator = unsafe { &*allocator };
+
+        if let Some(primary) = &mut self.primary_ray_pass {
+            if let Err(e) = primary.resize_images(&device, allocator, width, height) {
+                tracing::error!(%e, "failed to resize primary ray images");
+            }
+        }
+        if let (Some(lighting), Some(primary)) = (&mut self.lighting_pass, &self.primary_ray_pass) {
+            if let Err(e) = lighting.resize_images(&device, allocator, width, height, primary) {
+                tracing::error!(%e, "failed to resize lighting images");
+            }
         }
     }
 
@@ -705,12 +727,22 @@ impl ApplicationHandler for RevolumetricApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => {
+                // Skip rendering when minimized (zero-size window)
+                if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    if size.width == 0 || size.height == 0 {
+                        return;
+                    }
+                }
                 if let Err(error) = self.tick_frame() {
                     tracing::error!(%error, "frame execution failed");
                     event_loop.exit();
                 }
             }
             WindowEvent::Resized(size) => {
+                if size.width == 0 || size.height == 0 {
+                    return; // minimized — skip resize
+                }
                 if let Some(renderer) = self.renderer.as_mut() {
                     if let Err(error) = renderer.handle_resize(size.width, size.height) {
                         tracing::error!(%error, "failed to recreate swapchain after resize");
@@ -718,6 +750,7 @@ impl ApplicationHandler for RevolumetricApp {
                         return;
                     }
                 }
+                self.resize_render_passes(size.width, size.height);
                 tracing::debug!(width = size.width, height = size.height, "window resized");
             }
             WindowEvent::KeyboardInput { event, .. } => {
@@ -763,16 +796,8 @@ impl ApplicationHandler for RevolumetricApp {
                     }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    if input.right_mouse_held {
-                        if let Some((last_x, last_y)) = self.last_cursor_pos {
-                            input.mouse_dx += (position.x - last_x) as f32;
-                            input.mouse_dy += (position.y - last_y) as f32;
-                        }
-                        self.last_cursor_pos = Some((position.x, position.y));
-                    }
-                }
+            WindowEvent::CursorMoved { .. } => {
+                // Mouse deltas handled via DeviceEvent::MouseMotion for reliable FPS camera
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
@@ -795,6 +820,22 @@ impl ApplicationHandler for RevolumetricApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::MouseMotion { delta } = event {
+            if let Some(input) = self.world.resource_mut::<InputState>() {
+                if input.right_mouse_held {
+                    input.mouse_dx += delta.0 as f32;
+                    input.mouse_dy += delta.1 as f32;
+                }
+            }
         }
     }
 

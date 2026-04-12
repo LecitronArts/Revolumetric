@@ -11,10 +11,14 @@ float3 aces_tonemap(float3 x) {
 }
 
 // Sky color gradient based on ray direction.
-// Interpolates between ground_color (horizon-down) and sky_color (zenith).
+// Interpolates between sunlit ground radiance (horizon-down) and sky_color (zenith).
+// Models outdoor ground illuminated by sun — provides warm indirect through windows.
 float3 sky_color_for_dir(float3 dir, SceneUniforms scene) {
-    float t = dir.y * 0.5 + 0.5;
-    return lerp(scene.ground_color, scene.sky_color, saturate(t));
+    float t = saturate(dir.y * 0.5 + 0.5);
+    // Ground receives sun: radiance = albedo * sun_intensity * cos(sun_elevation)
+    float ground_ndotl = max(scene.sun_direction.y, 0.0);
+    float3 sunlit_ground = scene.ground_color * (1.0 + scene.sun_intensity * ground_ndotl);
+    return lerp(sunlit_ground, scene.sky_color, t);
 }
 
 // Hemisphere ambient: blend sky/ground based on surface normal Y component.

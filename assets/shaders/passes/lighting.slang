@@ -62,7 +62,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
         );
         float3 ray_dir = normalize(mul(float3(pixel, 1.0), dir_mat));
         float3 sky = sky_color_for_dir(ray_dir, scene);
-        // Apply tonemap + gamma to sky for consistency
         sky = aces_tonemap(sky);
         sky = pow(sky, float3(1.0 / 2.2));
         output_image[tid.xy] = float4(sky, 1.0);
@@ -76,28 +75,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint normal_id = gb1.r;
     float3 normal = NORMAL_TABLE[min(normal_id, 5u)];
 
-    // Emissive early-out
+    // Emissive early-out: Reinhard tonemap preserves warm color better than ACES at high values
     uint3 emissive_raw = uint3(gb1.g, gb1.b, gb1.a);
     if (emissive_raw.x + emissive_raw.y + emissive_raw.z > 0u) {
-        float3 emissive = float3(emissive_raw) / 255.0;
-        output_image[tid.xy] = float4(pow(emissive, float3(1.0 / 2.2)), 1.0);
+        float3 emissive = float3(emissive_raw) / 255.0 * 3.0;
+        float3 mapped = emissive / (1.0 + emissive);
+        output_image[tid.xy] = float4(pow(mapped, float3(1.0 / 2.2)), 1.0);
         return;
     }
 
-    // Shadow ray: offset from voxel center along normal to exit the solid voxel
+    // Shadow ray for direct sun
     float3 shadow_origin = position + normal * 0.51;
     Ray shadow_ray = make_ray(shadow_origin, scene.sun_direction);
     HitResult shadow_hit = trace_primary_ray(
         shadow_ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials
     );
-
-    // Lighting
     float shadow = shadow_hit.hit ? 0.0 : 1.0;
     float ndotl = max(dot(normal, scene.sun_direction), 0.0);
     float3 diffuse = base_color * scene.sun_intensity * ndotl * shadow;
+
+    // Indirect: RC probes or hemisphere fallback
     float3 ambient;
     if (scene.rc_enabled > 0u) {
-        float3 indirect = integrate_probe(position, normal, rc_probes, scene.rc_c0_offset, scene.rc_c0_grid);
+        uint3 c0_grid = uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z);
+        float3 indirect = integrate_probe(position, normal, rc_probes, scene.rc_c0_offset, c0_grid);
         ambient = base_color * indirect;
     } else {
         ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);

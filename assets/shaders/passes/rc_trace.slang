@@ -66,6 +66,19 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float probe_spacing = 8.0 * lod_factor;
     float3 probe_pos = (float3(probe_coord) + 0.5) * probe_spacing;
 
+    // Flag C0 probes outside the building interior as inside-geo.
+    // Only for C0 — higher cascades use GeoOffset and their larger spacing
+    // means centers can be outside bounds while still covering interior regions.
+    if (push.cascade_level == 0u) {
+        if (probe_pos.x < 19.0 || probe_pos.x > 109.0 ||
+            probe_pos.y < 2.0  || probe_pos.y > 87.0  ||
+            probe_pos.z < 7.0  || probe_pos.z > 121.0) {
+            uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);
+            probe_write[idx] = float4(0.0, 0.0, 0.0, -1.0);
+            return;
+        }
+    }
+
     float3 face_normal, face_tangent, face_bitangent;
     get_face_tbn(face, face_normal, face_tangent, face_bitangent);
 
@@ -94,17 +107,17 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
         float3 emissive = voxel_emissive(hit.cell);
         if (emissive.x + emissive.y + emissive.z > 0.001) {
-            result.xyz = emissive;
+            result.xyz = emissive * 8.0;  // HDR boost for probe radiance
         } else {
             uint mat_id = voxel_material(hit.cell);
-            float3 albedo = float3(0.9, 0.9, 0.9);
-            if (mat_id == 1u) albedo = float3(0.95, 0.925, 0.9);
-            else if (mat_id == 2u) albedo = float3(0.99, 0.4, 0.4);
-            else if (mat_id == 3u) albedo = float3(0.4, 0.99, 0.4);
-            else if (mat_id == 4u) albedo = float3(0.5, 0.6, 0.9);
-            else if (mat_id == 5u) albedo = float3(0.75, 0.65, 0.5);
-            else if (mat_id == 6u) albedo = float3(0.55, 0.52, 0.48);
-            else if (mat_id == 7u) albedo = float3(0.6, 0.4, 0.25);
+            float3 albedo = float3(0.7, 0.7, 0.7);
+            if (mat_id == 1u) albedo = float3(0.65, 0.63, 0.60);
+            else if (mat_id == 2u) albedo = float3(0.70, 0.20, 0.20);
+            else if (mat_id == 3u) albedo = float3(0.20, 0.70, 0.20);
+            else if (mat_id == 4u) albedo = float3(0.35, 0.42, 0.65);
+            else if (mat_id == 5u) albedo = float3(0.55, 0.40, 0.30);
+            else if (mat_id == 6u) albedo = float3(0.40, 0.37, 0.34);
+            else if (mat_id == 7u) albedo = float3(0.45, 0.30, 0.18);
 
             float3 hit_normal = hit.normal;
             float ndotl = max(dot(hit_normal, scene.sun_direction), 0.0);
@@ -119,9 +132,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
             float3 indirect = float3(0.0);
             if (scene.rc_enabled > 0u) {
-                indirect = integrate_probe(hit.position, hit_normal, probe_read, scene.rc_c0_offset, scene.rc_c0_grid);
-            } else {
-                indirect = hemisphere_ambient(hit_normal, scene.sky_color, scene.ground_color);
+                indirect = integrate_probe(hit.position, hit_normal, probe_read, scene.rc_c0_offset,
+                                           uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z));
             }
 
             result.xyz = (direct + indirect) * albedo;

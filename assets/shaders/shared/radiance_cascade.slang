@@ -100,7 +100,9 @@ float3 rc_geo_offset(float3 vertex,
     return float3(0.001);
 }
 
-// --- integrate_probe (visibility-weighted trilinear) ---
+// --- integrate_probe (trilinear, multi-face blend, skip inside-geo probes) ---
+// Reads primary face (matching surface normal) + 4 adjacent faces to capture
+// light sources on the same wall plane (e.g., sconces next to a wall surface).
 
 uint normal_to_face(float3 n) {
     return encode_normal_id(n);
@@ -118,16 +120,15 @@ float3 read_probe_face(uint3 probe_coord, uint face, uint3 grid_size,
     return total;
 }
 
-float probe_visibility(uint3 probe_coord, float3 world_pos, uint face,
-                       uint3 grid_size, uint c0_offset, float probe_spacing,
-                       StructuredBuffer<float4> rc_probes) {
-    float3 probe_world = (float3(probe_coord) + 0.5) * probe_spacing;
-    float dist = length(world_pos - probe_world);
-    uint center_idx = c0_offset +
-        ((probe_coord.z * grid_size.y + probe_coord.y) * grid_size.x + probe_coord.x)
-        * 6u * 9u + face * 9u + 4u;
-    float ray_dist = rc_probes[center_idx].w;
-    return (ray_dist < dist - 0.5) ? 0.00001 : 1.0;
+float3 read_probe_multi_face(uint3 probe_coord, uint primary_face, uint3 grid_size,
+                             uint c0_offset, StructuredBuffer<float4> rc_probes) {
+    uint opposite_face = primary_face ^ 1u; // 0<->1, 2<->3, 4<->5
+    float3 radiance = read_probe_face(probe_coord, primary_face, grid_size, c0_offset, rc_probes) * 0.75;
+    for (uint f = 0; f < 6; f++) {
+        if (f == primary_face || f == opposite_face) continue;
+        radiance += read_probe_face(probe_coord, f, grid_size, c0_offset, rc_probes) * 0.0625;
+    }
+    return radiance;
 }
 
 float3 integrate_probe(float3 world_pos, float3 normal,
@@ -148,15 +149,17 @@ float3 integrate_probe(float3 world_pos, float3 normal,
         int3 coord = base_coord + offset;
         uint3 clamped = uint3(clamp(coord, int3(0), int3(c0_grid_size) - 1));
 
+        // Skip inside-geo probes: center direction (index 4) has w < 0 when
+        // the probe position was inside solid geometry for this face.
+        uint probe_linear = (clamped.z * c0_grid_size.y + clamped.y) * c0_grid_size.x + clamped.x;
+        float center_w = rc_probes[c0_offset + probe_linear * 6u * 9u + face * 9u + 4u].w;
+        //if (center_w < 0.0) continue;
+
         float3 w = lerp(1.0 - frac_pos, frac_pos, float3(offset));
         float trilinear_w = w.x * w.y * w.z;
 
-        float vis_w = probe_visibility(clamped, world_pos, face,
-                                       c0_grid_size, c0_offset, spacing, rc_probes);
-
-        float weight = trilinear_w * vis_w;
-        total_radiance += read_probe_face(clamped, face, c0_grid_size, c0_offset, rc_probes) * weight;
-        total_weight += weight;
+        total_radiance += read_probe_multi_face(clamped, face, c0_grid_size, c0_offset, rc_probes) * trilinear_w;
+        total_weight += trilinear_w;
     }
 
     return (total_weight > 0.0001) ? total_radiance / total_weight : float3(0.0);

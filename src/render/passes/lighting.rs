@@ -165,6 +165,52 @@ impl LightingPass {
         })
     }
 
+    pub fn resize_images(
+        &mut self,
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+        width: u32,
+        height: u32,
+        primary_ray: &PrimaryRayPass,
+    ) -> Result<()> {
+        let new_output = GpuImage::new(device, allocator, &GpuImageDesc {
+            width, height, depth: 1,
+            format: vk::Format::R8G8B8A8_UNORM,
+            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            aspect: vk::ImageAspectFlags::COLOR,
+            name: "lighting_output",
+        })?;
+        let old_output = std::mem::replace(&mut self.output_image, new_output);
+        old_output.destroy(device, allocator);
+
+        for &ds in &self.descriptor_sets {
+            let image_infos = [
+                vk::DescriptorImageInfo::default()
+                    .image_view(primary_ray.gbuffer_pos.view)
+                    .image_layout(vk::ImageLayout::GENERAL),
+                vk::DescriptorImageInfo::default()
+                    .image_view(primary_ray.gbuffer0.view)
+                    .image_layout(vk::ImageLayout::GENERAL),
+                vk::DescriptorImageInfo::default()
+                    .image_view(primary_ray.gbuffer1.view)
+                    .image_layout(vk::ImageLayout::GENERAL),
+                vk::DescriptorImageInfo::default()
+                    .image_view(self.output_image.view)
+                    .image_layout(vk::ImageLayout::GENERAL),
+            ];
+            let writes: Vec<vk::WriteDescriptorSet> = image_infos.iter().enumerate().map(|(i, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding((i + 1) as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .image_info(std::slice::from_ref(info))
+            }).collect();
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+
+        Ok(())
+    }
+
     /// Record the lighting pass. Inserts input barriers on G-buffer images before dispatch.
     pub fn record(
         &self,

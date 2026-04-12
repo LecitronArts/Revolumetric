@@ -20,6 +20,43 @@ struct RcMergePush {
 [[vk::binding(0, 0)]]
 RWStructuredBuffer<float4> probe_buffer;
 
+// Compute visibility weight for a higher-cascade neighbor probe.
+// Reprojects direction from neighbor to current position onto the neighbor's
+// dominant face, finds the nearest traced direction, and checks ray distance.
+float neighbor_visibility(uint3 neighbor, float3 voxel_pos, float higher_lod_factor,
+                          uint h_grid, uint h_dirs, float h_probe_size_f) {
+    float3 neighbor_world = (float3(neighbor) + 0.5) * 8.0 * higher_lod_factor;
+    float3 rPos = voxel_pos - neighbor_world;
+    float dist = length(rPos);
+    if (dist < 0.001) return 1.0;
+
+    float3 aPos = abs(rPos);
+    uint vis_face;
+    float3 local_dir;
+
+    // Determine dominant face and transform to local TBN space
+    if (aPos.x > max(aPos.y, aPos.z)) {
+        vis_face = (rPos.x > 0.0) ? 0u : 1u;   // +X or -X
+        local_dir = float3(rPos.z, rPos.y, aPos.x);
+    } else if (aPos.y > aPos.z) {
+        vis_face = (rPos.y > 0.0) ? 2u : 3u;   // +Y or -Y
+        local_dir = float3(rPos.x, rPos.z, aPos.y);
+    } else {
+        vis_face = (rPos.z > 0.0) ? 4u : 5u;   // +Z or -Z
+        local_dir = float3(rPos.x, rPos.y, aPos.z);
+    }
+
+    // Project onto the face hemisphere to find the nearest direction
+    float2 projUV = ProjectDir(local_dir, h_probe_size_f);
+    if (projUV.x < 0.0) return 1.0; // dir behind hemisphere — assume visible
+
+    uint dir_idx = min(uint(projUV.x + floor(projUV.y) * h_probe_size_f), h_dirs - 1u);
+    uint vis_idx = rc_probe_index(neighbor, h_grid, h_dirs, vis_face, dir_idx, push.higher_offset);
+    float ray_dist = probe_buffer[vis_idx].w;
+
+    return (ray_dist < dist - 0.5) ? 0.00001 : 1.0;
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 dtid : SV_DispatchThreadID) {
@@ -51,30 +88,21 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     uint h_grid = push.higher_grid_dim;
     uint h_dirs = push.higher_probe_size * push.higher_probe_size;
+    float h_probe_size_f = float(push.higher_probe_size);
     float3 h_pos = clamp(voxel_pos / (8.0 * higher_lod_factor), float3(0.5), float3(float(h_grid)) - 0.5);
 
+    // Map own direction to the 2x2 block of higher-cascade directions
     float2 own_dir_uv = float2(float(dir_index % push.own_probe_size), float(dir_index / push.own_probe_size));
-    float h_dir_index0 = floor(own_dir_uv.x) * 2.0 + floor(own_dir_uv.y) * float(push.higher_probe_size) * 2.0 + 0.5;
+    float h_dir_index0 = floor(own_dir_uv.x) * 2.0 + floor(own_dir_uv.y) * h_probe_size_f * 2.0 + 0.5;
 
     float3 fPos = clamp(floor(h_pos - 0.5), float3(0.0), float3(float(h_grid) - 2.0));
     float3 frPos = min(float3(1.0), h_pos - 0.5 - fPos);
 
-    float h_pow4 = pow(4.0, float(push.cascade_level + 1u));
-    float h_probe_size_f = float(push.higher_probe_size);
-    float3 h_size = float3(float(h_grid));
-
-    float4 lDIUV0 = float4(
-        floor(fmod(h_dir_index0, h_pow4)) * h_size.x * h_size.y,
-        floor(h_dir_index0 / h_pow4) * h_size.z,
-        floor(fmod(h_dir_index0 + 1.0, h_pow4)) * h_size.x * h_size.y,
-        floor((h_dir_index0 + 1.0) / h_pow4) * h_size.z
-    );
-    float4 lDIUV1 = float4(
-        floor(fmod(h_dir_index0 + h_probe_size_f, h_pow4)) * h_size.x * h_size.y,
-        floor((h_dir_index0 + h_probe_size_f) / h_pow4) * h_size.z,
-        floor(fmod(h_dir_index0 + h_probe_size_f + 1.0, h_pow4)) * h_size.x * h_size.y,
-        floor((h_dir_index0 + h_probe_size_f + 1.0) / h_pow4) * h_size.z
-    );
+    // 4 direction offsets in the higher cascade (2x2 block)
+    uint d0 = min(uint(h_dir_index0), h_dirs - 1u);
+    uint d1 = min(uint(h_dir_index0 + 1.0), h_dirs - 1u);
+    uint d2 = min(uint(h_dir_index0 + h_probe_size_f), h_dirs - 1u);
+    uint d3 = min(uint(h_dir_index0 + h_probe_size_f + 1.0), h_dirs - 1u);
 
     float3 merged_radiance = float3(0.0);
     float merged_weight = 0.0;
@@ -84,23 +112,16 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         uint3 neighbor = uint3(int3(fPos) + offset);
         neighbor = clamp(neighbor, uint3(0), uint3(h_grid - 1));
 
-        uint vis_dir_idx = uint(h_dir_index0);
-        uint vis_idx = rc_probe_index(neighbor, h_grid, h_dirs, face, min(vis_dir_idx, h_dirs - 1u), push.higher_offset);
-        float vis_ray_dist = probe_buffer[vis_idx].w;
-        float3 neighbor_world = (float3(neighbor) + 0.5) * 8.0 * higher_lod_factor;
-        float dist_to_us = length(voxel_pos - neighbor_world);
-        float vis_w = (vis_ray_dist < dist_to_us - 0.5) ? 0.00001 : 1.0;
+        // Visibility: reproject face + direction from neighbor toward us
+        float vis_w = neighbor_visibility(neighbor, voxel_pos, higher_lod_factor,
+                                          h_grid, h_dirs, h_probe_size_f);
 
-        float4 sum = float4(0.0);
+        // Sum the 4 matching directions from this neighbor
         uint base = rc_probe_index(neighbor, h_grid, h_dirs, face, 0u, push.higher_offset);
-        uint d0 = min(uint(h_dir_index0), h_dirs - 1u);
-        uint d1 = min(uint(h_dir_index0 + 1.0), h_dirs - 1u);
-        uint d2 = min(uint(h_dir_index0 + h_probe_size_f), h_dirs - 1u);
-        uint d3 = min(uint(h_dir_index0 + h_probe_size_f + 1.0), h_dirs - 1u);
-        sum += probe_buffer[base + d0];
-        sum += probe_buffer[base + d1];
-        sum += probe_buffer[base + d2];
-        sum += probe_buffer[base + d3];
+        float4 sum = probe_buffer[base + d0]
+                   + probe_buffer[base + d1]
+                   + probe_buffer[base + d2]
+                   + probe_buffer[base + d3];
 
         float3 w = lerp(1.0 - frPos, frPos, float3(offset));
         float tri_w = w.x * w.y * w.z;
@@ -118,8 +139,12 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         merged_radiance /= merged_weight;
     }
 
-    float inv_lod_factor = 1.0 / lod_factor;
-    float dist_interp = clamp((own_data.w - lod_factor) * inv_lod_factor * 0.5, 0.0, 1.0);
+    // Blend own (near-field) vs merged (far-field) based on ray distance.
+    // Extended near-field for our 128^3 scene: C0 keeps own data up to half
+    // its spacing (4 voxels) since C1 is too sparse to resolve small features
+    // like sconces. Reference formula (t>=3) is too aggressive for our scale.
+    float half_spacing = lod_factor * 4.0;
+    float dist_interp = clamp((own_data.w - half_spacing) / half_spacing, 0.0, 1.0);
     float3 final_radiance = lerp(own_data.xyz, merged_radiance, dist_interp);
 
     probe_buffer[own_idx] = float4(final_radiance, own_data.w);

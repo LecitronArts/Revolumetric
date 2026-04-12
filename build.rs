@@ -7,7 +7,15 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders");
     std::fs::create_dir_all(&out_dir).unwrap();
 
-    println!("cargo:rerun-if-changed=assets/shaders");
+    // Track every shader file individually so edits trigger recompilation on
+    // Windows NTFS (directory mtime doesn't update when file contents change).
+    for entry in walkdir::WalkDir::new(&shader_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map_or(false, |ext| ext == "slang"))
+    {
+        println!("cargo:rerun-if-changed={}", entry.path().display());
+    }
 
     // Find all .slang files in passes/
     let passes_dir = shader_dir.join("passes");
