@@ -7,7 +7,7 @@ Post-Phase-5 optimization plan covering GPU profiling, material system upgrade, 
 ### 1.1 Goals
 
 - Establish GPU performance baseline with per-pass timing
-- Upgrade VoxelCell to 64-bit with per-voxel color, roughness, metallic
+- Redesign VoxelCell with per-voxel color, roughness, metallic (same 64-bit size)
 - Two-layer material system: per-voxel attributes + material template defaults
 - Soft shadows replacing binary shadow rays
 - Data-driven performance optimization
@@ -18,7 +18,7 @@ Post-Phase-5 optimization plan covering GPU profiling, material system upgrade, 
 | Phase | Name | Deliverable | Depends On |
 |-------|------|-------------|------------|
 | P1 | GPU Profiling | Per-pass GPU timing + console readout | — |
-| P2 | Material System | 64-bit VoxelCell + two-layer materials + G-buffer redesign | P1 |
+| P2 | Material System | VoxelCell redesign + two-layer materials + G-buffer redesign | P1 |
 | P3 | Soft Shadows | Stochastic shadow rays + temporal accumulation | P2 |
 | P4 | Performance Optimization | Bottleneck-targeted optimization (informed by P1 data) | P1, P2, P3 |
 | P5 | Advanced GI | Multi-bounce + temporal probe stability + vertex AO | P2, P3 |
@@ -74,33 +74,60 @@ impl GpuProfiler {
 
 ## 3. Phase P2: Material System Upgrade
 
-### 3.1 VoxelCell Layout (64-bit)
+### 3.1 VoxelCell Layout (64-bit → 64-bit redesign)
 
-Current (48-bit):
+**Current (64-bit / 8 bytes):**
 ```
-material_id: u16 | occupancy: u8 | emissive_r: u8 | emissive_g: u8 | emissive_b: u8
+Rust:  material: u16 | flags: u16 | emissive: [u8; 3] | _pad: u8
+GPU:   uint material_flags (low16: material, high16: flags)
+       uint emissive_pad   (low24: emissive RGB, high8: pad)
 ```
 
-New (64-bit):
+**New (64-bit / 8 bytes):**
 ```
-color_r:    u8  // per-voxel base color R
-color_g:    u8  // per-voxel base color G
-color_b:    u8  // per-voxel base color B
-roughness:  u8  // 0=mirror, 255=fully rough
-metallic:   u8  // 0=dielectric, 255=full metal
-emissive:   u8  // scalar intensity (emissive_color = base_color * intensity/255)
-material_id:u8  // template index (0-255) for upper-layer defaults
-flags:      u8  // bit 0: occupied, bits 1-3: reserved
+Rust:
+  color:       [u8; 3]   // per-voxel base color RGB
+  roughness:   u8        // 0=mirror, 255=fully rough
+  metallic:    u8        // 0=dielectric, 255=full metal
+  emissive:    u8        // scalar intensity (emissive_color = base_color * intensity/255)
+  material_id: u8        // template index (0-255) for upper-layer defaults
+  flags:       u8        // bit 0: override_roughness, bit 1: override_metallic, bits 2-7: reserved
+
+GPU (two uint32 words):
+  uint word0:  bits[7:0]   = color_r
+               bits[15:8]  = color_g
+               bits[23:16] = color_b
+               bits[31:24] = roughness
+  uint word1:  bits[7:0]   = metallic
+               bits[15:8]  = emissive
+               bits[23:16] = material_id
+               bits[31:24] = flags
+```
+
+**Accessor helpers (voxel_common.slang):**
+```slang
+float3 voxel_color(VoxelCell cell) {
+    return float3(cell.word0 & 0xFF, (cell.word0 >> 8) & 0xFF, (cell.word0 >> 16) & 0xFF) / 255.0;
+}
+float voxel_roughness(VoxelCell cell) { return float((cell.word0 >> 24) & 0xFF) / 255.0; }
+float voxel_metallic(VoxelCell cell)  { return float(cell.word1 & 0xFF) / 255.0; }
+float voxel_emissive_intensity(VoxelCell cell) { return float((cell.word1 >> 8) & 0xFF) / 255.0; }
+uint  voxel_material_id(VoxelCell cell) { return (cell.word1 >> 16) & 0xFF; }
+uint  voxel_flags(VoxelCell cell) { return (cell.word1 >> 24) & 0xFF; }
 ```
 
 **Design rationale:**
 - Per-voxel RGB replaces material_id→albedo LUT lookup
 - 8-bit roughness/metallic gives 256 levels (4-bit is too coarse for metallic transitions)
 - Emissive becomes scalar intensity × base color (saves 16 bits vs RGB emissive)
-- Material template ID provides defaults; per-voxel values override when non-zero
-- 64-bit alignment is GPU-optimal for structured buffers
+- Same 64-bit size — no memory impact change (512×8B = 4096B per brick, unchanged)
+- material_id shrinks from u16 to u8 (256 templates). Current usage: 8 materials. 256 is sufficient for procedural generation; a u16 can be reconsidered if file import is added later.
 
-**Memory impact:** Brick data grows from 3072B (512×6B) to 4096B (512×8B) per brick. +33% brick memory but better GPU alignment.
+**Template override resolution (flags-based, avoids roughness=0 ambiguity):**
+- `flags bit 0` (override_roughness): if set, use per-voxel roughness; if clear, use template default
+- `flags bit 1` (override_metallic): if set, use per-voxel metallic; if clear, use template default
+- This allows roughness=0 to be a valid mirror surface value, not conflated with "use default"
+- The procedural generator always sets both override bits when writing per-voxel PBR values
 
 ### 3.2 Material Template Table
 
@@ -114,13 +141,25 @@ pub struct MaterialTemplate {
 }
 ```
 
-Templates are CPU-side only for now. The procedural generator uses them to set per-voxel defaults:
+Templates are CPU-side only. The procedural generator resolves templates at voxel write time:
 ```rust
-// Stone template: rough, non-metallic
-let stone = MaterialTemplate { roughness: 200, metallic: 5, .. };
-// Metal template: smooth, metallic
-let iron = MaterialTemplate { roughness: 80, metallic: 230, .. };
+fn write_voxel(cell: &mut VoxelCell, color: [u8; 3], template: &MaterialTemplate,
+               roughness_override: Option<u8>, metallic_override: Option<u8>) {
+    cell.color = color;
+    cell.emissive = 0;
+    cell.material_id = template.id;
+    if let Some(r) = roughness_override {
+        cell.roughness = r;
+        cell.flags |= 0x01; // override_roughness
+    } else {
+        cell.roughness = template.default_roughness;
+        cell.flags |= 0x01; // always set — template resolved at write time
+    }
+    // same for metallic with bit 1
+}
 ```
+
+Since templates are resolved at write time, the GPU never sees template lookups. This keeps the shader path simple: always read roughness/metallic directly from VoxelCell.
 
 ### 3.3 G-Buffer Redesign
 
@@ -130,27 +169,62 @@ Current:
 
 New:
 - `gbuffer0` (RGBA8): rgb = per-voxel color (direct from VoxelCell), a = roughness (normalized)
-- `gbuffer1` (RGBA8UI): r = normal_id, g = metallic, b = emissive_intensity, a = flags
+- `gbuffer1` (RGBA8UI): r = normal_id, g = metallic, b = emissive_intensity, a = reserved (0)
 
 **Impact:** Removes `MATERIAL_ALBEDO` LUT from `primary_ray.slang` and the if-else chain from `rc_trace.slang`. Colors come directly from voxel data.
 
 ### 3.4 Shader Changes
 
+**voxel_common.slang:**
+- Replace `struct VoxelCell { uint material_flags; uint emissive_pad; }` with `struct VoxelCell { uint word0; uint word1; }`
+- Replace old accessors (`voxel_material`, `voxel_emissive`) with new ones (see 3.1)
+
 **primary_ray.slang:**
-- Read color_rgb directly from VoxelCell instead of LUT lookup
-- Write roughness to gbuffer0.a, metallic to gbuffer1.g
+- Read color_rgb via `voxel_color(hit.cell)` instead of LUT lookup
+- Write roughness to gbuffer0.a via `voxel_roughness(hit.cell)`
+- Write metallic to gbuffer1.g via `uint(voxel_metallic(hit.cell) * 255.0)`
+- Write emissive_intensity to gbuffer1.b
 
 **rc_trace.slang:**
-- Read albedo directly from VoxelCell.color_rgb (remove hardcoded if-else chain)
-- Emissive = VoxelCell.color * VoxelCell.emissive / 255.0
+- Read albedo via `voxel_color(hit.cell)` (remove hardcoded if-else chain at lines 113-121)
+- Emissive = `voxel_color(hit.cell) * voxel_emissive_intensity(hit.cell) * HDR_SCALE`
 
 **lighting.slang:**
-- Read roughness from gbuffer0.a, metallic from gbuffer1.g
-- Apply Cook-Torrance BRDF for specular (metallic surfaces)
-- Fresnel term: `F0 = lerp(0.04, base_color, metallic)`
-- Emissive path: `base_color * emissive_intensity / 255.0 * HDR_SCALE`
+- Read roughness from gbuffer0.a, metallic from gbuffer1.g / 255.0
+- Apply Cook-Torrance BRDF (see §3.5)
+- Emissive path: `base_color * emissive_intensity * HDR_SCALE`
 
-### 3.5 Sponza Generator Update
+### 3.5 Cook-Torrance BRDF Specification
+
+For metallic/rough surfaces, replace the current Lambert-only direct lighting with a microfacet BRDF:
+
+**Components:**
+- **NDF:** GGX/Trowbridge-Reitz: `D = α² / (π * (NdotH² * (α²-1) + 1)²)` where `α = roughness²`
+- **Geometry:** Smith-Schlick-GGX: `G = G1(N,V) * G1(N,L)` where `G1(N,X) = NdotX / (NdotX * (1-k) + k)`, `k = (roughness+1)² / 8`
+- **Fresnel:** Schlick approximation: `F = F0 + (1-F0) * (1-VdotH)⁵` where `F0 = lerp(0.04, base_color, metallic)`
+
+**View vector reconstruction:** `V = normalize(camera_origin - position)` where `camera_origin = scene.pixel_to_ray[3].xyz` (stored in column 3 of the 4×4 matrix) and `position` from gbuffer_pos.
+
+**Final direct lighting:**
+```slang
+float3 F0 = lerp(float3(0.04), base_color, metallic);
+float3 H = normalize(V + L);
+float NdotL = max(dot(N, L), 0.0);
+float NdotV = max(dot(N, V), 0.001);
+float NdotH = max(dot(N, H), 0.0);
+float VdotH = max(dot(V, H), 0.0);
+
+float D = DistributionGGX(NdotH, roughness);
+float G = GeometrySmith(NdotV, NdotL, roughness);
+float3 F = FresnelSchlick(VdotH, F0);
+
+float3 specular = D * G * F / max(4.0 * NdotV * NdotL, 0.001);
+float3 kD = (1.0 - F) * (1.0 - metallic);
+float3 diffuse = kD * base_color / PI;
+float3 direct = (diffuse + specular) * sun_intensity * NdotL * shadow;
+```
+
+### 3.6 Sponza Generator Update
 
 Update `SponzaGenerator::eval_voxel` to return the new VoxelCell format:
 - Stone: color(165,160,155), roughness=200, metallic=5
@@ -159,14 +233,16 @@ Update `SponzaGenerator::eval_voxel` to return the new VoxelCell format:
 - Cloth: color varies, roughness=240, metallic=0
 - Water: color(30,50,80), roughness=20, metallic=0, emissive=100
 
-### 3.6 Files
+All voxels set both override flags (bit 0 and bit 1 in flags) since templates are resolved at write time.
 
-- Modified: `src/voxel/brick.rs` (VoxelCell struct)
+### 3.7 Files
+
+- Modified: `src/voxel/brick.rs` (VoxelCell struct — same size, new fields)
 - Modified: `src/voxel/sponza_generator.rs` (new format)
 - Modified: `assets/shaders/passes/primary_ray.slang` (direct color, roughness/metallic)
 - Modified: `assets/shaders/passes/rc_trace.slang` (remove albedo LUT)
 - Modified: `assets/shaders/passes/lighting.slang` (Cook-Torrance BRDF, read roughness/metallic)
-- Modified: `assets/shaders/shared/voxel_common.slang` (VoxelCell layout)
+- Modified: `assets/shaders/shared/voxel_common.slang` (VoxelCell layout + new accessors)
 
 ## 4. Phase P3: Soft Shadows
 
@@ -189,24 +265,45 @@ float3 jittered_sun = normalize(scene.sun_direction + sun_tangent * (xi.x - 0.5)
 ```
 
 **Temporal accumulation (new history buffer):**
-- New RGBA16F texture: `shadow_history`
+- New **R16F** texture: `shadow_history` (single-channel — shadow is a scalar 0/1 value)
 - Blend: `shadow_out = lerp(shadow_history[tid.xy], current_shadow, 0.1)`
 - On camera move: increase blend factor to 0.3 (faster convergence)
-- Reproject using motion vectors (or reset on large camera motion)
+- Reprojection strategy: use `prev_view_proj` matrix to find previous screen position. If previous pixel is invalid (off-screen or depth mismatch > threshold), reset with blend factor 1.0 (no history).
+
+**Reprojection detail:**
+```slang
+// In lighting.slang:
+float4 prev_clip = mul(scene.prev_view_proj, float4(position, 1.0));
+float2 prev_uv = prev_clip.xy / prev_clip.w * 0.5 + 0.5;
+bool valid = all(prev_uv >= 0.0) && all(prev_uv <= 1.0);
+float blend = valid ? 0.1 : 1.0;
+// On large camera motion (detected CPU-side), set scene.shadow_reset = 1 → blend = 1.0
+```
 
 ### 4.3 SceneUniforms Extension
 
-Add to SceneUniforms:
+**New fields added to SceneUniforms (Rust + Slang must match):**
 - `frame_count: u32` (for hash seed)
-- `sun_tangent: float3` (for jitter basis)
-- `sun_bitangent: float3`
+- `shadow_reset: u32` (1 = force reset temporal history)
+- `prev_view_proj: float4x4` (64 bytes, for shadow reprojection)
+- `sun_tangent: float3` + pad (16 bytes, for jitter basis)
+- `sun_bitangent: float3` + pad (16 bytes, for jitter basis)
+
+**UBO size change:** 176B → 176 + 4 + 4 + 64 + 16 + 16 = **280B** (padded to 288B for 16-byte alignment).
+
+**All files referencing UBO size that must be updated:**
+- `src/render/scene_ubo.rs` — struct definition + size test (`gpu_scene_uniforms_size_is_176_bytes` → 288)
+- `assets/shaders/shared/scene_common.slang` — struct definition + size comment
+- Any descriptor set layout that specifies UBO range (verify in `src/render/passes/*.rs`)
 
 ### 4.4 Files
 
-- Modified: `assets/shaders/passes/lighting.slang` (stochastic shadow + temporal blend)
-- Modified: `assets/shaders/shared/scene_common.slang` (new uniforms)
-- Modified: `src/render/scene_ubo.rs` (new fields)
-- New: shadow history texture allocation in `LightingPass`
+- Modified: `assets/shaders/passes/lighting.slang` (stochastic shadow + temporal blend + reprojection)
+- Modified: `assets/shaders/shared/scene_common.slang` (new uniforms, updated size)
+- Modified: `src/render/scene_ubo.rs` (new fields, updated size, updated test)
+- Modified: `src/app.rs` (compute prev_view_proj, sun_tangent/bitangent, frame_count, shadow_reset)
+- New: shadow history texture allocation in `LightingPass` (R16F, same resolution as output)
+- New: `hash22()` utility function in `lighting_common.slang`
 
 ## 5. Phase P4: Performance Optimization
 
@@ -260,19 +357,29 @@ Already functional via temporal accumulation — each frame's trace reads last f
 
 ### 6.3 Per-Face Vertex AO
 
-From Phase 12 design. Cheap screen-space AO from occupancy lookups:
+Cheap screen-space AO from occupancy lookups:
 - For each hit face, sample 8 neighboring voxels (4 edge + 4 corner)
 - Compute per-vertex AO: `ao = (side1 + side2 + max(corner, side1 * side2)) / 3`
 - Bilinear interpolate across the face using hit position within voxel
 - Apply as multiplier on ambient term
+
+**Hit UV computation (no extra G-buffer channel needed):**
+The hit position within the voxel is derived in `lighting.slang` from `gbuffer_pos` and the normal:
+```slang
+float3 frac_pos = fract(position);  // position within voxel [0,1)^3
+// Project onto hit face based on normal_id to get 2D UV:
+// +X/-X face: uv = (frac_pos.z, frac_pos.y)
+// +Y/-Y face: uv = (frac_pos.x, frac_pos.z)
+// +Z/-Z face: uv = (frac_pos.x, frac_pos.y)
+```
+No additional G-buffer channel required — `gbuffer_pos.xyz` already contains sub-voxel precision positions from the DDA ray intersection.
 
 **Cost:** 8 voxel lookups + 4 interpolations per pixel. Negligible vs current shadow ray cost.
 
 ### 6.4 Files
 
 - Modified: `assets/shaders/passes/rc_trace.slang` (temporal blend, smooth normal for bounce)
-- Modified: `assets/shaders/passes/lighting.slang` (vertex AO)
-- Modified: `assets/shaders/passes/primary_ray.slang` (output hit UV within voxel for AO interpolation)
+- Modified: `assets/shaders/passes/lighting.slang` (vertex AO with computed hit UV)
 
 ## 7. Success Criteria
 
