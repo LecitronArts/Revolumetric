@@ -127,12 +127,12 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         float tri_w = w.x * w.y * w.z;
         float weight = tri_w * vis_w;
 
-        if (sum.w < -0.5) {
-            merged_radiance += sum.xyz * 0.001 * weight;
-        } else {
-            merged_radiance += sum.xyz * weight;
-        }
-        merged_weight += weight;
+        // Inside-geo probes (w=-1) contribute zero radiance.
+        // Reduce their weight so they don't dilute the result.
+        // Matches reference NearestCS which returns weight=0.001 for inside-geo.
+        float inside_w = (sum.w < -0.5) ? 0.001 : 1.0;
+        merged_radiance += sum.xyz * inside_w * weight;
+        merged_weight += inside_w * weight;
     }
 
     if (merged_weight > 0.0001) {
@@ -140,11 +140,11 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     }
 
     // Blend own (near-field) vs merged (far-field) based on ray distance.
-    // Extended near-field for our 128^3 scene: C0 keeps own data up to half
-    // its spacing (4 voxels) since C1 is too sparse to resolve small features
-    // like sconces. Reference formula (t>=3) is too aggressive for our scale.
-    float half_spacing = lod_factor * 4.0;
-    float dist_interp = clamp((own_data.w - half_spacing) / half_spacing, 0.0, 1.0);
+    // Reference: (t - lod) / (lod * 2). Our probes are 8x sparser, but the
+    // merge formula operates on ray distance in voxels, not probe spacings.
+    // Match reference scaling: start at lod_factor, fully at 3 * lod_factor.
+    // C0: transition 1-3 voxels. C1: transition 2-6 voxels.
+    float dist_interp = clamp((own_data.w - lod_factor) / (lod_factor * 2.0), 0.0, 1.0);
     float3 final_radiance = lerp(own_data.xyz, merged_radiance, dist_interp);
 
     probe_buffer[own_idx] = float4(final_radiance, own_data.w);

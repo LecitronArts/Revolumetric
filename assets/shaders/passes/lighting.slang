@@ -97,13 +97,31 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Indirect: RC probes or hemisphere fallback
     float3 ambient;
     if (scene.rc_enabled > 0u) {
+        // Compute occupancy-gradient smooth normal for RC probe blending.
+        // DDA normals snap to axis → hard face seams on curved surfaces (columns).
+        // The gradient of the occupancy field gives a continuous surface normal.
+        int3 ip = int3(floor(position));
+        float3 grad;
+        grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, 16u))
+               - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, 16u));
+        grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, 16u))
+               - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, 16u));
+        grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, 16u))
+               - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, 16u));
+        float3 smooth_normal = (length(grad) > 0.001) ? normalize(-grad) : normal;
+
         uint3 c0_grid = uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z);
-        float3 indirect = integrate_probe(position, normal, rc_probes, scene.rc_c0_offset, c0_grid);
+        float3 indirect = integrate_probe(position, smooth_normal, rc_probes, scene.rc_c0_offset, c0_grid);
         ambient = base_color * indirect;
     } else {
         ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
     }
     float3 hdr_color = diffuse + ambient;
+
+    // DEBUG: uncomment one of these to visualize RC components
+    // hdr_color = ambient;                    // RC indirect only
+    // hdr_color = float3(normal * 0.5 + 0.5); // normal visualization
+    // hdr_color = diffuse;                    // direct sun only
 
     // Tonemap (ACES Filmic) + gamma correction
     float3 mapped = aces_tonemap(hdr_color);

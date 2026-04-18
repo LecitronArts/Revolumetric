@@ -84,9 +84,10 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     if (push.cascade_level > 0u) {
         probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, 16u);
-    } else {
-        probe_pos -= face_normal * 0.25;
     }
+    // C0: no face_normal offset — all faces trace from the same position.
+    // This ensures consistent inside-geo flagging across all 6 faces,
+    // preventing per-face black line artifacts on curved surfaces.
 
     if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, 16u)) {
         uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);

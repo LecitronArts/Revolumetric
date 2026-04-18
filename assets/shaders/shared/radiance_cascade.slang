@@ -108,6 +108,13 @@ uint normal_to_face(float3 n) {
     return encode_normal_id(n);
 }
 
+// Face normals lookup for cosine weighting.
+static const float3 FACE_NORMALS[6] = {
+    float3(1,0,0), float3(-1,0,0),
+    float3(0,1,0), float3(0,-1,0),
+    float3(0,0,1), float3(0,0,-1),
+};
+
 float3 read_probe_face(uint3 probe_coord, uint face, uint3 grid_size,
                        uint c0_offset, StructuredBuffer<float4> rc_probes) {
     uint base = c0_offset +
@@ -120,21 +127,26 @@ float3 read_probe_face(uint3 probe_coord, uint face, uint3 grid_size,
     return total;
 }
 
-float3 read_probe_multi_face(uint3 probe_coord, uint primary_face, uint3 grid_size,
-                             uint c0_offset, StructuredBuffer<float4> rc_probes) {
-    uint opposite_face = primary_face ^ 1u; // 0<->1, 2<->3, 4<->5
-    float3 radiance = read_probe_face(probe_coord, primary_face, grid_size, c0_offset, rc_probes) * 0.75;
+// Read probe with cosine-weighted face blending based on continuous normal.
+// For axis-aligned normals, this reduces to single-face reading.
+// For smooth normals (e.g. gradient-based), this smoothly blends between faces.
+float3 read_probe_cosine(uint3 probe_coord, float3 normal, uint3 grid_size,
+                         uint c0_offset, StructuredBuffer<float4> rc_probes) {
+    float3 radiance = float3(0.0);
+    float total_w = 0.0;
     for (uint f = 0; f < 6; f++) {
-        if (f == primary_face || f == opposite_face) continue;
-        radiance += read_probe_face(probe_coord, f, grid_size, c0_offset, rc_probes) * 0.0625;
+        float w = max(dot(FACE_NORMALS[f], normal), 0.0);
+        if (w > 0.001) {
+            radiance += read_probe_face(probe_coord, f, grid_size, c0_offset, rc_probes) * w;
+            total_w += w;
+        }
     }
-    return radiance;
+    return (total_w > 0.001) ? radiance / total_w : float3(0.0);
 }
 
 float3 integrate_probe(float3 world_pos, float3 normal,
                        StructuredBuffer<float4> rc_probes,
                        uint c0_offset, uint3 c0_grid_size) {
-    uint face = normal_to_face(normal);
     float spacing = 8.0;
 
     float3 grid_pos = world_pos / spacing - 0.5;
@@ -149,17 +161,18 @@ float3 integrate_probe(float3 world_pos, float3 normal,
         int3 coord = base_coord + offset;
         uint3 clamped = uint3(clamp(coord, int3(0), int3(c0_grid_size) - 1));
 
-        // Skip inside-geo probes: center direction (index 4) has w < 0 when
-        // the probe position was inside solid geometry for this face.
-        uint probe_linear = (clamped.z * c0_grid_size.y + clamped.y) * c0_grid_size.x + clamped.x;
-        float center_w = rc_probes[c0_offset + probe_linear * 6u * 9u + face * 9u + 4u].w;
-        //if (center_w < 0.0) continue;
-
         float3 w = lerp(1.0 - frac_pos, frac_pos, float3(offset));
         float trilinear_w = w.x * w.y * w.z;
 
-        total_radiance += read_probe_multi_face(clamped, face, c0_grid_size, c0_offset, rc_probes) * trilinear_w;
-        total_weight += trilinear_w;
+        // Detect inside-geo probes (w == -1) and reduce their weight.
+        // These contribute zero radiance; full weight would darken areas near geometry.
+        uint probe_base = c0_offset +
+            ((clamped.z * c0_grid_size.y + clamped.y) * c0_grid_size.x + clamped.x)
+            * 6u * 9u;
+        float inside_geo_w = (rc_probes[probe_base].w < -0.5) ? 0.001 : 1.0;
+
+        total_radiance += read_probe_cosine(clamped, normal, c0_grid_size, c0_offset, rc_probes) * trilinear_w * inside_geo_w;
+        total_weight += trilinear_w * inside_geo_w;
     }
 
     return (total_weight > 0.0001) ? total_radiance / total_weight : float3(0.0);
