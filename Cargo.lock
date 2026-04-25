@@ -21,6 +21,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
  "winit",
 ]
 

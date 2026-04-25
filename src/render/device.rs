@@ -1,10 +1,11 @@
-use anyhow::{Context, Result, anyhow};
-use ash::{Device, Entry, Instance, vk};
+use anyhow::{anyhow, Context, Result};
+use ash::{vk, Device, Entry, Instance};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
 use winit::window::Window;
 
+use crate::render::allocator::GpuAllocator;
 use crate::render::frame::FrameContext;
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
 
@@ -25,6 +26,7 @@ pub struct RenderDevice {
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
     device: Device,
+    allocator: Option<GpuAllocator>,
     swapchain_loader: ash::khr::swapchain::Device,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
@@ -93,23 +95,18 @@ impl RenderDevice {
         let size = window.inner_size();
 
         let device_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
-        let selection = pick_physical_device(
-            &instance,
-            &surface_loader,
-            surface,
-            &device_extension_names,
-        )?;
+        let selection =
+            pick_physical_device(&instance, &surface_loader, surface, &device_extension_names)?;
 
-        let queue_family_indices = if selection.graphics_queue_family_index
-            == selection.present_queue_family_index
-        {
-            vec![selection.graphics_queue_family_index]
-        } else {
-            vec![
-                selection.graphics_queue_family_index,
-                selection.present_queue_family_index,
-            ]
-        };
+        let queue_family_indices =
+            if selection.graphics_queue_family_index == selection.present_queue_family_index {
+                vec![selection.graphics_queue_family_index]
+            } else {
+                vec![
+                    selection.graphics_queue_family_index,
+                    selection.present_queue_family_index,
+                ]
+            };
 
         let queue_priorities = [1.0_f32];
         let queue_create_infos = queue_family_indices
@@ -121,27 +118,31 @@ impl RenderDevice {
             })
             .collect::<Vec<_>>();
 
+        let mut bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+
+        let physical_features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
-            .enabled_extension_names(&device_extension_names);
+            .enabled_extension_names(&device_extension_names)
+            .enabled_features(&physical_features)
+            .push_next(&mut bda_features);
 
-        let device = unsafe {
-            instance.create_device(selection.physical_device, &device_create_info, None)
-        }
-        .context("failed to create logical Vulkan device")?;
+        let device =
+            unsafe { instance.create_device(selection.physical_device, &device_create_info, None) }
+                .context("failed to create logical Vulkan device")?;
+
+        let allocator = GpuAllocator::new(&instance, &device, selection.physical_device)?;
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-        let graphics_queue = unsafe {
-            device.get_device_queue(selection.graphics_queue_family_index, 0)
-        };
-        let present_queue = unsafe {
-            device.get_device_queue(selection.present_queue_family_index, 0)
-        };
-        let swapchain_support = query_swapchain_support(
-            &surface_loader,
-            surface,
-            selection.physical_device,
-        )?;
+        let graphics_queue =
+            unsafe { device.get_device_queue(selection.graphics_queue_family_index, 0) };
+        let present_queue =
+            unsafe { device.get_device_queue(selection.present_queue_family_index, 0) };
+        let swapchain_support =
+            query_swapchain_support(&surface_loader, surface, selection.physical_device)?;
         let swapchain = SwapchainManager::new(
             &device,
             &swapchain_loader,
@@ -153,7 +154,11 @@ impl RenderDevice {
             size.height.max(1),
         )?;
 
-        let frames = create_frame_resources(&device, selection.graphics_queue_family_index)?;
+        let frames = create_frame_resources(
+            &device,
+            selection.graphics_queue_family_index,
+            swapchain.images.len(),
+        )?;
 
         Ok(Self {
             entry,
@@ -162,6 +167,7 @@ impl RenderDevice {
             surface,
             physical_device: selection.physical_device,
             device,
+            allocator: Some(allocator),
             swapchain_loader,
             graphics_queue,
             present_queue,
@@ -218,11 +224,8 @@ impl RenderDevice {
 
         self.swapchain.destroy(&self.device, &self.swapchain_loader);
 
-        let support = query_swapchain_support(
-            &self.surface_loader,
-            self.surface,
-            self.physical_device,
-        )?;
+        let support =
+            query_swapchain_support(&self.surface_loader, self.surface, self.physical_device)?;
         self.swapchain = SwapchainManager::new(
             &self.device,
             &self.swapchain_loader,
@@ -237,7 +240,7 @@ impl RenderDevice {
         Ok(())
     }
 
-    pub fn render_frame(&mut self) -> Result<FrameContext> {
+    pub fn begin_frame(&mut self) -> Result<FrameContext> {
         let frame_slot = self.current_frame;
         let frame_resources = &self.frames[frame_slot];
         let command_pool = frame_resources.command_pool;
@@ -269,13 +272,12 @@ impl RenderDevice {
             Ok(result) => result,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
-                return Ok(FrameContext {
-                    frame_index: self.frame_index,
-                    should_render: false,
-                });
+                return Ok(FrameContext::skip(self.frame_index));
             }
             Err(error) => {
-                return Err(anyhow!("failed to acquire Vulkan swapchain image: {error:?}"));
+                return Err(anyhow!(
+                    "failed to acquire Vulkan swapchain image: {error:?}"
+                ));
             }
         };
 
@@ -296,68 +298,55 @@ impl RenderDevice {
             self.device
                 .begin_command_buffer(command_buffer, &command_buffer_begin_info)
                 .context("failed to begin Vulkan command buffer")?;
+        }
 
-            transition_swapchain_image(
-                &self.device,
-                command_buffer,
-                self.swapchain.images[image_index],
-                self.swapchain.image_layouts[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            );
+        self.frame_index += 1;
+        self.current_frame = (self.current_frame + 1) % self.frames.len();
 
-            let clear_value = vk::ClearColorValue {
-                float32: [0.02, 0.03, 0.05, 1.0],
-            };
-            let clear_range = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1);
-            self.device.cmd_clear_color_image(
-                command_buffer,
-                self.swapchain.images[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &clear_value,
-                &[clear_range],
-            );
+        Ok(FrameContext {
+            frame_index: self.frame_index,
+            frame_slot,
+            should_render: true,
+            command_buffer,
+            swapchain_image: self.swapchain.images[image_index],
+            swapchain_image_index: image_index,
+            swapchain_extent: self.swapchain.extent,
+            swapchain_format: self.swapchain.format,
+            image_available_semaphore,
+            render_finished_semaphore,
+            in_flight_fence,
+            suboptimal,
+        })
+    }
 
-            transition_swapchain_image(
-                &self.device,
-                command_buffer,
-                self.swapchain.images[image_index],
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                vk::AccessFlags::TRANSFER_WRITE,
-                vk::AccessFlags::empty(),
-            );
+    pub fn end_frame(&mut self, ctx: FrameContext) -> Result<()> {
+        if !ctx.should_render {
+            return Ok(());
+        }
 
+        unsafe {
             self.device
-                .end_command_buffer(command_buffer)
+                .end_command_buffer(ctx.command_buffer)
                 .context("failed to end Vulkan command buffer")?;
 
-            let wait_semaphores = [image_available_semaphore];
-            let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-            let command_buffers = [command_buffer];
-            let signal_semaphores = [render_finished_semaphore];
+            let wait_semaphores = [ctx.image_available_semaphore];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                | vk::PipelineStageFlags::COMPUTE_SHADER
+                | vk::PipelineStageFlags::TRANSFER];
+            let command_buffers = [ctx.command_buffer];
+            let signal_semaphores = [ctx.render_finished_semaphore];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
                 .command_buffers(&command_buffers)
                 .signal_semaphores(&signal_semaphores);
             self.device
-                .queue_submit(self.graphics_queue, &[submit_info], in_flight_fence)
+                .queue_submit(self.graphics_queue, &[submit_info], ctx.in_flight_fence)
                 .context("failed to submit Vulkan command buffer")?;
 
-            let present_wait_semaphores = [render_finished_semaphore];
+            let present_wait_semaphores = [ctx.render_finished_semaphore];
             let swapchains = [self.swapchain.handle];
-            let image_indices = [image_index as u32];
+            let image_indices = [ctx.swapchain_image_index as u32];
             let present_info = vk::PresentInfoKHR::default()
                 .wait_semaphores(&present_wait_semaphores)
                 .swapchains(&swapchains)
@@ -367,7 +356,7 @@ impl RenderDevice {
                 .queue_present(self.present_queue, &present_info)
             {
                 Ok(is_suboptimal) => {
-                    if is_suboptimal || suboptimal {
+                    if is_suboptimal || ctx.suboptimal {
                         self.recreate_swapchain()?;
                     }
                 }
@@ -375,29 +364,22 @@ impl RenderDevice {
                     self.recreate_swapchain()?;
                 }
                 Err(error) => {
-                    return Err(anyhow!("failed to present Vulkan swapchain image: {error:?}"));
+                    return Err(anyhow!(
+                        "failed to present Vulkan swapchain image: {error:?}"
+                    ));
                 }
             }
         }
 
-        self.swapchain.image_layouts[image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
-        self.frame_index += 1;
-        let frame = FrameContext::begin(self.frame_index);
+        self.swapchain.image_layouts[ctx.swapchain_image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+
         tracing::trace!(
-            frame_index = frame.frame_index,
-            frame_slot,
-            image_index,
-            width = self.swapchain.width,
-            height = self.swapchain.height,
-            image_count = self.swapchain.images.len(),
-            swapchain_format = ?self.swapchain.format,
-            command_buffer = ?command_buffer,
-            graphics_queue_family_index = self.graphics_queue_family_index,
-            present_queue_family_index = self.present_queue_family_index,
-            "executed Vulkan bootstrap frame"
+            frame_index = ctx.frame_index,
+            image_index = ctx.swapchain_image_index,
+            "completed frame"
         );
-        self.current_frame = (self.current_frame + 1) % self.frames.len();
-        Ok(frame)
+
+        Ok(())
     }
 
     pub fn surface(&self) -> vk::SurfaceKHR {
@@ -406,6 +388,14 @@ impl RenderDevice {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn instance(&self) -> &Instance {
+        &self.instance
+    }
+
+    pub fn allocator(&self) -> &GpuAllocator {
+        self.allocator.as_ref().expect("allocator already dropped")
     }
 
     pub fn physical_device(&self) -> vk::PhysicalDevice {
@@ -419,12 +409,34 @@ impl RenderDevice {
     pub fn present_queue(&self) -> vk::Queue {
         self.present_queue
     }
+
+    pub fn frame_slot_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn physical_device_properties(&self) -> vk::PhysicalDeviceProperties {
+        unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        }
+    }
+
+    pub fn graphics_queue_timestamp_valid_bits(&self) -> u32 {
+        unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(self.physical_device)
+        }
+        .get(self.graphics_queue_family_index as usize)
+        .map_or(0, |properties| properties.timestamp_valid_bits)
+    }
 }
 
 impl Drop for RenderDevice {
     fn drop(&mut self) {
         unsafe {
             let _ = self.device.device_wait_idle();
+            // Allocator must be dropped before the device is destroyed
+            drop(self.allocator.take());
             destroy_frame_resources(&self.device, &mut self.frames);
             self.swapchain.destroy(&self.device, &self.swapchain_loader);
             self.device.destroy_device(None);
@@ -434,13 +446,20 @@ impl Drop for RenderDevice {
     }
 }
 
-fn create_frame_resources(device: &Device, queue_family_index: u32) -> Result<Vec<FrameResources>> {
-    (0..MAX_FRAMES_IN_FLIGHT)
+fn create_frame_resources(
+    device: &Device,
+    queue_family_index: u32,
+    count: usize,
+) -> Result<Vec<FrameResources>> {
+    (0..count)
         .map(|_| create_single_frame_resources(device, queue_family_index))
         .collect()
 }
 
-fn create_single_frame_resources(device: &Device, queue_family_index: u32) -> Result<FrameResources> {
+fn create_single_frame_resources(
+    device: &Device,
+    queue_family_index: u32,
+) -> Result<FrameResources> {
     let command_pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -550,16 +569,21 @@ fn pick_physical_device(
             let properties = unsafe { instance.get_physical_device_properties(physical_device) };
             let device_name = vk_cstr_to_string(&properties.device_name);
 
-            match query_queue_families(instance, surface_loader, surface, physical_device)
-                .and_then(|queue_families| {
-                    ensure_required_device_extensions(instance, physical_device, required_extensions)?;
+            match query_queue_families(instance, surface_loader, surface, physical_device).and_then(
+                |queue_families| {
+                    ensure_required_device_extensions(
+                        instance,
+                        physical_device,
+                        required_extensions,
+                    )?;
                     Ok(PhysicalDeviceSelection {
                         physical_device,
                         graphics_queue_family_index: queue_families.graphics_queue_family_index,
                         present_queue_family_index: queue_families.present_queue_family_index,
                         device_name,
                     })
-                }) {
+                },
+            ) {
                 Ok(selection) => Some(selection),
                 Err(error) => {
                     tracing::debug!(%error, "skipping unsupported Vulkan physical device");
@@ -567,7 +591,9 @@ fn pick_physical_device(
                 }
             }
         })
-        .ok_or_else(|| anyhow!("failed to find a Vulkan physical device with graphics+present support"))
+        .ok_or_else(|| {
+            anyhow!("failed to find a Vulkan physical device with graphics+present support")
+        })
 }
 
 struct QueueFamilySelection {
@@ -581,7 +607,8 @@ fn query_queue_families(
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
 ) -> Result<QueueFamilySelection> {
-    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let queue_families =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
     let mut graphics_queue_family_index = None;
     let mut present_queue_family_index = None;
@@ -629,8 +656,9 @@ fn query_swapchain_support(
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
     }
     .context("failed to query Vulkan surface capabilities")?;
-    let formats = unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
-        .context("failed to query Vulkan surface formats")?;
+    let formats =
+        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+            .context("failed to query Vulkan surface formats")?;
     let present_modes = unsafe {
         surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
     }
@@ -648,8 +676,9 @@ fn ensure_required_device_extensions(
     physical_device: vk::PhysicalDevice,
     required_extensions: &[*const i8],
 ) -> Result<()> {
-    let available_extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-        .context("failed to enumerate Vulkan device extensions")?;
+    let available_extensions =
+        unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .context("failed to enumerate Vulkan device extensions")?;
 
     let available_extension_names = available_extensions
         .iter()
