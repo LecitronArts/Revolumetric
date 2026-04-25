@@ -27,9 +27,27 @@ struct CascadeParams {
 }
 
 const CASCADE_PARAMS: [CascadeParams; 3] = [
-    CascadeParams { level: 0, grid_dim: 16, probe_size: 3,  offset: rc_probe_buffer::RC_C0_OFFSET, total_invocations: 16*16*16*6*9 },
-    CascadeParams { level: 1, grid_dim: 8,  probe_size: 6,  offset: rc_probe_buffer::RC_C1_OFFSET, total_invocations: 8*8*8*6*36 },
-    CascadeParams { level: 2, grid_dim: 4,  probe_size: 12, offset: rc_probe_buffer::RC_C2_OFFSET, total_invocations: 4*4*4*6*144 },
+    CascadeParams {
+        level: 0,
+        grid_dim: 16,
+        probe_size: 3,
+        offset: rc_probe_buffer::RC_C0_OFFSET,
+        total_invocations: 16 * 16 * 16 * 6 * 9,
+    },
+    CascadeParams {
+        level: 1,
+        grid_dim: 8,
+        probe_size: 6,
+        offset: rc_probe_buffer::RC_C1_OFFSET,
+        total_invocations: 8 * 8 * 8 * 6 * 36,
+    },
+    CascadeParams {
+        level: 2,
+        grid_dim: 4,
+        probe_size: 12,
+        offset: rc_probe_buffer::RC_C2_OFFSET,
+        total_invocations: 4 * 4 * 4 * 6 * 144,
+    },
 ];
 
 pub struct RcTracePass {
@@ -49,19 +67,60 @@ impl RcTracePass {
         rc_probes: &RcProbeBuffer,
     ) -> Result<Self> {
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
-            .add_binding(0, vk::DescriptorType::UNIFORM_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(1, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(2, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(3, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(4, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(5, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(6, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
+            .add_binding(
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                1,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                2,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                3,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                4,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                5,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                6,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
         let pool_sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: frame_count as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 * frame_count as u32 },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: frame_count as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 6 * frame_count as u32,
+            },
         ];
         let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
@@ -86,20 +145,27 @@ impl RcTracePass {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&ubo_info));
 
-            let ucvh_infos: Vec<vk::DescriptorBufferInfo> = ucvh_buffers.iter().map(|buf| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(buf.handle)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)
-            }).collect();
+            let ucvh_infos: Vec<vk::DescriptorBufferInfo> = ucvh_buffers
+                .iter()
+                .map(|buf| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buf.handle)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)
+                })
+                .collect();
 
-            let ucvh_writes: Vec<vk::WriteDescriptorSet> = ucvh_infos.iter().enumerate().map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding((i + 1) as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            }).collect();
+            let ucvh_writes: Vec<vk::WriteDescriptorSet> = ucvh_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding((i + 1) as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
 
             let read_info = vk::DescriptorBufferInfo::default()
                 .buffer(rc_probes.read_buffer())
@@ -143,7 +209,12 @@ impl RcTracePass {
         )?;
         unsafe { device.destroy_shader_module(shader_module, None) };
 
-        Ok(Self { pipeline, descriptor_set_layout, descriptor_pool, descriptor_sets })
+        Ok(Self {
+            pipeline,
+            descriptor_set_layout,
+            descriptor_pool,
+            descriptor_sets,
+        })
     }
 
     pub fn update_probe_descriptors(
@@ -176,12 +247,15 @@ impl RcTracePass {
         unsafe { device.update_descriptor_sets(&[read_write, write_write], &[]) };
     }
 
-    pub fn record(
-        &self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        frame_slot: usize,
-    ) {
+    pub fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
+        self.bind(device, cmd, frame_slot);
+
+        for cascade_index in 0..CASCADE_PARAMS.len() {
+            self.record_cascade(device, cmd, cascade_index);
+        }
+    }
+
+    pub fn bind(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.handle);
             device.cmd_bind_descriptor_sets(
@@ -193,30 +267,38 @@ impl RcTracePass {
                 &[],
             );
         }
+    }
 
-        for params in &CASCADE_PARAMS {
-            let push = RcTracePushConstants {
-                cascade_level: params.level,
-                probe_grid_dim: params.grid_dim,
-                probe_size: params.probe_size,
-                buffer_offset: params.offset,
-            };
-            let push_bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &push as *const RcTracePushConstants as *const u8,
-                    std::mem::size_of::<RcTracePushConstants>(),
-                )
-            };
-            unsafe {
-                device.cmd_push_constants(
-                    cmd,
-                    self.pipeline.layout,
-                    vk::ShaderStageFlags::COMPUTE,
-                    0,
-                    push_bytes,
-                );
-                device.cmd_dispatch(cmd, (params.total_invocations + 63) / 64, 1, 1);
-            }
+    pub fn record_cascade(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        cascade_index: usize,
+    ) {
+        let params = CASCADE_PARAMS
+            .get(cascade_index)
+            .expect("radiance cascade trace index out of range");
+        let push = RcTracePushConstants {
+            cascade_level: params.level,
+            probe_grid_dim: params.grid_dim,
+            probe_size: params.probe_size,
+            buffer_offset: params.offset,
+        };
+        let push_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &push as *const RcTracePushConstants as *const u8,
+                std::mem::size_of::<RcTracePushConstants>(),
+            )
+        };
+        unsafe {
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                push_bytes,
+            );
+            device.cmd_dispatch(cmd, (params.total_invocations + 63) / 64, 1, 1);
         }
     }
 

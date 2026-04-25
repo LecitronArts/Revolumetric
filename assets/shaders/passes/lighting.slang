@@ -42,6 +42,38 @@ StructuredBuffer<VoxelCell> brick_materials;
 [[vk::binding(9, 0)]]
 StructuredBuffer<float4> rc_probes;
 
+float3 compute_occupancy_gradient_normal(
+    float3 position,
+    float3 fallback_normal,
+    uint grid_dim_l0,
+    StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<BrickOccupancy> brick_occupancy
+) {
+    int3 ip = int3(floor(position));
+    float3 grad;
+    grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, grid_dim_l0))
+           - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, grid_dim_l0));
+    grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, grid_dim_l0))
+           - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, grid_dim_l0));
+    grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, grid_dim_l0))
+           - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, grid_dim_l0));
+    return (length(grad) > 0.001) ? normalize(-grad) : fallback_normal;
+}
+
+float3 select_rc_normal(
+    SceneUniforms scene,
+    float3 position,
+    float3 axis_normal,
+    uint grid_dim_l0,
+    StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<BrickOccupancy> brick_occupancy
+) {
+    if (scene.rc_normal_strategy == RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT) {
+        return compute_occupancy_gradient_normal(position, axis_normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
+    }
+    return axis_normal;
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -84,34 +116,27 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    // Shadow ray for direct sun
-    float3 shadow_origin = position + normal * 0.51;
-    Ray shadow_ray = make_ray(shadow_origin, scene.sun_direction);
-    HitResult shadow_hit = trace_primary_ray(
-        shadow_ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials
-    );
-    float shadow = shadow_hit.hit ? 0.0 : 1.0;
     float ndotl = max(dot(normal, scene.sun_direction), 0.0);
+    float shadow = 1.0;
+    bool shadows_enabled = (scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) != 0u;
+    bool skip_backface_shadows = (scene.lighting_flags & LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS) != 0u;
+    if (shadows_enabled && (ndotl > 0.0 || !skip_backface_shadows)) {
+        float3 shadow_origin = position + normal * 0.51;
+        Ray shadow_ray = make_ray(shadow_origin, scene.sun_direction);
+        HitResult shadow_hit = trace_primary_ray(
+            shadow_ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials
+        );
+        shadow = shadow_hit.hit ? 0.0 : 1.0;
+    }
     float3 diffuse = base_color * scene.sun_intensity * ndotl * shadow;
 
     // Indirect: RC probes or hemisphere fallback
     float3 ambient;
     if (scene.rc_enabled > 0u) {
-        // Compute occupancy-gradient smooth normal for RC probe blending.
-        // DDA normals snap to axis → hard face seams on curved surfaces (columns).
-        // The gradient of the occupancy field gives a continuous surface normal.
-        int3 ip = int3(floor(position));
-        float3 grad;
-        grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, 16u))
-               - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, 16u));
-        grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, 16u))
-               - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, 16u));
-        grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, 16u))
-               - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, 16u));
-        float3 smooth_normal = (length(grad) > 0.001) ? normalize(-grad) : normal;
-
+        uint grid_dim_l0 = ucvh_config[0].brick_grid_size.x;
+        float3 rc_normal = select_rc_normal(scene, position, normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
         uint3 c0_grid = uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z);
-        float3 indirect = integrate_probe(position, smooth_normal, rc_probes, scene.rc_c0_offset, c0_grid);
+        float3 indirect = integrate_probe(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid);
         ambient = base_color * indirect;
     } else {
         ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);

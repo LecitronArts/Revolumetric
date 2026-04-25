@@ -1,5 +1,5 @@
-use anyhow::{Context, Result, anyhow};
-use ash::{Device, Entry, Instance, vk};
+use anyhow::{anyhow, Context, Result};
+use ash::{vk, Device, Entry, Instance};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};
@@ -95,23 +95,18 @@ impl RenderDevice {
         let size = window.inner_size();
 
         let device_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
-        let selection = pick_physical_device(
-            &instance,
-            &surface_loader,
-            surface,
-            &device_extension_names,
-        )?;
+        let selection =
+            pick_physical_device(&instance, &surface_loader, surface, &device_extension_names)?;
 
-        let queue_family_indices = if selection.graphics_queue_family_index
-            == selection.present_queue_family_index
-        {
-            vec![selection.graphics_queue_family_index]
-        } else {
-            vec![
-                selection.graphics_queue_family_index,
-                selection.present_queue_family_index,
-            ]
-        };
+        let queue_family_indices =
+            if selection.graphics_queue_family_index == selection.present_queue_family_index {
+                vec![selection.graphics_queue_family_index]
+            } else {
+                vec![
+                    selection.graphics_queue_family_index,
+                    selection.present_queue_family_index,
+                ]
+            };
 
         let queue_priorities = [1.0_f32];
         let queue_create_infos = queue_family_indices
@@ -123,11 +118,11 @@ impl RenderDevice {
             })
             .collect::<Vec<_>>();
 
-        let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
-            .buffer_device_address(true);
+        let mut bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
 
-        let physical_features = vk::PhysicalDeviceFeatures::default()
-            .shader_storage_image_extended_formats(true);
+        let physical_features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
 
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
@@ -135,25 +130,19 @@ impl RenderDevice {
             .enabled_features(&physical_features)
             .push_next(&mut bda_features);
 
-        let device = unsafe {
-            instance.create_device(selection.physical_device, &device_create_info, None)
-        }
-        .context("failed to create logical Vulkan device")?;
+        let device =
+            unsafe { instance.create_device(selection.physical_device, &device_create_info, None) }
+                .context("failed to create logical Vulkan device")?;
 
         let allocator = GpuAllocator::new(&instance, &device, selection.physical_device)?;
 
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-        let graphics_queue = unsafe {
-            device.get_device_queue(selection.graphics_queue_family_index, 0)
-        };
-        let present_queue = unsafe {
-            device.get_device_queue(selection.present_queue_family_index, 0)
-        };
-        let swapchain_support = query_swapchain_support(
-            &surface_loader,
-            surface,
-            selection.physical_device,
-        )?;
+        let graphics_queue =
+            unsafe { device.get_device_queue(selection.graphics_queue_family_index, 0) };
+        let present_queue =
+            unsafe { device.get_device_queue(selection.present_queue_family_index, 0) };
+        let swapchain_support =
+            query_swapchain_support(&surface_loader, surface, selection.physical_device)?;
         let swapchain = SwapchainManager::new(
             &device,
             &swapchain_loader,
@@ -235,11 +224,8 @@ impl RenderDevice {
 
         self.swapchain.destroy(&self.device, &self.swapchain_loader);
 
-        let support = query_swapchain_support(
-            &self.surface_loader,
-            self.surface,
-            self.physical_device,
-        )?;
+        let support =
+            query_swapchain_support(&self.surface_loader, self.surface, self.physical_device)?;
         self.swapchain = SwapchainManager::new(
             &self.device,
             &self.swapchain_loader,
@@ -289,7 +275,9 @@ impl RenderDevice {
                 return Ok(FrameContext::skip(self.frame_index));
             }
             Err(error) => {
-                return Err(anyhow!("failed to acquire Vulkan swapchain image: {error:?}"));
+                return Err(anyhow!(
+                    "failed to acquire Vulkan swapchain image: {error:?}"
+                ));
             }
         };
 
@@ -376,7 +364,9 @@ impl RenderDevice {
                     self.recreate_swapchain()?;
                 }
                 Err(error) => {
-                    return Err(anyhow!("failed to present Vulkan swapchain image: {error:?}"));
+                    return Err(anyhow!(
+                        "failed to present Vulkan swapchain image: {error:?}"
+                    ));
                 }
             }
         }
@@ -419,6 +409,26 @@ impl RenderDevice {
     pub fn present_queue(&self) -> vk::Queue {
         self.present_queue
     }
+
+    pub fn frame_slot_count(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn physical_device_properties(&self) -> vk::PhysicalDeviceProperties {
+        unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        }
+    }
+
+    pub fn graphics_queue_timestamp_valid_bits(&self) -> u32 {
+        unsafe {
+            self.instance
+                .get_physical_device_queue_family_properties(self.physical_device)
+        }
+        .get(self.graphics_queue_family_index as usize)
+        .map_or(0, |properties| properties.timestamp_valid_bits)
+    }
 }
 
 impl Drop for RenderDevice {
@@ -436,13 +446,20 @@ impl Drop for RenderDevice {
     }
 }
 
-fn create_frame_resources(device: &Device, queue_family_index: u32, count: usize) -> Result<Vec<FrameResources>> {
+fn create_frame_resources(
+    device: &Device,
+    queue_family_index: u32,
+    count: usize,
+) -> Result<Vec<FrameResources>> {
     (0..count)
         .map(|_| create_single_frame_resources(device, queue_family_index))
         .collect()
 }
 
-fn create_single_frame_resources(device: &Device, queue_family_index: u32) -> Result<FrameResources> {
+fn create_single_frame_resources(
+    device: &Device,
+    queue_family_index: u32,
+) -> Result<FrameResources> {
     let command_pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -552,16 +569,21 @@ fn pick_physical_device(
             let properties = unsafe { instance.get_physical_device_properties(physical_device) };
             let device_name = vk_cstr_to_string(&properties.device_name);
 
-            match query_queue_families(instance, surface_loader, surface, physical_device)
-                .and_then(|queue_families| {
-                    ensure_required_device_extensions(instance, physical_device, required_extensions)?;
+            match query_queue_families(instance, surface_loader, surface, physical_device).and_then(
+                |queue_families| {
+                    ensure_required_device_extensions(
+                        instance,
+                        physical_device,
+                        required_extensions,
+                    )?;
                     Ok(PhysicalDeviceSelection {
                         physical_device,
                         graphics_queue_family_index: queue_families.graphics_queue_family_index,
                         present_queue_family_index: queue_families.present_queue_family_index,
                         device_name,
                     })
-                }) {
+                },
+            ) {
                 Ok(selection) => Some(selection),
                 Err(error) => {
                     tracing::debug!(%error, "skipping unsupported Vulkan physical device");
@@ -569,7 +591,9 @@ fn pick_physical_device(
                 }
             }
         })
-        .ok_or_else(|| anyhow!("failed to find a Vulkan physical device with graphics+present support"))
+        .ok_or_else(|| {
+            anyhow!("failed to find a Vulkan physical device with graphics+present support")
+        })
 }
 
 struct QueueFamilySelection {
@@ -583,7 +607,8 @@ fn query_queue_families(
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
 ) -> Result<QueueFamilySelection> {
-    let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let queue_families =
+        unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
 
     let mut graphics_queue_family_index = None;
     let mut present_queue_family_index = None;
@@ -631,8 +656,9 @@ fn query_swapchain_support(
         surface_loader.get_physical_device_surface_capabilities(physical_device, surface)
     }
     .context("failed to query Vulkan surface capabilities")?;
-    let formats = unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
-        .context("failed to query Vulkan surface formats")?;
+    let formats =
+        unsafe { surface_loader.get_physical_device_surface_formats(physical_device, surface) }
+            .context("failed to query Vulkan surface formats")?;
     let present_modes = unsafe {
         surface_loader.get_physical_device_surface_present_modes(physical_device, surface)
     }
@@ -650,8 +676,9 @@ fn ensure_required_device_extensions(
     physical_device: vk::PhysicalDevice,
     required_extensions: &[*const i8],
 ) -> Result<()> {
-    let available_extensions = unsafe { instance.enumerate_device_extension_properties(physical_device) }
-        .context("failed to enumerate Vulkan device extensions")?;
+    let available_extensions =
+        unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .context("failed to enumerate Vulkan device extensions")?;
 
     let available_extension_names = available_extensions
         .iter()

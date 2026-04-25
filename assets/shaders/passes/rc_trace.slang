@@ -47,6 +47,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     uint grid_dim = push.probe_grid_dim;
     uint probe_size = push.probe_size;
     uint dirs_per_face = probe_size * probe_size;
+    uint grid_dim_l0 = ucvh_config[0].brick_grid_size.x;
 
     uint total = grid_dim * grid_dim * grid_dim * 6u * dirs_per_face;
     uint tid = dtid.x;
@@ -83,13 +84,13 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     get_face_tbn(face, face_normal, face_tangent, face_bitangent);
 
     if (push.cascade_level > 0u) {
-        probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, 16u);
+        probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0);
     }
     // C0: no face_normal offset — all faces trace from the same position.
     // This ensures consistent inside-geo flagging across all 6 faces,
     // preventing per-face black line artifacts on curved surfaces.
 
-    if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, 16u)) {
+    if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0)) {
         uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);
         probe_write[idx] = float4(0.0, 0.0, 0.0, -1.0);
         return;
