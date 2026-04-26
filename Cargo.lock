@@ -3,29 +3,6 @@
 version = 4
 
 [[package]]
-name = "Revolumetric"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ash",
- "ash-window",
- "bytemuck",
- "crossbeam",
- "glam",
- "gpu-allocator",
- "parking_lot",
- "raw-window-handle",
- "serde",
- "slotmap",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "tracing-subscriber",
- "walkdir",
- "winit",
-]
-
-[[package]]
 name = "ab_glyph"
 version = "0.2.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1260,6 +1237,29 @@ name = "regex-syntax"
 version = "0.8.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
+
+[[package]]
+name = "revolumetric"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "ash-window",
+ "bytemuck",
+ "crossbeam",
+ "glam",
+ "gpu-allocator",
+ "parking_lot",
+ "raw-window-handle",
+ "serde",
+ "slotmap",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "walkdir",
+ "winit",
+]
 
 [[package]]
 name = "rustc_version"

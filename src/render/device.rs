@@ -9,8 +9,6 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::frame::FrameContext;
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
 
-const MAX_FRAMES_IN_FLIGHT: usize = 2;
-
 struct FrameResources {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
@@ -20,7 +18,8 @@ struct FrameResources {
 }
 
 pub struct RenderDevice {
-    entry: Entry,
+    // Keeps the dynamically-loaded Vulkan loader alive for all instance/device calls.
+    _entry: Entry,
     instance: Instance,
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
@@ -161,7 +160,7 @@ impl RenderDevice {
         )?;
 
         Ok(Self {
-            entry,
+            _entry: entry,
             instance,
             surface_loader,
             surface,
@@ -503,47 +502,6 @@ fn destroy_frame_resources(device: &Device, frames: &mut Vec<FrameResources>) {
             device.destroy_semaphore(frame.image_available_semaphore, None);
             device.destroy_command_pool(frame.command_pool, None);
         }
-    }
-}
-
-fn transition_swapchain_image(
-    device: &Device,
-    command_buffer: vk::CommandBuffer,
-    image: vk::Image,
-    old_layout: vk::ImageLayout,
-    new_layout: vk::ImageLayout,
-    src_stage_mask: vk::PipelineStageFlags,
-    dst_stage_mask: vk::PipelineStageFlags,
-    src_access_mask: vk::AccessFlags,
-    dst_access_mask: vk::AccessFlags,
-) {
-    let barrier = vk::ImageMemoryBarrier::default()
-        .old_layout(old_layout)
-        .new_layout(new_layout)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(image)
-        .subresource_range(
-            vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .base_mip_level(0)
-                .level_count(1)
-                .base_array_layer(0)
-                .layer_count(1),
-        )
-        .src_access_mask(src_access_mask)
-        .dst_access_mask(dst_access_mask);
-
-    unsafe {
-        device.cmd_pipeline_barrier(
-            command_buffer,
-            src_stage_mask,
-            dst_stage_mask,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[barrier],
-        );
     }
 }
 

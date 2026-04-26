@@ -26,10 +26,10 @@ impl PassBuilder {
 
     pub fn create_image(
         &mut self,
-        width: u32,
-        height: u32,
-        format: vk::Format,
-        usage: vk::ImageUsageFlags,
+        _width: u32,
+        _height: u32,
+        _format: vk::Format,
+        _usage: vk::ImageUsageFlags,
     ) -> ResourceHandle {
         let handle = ResourceHandle {
             id: self.next_resource_id,

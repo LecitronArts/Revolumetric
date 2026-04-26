@@ -60,7 +60,7 @@ pub struct RcTracePass {
 impl RcTracePass {
     pub fn new(
         device: &ash::Device,
-        allocator: &GpuAllocator,
+        _allocator: &GpuAllocator,
         spirv_bytes: &[u8],
         ucvh_gpu: &UcvhGpuResources,
         scene_ubo: &SceneUniformBuffer,
