@@ -1,4 +1,4 @@
-use crate::voxel::brick::{BrickData, BrickOccupancy, VoxelCell, BRICK_VOLUME};
+use crate::voxel::brick::{BRICK_VOLUME, BrickData, BrickOccupancy, VoxelCell};
 use bytemuck::Zeroable;
 
 pub type BrickId = u32;
@@ -26,9 +26,8 @@ impl BrickPool {
     }
 
     pub fn allocate(&mut self) -> Option<BrickId> {
-        self.free_list.pop().map(|id| {
+        self.free_list.pop().inspect(|_| {
             self.allocated_count += 1;
-            id
         })
     }
 
@@ -63,10 +62,18 @@ impl BrickPool {
         self.materials[id as usize * BRICK_VOLUME + morton as usize]
     }
 
-    pub fn occupancy_pool(&self) -> &[BrickOccupancy] { &self.occupancy }
-    pub fn material_pool(&self) -> &[VoxelCell] { &self.materials }
-    pub fn capacity(&self) -> u32 { self.capacity }
-    pub fn allocated_count(&self) -> u32 { self.allocated_count }
+    pub fn occupancy_pool(&self) -> &[BrickOccupancy] {
+        &self.occupancy
+    }
+    pub fn material_pool(&self) -> &[VoxelCell] {
+        &self.materials
+    }
+    pub fn capacity(&self) -> u32 {
+        self.capacity
+    }
+    pub fn allocated_count(&self) -> u32 {
+        self.allocated_count
+    }
 }
 
 #[cfg(test)]
@@ -108,7 +115,12 @@ mod tests {
         let mut pool = BrickPool::new(4);
         let id = pool.allocate().unwrap();
         let mut data = BrickData::new();
-        let cell = VoxelCell { material: 7, flags: 0, emissive: [0; 3], _pad: 0 };
+        let cell = VoxelCell {
+            material: 7,
+            flags: 0,
+            emissive: [0; 3],
+            _pad: 0,
+        };
         data.set_voxel(2, 3, 4, cell);
         pool.write_brick(id, &data);
 
@@ -122,7 +134,17 @@ mod tests {
         let mut pool = BrickPool::new(4);
         let id = pool.allocate().unwrap();
         let mut data = BrickData::new();
-        data.set_voxel(0, 0, 0, VoxelCell { material: 1, flags: 0, emissive: [0; 3], _pad: 0 });
+        data.set_voxel(
+            0,
+            0,
+            0,
+            VoxelCell {
+                material: 1,
+                flags: 0,
+                emissive: [0; 3],
+                _pad: 0,
+            },
+        );
         pool.write_brick(id, &data);
         pool.free(id);
 

@@ -1,7 +1,7 @@
-use glam::{UVec3, Vec3};
-use crate::voxel::brick::{BrickData, VoxelCell, BRICK_EDGE};
-use crate::voxel::ucvh::UcvhConfig;
+use crate::voxel::brick::{BRICK_EDGE, BrickData, VoxelCell};
 use crate::voxel::generator::VoxelGenerator;
+use crate::voxel::ucvh::UcvhConfig;
+use glam::{UVec3, Vec3};
 
 /// Material IDs matching the shader-side MATERIAL_ALBEDO LUT.
 const MAT_STONE: u16 = 1;
@@ -250,9 +250,12 @@ impl SponzaGenerator {
             let bench_x_near = if cx < 48.0 { cx + 8.0 } else { cx - 10.0 };
             let mut cz = 25.0;
             while cz < 100.0 {
-                if v.x > bench_x_near && v.x < bench_x_near + 4.0
-                    && v.z > cz - 2.0 && v.z < cz + 2.0
-                    && v.y >= 2.0 && v.y < 6.0
+                if v.x > bench_x_near
+                    && v.x < bench_x_near + 4.0
+                    && v.z > cz - 2.0
+                    && v.z < cz + 2.0
+                    && v.y >= 2.0
+                    && v.y < 6.0
                 {
                     return Some((MAT_WOOD, [0; 3]));
                 }
@@ -331,7 +334,10 @@ mod tests {
         let result = SponzaGenerator::eval_voxel(Vec3::new(64.0, 0.5, 64.0));
         assert!(result.is_some(), "floor voxel should be solid");
         let (mat, _) = result.unwrap();
-        assert!(mat == MAT_STONE || mat == MAT_DARK_STONE, "floor should be stone or dark_stone");
+        assert!(
+            mat == MAT_STONE || mat == MAT_DARK_STONE,
+            "floor should be stone or dark_stone"
+        );
     }
 
     #[test]
@@ -339,7 +345,11 @@ mod tests {
         let a = SponzaGenerator::eval_voxel(Vec3::new(20.5, 0.5, 8.5));
         let b = SponzaGenerator::eval_voxel(Vec3::new(28.5, 0.5, 8.5));
         assert!(a.is_some() && b.is_some());
-        assert_ne!(a.unwrap().0, b.unwrap().0, "adjacent floor tiles should differ");
+        assert_ne!(
+            a.unwrap().0,
+            b.unwrap().0,
+            "adjacent floor tiles should differ"
+        );
     }
 
     #[test]

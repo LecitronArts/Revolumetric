@@ -1,11 +1,12 @@
+use crate::render::resource::{QueueType, ResourceDesc, ResourceHandle};
 use ash::vk;
-use crate::render::resource::{ResourceHandle, QueueType};
 
 pub struct PassBuilder {
     pub name: &'static str,
     pub queue_type: QueueType,
     pub reads: Vec<ResourceHandle>,
     pub writes: Vec<ResourceHandle>,
+    pub(crate) resource_descs: Vec<(ResourceHandle, ResourceDesc)>,
     pub(crate) next_resource_id: u32,
 }
 
@@ -16,6 +17,7 @@ impl PassBuilder {
             queue_type,
             reads: Vec::new(),
             writes: Vec::new(),
+            resource_descs: Vec::new(),
             next_resource_id: next_id,
         }
     }
@@ -26,10 +28,10 @@ impl PassBuilder {
 
     pub fn create_image(
         &mut self,
-        _width: u32,
-        _height: u32,
-        _format: vk::Format,
-        _usage: vk::ImageUsageFlags,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
     ) -> ResourceHandle {
         let handle = ResourceHandle {
             id: self.next_resource_id,
@@ -37,6 +39,31 @@ impl PassBuilder {
         };
         self.next_resource_id += 1;
         self.writes.push(handle);
+        self.resource_descs.push((
+            handle,
+            ResourceDesc::Image {
+                width,
+                height,
+                format,
+                usage,
+            },
+        ));
+        handle
+    }
+
+    pub fn create_buffer(
+        &mut self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+    ) -> ResourceHandle {
+        let handle = ResourceHandle {
+            id: self.next_resource_id,
+            version: 0,
+        };
+        self.next_resource_id += 1;
+        self.writes.push(handle);
+        self.resource_descs
+            .push((handle, ResourceDesc::Buffer { size, usage }));
         handle
     }
 

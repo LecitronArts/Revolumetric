@@ -1,9 +1,9 @@
 // src/voxel/ucvh.rs
-use glam::UVec3;
-use crate::voxel::brick::{BrickData, VoxelCell, BRICK_EDGE};
+use crate::voxel::brick::{BRICK_EDGE, BrickData, VoxelCell};
 use crate::voxel::brick_pool::{BrickId, BrickPool};
 use crate::voxel::morton;
 use crate::voxel::occupancy::CascadedOccupancy;
+use glam::UVec3;
 
 pub struct UcvhConfig {
     pub world_size: UVec3,
@@ -17,7 +17,11 @@ impl UcvhConfig {
         // Estimate capacity at 40% fill + headroom
         let total_bricks = brick_grid_size.x * brick_grid_size.y * brick_grid_size.z;
         let capacity = (total_bricks * 2 / 5).max(64);
-        Self { world_size, brick_grid_size, brick_capacity: capacity }
+        Self {
+            world_size,
+            brick_grid_size,
+            brick_capacity: capacity,
+        }
     }
 }
 
@@ -54,6 +58,18 @@ impl Ucvh {
         (pos / BRICK_EDGE, pos % BRICK_EDGE)
     }
 
+    fn contains_world_pos(&self, pos: UVec3) -> bool {
+        pos.x < self.config.world_size.x
+            && pos.y < self.config.world_size.y
+            && pos.z < self.config.world_size.z
+    }
+
+    fn contains_brick_pos(&self, brick_pos: UVec3) -> bool {
+        brick_pos.x < self.config.brick_grid_size.x
+            && brick_pos.y < self.config.brick_grid_size.y
+            && brick_pos.z < self.config.brick_grid_size.z
+    }
+
     fn l0_index(&self, brick_pos: UVec3) -> usize {
         CascadedOccupancy::flat_index(brick_pos, self.config.brick_grid_size)
     }
@@ -70,8 +86,13 @@ impl Ucvh {
     }
 
     pub fn set_voxel(&mut self, pos: UVec3, cell: VoxelCell) -> bool {
+        if !self.contains_world_pos(pos) {
+            return false;
+        }
         let (bp, lp) = Self::decompose(pos);
-        let Some(id) = self.ensure_brick(bp) else { return false };
+        let Some(id) = self.ensure_brick(bp) else {
+            return false;
+        };
         let m = morton::encode(lp.x, lp.y, lp.z);
         self.pool.set_material(id, m, cell);
         if cell.is_air() {
@@ -87,6 +108,9 @@ impl Ucvh {
     }
 
     pub fn get_voxel(&self, pos: UVec3) -> VoxelCell {
+        if !self.contains_world_pos(pos) {
+            return VoxelCell::AIR;
+        }
         let (bp, lp) = Self::decompose(pos);
         let idx = self.l0_index(bp);
         match self.brick_map[idx] {
@@ -97,7 +121,12 @@ impl Ucvh {
 
     /// Write a full BrickData at a brick grid position.
     pub fn write_brick(&mut self, brick_pos: UVec3, data: &BrickData) -> bool {
-        let Some(id) = self.ensure_brick(brick_pos) else { return false };
+        if !self.contains_brick_pos(brick_pos) {
+            return false;
+        }
+        let Some(id) = self.ensure_brick(brick_pos) else {
+            return false;
+        };
         self.pool.write_brick(id, data);
         if !self.dirty_bricks.contains(&id) {
             self.dirty_bricks.push(id);
@@ -161,7 +190,12 @@ mod tests {
     #[test]
     fn set_and_get_voxel() {
         let mut u = test_ucvh();
-        let cell = VoxelCell { material: 5, flags: 0, emissive: [0; 3], _pad: 0 };
+        let cell = VoxelCell {
+            material: 5,
+            flags: 0,
+            emissive: [0; 3],
+            _pad: 0,
+        };
         assert!(u.set_voxel(UVec3::new(10, 20, 30), cell));
         assert_eq!(u.get_voxel(UVec3::new(10, 20, 30)).material, 5);
         assert_eq!(u.get_voxel(UVec3::new(0, 0, 0)).material, 0); // air
@@ -170,7 +204,12 @@ mod tests {
     #[test]
     fn dirty_tracking() {
         let mut u = test_ucvh();
-        let cell = VoxelCell { material: 1, flags: 0, emissive: [0; 3], _pad: 0 };
+        let cell = VoxelCell {
+            material: 1,
+            flags: 0,
+            emissive: [0; 3],
+            _pad: 0,
+        };
         u.set_voxel(UVec3::new(0, 0, 0), cell);
         u.set_voxel(UVec3::new(1, 0, 0), cell); // same brick
         let dirty = u.take_dirty_bricks();
@@ -180,7 +219,12 @@ mod tests {
     #[test]
     fn hierarchy_rebuild_propagates() {
         let mut u = test_ucvh();
-        let cell = VoxelCell { material: 1, flags: 0, emissive: [0; 3], _pad: 0 };
+        let cell = VoxelCell {
+            material: 1,
+            flags: 0,
+            emissive: [0; 3],
+            _pad: 0,
+        };
         u.set_voxel(UVec3::new(0, 0, 0), cell);
         u.rebuild_hierarchy();
 
@@ -200,11 +244,54 @@ mod tests {
         for z in 0..8 {
             for y in 0..8 {
                 for x in 0..8 {
-                    data.set_voxel(x, y, z, VoxelCell { material: 1, flags: 0, emissive: [0; 3], _pad: 0 });
+                    data.set_voxel(
+                        x,
+                        y,
+                        z,
+                        VoxelCell {
+                            material: 1,
+                            flags: 0,
+                            emissive: [0; 3],
+                            _pad: 0,
+                        },
+                    );
                 }
             }
         }
         assert!(u.write_brick(UVec3::ZERO, &data));
         assert_eq!(u.pool.occupancy(0).count, 512);
+    }
+
+    #[test]
+    fn out_of_bounds_set_voxel_returns_false_without_allocating() {
+        let mut u = test_ucvh();
+        let cell = VoxelCell {
+            material: 1,
+            flags: 0,
+            emissive: [0; 3],
+            _pad: 0,
+        };
+
+        assert!(!u.set_voxel(UVec3::new(128, 0, 0), cell));
+        assert_eq!(u.allocated_brick_count(), 0);
+    }
+
+    #[test]
+    fn out_of_bounds_get_voxel_returns_air() {
+        let u = test_ucvh();
+
+        assert_eq!(
+            u.get_voxel(UVec3::new(0, 128, 0)).material,
+            VoxelCell::AIR.material
+        );
+    }
+
+    #[test]
+    fn out_of_bounds_write_brick_returns_false_without_allocating() {
+        let mut u = test_ucvh();
+        let data = BrickData::new();
+
+        assert!(!u.write_brick(UVec3::new(16, 0, 0), &data));
+        assert_eq!(u.allocated_brick_count(), 0);
     }
 }

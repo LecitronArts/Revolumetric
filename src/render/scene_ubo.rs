@@ -254,6 +254,42 @@ impl GpuSceneUniforms {
     }
 }
 
+pub struct SceneUniformInputs {
+    pub pixel_to_ray: glam::Mat4,
+    pub resolution: [u32; 2],
+    pub sun_direction: glam::Vec3,
+    pub sun_intensity: glam::Vec3,
+    pub sky_color: [f32; 3],
+    pub ground_color: [f32; 3],
+    pub time: f32,
+    pub rc_enabled: bool,
+    pub lighting_settings: LightingSettings,
+}
+
+pub fn build_scene_uniforms(inputs: SceneUniformInputs) -> GpuSceneUniforms {
+    let mut uniforms = GpuSceneUniforms {
+        pixel_to_ray: inputs.pixel_to_ray.transpose().to_cols_array_2d(),
+        resolution: inputs.resolution,
+        _pad0: [0; 2],
+        sun_direction: inputs.sun_direction.to_array(),
+        _pad1: 0.0,
+        sun_intensity: inputs.sun_intensity.to_array(),
+        _pad2: 0.0,
+        sky_color: inputs.sky_color,
+        _pad3: 0.0,
+        ground_color: inputs.ground_color,
+        time: inputs.time,
+        rc_c0_grid: [16, 16, 16],
+        rc_c0_offset: 0,
+        rc_enabled: u32::from(inputs.rc_enabled),
+        lighting_flags: 0,
+        rc_normal_strategy: 0,
+        rc_probe_quality: 0,
+    };
+    uniforms.apply_lighting_settings(inputs.lighting_settings);
+    uniforms
+}
+
 /// Manages per-frame-slot uniform buffers for SceneUniforms.
 /// One buffer per frame slot to prevent CPU/GPU write-after-read hazards.
 pub struct SceneUniformBuffer {
@@ -392,6 +428,38 @@ mod tests {
             uniforms.lighting_flags & LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS,
             LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS
         );
+    }
+
+    #[test]
+    fn build_scene_uniforms_copies_scene_inputs() {
+        let settings = LightingSettings {
+            shadows_enabled: true,
+            skip_backface_shadows: true,
+            rc_normal_strategy: RcNormalStrategy::AxisNormal,
+            rc_probe_quality: RcProbeQuality::Full,
+        };
+
+        let uniforms = build_scene_uniforms(SceneUniformInputs {
+            pixel_to_ray: glam::Mat4::IDENTITY,
+            resolution: [800, 600],
+            sun_direction: glam::Vec3::X,
+            sun_intensity: glam::Vec3::splat(2.0),
+            sky_color: [0.1, 0.2, 0.3],
+            ground_color: [0.4, 0.5, 0.6],
+            time: 12.5,
+            rc_enabled: true,
+            lighting_settings: settings,
+        });
+
+        assert_eq!(uniforms.resolution, [800, 600]);
+        assert_eq!(uniforms.sun_direction, [1.0, 0.0, 0.0]);
+        assert_eq!(uniforms.sun_intensity, [2.0, 2.0, 2.0]);
+        assert_eq!(uniforms.sky_color, [0.1, 0.2, 0.3]);
+        assert_eq!(uniforms.ground_color, [0.4, 0.5, 0.6]);
+        assert_eq!(uniforms.time, 12.5);
+        assert_eq!(uniforms.rc_enabled, 1);
+        assert_eq!(uniforms.lighting_flags, 3);
+        assert_eq!(uniforms.rc_normal_strategy, RC_NORMAL_STRATEGY_AXIS_NORMAL);
     }
 
     #[test]

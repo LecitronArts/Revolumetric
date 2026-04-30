@@ -47,7 +47,10 @@ impl ComputePipeline {
 }
 
 pub fn create_shader_module(device: &ash::Device, spirv: &[u8]) -> Result<vk::ShaderModule> {
-    assert!(spirv.len() % 4 == 0, "SPIR-V byte length must be a multiple of 4");
+    assert!(
+        spirv.len().is_multiple_of(4),
+        "SPIR-V byte length must be a multiple of 4"
+    );
     // Copy into an aligned Vec<u32> to avoid UB from misaligned &[u8] → &[u32] cast.
     // include_bytes!() only guarantees 1-byte alignment.
     let mut code = vec![0u32; spirv.len() / 4];

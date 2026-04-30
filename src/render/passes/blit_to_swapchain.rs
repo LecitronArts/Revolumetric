@@ -44,7 +44,9 @@ pub fn record_blit(
             vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::PipelineStageFlags::TRANSFER,
             vk::DependencyFlags::empty(),
-            &[], &[], &[src_barrier, dst_barrier],
+            &[],
+            &[],
+            &[src_barrier, dst_barrier],
         );
     }
 
@@ -112,7 +114,9 @@ pub fn record_blit(
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,
             vk::DependencyFlags::empty(),
-            &[], &[], &[present_barrier],
+            &[],
+            &[],
+            &[present_barrier],
         );
     }
 }

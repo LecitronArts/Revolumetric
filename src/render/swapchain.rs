@@ -42,6 +42,7 @@ impl Default for SwapchainManager {
 }
 
 impl SwapchainManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &Device,
         swapchain_loader: &ash::khr::swapchain::Device,
@@ -113,11 +114,7 @@ impl SwapchainManager {
         self.height = height.max(1);
     }
 
-    pub fn destroy(
-        &mut self,
-        device: &Device,
-        swapchain_loader: &ash::khr::swapchain::Device,
-    ) {
+    pub fn destroy(&mut self, device: &Device, swapchain_loader: &ash::khr::swapchain::Device) {
         unsafe {
             for image_view in self.image_views.drain(..) {
                 device.destroy_image_view(image_view, None);
@@ -147,8 +144,10 @@ fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> Option<vk::Surface
         .or_else(|| {
             // Fallback: any UNORM format
             formats.iter().copied().find(|format| {
-                matches!(format.format,
-                    vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM)
+                matches!(
+                    format.format,
+                    vk::Format::B8G8R8A8_UNORM | vk::Format::R8G8B8A8_UNORM
+                )
             })
         })
         .or_else(|| formats.first().copied())
@@ -192,7 +191,11 @@ fn choose_image_count(capabilities: &vk::SurfaceCapabilitiesKHR) -> u32 {
     }
 }
 
-fn create_image_view(device: &Device, image: vk::Image, format: vk::Format) -> Result<vk::ImageView> {
+fn create_image_view(
+    device: &Device,
+    image: vk::Image,
+    format: vk::Format,
+) -> Result<vk::ImageView> {
     let subresource_range = vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)

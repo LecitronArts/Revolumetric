@@ -1,5 +1,5 @@
-use anyhow::{anyhow, Context, Result};
-use ash::{vk, Device, Entry, Instance};
+use anyhow::{Context, Result, anyhow};
+use ash::{Device, Entry, Instance, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString};

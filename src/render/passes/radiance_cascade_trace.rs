@@ -1,10 +1,9 @@
 use anyhow::Result;
 use ash::vk;
-use std::ffi::CStr;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
-use crate::render::pipeline::{create_shader_module, ComputePipeline};
+use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::rc_probe_buffer::{self, RcProbeBuffer};
 use crate::render::scene_ubo::SceneUniformBuffer;
 use crate::voxel::gpu_upload::UcvhGpuResources;
@@ -203,7 +202,7 @@ impl RcTracePass {
         let pipeline = ComputePipeline::new(
             device,
             shader_module,
-            unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") },
+            c"main",
             &[descriptor_set_layout],
             &[push_range],
         )?;
@@ -298,7 +297,7 @@ impl RcTracePass {
                 0,
                 push_bytes,
             );
-            device.cmd_dispatch(cmd, (params.total_invocations + 63) / 64, 1, 1);
+            device.cmd_dispatch(cmd, params.total_invocations.div_ceil(64), 1, 1);
         }
     }
 

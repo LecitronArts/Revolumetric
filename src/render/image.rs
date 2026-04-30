@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::render::allocator::GpuAllocator;
 
@@ -55,8 +55,8 @@ impl GpuImage {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .initial_layout(vk::ImageLayout::UNDEFINED);
 
-        let handle = unsafe { device.create_image(&image_info, None) }
-            .context("failed to create image")?;
+        let handle =
+            unsafe { device.create_image(&image_info, None) }.context("failed to create image")?;
 
         let requirements = unsafe { device.get_image_memory_requirements(handle) };
 

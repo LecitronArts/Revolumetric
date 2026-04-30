@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use ash::vk;
-use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 use gpu_allocator::MemoryLocation;
+use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
 
 use crate::render::allocator::GpuAllocator;
 
@@ -39,10 +39,8 @@ impl GpuBuffer {
             allocation_scheme: AllocationScheme::GpuAllocatorManaged,
         })?;
 
-        unsafe {
-            device.bind_buffer_memory(handle, allocation.memory(), allocation.offset())
-        }
-        .context("failed to bind buffer memory")?;
+        unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) }
+            .context("failed to bind buffer memory")?;
 
         Ok(Self {
             handle,

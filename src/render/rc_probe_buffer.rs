@@ -6,13 +6,13 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 
 /// Cascade layout constants.
-pub const RC_C0_ENTRIES: u32 = 4096 * 6 * 9;       // 221,184
-pub const RC_C1_ENTRIES: u32 = 512 * 6 * 36;        // 110,592
-pub const RC_C2_ENTRIES: u32 = 64 * 6 * 144;        // 55,296
+pub const RC_C0_ENTRIES: u32 = 4096 * 6 * 9; // 221,184
+pub const RC_C1_ENTRIES: u32 = 512 * 6 * 36; // 110,592
+pub const RC_C2_ENTRIES: u32 = 64 * 6 * 144; // 55,296
 pub const RC_TOTAL_ENTRIES: u32 = RC_C0_ENTRIES + RC_C1_ENTRIES + RC_C2_ENTRIES; // 387,072
 
 pub const RC_C0_OFFSET: u32 = 0;
-pub const RC_C1_OFFSET: u32 = RC_C0_ENTRIES;        // 221,184
+pub const RC_C1_OFFSET: u32 = RC_C0_ENTRIES; // 221,184
 pub const RC_C2_OFFSET: u32 = RC_C0_ENTRIES + RC_C1_ENTRIES; // 331,776
 
 /// Entry size: float4 = 16 bytes (radiance.rgb + ray_distance).
@@ -62,11 +62,7 @@ impl RcProbeBuffer {
         self.current ^= 1;
     }
 
-    pub fn record_clear(
-        &self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-    ) {
+    pub fn record_clear(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
         let size = self.buffer_size();
         unsafe {
             device.cmd_fill_buffer(cmd, self.buffers[0].handle, 0, size, 0);

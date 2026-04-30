@@ -1,15 +1,13 @@
 use anyhow::Result;
 use ash::vk;
-use std::ffi::CStr;
-
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::primary_ray::PrimaryRayPass;
-use crate::render::pipeline::{create_shader_module, ComputePipeline};
-use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::rc_probe_buffer::RcProbeBuffer;
+use crate::render::scene_ubo::SceneUniformBuffer;
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct LightingPass {
@@ -21,6 +19,7 @@ pub struct LightingPass {
 }
 
 impl LightingPass {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -34,36 +33,101 @@ impl LightingPass {
     ) -> Result<Self> {
         // Descriptor layout: 1 UBO + 3 G-buffer (storage image) + 1 output (storage image) + 4 UCVH (SSBO)
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
-            .add_binding(0, vk::DescriptorType::UNIFORM_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(1, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(2, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(3, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(4, vk::DescriptorType::STORAGE_IMAGE, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(5, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(6, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(7, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(8, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
-            .add_binding(9, vk::DescriptorType::STORAGE_BUFFER, vk::ShaderStageFlags::COMPUTE, 1)
+            .add_binding(
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                1,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                2,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                3,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                4,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                5,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                6,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                7,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                8,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
+            .add_binding(
+                9,
+                vk::DescriptorType::STORAGE_BUFFER,
+                vk::ShaderStageFlags::COMPUTE,
+                1,
+            )
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
         let pool_sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: frame_count as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 4 * frame_count as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 5 * frame_count as u32 },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: frame_count as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 4 * frame_count as u32,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 5 * frame_count as u32,
+            },
         ];
         let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
         let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
 
         // Output image (same size as G-buffer, RGBA8 for final color)
-        let output_image = GpuImage::new(device, allocator, &GpuImageDesc {
-            width, height, depth: 1,
-            format: vk::Format::R8G8B8A8_UNORM,
-            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-            aspect: vk::ImageAspectFlags::COLOR,
-            name: "lighting_output",
-        })?;
+        let output_image = GpuImage::new(
+            device,
+            allocator,
+            &GpuImageDesc {
+                width,
+                height,
+                depth: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
+                usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+                aspect: vk::ImageAspectFlags::COLOR,
+                name: "lighting_output",
+            },
+        )?;
 
         // UCVH buffers: config, l0, occupancy, materials
         let ucvh_buffers = [
@@ -102,29 +166,40 @@ impl LightingPass {
                     .image_layout(vk::ImageLayout::GENERAL),
             ];
 
-            let image_writes: Vec<vk::WriteDescriptorSet> = image_infos.iter().enumerate().map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding((i + 1) as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(std::slice::from_ref(info))
-            }).collect();
+            let image_writes: Vec<vk::WriteDescriptorSet> = image_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding((i + 1) as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(info))
+                })
+                .collect();
 
             // Bindings 5-8: UCVH buffers
-            let buffer_infos: Vec<vk::DescriptorBufferInfo> = ucvh_buffers.iter().map(|buf| {
-                vk::DescriptorBufferInfo::default()
-                    .buffer(buf.handle)
-                    .offset(0)
-                    .range(vk::WHOLE_SIZE)
-            }).collect();
+            let buffer_infos: Vec<vk::DescriptorBufferInfo> = ucvh_buffers
+                .iter()
+                .map(|buf| {
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buf.handle)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)
+                })
+                .collect();
 
-            let buffer_writes: Vec<vk::WriteDescriptorSet> = buffer_infos.iter().enumerate().map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding((i + 5) as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .buffer_info(std::slice::from_ref(info))
-            }).collect();
+            let buffer_writes: Vec<vk::WriteDescriptorSet> = buffer_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding((i + 5) as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
 
             let mut all_writes = vec![ubo_write];
             all_writes.extend(image_writes);
@@ -150,7 +225,7 @@ impl LightingPass {
         let pipeline = ComputePipeline::new(
             device,
             shader_module,
-            unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") },
+            c"main",
             &[descriptor_set_layout],
             &[],
         )?;
@@ -173,13 +248,19 @@ impl LightingPass {
         height: u32,
         primary_ray: &PrimaryRayPass,
     ) -> Result<()> {
-        let new_output = GpuImage::new(device, allocator, &GpuImageDesc {
-            width, height, depth: 1,
-            format: vk::Format::R8G8B8A8_UNORM,
-            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-            aspect: vk::ImageAspectFlags::COLOR,
-            name: "lighting_output",
-        })?;
+        let new_output = GpuImage::new(
+            device,
+            allocator,
+            &GpuImageDesc {
+                width,
+                height,
+                depth: 1,
+                format: vk::Format::R8G8B8A8_UNORM,
+                usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+                aspect: vk::ImageAspectFlags::COLOR,
+                name: "lighting_output",
+            },
+        )?;
         let old_output = std::mem::replace(&mut self.output_image, new_output);
         old_output.destroy(device, allocator);
 
@@ -198,13 +279,17 @@ impl LightingPass {
                     .image_view(self.output_image.view)
                     .image_layout(vk::ImageLayout::GENERAL),
             ];
-            let writes: Vec<vk::WriteDescriptorSet> = image_infos.iter().enumerate().map(|(i, info)| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(ds)
-                    .dst_binding((i + 1) as u32)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .image_info(std::slice::from_ref(info))
-            }).collect();
+            let writes: Vec<vk::WriteDescriptorSet> = image_infos
+                .iter()
+                .enumerate()
+                .map(|(i, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding((i + 1) as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(info))
+                })
+                .collect();
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
 
@@ -222,20 +307,23 @@ impl LightingPass {
         let extent = self.output_image.extent;
 
         // Barrier: G-buffer SHADER_WRITE → SHADER_READ + output to GENERAL
-        let mut barriers: Vec<vk::ImageMemoryBarrier> = gbuffer_images.iter().map(|&image| {
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                .image(image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )
-        }).collect();
+        let mut barriers: Vec<vk::ImageMemoryBarrier> = gbuffer_images
+            .iter()
+            .map(|&image| {
+                vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                    .image(image)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .level_count(1)
+                            .layer_count(1),
+                    )
+            })
+            .collect();
 
         // Output image to GENERAL for compute write
         barriers.push(
@@ -250,7 +338,7 @@ impl LightingPass {
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
                         .level_count(1)
                         .layer_count(1),
-                )
+                ),
         );
 
         unsafe {
@@ -259,7 +347,9 @@ impl LightingPass {
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
-                &[], &[], &barriers,
+                &[],
+                &[],
+                &barriers,
             );
         }
 
@@ -276,13 +366,18 @@ impl LightingPass {
             );
         }
 
-        let groups_x = (extent.width + 7) / 8;
-        let groups_y = (extent.height + 7) / 8;
+        let groups_x = extent.width.div_ceil(8);
+        let groups_y = extent.height.div_ceil(8);
         unsafe { device.cmd_dispatch(cmd, groups_x, groups_y, 1) };
     }
 
     /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
-    pub fn update_rc_descriptor(&self, device: &ash::Device, rc_probes: &RcProbeBuffer, frame_slot: usize) {
+    pub fn update_rc_descriptor(
+        &self,
+        device: &ash::Device,
+        rc_probes: &RcProbeBuffer,
+        frame_slot: usize,
+    ) {
         let ds = self.descriptor_sets[frame_slot];
         let rc_info = vk::DescriptorBufferInfo::default()
             .buffer(rc_probes.write_buffer())

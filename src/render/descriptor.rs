@@ -7,7 +7,9 @@ pub struct DescriptorLayoutBuilder {
 
 impl DescriptorLayoutBuilder {
     pub fn new() -> Self {
-        Self { bindings: Vec::new() }
+        Self {
+            bindings: Vec::new(),
+        }
     }
 
     pub fn add_binding(
@@ -28,10 +30,15 @@ impl DescriptorLayoutBuilder {
     }
 
     pub fn build(&self, device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-        let create_info = vk::DescriptorSetLayoutCreateInfo::default()
-            .bindings(&self.bindings);
+        let create_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&self.bindings);
         unsafe { device.create_descriptor_set_layout(&create_info, None) }
             .context("failed to create descriptor set layout")
+    }
+}
+
+impl Default for DescriptorLayoutBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

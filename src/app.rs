@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ash::vk;
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -8,6 +8,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use crate::platform::input::InputState;
+use crate::scene::camera::update_fly_camera;
 use crate::scene::components::CameraRig;
 
 use crate::ecs::schedule::{Schedule, Stage};
@@ -25,7 +26,9 @@ use crate::render::passes::radiance_cascade_merge::RcMergePass;
 use crate::render::passes::radiance_cascade_trace::RcTracePass;
 use crate::render::rc_probe_buffer::RcProbeBuffer;
 use crate::render::resource::QueueType;
-use crate::render::scene_ubo::{GpuSceneUniforms, LightingSettings, SceneUniformBuffer};
+use crate::render::scene_ubo::{
+    LightingSettings, SceneUniformBuffer, SceneUniformInputs, build_scene_uniforms,
+};
 use crate::scene::light::DirectionalLight;
 use crate::scene::systems;
 use crate::voxel::generator;
@@ -140,44 +143,9 @@ impl RevolumetricApp {
             None => return,
         };
 
-        let rig = match self.world.resource_mut::<CameraRig>() {
-            Some(rig) => rig,
-            None => return,
-        };
-        let ctrl = &mut rig.controller;
-        let cam = &mut rig.camera;
-
-        // Scroll → adjust speed
-        if input.scroll_delta != 0.0 {
-            ctrl.move_speed *= ctrl.scroll_multiplier.powf(input.scroll_delta);
-            ctrl.move_speed = ctrl.move_speed.clamp(ctrl.min_speed, ctrl.max_speed);
+        if let Some(rig) = self.world.resource_mut::<CameraRig>() {
+            update_fly_camera(rig, input, dt);
         }
-
-        // Mouse → yaw/pitch
-        let sens_rad = ctrl.mouse_sensitivity * std::f32::consts::PI / 180.0;
-        ctrl.yaw += input.mouse_dx * sens_rad;
-        ctrl.pitch -= input.mouse_dy * sens_rad;
-        ctrl.pitch = ctrl.pitch.clamp(-1.553, 1.553); // ±89°
-
-        // Recompute forward from yaw/pitch
-        cam.forward = glam::Vec3::new(
-            ctrl.pitch.cos() * ctrl.yaw.sin(),
-            ctrl.pitch.sin(),
-            ctrl.pitch.cos() * ctrl.yaw.cos(),
-        );
-
-        // Horizontal movement
-        let hz_forward = glam::Vec3::new(ctrl.yaw.sin(), 0.0, ctrl.yaw.cos());
-        let hz_right = glam::Vec3::Y.cross(hz_forward);
-
-        let mut velocity = hz_forward * input.move_forward
-            + hz_right * input.move_right
-            + glam::Vec3::Y * input.move_up;
-        if velocity.length_squared() > 0.0 {
-            velocity = velocity.normalize();
-        }
-
-        cam.position += velocity * ctrl.move_speed * dt;
     }
 
     fn tick_frame(&mut self) -> Result<()> {
@@ -218,422 +186,435 @@ impl RevolumetricApp {
                 // Upload UCVH data to GPU (first frame only)
                 if !self.ucvh_uploaded {
                     if let (Some(ucvh), Some(gpu)) = (&self.ucvh, &self.ucvh_gpu) {
-                        gpu.upload_all(renderer.device(), frame.command_buffer, ucvh);
-                        self.ucvh_uploaded = true;
-                        tracing::info!("uploaded UCVH data to GPU");
+                        match gpu.upload_all(renderer.device(), frame.command_buffer, ucvh) {
+                            Ok(()) => {
+                                self.ucvh_uploaded = true;
+                                tracing::info!("uploaded UCVH data to GPU");
+                            }
+                            Err(error) => {
+                                tracing::error!(%error, "failed to upload UCVH data to GPU");
+                            }
+                        }
                     }
                 }
+                let ucvh_ready = self.ucvh_uploaded;
 
                 let mut graph = RenderGraph::new();
                 let profiler = self.gpu_profiler.as_ref();
 
-                if let Some(pass) = &self.primary_ray_pass {
-                    let (cam_pos, cam_forward, cam_up, fov_y) = {
-                        let rig = self.world.resource::<CameraRig>();
-                        match rig {
-                            Some(rig) => (
-                                rig.camera.position,
-                                rig.camera.forward,
-                                rig.camera.up,
-                                rig.camera.fov_y_radians,
-                            ),
-                            None => (
-                                glam::Vec3::new(64.0, 80.0, -40.0),
-                                glam::Vec3::Z,
-                                glam::Vec3::Y,
-                                std::f32::consts::FRAC_PI_4,
-                            ),
-                        }
-                    };
+                if ucvh_ready {
+                    if let Some(pass) = &self.primary_ray_pass {
+                        let (cam_pos, cam_forward, cam_up, fov_y) = {
+                            let rig = self.world.resource::<CameraRig>();
+                            match rig {
+                                Some(rig) => (
+                                    rig.camera.position,
+                                    rig.camera.forward,
+                                    rig.camera.up,
+                                    rig.camera.fov_y_radians,
+                                ),
+                                None => (
+                                    glam::Vec3::new(64.0, 80.0, -40.0),
+                                    glam::Vec3::Z,
+                                    glam::Vec3::Y,
+                                    std::f32::consts::FRAC_PI_4,
+                                ),
+                            }
+                        };
 
-                    let pixel_to_ray = compute_pixel_to_ray(
-                        cam_pos,
-                        cam_forward,
-                        cam_up,
-                        fov_y,
-                        frame.swapchain_extent.width,
-                        frame.swapchain_extent.height,
-                    );
+                        let pixel_to_ray = compute_pixel_to_ray(
+                            cam_pos,
+                            cam_forward,
+                            cam_up,
+                            fov_y,
+                            frame.swapchain_extent.width,
+                            frame.swapchain_extent.height,
+                        );
 
-                    // Read DirectionalLight from World
-                    let (sun_dir, sun_intensity) = {
-                        let light = self.world.resource::<DirectionalLight>();
-                        match light {
-                            Some(l) => (l.direction, l.intensity),
-                            None => (
-                                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
-                                glam::Vec3::new(2.0, 1.5, 1.25),
-                            ),
-                        }
-                    };
+                        // Read DirectionalLight from World
+                        let (sun_dir, sun_intensity) = {
+                            let light = self.world.resource::<DirectionalLight>();
+                            match light {
+                                Some(l) => (l.direction, l.intensity),
+                                None => (
+                                    glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                                    glam::Vec3::new(2.0, 1.5, 1.25),
+                                ),
+                            }
+                        };
 
-                    // Fill and upload Scene UBO
-                    let mut scene_data = GpuSceneUniforms {
-                        pixel_to_ray: pixel_to_ray.transpose().to_cols_array_2d(),
-                        resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
-                        _pad0: [0; 2],
-                        sun_direction: sun_dir.to_array(),
-                        _pad1: 0.0,
-                        sun_intensity: sun_intensity.to_array(),
-                        _pad2: 0.0,
-                        sky_color: [0.4, 0.5, 0.7],
-                        _pad3: 0.0,
-                        ground_color: [0.15, 0.1, 0.08],
-                        time: self
-                            .world
-                            .resource::<Time>()
-                            .map_or(0.0, |t| t.elapsed_seconds),
-                        rc_c0_grid: [16, 16, 16],
-                        rc_c0_offset: 0,
-                        rc_enabled: if self.rc_trace_pass.is_some() { 1 } else { 0 },
-                        lighting_flags: 0,
-                        rc_normal_strategy: 0,
-                        rc_probe_quality: 0,
-                    };
-                    scene_data.apply_lighting_settings(self.lighting_settings);
-
-                    if let Some(ubo) = &self.scene_ubo {
-                        ubo.update(frame.frame_slot, &scene_data);
-                    }
-
-                    let primary_ray_writes =
-                        graph.add_pass("primary_ray", QueueType::Compute, |builder| {
-                            let _gbp = builder.create_image(
+                        let scene_data = build_scene_uniforms(SceneUniformInputs {
+                            pixel_to_ray,
+                            resolution: [
                                 frame.swapchain_extent.width,
                                 frame.swapchain_extent.height,
-                                vk::Format::R32G32B32A32_SFLOAT,
-                                vk::ImageUsageFlags::STORAGE,
-                            );
-                            let _gb0 = builder.create_image(
-                                frame.swapchain_extent.width,
-                                frame.swapchain_extent.height,
-                                vk::Format::R8G8B8A8_UNORM,
-                                vk::ImageUsageFlags::STORAGE,
-                            );
-                            let _gb1 = builder.create_image(
-                                frame.swapchain_extent.width,
-                                frame.swapchain_extent.height,
-                                vk::Format::R8G8B8A8_UINT,
-                                vk::ImageUsageFlags::STORAGE,
-                            );
-                            let slot = frame.frame_slot;
-                            Box::new(move |ctx| {
-                                if let Some(profiler) = profiler {
-                                    profiler.begin_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::PrimaryRay,
-                                    );
-                                }
-                                pass.record(ctx.device, ctx.command_buffer, slot);
-                                if let Some(profiler) = profiler {
-                                    profiler.end_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::PrimaryRay,
-                                    );
-                                }
-                            })
+                            ],
+                            sun_direction: sun_dir,
+                            sun_intensity,
+                            sky_color: [0.4, 0.5, 0.7],
+                            ground_color: [0.15, 0.1, 0.08],
+                            time: self
+                                .world
+                                .resource::<Time>()
+                                .map_or(0.0, |t| t.elapsed_seconds),
+                            rc_enabled: self.rc_trace_pass.is_some(),
+                            lighting_settings: self.lighting_settings,
                         });
 
-                    // RC trace + merge passes (between primary_ray and lighting)
-                    if let (Some(rc_trace), Some(rc_merge), Some(rc_probes)) =
-                        (&self.rc_trace_pass, &self.rc_merge_pass, &self.rc_probes)
-                    {
-                        // Zero-init on first frame
-                        if !self.rc_cleared {
-                            if let Some(profiler) = profiler {
-                                profiler.begin_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    GpuProfileScope::RcClear,
-                                );
-                            }
-                            rc_probes.record_clear(renderer.device(), frame.command_buffer);
-                            // Barrier: TRANSFER → COMPUTE
-                            let barrier = vk::BufferMemoryBarrier::default()
-                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                .dst_access_mask(
-                                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                                )
-                                .buffer(rc_probes.write_buffer())
-                                .size(vk::WHOLE_SIZE);
-                            let barrier2 = vk::BufferMemoryBarrier::default()
-                                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                                .buffer(rc_probes.read_buffer())
-                                .size(vk::WHOLE_SIZE);
-                            unsafe {
-                                renderer.device().cmd_pipeline_barrier(
-                                    frame.command_buffer,
-                                    vk::PipelineStageFlags::TRANSFER,
-                                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                                    vk::DependencyFlags::empty(),
-                                    &[],
-                                    &[barrier, barrier2],
-                                    &[],
-                                );
-                            }
-                            if let Some(profiler) = profiler {
-                                profiler.end_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    GpuProfileScope::RcClear,
-                                );
-                            }
-                            self.rc_cleared = true;
+                        if let Some(ubo) = &self.scene_ubo {
+                            ubo.update(frame.frame_slot, &scene_data);
                         }
 
-                        // Update descriptors for swapped buffers (only current frame_slot)
-                        rc_trace.update_probe_descriptors(
-                            renderer.device(),
-                            rc_probes,
-                            frame.frame_slot,
-                        );
-                        rc_merge.update_probe_descriptor(
-                            renderer.device(),
-                            rc_probes,
-                            frame.frame_slot,
-                        );
-                        if let Some(lighting) = &self.lighting_pass {
-                            lighting.update_rc_descriptor(
-                                renderer.device(),
-                                rc_probes,
-                                frame.frame_slot,
-                            );
-                        }
-
-                        // RC trace (all 3 cascades, no inter-dispatch barriers)
-                        rc_trace.bind(renderer.device(), frame.command_buffer, frame.frame_slot);
-                        for (cascade_index, scope) in [
-                            (0, GpuProfileScope::RcTraceC0),
-                            (1, GpuProfileScope::RcTraceC1),
-                            (2, GpuProfileScope::RcTraceC2),
-                        ] {
-                            if let Some(profiler) = profiler {
-                                profiler.begin_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    scope,
+                        let primary_ray_writes =
+                            graph.add_pass("primary_ray", QueueType::Compute, |builder| {
+                                let _gbp = builder.create_image(
+                                    frame.swapchain_extent.width,
+                                    frame.swapchain_extent.height,
+                                    vk::Format::R32G32B32A32_SFLOAT,
+                                    vk::ImageUsageFlags::STORAGE,
                                 );
-                            }
-                            rc_trace.record_cascade(
-                                renderer.device(),
-                                frame.command_buffer,
-                                cascade_index,
-                            );
-                            if let Some(profiler) = profiler {
-                                profiler.end_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    scope,
-                                );
-                            }
-                        }
-
-                        // Barrier: rc_trace writes → rc_merge reads
-                        let barrier = vk::BufferMemoryBarrier::default()
-                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                            .dst_access_mask(
-                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                            )
-                            .buffer(rc_probes.write_buffer())
-                            .size(vk::WHOLE_SIZE);
-                        unsafe {
-                            renderer.device().cmd_pipeline_barrier(
-                                frame.command_buffer,
-                                vk::PipelineStageFlags::COMPUTE_SHADER,
-                                vk::PipelineStageFlags::COMPUTE_SHADER,
-                                vk::DependencyFlags::empty(),
-                                &[],
-                                &[barrier],
-                                &[],
-                            );
-                        }
-
-                        // RC merge (C2→C1, barrier, C1→C0)
-                        rc_merge.bind(renderer.device(), frame.command_buffer, frame.frame_slot);
-                        for (step_index, scope) in [
-                            (0, GpuProfileScope::RcMergeC2ToC1),
-                            (1, GpuProfileScope::RcMergeC1ToC0),
-                        ] {
-                            if let Some(profiler) = profiler {
-                                profiler.begin_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    scope,
-                                );
-                            }
-                            rc_merge.record_step(
-                                renderer.device(),
-                                frame.command_buffer,
-                                rc_probes.write_buffer(),
-                                step_index,
-                            );
-                            if let Some(profiler) = profiler {
-                                profiler.end_scope(
-                                    renderer.device(),
-                                    frame.command_buffer,
-                                    frame.frame_slot,
-                                    scope,
-                                );
-                            }
-                        }
-
-                        // Barrier: rc_merge writes → lighting reads
-                        let barrier = vk::BufferMemoryBarrier::default()
-                            .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                            .buffer(rc_probes.write_buffer())
-                            .size(vk::WHOLE_SIZE);
-                        unsafe {
-                            renderer.device().cmd_pipeline_barrier(
-                                frame.command_buffer,
-                                vk::PipelineStageFlags::COMPUTE_SHADER,
-                                vk::PipelineStageFlags::COMPUTE_SHADER,
-                                vk::DependencyFlags::empty(),
-                                &[],
-                                &[barrier],
-                                &[],
-                            );
-                        }
-                    }
-
-                    // Lighting pass
-                    if let Some(lighting) = &self.lighting_pass {
-                        let gbuf_images = [
-                            pass.gbuffer_pos.handle,
-                            pass.gbuffer0.handle,
-                            pass.gbuffer1.handle,
-                        ];
-                        let lighting_output = lighting.output_image.handle;
-                        let lighting_extent = lighting.output_image.extent;
-                        let dep0 = primary_ray_writes[0];
-                        let dep1 = primary_ray_writes[1];
-                        let dep2 = primary_ray_writes[2];
-                        let slot = frame.frame_slot;
-
-                        let lighting_writes =
-                            graph.add_pass("lighting", QueueType::Compute, |builder| {
-                                builder.read(dep0);
-                                builder.read(dep1);
-                                builder.read(dep2);
-                                let _out = builder.create_image(
+                                let _gb0 = builder.create_image(
                                     frame.swapchain_extent.width,
                                     frame.swapchain_extent.height,
                                     vk::Format::R8G8B8A8_UNORM,
-                                    vk::ImageUsageFlags::STORAGE
-                                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                                    vk::ImageUsageFlags::STORAGE,
                                 );
+                                let _gb1 = builder.create_image(
+                                    frame.swapchain_extent.width,
+                                    frame.swapchain_extent.height,
+                                    vk::Format::R8G8B8A8_UINT,
+                                    vk::ImageUsageFlags::STORAGE,
+                                );
+                                let slot = frame.frame_slot;
                                 Box::new(move |ctx| {
                                     if let Some(profiler) = profiler {
                                         profiler.begin_scope(
                                             ctx.device,
                                             ctx.command_buffer,
                                             slot,
-                                            GpuProfileScope::Lighting,
+                                            GpuProfileScope::PrimaryRay,
                                         );
                                     }
-                                    lighting.record(
+                                    pass.record(ctx.device, ctx.command_buffer, slot);
+                                    if let Some(profiler) = profiler {
+                                        profiler.end_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::PrimaryRay,
+                                        );
+                                    }
+                                })
+                            });
+
+                        // RC trace + merge passes (between primary_ray and lighting)
+                        if let (Some(rc_trace), Some(rc_merge), Some(rc_probes)) =
+                            (&self.rc_trace_pass, &self.rc_merge_pass, &self.rc_probes)
+                        {
+                            // Zero-init on first frame
+                            if !self.rc_cleared {
+                                if let Some(profiler) = profiler {
+                                    profiler.begin_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        GpuProfileScope::RcClear,
+                                    );
+                                }
+                                rc_probes.record_clear(renderer.device(), frame.command_buffer);
+                                // Barrier: TRANSFER → COMPUTE
+                                let barrier = vk::BufferMemoryBarrier::default()
+                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                    .dst_access_mask(
+                                        vk::AccessFlags::SHADER_READ
+                                            | vk::AccessFlags::SHADER_WRITE,
+                                    )
+                                    .buffer(rc_probes.write_buffer())
+                                    .size(vk::WHOLE_SIZE);
+                                let barrier2 = vk::BufferMemoryBarrier::default()
+                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                                    .buffer(rc_probes.read_buffer())
+                                    .size(vk::WHOLE_SIZE);
+                                unsafe {
+                                    renderer.device().cmd_pipeline_barrier(
+                                        frame.command_buffer,
+                                        vk::PipelineStageFlags::TRANSFER,
+                                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                                        vk::DependencyFlags::empty(),
+                                        &[],
+                                        &[barrier, barrier2],
+                                        &[],
+                                    );
+                                }
+                                if let Some(profiler) = profiler {
+                                    profiler.end_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        GpuProfileScope::RcClear,
+                                    );
+                                }
+                                self.rc_cleared = true;
+                            }
+
+                            // Update descriptors for swapped buffers (only current frame_slot)
+                            rc_trace.update_probe_descriptors(
+                                renderer.device(),
+                                rc_probes,
+                                frame.frame_slot,
+                            );
+                            rc_merge.update_probe_descriptor(
+                                renderer.device(),
+                                rc_probes,
+                                frame.frame_slot,
+                            );
+                            if let Some(lighting) = &self.lighting_pass {
+                                lighting.update_rc_descriptor(
+                                    renderer.device(),
+                                    rc_probes,
+                                    frame.frame_slot,
+                                );
+                            }
+
+                            // RC trace (all 3 cascades, no inter-dispatch barriers)
+                            rc_trace.bind(
+                                renderer.device(),
+                                frame.command_buffer,
+                                frame.frame_slot,
+                            );
+                            for (cascade_index, scope) in [
+                                (0, GpuProfileScope::RcTraceC0),
+                                (1, GpuProfileScope::RcTraceC1),
+                                (2, GpuProfileScope::RcTraceC2),
+                            ] {
+                                if let Some(profiler) = profiler {
+                                    profiler.begin_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        scope,
+                                    );
+                                }
+                                rc_trace.record_cascade(
+                                    renderer.device(),
+                                    frame.command_buffer,
+                                    cascade_index,
+                                );
+                                if let Some(profiler) = profiler {
+                                    profiler.end_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        scope,
+                                    );
+                                }
+                            }
+
+                            // Barrier: rc_trace writes → rc_merge reads
+                            let barrier = vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(
+                                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                                )
+                                .buffer(rc_probes.write_buffer())
+                                .size(vk::WHOLE_SIZE);
+                            unsafe {
+                                renderer.device().cmd_pipeline_barrier(
+                                    frame.command_buffer,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    &[barrier],
+                                    &[],
+                                );
+                            }
+
+                            // RC merge (C2→C1, barrier, C1→C0)
+                            rc_merge.bind(
+                                renderer.device(),
+                                frame.command_buffer,
+                                frame.frame_slot,
+                            );
+                            for (step_index, scope) in [
+                                (0, GpuProfileScope::RcMergeC2ToC1),
+                                (1, GpuProfileScope::RcMergeC1ToC0),
+                            ] {
+                                if let Some(profiler) = profiler {
+                                    profiler.begin_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        scope,
+                                    );
+                                }
+                                rc_merge.record_step(
+                                    renderer.device(),
+                                    frame.command_buffer,
+                                    rc_probes.write_buffer(),
+                                    step_index,
+                                );
+                                if let Some(profiler) = profiler {
+                                    profiler.end_scope(
+                                        renderer.device(),
+                                        frame.command_buffer,
+                                        frame.frame_slot,
+                                        scope,
+                                    );
+                                }
+                            }
+
+                            // Barrier: rc_merge writes → lighting reads
+                            let barrier = vk::BufferMemoryBarrier::default()
+                                .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                                .dst_access_mask(vk::AccessFlags::SHADER_READ)
+                                .buffer(rc_probes.write_buffer())
+                                .size(vk::WHOLE_SIZE);
+                            unsafe {
+                                renderer.device().cmd_pipeline_barrier(
+                                    frame.command_buffer,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                                    vk::DependencyFlags::empty(),
+                                    &[],
+                                    &[barrier],
+                                    &[],
+                                );
+                            }
+                        }
+
+                        // Lighting pass
+                        if let Some(lighting) = &self.lighting_pass {
+                            let gbuf_images = [
+                                pass.gbuffer_pos.handle,
+                                pass.gbuffer0.handle,
+                                pass.gbuffer1.handle,
+                            ];
+                            let lighting_output = lighting.output_image.handle;
+                            let lighting_extent = lighting.output_image.extent;
+                            let dep0 = primary_ray_writes[0];
+                            let dep1 = primary_ray_writes[1];
+                            let dep2 = primary_ray_writes[2];
+                            let slot = frame.frame_slot;
+
+                            let lighting_writes =
+                                graph.add_pass("lighting", QueueType::Compute, |builder| {
+                                    builder.read(dep0);
+                                    builder.read(dep1);
+                                    builder.read(dep2);
+                                    let _out = builder.create_image(
+                                        frame.swapchain_extent.width,
+                                        frame.swapchain_extent.height,
+                                        vk::Format::R8G8B8A8_UNORM,
+                                        vk::ImageUsageFlags::STORAGE
+                                            | vk::ImageUsageFlags::TRANSFER_SRC,
+                                    );
+                                    Box::new(move |ctx| {
+                                        if let Some(profiler) = profiler {
+                                            profiler.begin_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::Lighting,
+                                            );
+                                        }
+                                        lighting.record(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            gbuf_images,
+                                        );
+                                        if let Some(profiler) = profiler {
+                                            profiler.end_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::Lighting,
+                                            );
+                                        }
+                                    })
+                                });
+
+                            // Blit lighting output to swapchain
+                            let src_image = lighting_output;
+                            let src_extent = lighting_extent;
+                            let dst_image = frame.swapchain_image;
+                            let dst_extent = frame.swapchain_extent;
+                            let dep_handle = lighting_writes[0];
+                            graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
+                                builder.read(dep_handle);
+                                Box::new(move |ctx| {
+                                    if let Some(profiler) = profiler {
+                                        profiler.begin_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::BlitToSwapchain,
+                                        );
+                                    }
+                                    blit_to_swapchain::record_blit(
                                         ctx.device,
                                         ctx.command_buffer,
-                                        slot,
-                                        gbuf_images,
+                                        src_image,
+                                        src_extent,
+                                        dst_image,
+                                        dst_extent,
                                     );
                                     if let Some(profiler) = profiler {
                                         profiler.end_scope(
                                             ctx.device,
                                             ctx.command_buffer,
                                             slot,
-                                            GpuProfileScope::Lighting,
+                                            GpuProfileScope::BlitToSwapchain,
                                         );
                                     }
                                 })
                             });
-
-                        // Blit lighting output to swapchain
-                        let src_image = lighting_output;
-                        let src_extent = lighting_extent;
-                        let dst_image = frame.swapchain_image;
-                        let dst_extent = frame.swapchain_extent;
-                        let dep_handle = lighting_writes[0];
-                        graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
-                            builder.read(dep_handle);
-                            Box::new(move |ctx| {
-                                if let Some(profiler) = profiler {
-                                    profiler.begin_scope(
+                        } else {
+                            // Fallback: blit raw G-buffer if lighting pass not ready
+                            let src_image = pass.gbuffer0.handle;
+                            let src_extent = pass.gbuffer0.extent;
+                            let dst_image = frame.swapchain_image;
+                            let dst_extent = frame.swapchain_extent;
+                            let dep_handle = primary_ray_writes[0];
+                            let slot = frame.frame_slot;
+                            graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
+                                builder.read(dep_handle);
+                                Box::new(move |ctx| {
+                                    if let Some(profiler) = profiler {
+                                        profiler.begin_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::BlitToSwapchain,
+                                        );
+                                    }
+                                    blit_to_swapchain::record_blit(
                                         ctx.device,
                                         ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
+                                        src_image,
+                                        src_extent,
+                                        dst_image,
+                                        dst_extent,
                                     );
-                                }
-                                blit_to_swapchain::record_blit(
-                                    ctx.device,
-                                    ctx.command_buffer,
-                                    src_image,
-                                    src_extent,
-                                    dst_image,
-                                    dst_extent,
-                                );
-                                if let Some(profiler) = profiler {
-                                    profiler.end_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
-                                    );
-                                }
-                            })
-                        });
-                    } else {
-                        // Fallback: blit raw G-buffer if lighting pass not ready
-                        let src_image = pass.gbuffer0.handle;
-                        let src_extent = pass.gbuffer0.extent;
-                        let dst_image = frame.swapchain_image;
-                        let dst_extent = frame.swapchain_extent;
-                        let dep_handle = primary_ray_writes[0];
-                        let slot = frame.frame_slot;
-                        graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
-                            builder.read(dep_handle);
-                            Box::new(move |ctx| {
-                                if let Some(profiler) = profiler {
-                                    profiler.begin_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
-                                    );
-                                }
-                                blit_to_swapchain::record_blit(
-                                    ctx.device,
-                                    ctx.command_buffer,
-                                    src_image,
-                                    src_extent,
-                                    dst_image,
-                                    dst_extent,
-                                );
-                                if let Some(profiler) = profiler {
-                                    profiler.end_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
-                                    );
-                                }
-                            })
-                        });
+                                    if let Some(profiler) = profiler {
+                                        profiler.end_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::BlitToSwapchain,
+                                        );
+                                    }
+                                })
+                            });
+                        }
                     }
+                } else {
+                    tracing::warn!("skipping UCVH render passes until GPU upload succeeds");
                 }
 
-                graph.compile();
+                graph.compile()?;
                 graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
                 renderer.end_frame(frame)?;
 

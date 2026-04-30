@@ -20,7 +20,11 @@ pub struct NodeLN {
     pub _pad: [u8; 2],
 }
 
-pub const EMPTY_L0: NodeL0 = NodeL0 { brick_id: u32::MAX, flags: 0, _pad: 0 };
+pub const EMPTY_L0: NodeL0 = NodeL0 {
+    brick_id: u32::MAX,
+    flags: 0,
+    _pad: 0,
+};
 
 /// 5-level cascaded occupancy hierarchy.
 /// L0 = brick_grid_size, each subsequent level halves dimensions.
@@ -136,10 +140,10 @@ mod tests {
     fn hierarchy_dims() {
         let h = CascadedOccupancy::new(UVec3::splat(16));
         assert_eq!(h.dims[0], UVec3::splat(16)); // L0
-        assert_eq!(h.dims[1], UVec3::splat(8));  // L1
-        assert_eq!(h.dims[2], UVec3::splat(4));  // L2
-        assert_eq!(h.dims[3], UVec3::splat(2));  // L3
-        assert_eq!(h.dims[4], UVec3::splat(1));  // L4
+        assert_eq!(h.dims[1], UVec3::splat(8)); // L1
+        assert_eq!(h.dims[2], UVec3::splat(4)); // L2
+        assert_eq!(h.dims[3], UVec3::splat(2)); // L3
+        assert_eq!(h.dims[4], UVec3::splat(1)); // L4
     }
 
     #[test]

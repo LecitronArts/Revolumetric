@@ -56,13 +56,19 @@ mod tests {
     #[test]
     fn center_pixel_looks_along_forward() {
         let m = compute_pixel_to_ray(
-            Vec3::ZERO, Vec3::Z, Vec3::Y,
-            std::f32::consts::FRAC_PI_2, 800, 600,
+            Vec3::ZERO,
+            Vec3::Z,
+            Vec3::Y,
+            std::f32::consts::FRAC_PI_2,
+            800,
+            600,
         );
         let origin = Vec3::new(m.col(3).x, m.col(3).y, m.col(3).z);
         assert!((origin - Vec3::ZERO).length() < 1e-5);
         let mat3 = glam::Mat3::from_cols(
-            m.col(0).truncate(), m.col(1).truncate(), m.col(2).truncate(),
+            m.col(0).truncate(),
+            m.col(1).truncate(),
+            m.col(2).truncate(),
         );
         let dir = (mat3 * Vec3::new(400.0, 300.0, 1.0)).normalize();
         assert!(dir.z > 0.5, "center ray should point along +Z, got {dir}");
@@ -80,7 +86,9 @@ mod tests {
     fn horizontal_ray_divergence() {
         let m = compute_pixel_to_ray(Vec3::ZERO, Vec3::Z, Vec3::Y, 1.0, 800, 600);
         let mat3 = glam::Mat3::from_cols(
-            m.col(0).truncate(), m.col(1).truncate(), m.col(2).truncate(),
+            m.col(0).truncate(),
+            m.col(1).truncate(),
+            m.col(2).truncate(),
         );
         let left = (mat3 * Vec3::new(0.0, 300.0, 1.0)).normalize();
         let right = (mat3 * Vec3::new(799.0, 300.0, 1.0)).normalize();

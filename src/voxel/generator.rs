@@ -1,7 +1,7 @@
 // src/voxel/generator.rs
-use glam::{UVec3, Vec3};
-use crate::voxel::brick::{BrickData, VoxelCell, BRICK_EDGE};
+use crate::voxel::brick::{BRICK_EDGE, BrickData, VoxelCell};
 use crate::voxel::ucvh::{Ucvh, UcvhConfig};
+use glam::{UVec3, Vec3};
 
 pub trait VoxelGenerator {
     /// Generate brick data at the given brick grid coordinate.
@@ -30,12 +30,17 @@ impl VoxelGenerator for SphereGenerator {
                         (base.z + lz) as f32 + 0.5,
                     );
                     if world.distance(self.center) <= self.radius {
-                        data.set_voxel(lx, ly, lz, VoxelCell {
-                            material: self.material,
-                            flags: 1, // solid
-                            emissive: [0; 3],
-                            _pad: 0,
-                        });
+                        data.set_voxel(
+                            lx,
+                            ly,
+                            lz,
+                            VoxelCell {
+                                material: self.material,
+                                flags: 1, // solid
+                                emissive: [0; 3],
+                                _pad: 0,
+                            },
+                        );
                         any_solid = true;
                     }
                 }
@@ -56,7 +61,9 @@ pub fn generate_sponza_scene(ucvh: &mut Ucvh) -> u32 {
             for bx in 0..bgs.x {
                 let bp = UVec3::new(bx, by, bz);
                 if let Some(data) = generator.generate_brick(bp, &ucvh.config) {
-                    if ucvh.write_brick(bp, &data) { count += 1; }
+                    if ucvh.write_brick(bp, &data) {
+                        count += 1;
+                    }
                 }
             }
         }

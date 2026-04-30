@@ -1,5 +1,5 @@
-use bytemuck::{Pod, Zeroable};
 use crate::voxel::morton;
+use bytemuck::{Pod, Zeroable};
 
 pub const BRICK_EDGE: u32 = 8;
 pub const BRICK_VOLUME: usize = 512; // 8^3
@@ -9,9 +9,9 @@ pub const BRICK_VOLUME: usize = 512; // 8^3
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct BrickOccupancy {
-    pub bits: [u32; 16],  // 512 bits
-    pub count: u32,       // number of solid voxels (0 = empty, skip instantly)
-    pub _pad: [u32; 3],   // pad to 80 bytes (16-byte GPU alignment)
+    pub bits: [u32; 16], // 512 bits
+    pub count: u32,      // number of solid voxels (0 = empty, skip instantly)
+    pub _pad: [u32; 3],  // pad to 80 bytes (16-byte GPU alignment)
 }
 
 impl BrickOccupancy {
@@ -55,11 +55,23 @@ pub struct VoxelCell {
 }
 
 impl VoxelCell {
-    pub const AIR: Self = Self { material: 0, flags: 0, emissive: [0; 3], _pad: 0 };
-    pub fn is_air(&self) -> bool { self.material == 0 }
+    pub const AIR: Self = Self {
+        material: 0,
+        flags: 0,
+        emissive: [0; 3],
+        _pad: 0,
+    };
+    pub fn is_air(&self) -> bool {
+        self.material == 0
+    }
 
     pub fn new(material: u16, flags: u16, emissive: [u8; 3]) -> Self {
-        Self { material, flags, emissive, _pad: 0 }
+        Self {
+            material,
+            flags,
+            emissive,
+            _pad: 0,
+        }
     }
 }
 
@@ -89,6 +101,12 @@ impl BrickData {
 
     pub fn get_voxel(&self, x: u32, y: u32, z: u32) -> VoxelCell {
         self.materials[morton::encode(x, y, z) as usize]
+    }
+}
+
+impl Default for BrickData {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -132,7 +150,12 @@ mod tests {
     #[test]
     fn brick_data_set_and_read() {
         let mut b = BrickData::new();
-        let cell = VoxelCell { material: 42, flags: 1, emissive: [0; 3], _pad: 0 };
+        let cell = VoxelCell {
+            material: 42,
+            flags: 1,
+            emissive: [0; 3],
+            _pad: 0,
+        };
         b.set_voxel(7, 7, 7, cell);
         assert!(b.occupancy.get(7, 7, 7));
         assert_eq!(b.get_voxel(7, 7, 7).material, 42);
@@ -142,7 +165,17 @@ mod tests {
     #[test]
     fn brick_data_air_clears() {
         let mut b = BrickData::new();
-        b.set_voxel(0, 0, 0, VoxelCell { material: 1, flags: 0, emissive: [0; 3], _pad: 0 });
+        b.set_voxel(
+            0,
+            0,
+            0,
+            VoxelCell {
+                material: 1,
+                flags: 0,
+                emissive: [0; 3],
+                _pad: 0,
+            },
+        );
         assert!(b.occupancy.get(0, 0, 0));
         b.set_voxel(0, 0, 0, VoxelCell::AIR);
         assert!(!b.occupancy.get(0, 0, 0));

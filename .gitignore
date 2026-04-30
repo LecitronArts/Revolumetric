@@ -1,2 +1,26 @@
 /target
 node_modules/
+
+# Local editor and IDE state
+.idea/
+.vscode/
+*.iml
+
+# Local environment and OS files
+.env
+.env.*
+.DS_Store
+Thumbs.db
+*.log
+
+# Large local research checkouts. Keep small curated reference files tracked.
+/reference/HashDAG/
+/reference/Q2RTX/
+/reference/RTXGI/
+/reference/SparseVoxelOctree/
+/reference/amitabha/
+/reference/dust/
+/reference/openvdb/
+/reference/radiance-cascades-3d-grid/
+/reference/three-rc/
+/reference/vk_voxel_cone_tracing/

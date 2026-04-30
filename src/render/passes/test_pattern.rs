@@ -1,11 +1,10 @@
 use anyhow::Result;
 use ash::vk;
-use std::ffi::CStr;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
-use crate::render::pipeline::{create_shader_module, ComputePipeline};
+use crate::render::pipeline::{ComputePipeline, create_shader_module};
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -83,7 +82,7 @@ impl TestPatternPass {
         let pipeline = ComputePipeline::new(
             device,
             shader_module,
-            unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") },
+            c"main",
             &[descriptor_set_layout],
             &push_constant_ranges,
         )?;
@@ -120,7 +119,9 @@ impl TestPatternPass {
                 vk::PipelineStageFlags::TOP_OF_PIPE,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
-                &[], &[], &[barrier],
+                &[],
+                &[],
+                &[barrier],
             );
         }
 
@@ -159,8 +160,8 @@ impl TestPatternPass {
         }
 
         // Dispatch workgroups (8x8 threads per group)
-        let groups_x = (extent.width + 7) / 8;
-        let groups_y = (extent.height + 7) / 8;
+        let groups_x = extent.width.div_ceil(8);
+        let groups_y = extent.height.div_ceil(8);
         unsafe { device.cmd_dispatch(cmd, groups_x, groups_y, 1) };
     }
 
