@@ -1,5 +1,6 @@
 /target
 node_modules/
+.worktrees/
 
 # Local editor and IDE state
 .idea/
