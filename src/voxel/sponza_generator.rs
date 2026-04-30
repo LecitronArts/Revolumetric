@@ -387,6 +387,31 @@ mod tests {
     }
 
     #[test]
+    fn side_wall_windows_are_thin_openings_with_solid_frames() {
+        assert!(
+            SponzaGenerator::eval_voxel(Vec3::new(16.5, 20.5, 18.5)).is_none(),
+            "left lower window should be open through the wall"
+        );
+        assert!(
+            SponzaGenerator::eval_voxel(Vec3::new(18.5, 35.5, 27.5)).is_none(),
+            "left lower window should stay open through all three wall voxels"
+        );
+        assert!(
+            SponzaGenerator::eval_voxel(Vec3::new(109.5, 60.5, 38.5)).is_none(),
+            "right upper window should be open through the wall"
+        );
+
+        assert!(
+            SponzaGenerator::eval_voxel(Vec3::new(16.5, 20.5, 17.5)).is_some(),
+            "z-adjacent window frame voxel should be solid"
+        );
+        assert!(
+            SponzaGenerator::eval_voxel(Vec3::new(16.5, 48.5, 18.5)).is_some(),
+            "y-adjacent wall band between window rows should be solid"
+        );
+    }
+
+    #[test]
     fn sponza_generates_bricks() {
         let config = UcvhConfig::new(UVec3::splat(128));
         let generator = SponzaGenerator;

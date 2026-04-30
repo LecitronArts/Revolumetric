@@ -69,7 +69,10 @@ float3 select_rc_normal(
     StructuredBuffer<BrickOccupancy> brick_occupancy
 ) {
     if (scene.rc_normal_strategy == RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT) {
-        return compute_occupancy_gradient_normal(position, axis_normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
+        float3 gradient_normal = compute_occupancy_gradient_normal(position, axis_normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
+        if (dot(gradient_normal, axis_normal) > 0.5) {
+            return gradient_normal;
+        }
     }
     return axis_normal;
 }

@@ -398,3 +398,22 @@ impl LightingPass {
         self.output_image.destroy(device, allocator);
     }
 }
+
+#[cfg(test)]
+mod shader_source_tests {
+    #[test]
+    fn rc_gradient_normal_does_not_override_unrelated_hit_face() {
+        let source =
+            include_str!("../../../assets/shaders/passes/lighting.slang").replace("\r\n", "\n");
+
+        source
+            .find("float3 gradient_normal = compute_occupancy_gradient_normal")
+            .expect("lighting shader should compute the optional RC gradient normal");
+        source
+            .find("if (dot(gradient_normal, axis_normal) > 0.5)")
+            .expect("gradient normal must be gated by the actual hit face normal");
+        source
+            .find("return axis_normal;")
+            .expect("lighting shader should fall back to DDA hit face normal");
+    }
+}

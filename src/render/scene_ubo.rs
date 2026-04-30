@@ -68,7 +68,7 @@ impl Default for LightingSettings {
         Self {
             shadows_enabled: true,
             skip_backface_shadows: false,
-            rc_normal_strategy: RcNormalStrategy::OccupancyGradient,
+            rc_normal_strategy: RcNormalStrategy::AxisNormal,
             rc_probe_quality: RcProbeQuality::Full,
         }
     }
@@ -388,10 +388,7 @@ mod tests {
 
         assert!(settings.shadows_enabled);
         assert!(!settings.skip_backface_shadows);
-        assert_eq!(
-            settings.rc_normal_strategy,
-            RcNormalStrategy::OccupancyGradient
-        );
+        assert_eq!(settings.rc_normal_strategy, RcNormalStrategy::AxisNormal);
         assert_eq!(settings.rc_probe_quality, RcProbeQuality::Full);
     }
 
@@ -410,10 +407,7 @@ mod tests {
             uniforms.lighting_flags & LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS,
             0
         );
-        assert_eq!(
-            uniforms.rc_normal_strategy,
-            RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT
-        );
+        assert_eq!(uniforms.rc_normal_strategy, RC_NORMAL_STRATEGY_AXIS_NORMAL);
         assert_eq!(uniforms.rc_probe_quality, RC_PROBE_QUALITY_FULL);
     }
 
