@@ -17,6 +17,32 @@ struct FrameResources {
     in_flight_fence: vk::Fence,
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum FramePreparationStep {
+    WaitFence,
+    AcquireImage,
+    ResetFence,
+    ResetCommandPool,
+}
+
+#[cfg(test)]
+fn frame_preparation_order(acquire_succeeds: bool) -> &'static [FramePreparationStep] {
+    if acquire_succeeds {
+        &[
+            FramePreparationStep::WaitFence,
+            FramePreparationStep::AcquireImage,
+            FramePreparationStep::ResetFence,
+            FramePreparationStep::ResetCommandPool,
+        ]
+    } else {
+        &[
+            FramePreparationStep::WaitFence,
+            FramePreparationStep::AcquireImage,
+        ]
+    }
+}
+
 pub struct RenderDevice {
     // Keeps the dynamically-loaded Vulkan loader alive for all instance/device calls.
     _entry: Entry,
@@ -252,12 +278,6 @@ impl RenderDevice {
             self.device
                 .wait_for_fences(&[in_flight_fence], true, u64::MAX)
                 .context("failed to wait for Vulkan in-flight fence")?;
-            self.device
-                .reset_fences(&[in_flight_fence])
-                .context("failed to reset Vulkan in-flight fence")?;
-            self.device
-                .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
-                .context("failed to reset Vulkan command pool")?;
         }
 
         let (image_index, suboptimal) = match unsafe {
@@ -279,6 +299,15 @@ impl RenderDevice {
                 ));
             }
         };
+
+        unsafe {
+            self.device
+                .reset_fences(&[in_flight_fence])
+                .context("failed to reset Vulkan in-flight fence")?;
+            self.device
+                .reset_command_pool(command_pool, vk::CommandPoolResetFlags::empty())
+                .context("failed to reset Vulkan command pool")?;
+        }
 
         let image_index = image_index as usize;
         let image_fence = self.swapchain.in_flight_fences[image_index];
@@ -534,6 +563,9 @@ fn pick_physical_device(
                         physical_device,
                         required_extensions,
                     )?;
+                    let (features, bda_features) =
+                        query_required_device_features(instance, physical_device);
+                    ensure_required_device_features(&features, &bda_features)?;
                     Ok(PhysicalDeviceSelection {
                         physical_device,
                         graphics_queue_family_index: queue_families.graphics_queue_family_index,
@@ -656,6 +688,38 @@ fn ensure_required_device_extensions(
     Ok(())
 }
 
+fn query_required_device_features(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> (
+    vk::PhysicalDeviceFeatures,
+    vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>,
+) {
+    let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_features);
+    unsafe {
+        instance.get_physical_device_features2(physical_device, &mut features2);
+    }
+    (features2.features, bda_features)
+}
+
+fn ensure_required_device_features(
+    features: &vk::PhysicalDeviceFeatures,
+    bda_features: &vk::PhysicalDeviceBufferDeviceAddressFeatures<'_>,
+) -> Result<()> {
+    if bda_features.buffer_device_address == vk::FALSE {
+        return Err(anyhow!(
+            "missing required Vulkan feature: bufferDeviceAddress"
+        ));
+    }
+    if features.shader_storage_image_extended_formats == vk::FALSE {
+        return Err(anyhow!(
+            "missing required Vulkan feature: shaderStorageImageExtendedFormats"
+        ));
+    }
+    Ok(())
+}
+
 fn has_layer(available_layers: &[vk::LayerProperties], target: &CStr) -> bool {
     available_layers.iter().any(|layer| {
         let name = unsafe { CStr::from_ptr(layer.layer_name.as_ptr()) };
@@ -666,4 +730,71 @@ fn has_layer(available_layers: &[vk::LayerProperties], target: &CStr) -> bool {
 fn vk_cstr_to_string(raw_name: &[i8]) -> String {
     let name = unsafe { CStr::from_ptr(raw_name.as_ptr()) };
     name.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_resources_reset_only_after_successful_acquire() {
+        assert_eq!(
+            frame_preparation_order(true),
+            &[
+                FramePreparationStep::WaitFence,
+                FramePreparationStep::AcquireImage,
+                FramePreparationStep::ResetFence,
+                FramePreparationStep::ResetCommandPool,
+            ]
+        );
+    }
+
+    #[test]
+    fn out_of_date_acquire_leaves_current_frame_fence_signaled() {
+        assert_eq!(
+            frame_preparation_order(false),
+            &[
+                FramePreparationStep::WaitFence,
+                FramePreparationStep::AcquireImage,
+            ]
+        );
+    }
+
+    #[test]
+    fn required_device_features_accept_supported_features() {
+        let features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+        let bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+
+        ensure_required_device_features(&features, &bda_features).unwrap();
+    }
+
+    #[test]
+    fn required_device_features_report_missing_bda() {
+        let features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+        let bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(false);
+
+        let error = ensure_required_device_features(&features, &bda_features).unwrap_err();
+
+        assert!(error.to_string().contains("bufferDeviceAddress"));
+    }
+
+    #[test]
+    fn required_device_features_report_missing_storage_image_extended_formats() {
+        let features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(false);
+        let bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+
+        let error = ensure_required_device_features(&features, &bda_features).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("shaderStorageImageExtendedFormats")
+        );
+    }
 }

@@ -80,13 +80,26 @@ impl RcMergePass {
             ty: vk::DescriptorType::STORAGE_BUFFER,
             descriptor_count: frame_count as u32,
         }];
-        let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
+        let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
-        let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
+        let descriptor_sets = match descriptor_pool.allocate(device, &layouts) {
+            Ok(sets) => sets,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
-        for &ds in &descriptor_sets {
+        for (set_idx, &ds) in descriptor_sets.iter().enumerate() {
             let buf_info = vk::DescriptorBufferInfo::default()
-                .buffer(rc_probes.write_buffer())
+                .buffer(rc_probes.write_buffer(set_idx))
                 .offset(0)
                 .range(vk::WHOLE_SIZE);
             let write = vk::WriteDescriptorSet::default()
@@ -102,14 +115,29 @@ impl RcMergePass {
             .offset(0)
             .size(std::mem::size_of::<RcMergePushConstants>() as u32);
 
-        let shader_module = create_shader_module(device, spirv_bytes)?;
-        let pipeline = ComputePipeline::new(
+        let shader_module = match create_shader_module(device, spirv_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
+        let pipeline = match ComputePipeline::new(
             device,
             shader_module,
             c"main",
             &[descriptor_set_layout],
             &[push_range],
-        )?;
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.destroy_shader_module(shader_module, None) };
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         Ok(Self {
@@ -128,7 +156,7 @@ impl RcMergePass {
     ) {
         let ds = self.descriptor_sets[frame_slot];
         let buf_info = vk::DescriptorBufferInfo::default()
-            .buffer(rc_probes.write_buffer())
+            .buffer(rc_probes.write_buffer(frame_slot))
             .offset(0)
             .range(vk::WHOLE_SIZE);
         let write = vk::WriteDescriptorSet::default()
@@ -238,10 +266,22 @@ mod tests {
     fn rc_merge_blends_by_world_probe_spacing() {
         let source =
             include_str!("../../../assets/shaders/passes/rc_merge.slang").replace("\r\n", "\n");
+        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
+            .replace("\r\n", "\n");
 
         assert!(
-            source.contains("float probe_spacing = 8.0 * lod_factor;"),
-            "merge shader should compute the world-space probe spacing"
+            shared.contains("float rc_probe_spacing(uint cascade_level)"),
+            "merge shader should use the shared world-space probe spacing helper"
+        );
+        assert!(
+            source.contains("float probe_spacing = rc_probe_spacing(push.cascade_level);"),
+            "merge shader should compute the world-space probe spacing through the shared helper"
+        );
+        assert!(
+            source.contains(
+                "float3 voxel_pos = rc_probe_world_position(probe_coord, push.cascade_level);"
+            ),
+            "merge shader should use the same probe_coord -> world mapping as trace"
         );
         assert!(
             source.contains("(own_data.w - probe_spacing) / (probe_spacing * 2.0)"),

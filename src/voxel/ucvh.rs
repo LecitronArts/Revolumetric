@@ -5,6 +5,14 @@ use crate::voxel::morton;
 use crate::voxel::occupancy::CascadedOccupancy;
 use glam::UVec3;
 
+fn div_ceil_uvec3(value: UVec3, divisor: u32) -> UVec3 {
+    UVec3::new(
+        value.x.div_ceil(divisor),
+        value.y.div_ceil(divisor),
+        value.z.div_ceil(divisor),
+    )
+}
+
 pub struct UcvhConfig {
     pub world_size: UVec3,
     pub brick_grid_size: UVec3,
@@ -13,7 +21,7 @@ pub struct UcvhConfig {
 
 impl UcvhConfig {
     pub fn new(world_size: UVec3) -> Self {
-        let brick_grid_size = world_size / BRICK_EDGE;
+        let brick_grid_size = div_ceil_uvec3(world_size, BRICK_EDGE);
         // Estimate capacity at 40% fill + headroom
         let total_bricks = brick_grid_size.x * brick_grid_size.y * brick_grid_size.z;
         let capacity = (total_bricks * 2 / 5).max(64);
@@ -90,8 +98,16 @@ impl Ucvh {
             return false;
         }
         let (bp, lp) = Self::decompose(pos);
-        let Some(id) = self.ensure_brick(bp) else {
-            return false;
+        let idx = self.l0_index(bp);
+        let id = match self.brick_map[idx] {
+            Some(id) => id,
+            None if cell.is_air() => return true,
+            None => {
+                let Some(id) = self.ensure_brick(bp) else {
+                    return false;
+                };
+                id
+            }
         };
         let m = morton::encode(lp.x, lp.y, lp.z);
         self.pool.set_material(id, m, cell);
@@ -185,6 +201,35 @@ mod tests {
     fn config_computes_grid_size() {
         let c = UcvhConfig::new(UVec3::splat(128));
         assert_eq!(c.brick_grid_size, UVec3::splat(16));
+    }
+
+    #[test]
+    fn non_aligned_world_size_can_write_last_valid_voxel() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(129, 9, 8)));
+        let cell = VoxelCell::new(1, 0, [0; 3]);
+
+        assert!(u.set_voxel(UVec3::new(128, 8, 7), cell));
+        assert_eq!(u.get_voxel(UVec3::new(128, 8, 7)).material, 1);
+    }
+
+    #[test]
+    fn tiny_world_size_can_write_valid_voxel() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(1, 1, 1)));
+        let cell = VoxelCell::new(1, 0, [0; 3]);
+
+        assert!(u.set_voxel(UVec3::ZERO, cell));
+        assert_eq!(u.get_voxel(UVec3::ZERO).material, 1);
+    }
+
+    #[test]
+    fn setting_air_in_missing_brick_does_not_allocate() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(9, 9, 9)));
+
+        assert!(u.set_voxel(UVec3::new(8, 8, 8), VoxelCell::AIR));
+        assert_eq!(u.allocated_brick_count(), 0);
+        assert_eq!(u.get_voxel(UVec3::new(8, 8, 8)).material, 0);
+        assert!(!u.is_hierarchy_dirty());
+        assert!(u.take_dirty_bricks().is_empty());
     }
 
     #[test]

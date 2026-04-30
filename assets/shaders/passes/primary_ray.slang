@@ -4,6 +4,7 @@
 
 #include "scene_common.slang"
 #include "voxel_traverse.slang"
+#include "material_common.slang"
 
 // Binding 0: Scene UBO (ConstantBuffer — maps to VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER)
 [[vk::binding(0, 0)]]
@@ -11,7 +12,8 @@ ConstantBuffer<SceneUniforms> scene_ubo;
 
 // Binding 1-3: G-buffer outputs
 [[vk::binding(1, 0)]]
-RWTexture2D<float4> gbuffer_pos;    // RGBA32F: xyz = voxel center, w = hit_t (-1 = miss)
+[[vk::image_format("rgba32f")]]
+RWTexture2D<float4> gbuffer_pos;    // RGBA32F: xyz = surface hit point, w = hit_t (-1 = miss)
 
 [[vk::binding(2, 0)]]
 [[vk::image_format("rgba8")]]
@@ -20,17 +22,6 @@ RWTexture2D<float4> gbuffer0;       // RGBA8_UNORM: rgb = base_color, a = ao
 [[vk::binding(3, 0)]]
 [[vk::image_format("rgba8ui")]]
 RWTexture2D<uint4> gbuffer1;        // RGBA8_UINT: r = normal_id, g = roughness, b = metallic, a = flags
-
-static const float3 MATERIAL_ALBEDO[8] = {
-    float3(0.7, 0.7, 0.7),       // 0: default
-    float3(0.65, 0.63, 0.60),    // 1: stone
-    float3(0.70, 0.20, 0.20),    // 2: red cloth
-    float3(0.20, 0.70, 0.20),    // 3: green cloth
-    float3(0.35, 0.42, 0.65),    // 4: blue
-    float3(0.55, 0.40, 0.30),    // 5: brick
-    float3(0.40, 0.37, 0.34),    // 6: dark stone
-    float3(0.45, 0.30, 0.18),    // 7: wood
-};
 
 // Binding 4-7: UCVH buffers (order matches trace_primary_ray parameter order)
 [[vk::binding(4, 0)]]
@@ -67,8 +58,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     if (hit.hit) {
         gbuffer_pos[tid.xy] = float4(hit.position, hit.t);
-        uint mat_id = voxel_material(hit.cell);
-        float3 albedo = MATERIAL_ALBEDO[min(mat_id, 7u)];
+        float3 albedo = material_cell_albedo(hit.cell);
         gbuffer0[tid.xy] = float4(albedo, 1.0);
         float3 emissive = voxel_emissive(hit.cell);
         uint3 emissive_raw = uint3(emissive * 255.0);

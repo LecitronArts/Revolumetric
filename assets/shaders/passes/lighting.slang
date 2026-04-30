@@ -11,6 +11,7 @@ ConstantBuffer<SceneUniforms> scene_ubo;
 
 // Binding 1-3: G-buffer inputs (read-only via RWTexture2D — no sampler needed)
 [[vk::binding(1, 0)]]
+[[vk::image_format("rgba32f")]]
 RWTexture2D<float4> gbuffer_pos;
 
 [[vk::binding(2, 0)]]
@@ -23,6 +24,7 @@ RWTexture2D<uint4> gbuffer1;
 
 // Binding 4: output image
 [[vk::binding(4, 0)]]
+[[vk::image_format("rgba8")]]
 RWTexture2D<float4> output_image;
 
 // Binding 5-8: UCVH buffers (for shadow ray tracing)
@@ -45,18 +47,19 @@ StructuredBuffer<float4> rc_probes;
 float3 compute_occupancy_gradient_normal(
     float3 position,
     float3 fallback_normal,
-    uint grid_dim_l0,
+    uint3 brick_grid_size,
+    uint3 world_size,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<BrickOccupancy> brick_occupancy
 ) {
     int3 ip = int3(floor(position));
     float3 grad;
-    grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, grid_dim_l0))
-           - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, grid_dim_l0));
-    grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, grid_dim_l0))
-           - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, grid_dim_l0));
-    grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, grid_dim_l0))
-           - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, grid_dim_l0));
+    grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
+           - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
+    grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
+           - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
+    grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
+           - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
     return (length(grad) > 0.001) ? normalize(-grad) : fallback_normal;
 }
 
@@ -64,12 +67,13 @@ float3 select_rc_normal(
     SceneUniforms scene,
     float3 position,
     float3 axis_normal,
-    uint grid_dim_l0,
+    uint3 brick_grid_size,
+    uint3 world_size,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<BrickOccupancy> brick_occupancy
 ) {
     if (scene.rc_normal_strategy == RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT) {
-        float3 gradient_normal = compute_occupancy_gradient_normal(position, axis_normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
+        float3 gradient_normal = compute_occupancy_gradient_normal(position, axis_normal, brick_grid_size, world_size, hierarchy_l0, brick_occupancy);
         if (dot(gradient_normal, axis_normal) > 0.5) {
             return gradient_normal;
         }
@@ -136,20 +140,24 @@ void main(uint3 tid : SV_DispatchThreadID) {
     // Indirect: RC probes or hemisphere fallback
     float3 ambient;
     if (scene.rc_enabled > 0u) {
-        uint grid_dim_l0 = ucvh_config[0].brick_grid_size.x;
-        float3 rc_normal = select_rc_normal(scene, position, normal, grid_dim_l0, hierarchy_l0, brick_occupancy);
+        uint3 brick_grid_size = ucvh_config[0].brick_grid_size.xyz;
+        uint3 world_size = ucvh_config[0].world_size.xyz;
+        float3 rc_normal = select_rc_normal(scene, position, normal, brick_grid_size, world_size, hierarchy_l0, brick_occupancy);
         uint3 c0_grid = uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z);
-        float3 indirect = integrate_probe(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid);
+        float3 indirect = integrate_probe_quality(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid, scene.rc_probe_quality);
         ambient = base_color * indirect;
     } else {
         ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
     }
     float3 hdr_color = diffuse + ambient;
-
-    // DEBUG: uncomment one of these to visualize RC components
-    // hdr_color = ambient;                    // RC indirect only
-    // hdr_color = float3(normal * 0.5 + 0.5); // normal visualization
-    // hdr_color = diffuse;                    // direct sun only
+    uint debug_view = lighting_debug_view(scene.lighting_flags);
+    if (debug_view == LIGHTING_DEBUG_VIEW_RC_INDIRECT) {
+        hdr_color = ambient;
+    } else if (debug_view == LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE) {
+        hdr_color = diffuse;
+    } else if (debug_view == LIGHTING_DEBUG_VIEW_NORMAL) {
+        hdr_color = float3(normal * 0.5 + 0.5);
+    }
 
     // Tonemap (ACES Filmic) + gamma correction
     float3 mapped = aces_tonemap(hdr_color);

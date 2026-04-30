@@ -13,6 +13,7 @@ struct PushConstants {
 PushConstants pc;
 
 [[vk::binding(0, 0)]]
+[[vk::image_format("rgba8")]]
 RWTexture2D<float4> output_image;
 
 [shader("compute")]

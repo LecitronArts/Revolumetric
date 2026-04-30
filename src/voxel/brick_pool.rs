@@ -9,6 +9,7 @@ pub struct BrickPool {
     occupancy: Vec<BrickOccupancy>,
     materials: Vec<VoxelCell>, // flat: brick_id * 512 + morton_index
     free_list: Vec<BrickId>,
+    allocated: Vec<bool>,
     capacity: u32,
     allocated_count: u32,
 }
@@ -20,24 +21,30 @@ impl BrickPool {
             occupancy: vec![BrickOccupancy::zeroed(); capacity as usize],
             materials: vec![VoxelCell::AIR; total_voxels],
             free_list: (0..capacity).rev().collect(),
+            allocated: vec![false; capacity as usize],
             capacity,
             allocated_count: 0,
         }
     }
 
     pub fn allocate(&mut self) -> Option<BrickId> {
-        self.free_list.pop().inspect(|_| {
+        self.free_list.pop().inspect(|id| {
+            self.allocated[*id as usize] = true;
             self.allocated_count += 1;
         })
     }
 
-    pub fn free(&mut self, id: BrickId) {
-        debug_assert!((id as usize) < self.occupancy.len());
+    pub fn free(&mut self, id: BrickId) -> bool {
+        if id >= self.capacity || !self.allocated[id as usize] {
+            return false;
+        }
+        self.allocated[id as usize] = false;
         self.occupancy[id as usize] = BrickOccupancy::zeroed();
         let base = id as usize * BRICK_VOLUME;
         self.materials[base..base + BRICK_VOLUME].fill(VoxelCell::AIR);
         self.free_list.push(id);
         self.allocated_count -= 1;
+        true
     }
 
     pub fn write_brick(&mut self, id: BrickId, data: &BrickData) {
@@ -108,6 +115,41 @@ mod tests {
         assert_eq!(pool.allocated_count(), 1);
         let id2 = pool.allocate().unwrap();
         assert_eq!(id2, id0);
+    }
+
+    #[test]
+    fn double_free_is_rejected_without_corrupting_free_list() {
+        let mut pool = BrickPool::new(2);
+        let id = pool.allocate().unwrap();
+
+        assert!(pool.free(id));
+        assert!(!pool.free(id));
+        assert_eq!(pool.allocated_count(), 0);
+
+        let a = pool.allocate().unwrap();
+        let b = pool.allocate().unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn free_rejects_never_allocated_id() {
+        let mut pool = BrickPool::new(2);
+
+        assert!(!pool.free(1));
+        assert_eq!(pool.allocated_count(), 0);
+        assert_eq!(pool.allocate(), Some(0));
+        assert_eq!(pool.allocate(), Some(1));
+    }
+
+    #[test]
+    fn free_rejects_out_of_bounds_id() {
+        let mut pool = BrickPool::new(2);
+
+        assert!(!pool.free(2));
+        assert!(!pool.free(u32::MAX));
+        assert_eq!(pool.allocated_count(), 0);
+        assert_eq!(pool.allocate(), Some(0));
+        assert_eq!(pool.allocate(), Some(1));
     }
 
     #[test]

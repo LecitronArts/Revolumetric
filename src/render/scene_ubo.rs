@@ -8,11 +8,37 @@ use crate::render::buffer::GpuBuffer;
 
 pub const LIGHTING_FLAG_SHADOWS_ENABLED: u32 = 1 << 0;
 pub const LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS: u32 = 1 << 1;
+pub const LIGHTING_DEBUG_VIEW_SHIFT: u32 = 28;
+pub const LIGHTING_DEBUG_VIEW_MASK: u32 = 0xF << LIGHTING_DEBUG_VIEW_SHIFT;
+pub const LIGHTING_DEBUG_VIEW_FINAL: u32 = 0;
+pub const LIGHTING_DEBUG_VIEW_RC_INDIRECT: u32 = 1;
+pub const LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE: u32 = 2;
+pub const LIGHTING_DEBUG_VIEW_NORMAL: u32 = 3;
 
 pub const RC_NORMAL_STRATEGY_AXIS_NORMAL: u32 = 0;
 pub const RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT: u32 = 1;
 
 pub const RC_PROBE_QUALITY_FULL: u32 = 0;
+pub const RC_PROBE_QUALITY_FAST: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightingDebugView {
+    Final,
+    RcIndirect,
+    DirectDiffuse,
+    Normal,
+}
+
+impl LightingDebugView {
+    pub fn as_gpu_value(self) -> u32 {
+        match self {
+            Self::Final => LIGHTING_DEBUG_VIEW_FINAL,
+            Self::RcIndirect => LIGHTING_DEBUG_VIEW_RC_INDIRECT,
+            Self::DirectDiffuse => LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE,
+            Self::Normal => LIGHTING_DEBUG_VIEW_NORMAL,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RcNormalStrategy {
@@ -32,12 +58,14 @@ impl RcNormalStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RcProbeQuality {
     Full,
+    Fast,
 }
 
 impl RcProbeQuality {
     pub fn as_gpu_value(self) -> u32 {
         match self {
             Self::Full => RC_PROBE_QUALITY_FULL,
+            Self::Fast => RC_PROBE_QUALITY_FAST,
         }
     }
 }
@@ -46,6 +74,7 @@ impl RcProbeQuality {
 pub struct LightingSettings {
     pub shadows_enabled: bool,
     pub skip_backface_shadows: bool,
+    pub debug_view: LightingDebugView,
     pub rc_normal_strategy: RcNormalStrategy,
     pub rc_probe_quality: RcProbeQuality,
 }
@@ -68,6 +97,7 @@ impl Default for LightingSettings {
         Self {
             shadows_enabled: true,
             skip_backface_shadows: false,
+            debug_view: LightingDebugView::Final,
             rc_normal_strategy: RcNormalStrategy::AxisNormal,
             rc_probe_quality: RcProbeQuality::Full,
         }
@@ -82,11 +112,13 @@ impl LightingSettings {
     pub fn from_env_report() -> LightingSettingsParseResult {
         let shadows = std::env::var("REVOLUMETRIC_LIGHTING_SHADOWS").ok();
         let skip_backface = std::env::var("REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS").ok();
+        let debug_view = std::env::var("REVOLUMETRIC_LIGHTING_DEBUG_VIEW").ok();
         let normal_strategy = std::env::var("REVOLUMETRIC_RC_NORMAL_STRATEGY").ok();
         let probe_quality = std::env::var("REVOLUMETRIC_RC_PROBE_QUALITY").ok();
         Self::from_values_report(
             shadows.as_deref(),
             skip_backface.as_deref(),
+            debug_view.as_deref(),
             normal_strategy.as_deref(),
             probe_quality.as_deref(),
         )
@@ -95,12 +127,14 @@ impl LightingSettings {
     pub fn from_values(
         shadows: Option<&str>,
         skip_backface_shadows: Option<&str>,
+        debug_view: Option<&str>,
         rc_normal_strategy: Option<&str>,
         rc_probe_quality: Option<&str>,
     ) -> Self {
         Self::from_values_report(
             shadows,
             skip_backface_shadows,
+            debug_view,
             rc_normal_strategy,
             rc_probe_quality,
         )
@@ -110,6 +144,7 @@ impl LightingSettings {
     pub fn from_values_report(
         shadows: Option<&str>,
         skip_backface_shadows: Option<&str>,
+        debug_view: Option<&str>,
         rc_normal_strategy: Option<&str>,
         rc_probe_quality: Option<&str>,
     ) -> LightingSettingsParseResult {
@@ -133,6 +168,14 @@ impl LightingSettings {
             &mut warnings,
         );
         apply_optional_override(
+            &mut settings.debug_view,
+            debug_view,
+            "REVOLUMETRIC_LIGHTING_DEBUG_VIEW",
+            "final|off|rc|indirect|ambient|diffuse|direct|normal",
+            parse_lighting_debug_view,
+            &mut warnings,
+        );
+        apply_optional_override(
             &mut settings.rc_normal_strategy,
             rc_normal_strategy,
             "REVOLUMETRIC_RC_NORMAL_STRATEGY",
@@ -144,7 +187,7 @@ impl LightingSettings {
             &mut settings.rc_probe_quality,
             rc_probe_quality,
             "REVOLUMETRIC_RC_PROBE_QUALITY",
-            "full",
+            "full|fast|cheap|low",
             parse_rc_probe_quality,
             &mut warnings,
         );
@@ -160,6 +203,8 @@ impl LightingSettings {
         if self.skip_backface_shadows {
             flags |= LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS;
         }
+        flags |= (self.debug_view.as_gpu_value() << LIGHTING_DEBUG_VIEW_SHIFT)
+            & LIGHTING_DEBUG_VIEW_MASK;
         flags
     }
 }
@@ -173,6 +218,24 @@ fn parse_bool_value(value: &str) -> Option<bool> {
         || value.eq_ignore_ascii_case("off")
     {
         Some(false)
+    } else {
+        None
+    }
+}
+
+fn parse_lighting_debug_view(value: &str) -> Option<LightingDebugView> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("final") || value.eq_ignore_ascii_case("off") {
+        Some(LightingDebugView::Final)
+    } else if value.eq_ignore_ascii_case("rc")
+        || value.eq_ignore_ascii_case("indirect")
+        || value.eq_ignore_ascii_case("ambient")
+    {
+        Some(LightingDebugView::RcIndirect)
+    } else if value.eq_ignore_ascii_case("diffuse") || value.eq_ignore_ascii_case("direct") {
+        Some(LightingDebugView::DirectDiffuse)
+    } else if value.eq_ignore_ascii_case("normal") {
+        Some(LightingDebugView::Normal)
     } else {
         None
     }
@@ -214,8 +277,14 @@ fn parse_rc_normal_strategy(value: &str) -> Option<RcNormalStrategy> {
 }
 
 fn parse_rc_probe_quality(value: &str) -> Option<RcProbeQuality> {
-    if value.trim().eq_ignore_ascii_case("full") {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("full") {
         Some(RcProbeQuality::Full)
+    } else if value.eq_ignore_ascii_case("fast")
+        || value.eq_ignore_ascii_case("cheap")
+        || value.eq_ignore_ascii_case("low")
+    {
+        Some(RcProbeQuality::Fast)
     } else {
         None
     }
@@ -388,6 +457,7 @@ mod tests {
 
         assert!(settings.shadows_enabled);
         assert!(!settings.skip_backface_shadows);
+        assert_eq!(settings.debug_view, LightingDebugView::Final);
         assert_eq!(settings.rc_normal_strategy, RcNormalStrategy::AxisNormal);
         assert_eq!(settings.rc_probe_quality, RcProbeQuality::Full);
     }
@@ -413,7 +483,7 @@ mod tests {
 
     #[test]
     fn lighting_settings_can_enable_backface_shadow_skip_explicitly() {
-        let settings = LightingSettings::from_values(None, Some("on"), None, None);
+        let settings = LightingSettings::from_values(None, Some("on"), None, None, None);
         let mut uniforms = GpuSceneUniforms::zeroed();
 
         uniforms.apply_lighting_settings(settings);
@@ -429,6 +499,7 @@ mod tests {
         let settings = LightingSettings {
             shadows_enabled: true,
             skip_backface_shadows: true,
+            debug_view: LightingDebugView::Final,
             rc_normal_strategy: RcNormalStrategy::AxisNormal,
             rc_probe_quality: RcProbeQuality::Full,
         };
@@ -458,7 +529,7 @@ mod tests {
 
     #[test]
     fn lighting_settings_parse_bool_overrides_case_insensitively() {
-        let settings = LightingSettings::from_values(Some("Off"), Some("FALSE"), None, None);
+        let settings = LightingSettings::from_values(Some("Off"), Some("FALSE"), None, None, None);
 
         assert!(!settings.shadows_enabled);
         assert!(!settings.skip_backface_shadows);
@@ -466,9 +537,14 @@ mod tests {
 
     #[test]
     fn lighting_settings_parse_strategy_overrides() {
-        let axis = LightingSettings::from_values(None, None, Some("axis"), None);
-        let gradient =
-            LightingSettings::from_values(None, None, Some("occupancy-gradient"), Some("full"));
+        let axis = LightingSettings::from_values(None, None, None, Some("axis"), None);
+        let gradient = LightingSettings::from_values(
+            None,
+            None,
+            None,
+            Some("occupancy-gradient"),
+            Some("full"),
+        );
 
         assert_eq!(axis.rc_normal_strategy, RcNormalStrategy::AxisNormal);
         assert_eq!(
@@ -479,16 +555,107 @@ mod tests {
     }
 
     #[test]
+    fn lighting_settings_parse_fast_probe_quality() {
+        let settings = LightingSettings::from_values(None, None, None, None, Some("fast"));
+
+        assert_eq!(settings.rc_probe_quality, RcProbeQuality::Fast);
+    }
+
+    #[test]
+    fn lighting_settings_encode_fast_probe_quality() {
+        let settings = LightingSettings {
+            shadows_enabled: true,
+            skip_backface_shadows: false,
+            debug_view: LightingDebugView::Final,
+            rc_normal_strategy: RcNormalStrategy::AxisNormal,
+            rc_probe_quality: RcProbeQuality::Fast,
+        };
+
+        let uniforms = build_scene_uniforms(SceneUniformInputs {
+            pixel_to_ray: glam::Mat4::IDENTITY,
+            resolution: [640, 480],
+            sun_direction: glam::Vec3::Y,
+            sun_intensity: glam::Vec3::ONE,
+            sky_color: [0.4, 0.5, 0.7],
+            ground_color: [0.15, 0.1, 0.08],
+            time: 0.0,
+            rc_enabled: true,
+            lighting_settings: settings,
+        });
+
+        assert_eq!(uniforms.rc_probe_quality, RC_PROBE_QUALITY_FAST);
+    }
+
+    #[test]
+    fn lighting_settings_parse_debug_view_aliases() {
+        let final_view = LightingSettings::from_values(None, None, Some("final"), None, None);
+        let rc = LightingSettings::from_values(None, None, Some("rc"), None, None);
+        let ambient = LightingSettings::from_values(None, None, Some("ambient"), None, None);
+        let indirect = LightingSettings::from_values(None, None, Some("indirect"), None, None);
+        let diffuse = LightingSettings::from_values(None, None, Some("diffuse"), None, None);
+        let direct = LightingSettings::from_values(None, None, Some("direct"), None, None);
+        let normal = LightingSettings::from_values(None, None, Some("normal"), None, None);
+
+        assert_eq!(final_view.debug_view, LightingDebugView::Final);
+        assert_eq!(rc.debug_view, LightingDebugView::RcIndirect);
+        assert_eq!(ambient.debug_view, LightingDebugView::RcIndirect);
+        assert_eq!(indirect.debug_view, LightingDebugView::RcIndirect);
+        assert_eq!(diffuse.debug_view, LightingDebugView::DirectDiffuse);
+        assert_eq!(direct.debug_view, LightingDebugView::DirectDiffuse);
+        assert_eq!(normal.debug_view, LightingDebugView::Normal);
+    }
+
+    #[test]
+    fn lighting_settings_encode_debug_view_without_colliding_with_boolean_flags() {
+        let cases = [
+            (LightingDebugView::Final, LIGHTING_DEBUG_VIEW_FINAL),
+            (
+                LightingDebugView::RcIndirect,
+                LIGHTING_DEBUG_VIEW_RC_INDIRECT,
+            ),
+            (
+                LightingDebugView::DirectDiffuse,
+                LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE,
+            ),
+            (LightingDebugView::Normal, LIGHTING_DEBUG_VIEW_NORMAL),
+        ];
+
+        for (debug_view, expected_gpu_value) in cases {
+            let settings = LightingSettings {
+                shadows_enabled: true,
+                skip_backface_shadows: true,
+                debug_view,
+                rc_normal_strategy: RcNormalStrategy::AxisNormal,
+                rc_probe_quality: RcProbeQuality::Full,
+            };
+
+            assert_eq!(
+                settings.gpu_flags() & LIGHTING_DEBUG_VIEW_MASK,
+                expected_gpu_value << LIGHTING_DEBUG_VIEW_SHIFT
+            );
+            assert_eq!(
+                settings.gpu_flags() & LIGHTING_FLAG_SHADOWS_ENABLED,
+                LIGHTING_FLAG_SHADOWS_ENABLED
+            );
+            assert_eq!(
+                settings.gpu_flags() & LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS,
+                LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS
+            );
+        }
+    }
+
+    #[test]
     fn lighting_settings_reports_invalid_overrides_without_changing_defaults() {
         let result = LightingSettings::from_values_report(
             Some("maybe"),
             Some("sometimes"),
+            Some("beauty"),
             Some("smooth"),
-            Some("cheap"),
+            Some("invalid-quality"),
         );
 
         assert_eq!(result.settings, LightingSettings::default());
-        assert_eq!(result.warnings.len(), 4);
+        assert_eq!(result.warnings.len(), 5);
         assert_eq!(result.warnings[0].variable, "REVOLUMETRIC_LIGHTING_SHADOWS");
         assert_eq!(
             result.warnings[1].variable,
@@ -496,8 +663,12 @@ mod tests {
         );
         assert_eq!(
             result.warnings[2].variable,
+            "REVOLUMETRIC_LIGHTING_DEBUG_VIEW"
+        );
+        assert_eq!(
+            result.warnings[3].variable,
             "REVOLUMETRIC_RC_NORMAL_STRATEGY"
         );
-        assert_eq!(result.warnings[3].variable, "REVOLUMETRIC_RC_PROBE_QUALITY");
+        assert_eq!(result.warnings[4].variable, "REVOLUMETRIC_RC_PROBE_QUALITY");
     }
 }

@@ -44,10 +44,23 @@ impl TestPatternPass {
             ty: vk::DescriptorType::STORAGE_IMAGE,
             descriptor_count: 1,
         }];
-        let descriptor_pool = DescriptorPool::new(device, 1, &pool_sizes)?;
-        let descriptor_set = descriptor_pool.allocate(device, &[descriptor_set_layout])?[0];
+        let descriptor_pool = match DescriptorPool::new(device, 1, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
+        let descriptor_set = match descriptor_pool.allocate(device, &[descriptor_set_layout]) {
+            Ok(sets) => sets[0],
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
-        let output_image = GpuImage::new(
+        let output_image = match GpuImage::new(
             device,
             allocator,
             &GpuImageDesc {
@@ -59,7 +72,14 @@ impl TestPatternPass {
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "test_pattern_output",
             },
-        )?;
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         // Update descriptor set to point to output image
         let image_info = vk::DescriptorImageInfo::default()
@@ -73,19 +93,36 @@ impl TestPatternPass {
         unsafe { device.update_descriptor_sets(&[write], &[]) };
 
         // Pipeline
-        let shader_module = create_shader_module(device, spirv_bytes)?;
+        let shader_module = match create_shader_module(device, spirv_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                output_image.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let push_constant_ranges = [vk::PushConstantRange {
             stage_flags: vk::ShaderStageFlags::COMPUTE,
             offset: 0,
             size: std::mem::size_of::<TestPatternPushConstants>() as u32,
         }];
-        let pipeline = ComputePipeline::new(
+        let pipeline = match ComputePipeline::new(
             device,
             shader_module,
             c"main",
             &[descriptor_set_layout],
             &push_constant_ranges,
-        )?;
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.destroy_shader_module(shader_module, None) };
+                output_image.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         Ok(Self {

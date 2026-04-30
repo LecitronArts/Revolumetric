@@ -5,7 +5,7 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::rc_probe_buffer::{self, RcProbeBuffer};
-use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 #[repr(C)]
@@ -121,9 +121,22 @@ impl RcTracePass {
                 descriptor_count: 6 * frame_count as u32,
             },
         ];
-        let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
+        let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
-        let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
+        let descriptor_sets = match descriptor_pool.allocate(device, &layouts) {
+            Ok(sets) => sets,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         let ucvh_buffers = [
             &ucvh_gpu.config_buffer,
@@ -136,7 +149,7 @@ impl RcTracePass {
             let ubo_info = vk::DescriptorBufferInfo::default()
                 .buffer(scene_ubo.buffer_handle(set_idx))
                 .offset(0)
-                .range(176);
+                .range(std::mem::size_of::<GpuSceneUniforms>() as u64);
 
             let ubo_write = vk::WriteDescriptorSet::default()
                 .dst_set(ds)
@@ -167,7 +180,7 @@ impl RcTracePass {
                 .collect();
 
             let read_info = vk::DescriptorBufferInfo::default()
-                .buffer(rc_probes.read_buffer())
+                .buffer(rc_probes.read_buffer(set_idx))
                 .offset(0)
                 .range(vk::WHOLE_SIZE);
             let read_write = vk::WriteDescriptorSet::default()
@@ -177,7 +190,7 @@ impl RcTracePass {
                 .buffer_info(std::slice::from_ref(&read_info));
 
             let write_info = vk::DescriptorBufferInfo::default()
-                .buffer(rc_probes.write_buffer())
+                .buffer(rc_probes.write_buffer(set_idx))
                 .offset(0)
                 .range(vk::WHOLE_SIZE);
             let write_write = vk::WriteDescriptorSet::default()
@@ -198,14 +211,29 @@ impl RcTracePass {
             .offset(0)
             .size(std::mem::size_of::<RcTracePushConstants>() as u32);
 
-        let shader_module = create_shader_module(device, spirv_bytes)?;
-        let pipeline = ComputePipeline::new(
+        let shader_module = match create_shader_module(device, spirv_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
+        let pipeline = match ComputePipeline::new(
             device,
             shader_module,
             c"main",
             &[descriptor_set_layout],
             &[push_range],
-        )?;
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.destroy_shader_module(shader_module, None) };
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         Ok(Self {
@@ -224,7 +252,7 @@ impl RcTracePass {
     ) {
         let ds = self.descriptor_sets[frame_slot];
         let read_info = vk::DescriptorBufferInfo::default()
-            .buffer(rc_probes.read_buffer())
+            .buffer(rc_probes.read_buffer(frame_slot))
             .offset(0)
             .range(vk::WHOLE_SIZE);
         let read_write = vk::WriteDescriptorSet::default()
@@ -234,7 +262,7 @@ impl RcTracePass {
             .buffer_info(std::slice::from_ref(&read_info));
 
         let write_info = vk::DescriptorBufferInfo::default()
-            .buffer(rc_probes.write_buffer())
+            .buffer(rc_probes.write_buffer(frame_slot))
             .offset(0)
             .range(vk::WHOLE_SIZE);
         let write_write = vk::WriteDescriptorSet::default()
@@ -311,36 +339,91 @@ impl RcTracePass {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn rc_trace_relocates_c0_probes_before_inside_geo_rejection() {
+    fn rc_trace_temporally_blends_radiance_but_keeps_current_distance() {
+        let source =
+            include_str!("../../../assets/shaders/passes/rc_trace.slang").replace("\r\n", "\n");
+
+        assert!(source.contains("float4 rc_temporal_blend(float4 current, float4 previous)"));
+        assert!(source.contains(
+            "return float4(lerp(previous.xyz, current.xyz, RC_TEMPORAL_BLEND), current.w);"
+        ));
+        assert!(source.contains("probe_write[idx] = rc_temporal_blend(result, probe_read[idx]);"));
+    }
+
+    #[test]
+    fn rc_trace_uses_shared_material_helpers() {
+        let source =
+            include_str!("../../../assets/shaders/passes/rc_trace.slang").replace("\r\n", "\n");
+
+        assert!(source.contains("#include \"material_common.slang\""));
+        assert!(source.contains("material_emissive(hit.cell)"));
+        assert!(source.contains("material_cell_albedo(hit.cell)"));
+        assert!(!source.contains("if (mat_id == 1u)"));
+    }
+
+    #[test]
+    fn rc_trace_uses_the_same_grid_center_positions_as_sampling_paths() {
         let source =
             include_str!("../../../assets/shaders/passes/rc_trace.slang").replace("\r\n", "\n");
         let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
             .replace("\r\n", "\n");
-        let relocation = source
-            .find("if (push.cascade_level == 0u) {\n        float3 relocated_probe_pos;\n        if (rc_find_nearest_empty_probe_position")
-            .expect("rc_trace should relocate C0 probes near solid geometry");
-        let higher_cascade_offset = source
-            .find("} else {\n        probe_pos += rc_geo_offset")
-            .expect("rc_trace should keep geo offsets for higher cascades");
+
+        assert!(
+            shared
+                .contains("float3 rc_probe_world_position(uint3 probe_coord, uint cascade_level)"),
+            "trace and merge should share the same probe_coord -> world position mapping"
+        );
+        assert!(
+            shared.contains("float3 rc_world_to_c0_grid_position(float3 world_pos)"),
+            "lighting should share the inverse C0 world -> grid mapping"
+        );
+        assert!(
+            source.contains(
+                "float3 probe_pos = rc_probe_world_position(probe_coord, push.cascade_level);"
+            ),
+            "trace should use the shared probe position helper"
+        );
+        assert!(
+            !source.contains("rc_find_nearest_empty_probe_position"),
+            "C0 trace must not relocate a probe slot away from the world position used by integrate_probe and rc_merge"
+        );
+
         let inside_geo_rejection = source
             .find("if (!rc_outside_geo(probe_pos")
             .expect("rc_trace should still reject probes trapped inside geometry");
 
         assert!(
-            relocation < inside_geo_rejection,
-            "probe relocation must run before inside-geometry rejection"
+            source.find("float3 probe_pos = rc_probe_world_position") < Some(inside_geo_rejection),
+            "trace should reject inside-geometry probes at the same grid-center position used by merge"
         );
         assert!(
-            higher_cascade_offset < inside_geo_rejection,
-            "higher-cascade geo offset must run before inside-geometry rejection"
+            !source.contains("rc_geo_offset"),
+            "trace must not offset C1/C2 probe origins unless merge uses the same offset positions"
+        );
+    }
+
+    #[test]
+    fn rc_geometry_queries_use_uploaded_world_dimensions() {
+        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
+            .replace("\r\n", "\n");
+        let trace =
+            include_str!("../../../assets/shaders/passes/rc_trace.slang").replace("\r\n", "\n");
+
+        assert!(
+            shared.contains("uint3 brick_grid_size,\n                    uint3 world_size"),
+            "RC geometry queries should receive uploaded UCVH dimensions"
         );
         assert!(
-            shared.contains("rc_probe_pos_inside_bounds(candidate, bounds_min, bounds_max)"),
-            "relocation candidates must stay inside the same C0 bounds used by rc_trace"
+            !shared.contains("int3(128)"),
+            "RC geometry queries must not hard-code a 128^3 world"
         );
         assert!(
-            shared.contains("best_dist_sq"),
-            "relocation should choose the nearest valid candidate, not the first loop hit"
+            trace.contains("uint3 brick_grid_size = ucvh_config[0].brick_grid_size.xyz;"),
+            "rc_trace should pass the uploaded brick grid dimensions"
+        );
+        assert!(
+            trace.contains("uint3 world_size = ucvh_config[0].world_size.xyz;"),
+            "rc_trace should pass the uploaded world dimensions"
         );
     }
 }

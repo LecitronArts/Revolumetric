@@ -323,19 +323,19 @@ impl RevolumetricApp {
                                 }
                                 rc_probes.record_clear(renderer.device(), frame.command_buffer);
                                 // Barrier: TRANSFER → COMPUTE
-                                let barrier = vk::BufferMemoryBarrier::default()
-                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                    .dst_access_mask(
-                                        vk::AccessFlags::SHADER_READ
-                                            | vk::AccessFlags::SHADER_WRITE,
-                                    )
-                                    .buffer(rc_probes.write_buffer())
-                                    .size(vk::WHOLE_SIZE);
-                                let barrier2 = vk::BufferMemoryBarrier::default()
-                                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                                    .buffer(rc_probes.read_buffer())
-                                    .size(vk::WHOLE_SIZE);
+                                let barriers: Vec<_> = rc_probes
+                                    .all_buffer_handles()
+                                    .map(|buffer| {
+                                        vk::BufferMemoryBarrier::default()
+                                            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                                            .dst_access_mask(
+                                                vk::AccessFlags::SHADER_READ
+                                                    | vk::AccessFlags::SHADER_WRITE,
+                                            )
+                                            .buffer(buffer)
+                                            .size(vk::WHOLE_SIZE)
+                                    })
+                                    .collect();
                                 unsafe {
                                     renderer.device().cmd_pipeline_barrier(
                                         frame.command_buffer,
@@ -343,7 +343,7 @@ impl RevolumetricApp {
                                         vk::PipelineStageFlags::COMPUTE_SHADER,
                                         vk::DependencyFlags::empty(),
                                         &[],
-                                        &[barrier, barrier2],
+                                        &barriers,
                                         &[],
                                     );
                                 }
@@ -417,7 +417,7 @@ impl RevolumetricApp {
                                 .dst_access_mask(
                                     vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                                 )
-                                .buffer(rc_probes.write_buffer())
+                                .buffer(rc_probes.write_buffer(frame.frame_slot))
                                 .size(vk::WHOLE_SIZE);
                             unsafe {
                                 renderer.device().cmd_pipeline_barrier(
@@ -452,7 +452,7 @@ impl RevolumetricApp {
                                 rc_merge.record_step(
                                     renderer.device(),
                                     frame.command_buffer,
-                                    rc_probes.write_buffer(),
+                                    rc_probes.write_buffer(frame.frame_slot),
                                     step_index,
                                 );
                                 if let Some(profiler) = profiler {
@@ -469,7 +469,7 @@ impl RevolumetricApp {
                             let barrier = vk::BufferMemoryBarrier::default()
                                 .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                                 .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                                .buffer(rc_probes.write_buffer())
+                                .buffer(rc_probes.write_buffer(frame.frame_slot))
                                 .size(vk::WHOLE_SIZE);
                             unsafe {
                                 renderer.device().cmd_pipeline_barrier(
@@ -616,10 +616,11 @@ impl RevolumetricApp {
 
                 graph.compile()?;
                 graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
+                let frame_slot = frame.frame_slot;
                 renderer.end_frame(frame)?;
 
                 if let Some(rc_probes) = &mut self.rc_probes {
-                    rc_probes.swap();
+                    rc_probes.swap_slot(frame_slot);
                 }
             }
         }
@@ -814,9 +815,16 @@ impl ApplicationHandler for RevolumetricApp {
         // Create RC probe buffer (before lighting pass, since lighting needs it)
         if self.rc_probes.is_none() {
             let renderer = self.renderer.as_ref().unwrap();
-            match RcProbeBuffer::new(renderer.device(), renderer.allocator()) {
+            match RcProbeBuffer::new(
+                renderer.device(),
+                renderer.allocator(),
+                renderer.frame_slot_count(),
+            ) {
                 Ok(buf) => {
-                    tracing::info!("created RC probe buffer (double-buffered, ~12 MB)");
+                    tracing::info!(
+                        frame_slots = buf.frame_slot_count(),
+                        "created RC probe buffer (per-frame double-buffered)"
+                    );
                     self.rc_probes = Some(buf);
                 }
                 Err(e) => tracing::error!(%e, "failed to create RC probe buffer"),
@@ -886,6 +894,8 @@ impl ApplicationHandler for RevolumetricApp {
                         }
                         Err(e) => tracing::error!(%e, "failed to create RC trace pass"),
                     }
+                } else {
+                    tracing::warn!("rc_trace.spv is empty - slangc may not be installed");
                 }
             }
         }
@@ -908,6 +918,8 @@ impl ApplicationHandler for RevolumetricApp {
                         }
                         Err(e) => tracing::error!(%e, "failed to create RC merge pass"),
                     }
+                } else {
+                    tracing::warn!("rc_merge.spv is empty - slangc may not be installed");
                 }
             }
         }

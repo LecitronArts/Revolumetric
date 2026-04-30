@@ -31,16 +31,27 @@ impl GpuBuffer {
 
         let requirements = unsafe { device.get_buffer_memory_requirements(handle) };
 
-        let allocation = allocator.allocate(&AllocationCreateDesc {
+        let allocation = match allocator.allocate(&AllocationCreateDesc {
             name,
             requirements,
             location,
             linear: true,
             allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-        })?;
+        }) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { device.destroy_buffer(handle, None) };
+                return Err(error).context("failed to allocate buffer memory");
+            }
+        };
 
-        unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) }
-            .context("failed to bind buffer memory")?;
+        if let Err(error) =
+            unsafe { device.bind_buffer_memory(handle, allocation.memory(), allocation.offset()) }
+        {
+            unsafe { device.destroy_buffer(handle, None) };
+            let _ = allocator.free(allocation);
+            return Err(error).context("failed to bind buffer memory");
+        }
 
         Ok(Self {
             handle,

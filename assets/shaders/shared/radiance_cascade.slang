@@ -2,6 +2,7 @@
 // Radiance Cascade shared helpers.
 // Ported from Shadertoy M3ycWt (common.glsl).
 
+#include "scene_common.slang"
 #include "voxel_common.slang"
 
 static const float RC_PI = 3.141592653;
@@ -63,6 +64,18 @@ void get_face_tbn(uint face, out float3 normal, out float3 tangent, out float3 b
 
 // --- Probe buffer indexing ---
 
+float rc_probe_spacing(uint cascade_level) {
+    return 8.0 * float(1u << cascade_level);
+}
+
+float3 rc_probe_world_position(uint3 probe_coord, uint cascade_level) {
+    return (float3(probe_coord) + 0.5) * rc_probe_spacing(cascade_level);
+}
+
+float3 rc_world_to_c0_grid_position(float3 world_pos) {
+    return world_pos / rc_probe_spacing(0u) - 0.5;
+}
+
 uint rc_probe_index(uint3 probe_coord, uint grid_dim, uint dirs_per_face, uint face, uint dir_index, uint buffer_offset) {
     uint probe_linear = (probe_coord.z * grid_dim + probe_coord.y) * grid_dim + probe_coord.x;
     return buffer_offset + probe_linear * 6u * dirs_per_face + face * dirs_per_face + dir_index;
@@ -73,11 +86,15 @@ uint rc_probe_index(uint3 probe_coord, uint grid_dim, uint dirs_per_face, uint f
 bool rc_outside_geo(float3 sp,
                     StructuredBuffer<NodeL0> hierarchy_l0,
                     StructuredBuffer<BrickOccupancy> occupancy_buf,
-                    uint grid_dim_l0) {
+                    uint3 brick_grid_size,
+                    uint3 world_size) {
     int3 p = int3(floor(sp));
-    if (any(p < int3(0)) || any(p >= int3(128))) return true;
+    if (any(p < int3(0)) || any(p >= int3(world_size))) return true;
     int3 brick_coord = p / 8;
-    uint l0_idx = uint(brick_coord.x) + uint(brick_coord.y) * grid_dim_l0 + uint(brick_coord.z) * grid_dim_l0 * grid_dim_l0;
+    if (any(brick_coord < int3(0)) || any(brick_coord >= int3(brick_grid_size))) return true;
+    uint l0_idx = uint(brick_coord.x)
+                + uint(brick_coord.y) * brick_grid_size.x
+                + uint(brick_coord.z) * brick_grid_size.x * brick_grid_size.y;
     NodeL0 node = hierarchy_l0[l0_idx];
     if (node_l0_is_empty(node)) return true;
     BrickOccupancy occ = occupancy_buf[node.brick_id];
@@ -85,74 +102,19 @@ bool rc_outside_geo(float3 sp,
     return !read_occupancy_bit(occ, local);
 }
 
-float3 rc_geo_offset(float3 vertex,
-                     StructuredBuffer<NodeL0> hierarchy_l0,
-                     StructuredBuffer<BrickOccupancy> occupancy_buf,
-                     uint grid_dim_l0) {
-    for (float x = -0.5; x < 1.0; x += 1.0) {
-        for (float y = -0.5; y < 1.0; y += 1.0) {
-            for (float z = -0.5; z < 1.0; z += 1.0) {
-                if (rc_outside_geo(vertex + float3(x, y, z), hierarchy_l0, occupancy_buf, grid_dim_l0))
-                    return float3(x, y, z) * 0.1;
-            }
-        }
-    }
-    return float3(0.001);
-}
-
-bool rc_probe_pos_inside_bounds(float3 probe_pos, float3 bounds_min, float3 bounds_max) {
-    return all(probe_pos >= bounds_min) && all(probe_pos <= bounds_max);
-}
-
-bool rc_find_nearest_empty_probe_position(float3 center,
-                                          float search_radius,
-                                          float3 bounds_min,
-                                          float3 bounds_max,
-                                          StructuredBuffer<NodeL0> hierarchy_l0,
-                                          StructuredBuffer<BrickOccupancy> occupancy_buf,
-                                          uint grid_dim_l0,
-                                          out float3 probe_pos) {
-    if (rc_probe_pos_inside_bounds(center, bounds_min, bounds_max) &&
-        rc_outside_geo(center, hierarchy_l0, occupancy_buf, grid_dim_l0)) {
-        probe_pos = center;
-        return true;
-    }
-
-    float radius = max(search_radius, 0.5);
-    bool found = false;
-    float best_dist_sq = 1e30;
-    float3 best_probe_pos = center;
-
-    for (int z = -1; z <= 1; z++) {
-        for (int y = -1; y <= 1; y++) {
-            for (int x = -1; x <= 1; x++) {
-                int3 offset_i = int3(x, y, z);
-                if (all(offset_i == int3(0))) continue;
-
-                float3 candidate = center + float3(offset_i) * radius;
-                if (rc_probe_pos_inside_bounds(candidate, bounds_min, bounds_max) &&
-                    rc_outside_geo(candidate, hierarchy_l0, occupancy_buf, grid_dim_l0)) {
-                    float dist_sq = dot(candidate - center, candidate - center);
-                    if (!found || dist_sq < best_dist_sq) {
-                        found = true;
-                        best_dist_sq = dist_sq;
-                        best_probe_pos = candidate;
-                    }
-                }
-            }
-        }
-    }
-
-    probe_pos = best_probe_pos;
-    return found;
-}
-
 // --- integrate_probe (trilinear, multi-face blend, skip inside-geo probes) ---
 // Reads primary face (matching surface normal) + 4 adjacent faces to capture
 // light sources on the same wall plane (e.g., sconces next to a wall surface).
 
 uint normal_to_face(float3 n) {
-    return encode_normal_id(n);
+    float3 a = abs(n);
+    if (a.x >= a.y && a.x >= a.z) {
+        return (n.x >= 0.0) ? 0u : 1u;
+    }
+    if (a.y >= a.z) {
+        return (n.y >= 0.0) ? 2u : 3u;
+    }
+    return (n.z >= 0.0) ? 4u : 5u;
 }
 
 // Face normals lookup for cosine weighting.
@@ -194,9 +156,7 @@ float3 read_probe_cosine(uint3 probe_coord, float3 normal, uint3 grid_size,
 float3 integrate_probe(float3 world_pos, float3 normal,
                        StructuredBuffer<float4> rc_probes,
                        uint c0_offset, uint3 c0_grid_size) {
-    float spacing = 8.0;
-
-    float3 grid_pos = world_pos / spacing - 0.5;
+    float3 grid_pos = rc_world_to_c0_grid_position(world_pos);
     int3 base_coord = int3(floor(grid_pos));
     float3 frac_pos = grid_pos - float3(base_coord);
 
@@ -223,4 +183,31 @@ float3 integrate_probe(float3 world_pos, float3 normal,
     }
 
     return (total_weight > 0.0001) ? total_radiance / total_weight : float3(0.0);
+}
+
+float3 integrate_probe_fast(float3 world_pos, float3 normal,
+                            StructuredBuffer<float4> rc_probes,
+                            uint c0_offset, uint3 c0_grid_size) {
+    float3 grid_pos = rc_world_to_c0_grid_position(world_pos);
+    uint3 coord = uint3(clamp(int3(round(grid_pos)), int3(0), int3(c0_grid_size) - 1));
+    uint face = normal_to_face(normal);
+
+    uint probe_base = c0_offset +
+        ((coord.z * c0_grid_size.y + coord.y) * c0_grid_size.x + coord.x)
+        * 6u * 9u;
+    if (rc_probes[probe_base].w < -0.5) {
+        return float3(0.0);
+    }
+
+    return read_probe_face(coord, face, c0_grid_size, c0_offset, rc_probes);
+}
+
+float3 integrate_probe_quality(float3 world_pos, float3 normal,
+                               StructuredBuffer<float4> rc_probes,
+                               uint c0_offset, uint3 c0_grid_size,
+                               uint quality) {
+    if (quality == RC_PROBE_QUALITY_FAST) {
+        return integrate_probe_fast(world_pos, normal, rc_probes, c0_offset, c0_grid_size);
+    }
+    return integrate_probe(world_pos, normal, rc_probes, c0_offset, c0_grid_size);
 }

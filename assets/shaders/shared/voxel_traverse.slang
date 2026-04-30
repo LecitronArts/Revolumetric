@@ -42,6 +42,7 @@ bool brick_dda(
     float3 pos = ray_origin + ray_dir * (t_enter + 0.001);
     int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
     int3 step_dir = int3(sign(ray_dir));
+    float current_t = t_enter;
 
     // Entry face normal: use brick AABB slab intersection to find which face was entered.
     // The axis with the largest t_near is the entry face (last axis to "enter").
@@ -57,9 +58,9 @@ bool brick_dda(
     float3 t_delta = abs(inv_dir);   // distance in t to cross one voxel
     // t_max: distance to next voxel boundary along each axis
     float3 t_max = float3(
-        ((step_dir.x > 0 ? coord.x + 1 : coord.x) - pos.x) * inv_dir.x,
-        ((step_dir.y > 0 ? coord.y + 1 : coord.y) - pos.y) * inv_dir.y,
-        ((step_dir.z > 0 ? coord.z + 1 : coord.z) - pos.z) * inv_dir.z
+        ((step_dir.x > 0 ? coord.x + 1 : coord.x) - ray_origin.x) * inv_dir.x,
+        ((step_dir.y > 0 ? coord.y + 1 : coord.y) - ray_origin.y) * inv_dir.y,
+        ((step_dir.z > 0 ? coord.z + 1 : coord.z) - ray_origin.z) * inv_dir.z
     );
 
     // Load the full BrickOccupancy once (80 bytes, fits in registers)
@@ -72,7 +73,7 @@ bool brick_dda(
         // Morton-order bit read (matches Rust BrickOccupancy storage)
         if (read_occupancy_bit(occ, uint3(coord))) {
             hit_local = uint3(coord);
-            hit_t = t_enter + min(min(t_max.x, t_max.y), t_max.z);
+            hit_t = current_t;
             return true;
         }
 
@@ -80,20 +81,24 @@ bool brick_dda(
         if (t_max.x < t_max.y) {
             if (t_max.x < t_max.z) {
                 hit_normal = float3(-float(step_dir.x), 0, 0);
+                current_t = t_max.x;
                 coord.x += step_dir.x;
                 t_max.x += t_delta.x;
             } else {
                 hit_normal = float3(0, 0, -float(step_dir.z));
+                current_t = t_max.z;
                 coord.z += step_dir.z;
                 t_max.z += t_delta.z;
             }
         } else {
             if (t_max.y < t_max.z) {
                 hit_normal = float3(0, -float(step_dir.y), 0);
+                current_t = t_max.y;
                 coord.y += step_dir.y;
                 t_max.y += t_delta.y;
             } else {
                 hit_normal = float3(0, 0, -float(step_dir.z));
+                current_t = t_max.z;
                 coord.z += step_dir.z;
                 t_max.z += t_delta.z;
             }
@@ -165,7 +170,7 @@ HitResult trace_primary_ray(
                     HitResult result;
                     result.hit = true;
                     result.t = hit_t;
-                    result.position = brick_origin + float3(hit_local) + 0.5;
+                    result.position = ray.origin + ray.direction * hit_t;
                     result.normal = hit_normal;
                     result.brick_id = node.brick_id;
                     result.local = hit_local;

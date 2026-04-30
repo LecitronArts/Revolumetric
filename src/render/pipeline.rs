@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use ash::vk;
 
 pub struct ComputePipeline {
@@ -29,11 +29,26 @@ impl ComputePipeline {
             .stage(stage)
             .layout(layout);
 
-        let handle = unsafe {
+        let handle = match unsafe {
             device.create_compute_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
-        }
-        .map_err(|(_, err)| err)
-        .context("failed to create compute pipeline")?[0];
+        } {
+            Ok(mut pipelines) => match pipelines.pop() {
+                Some(pipeline) => pipeline,
+                None => {
+                    unsafe { device.destroy_pipeline_layout(layout, None) };
+                    return Err(anyhow!("Vulkan returned no compute pipelines"));
+                }
+            },
+            Err((pipelines, error)) => {
+                unsafe {
+                    for pipeline in pipelines {
+                        device.destroy_pipeline(pipeline, None);
+                    }
+                    device.destroy_pipeline_layout(layout, None);
+                }
+                return Err(error).context("failed to create compute pipeline");
+            }
+        };
 
         Ok(Self { handle, layout })
     }

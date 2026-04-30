@@ -5,7 +5,7 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
-use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct PrimaryRayPass {
@@ -95,12 +95,25 @@ impl PrimaryRayPass {
                 descriptor_count: 4 * frame_count as u32,
             },
         ];
-        let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
+        let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
-        let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
+        let descriptor_sets = match descriptor_pool.allocate(device, &layouts) {
+            Ok(sets) => sets,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         // G-buffer images
-        let gbuffer_pos = GpuImage::new(
+        let gbuffer_pos = match GpuImage::new(
             device,
             allocator,
             &GpuImageDesc {
@@ -112,9 +125,16 @@ impl PrimaryRayPass {
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "gbuffer_pos",
             },
-        )?;
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
-        let gbuffer0 = GpuImage::new(
+        let gbuffer0 = match GpuImage::new(
             device,
             allocator,
             &GpuImageDesc {
@@ -126,9 +146,17 @@ impl PrimaryRayPass {
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "gbuffer0",
             },
-        )?;
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                gbuffer_pos.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
-        let gbuffer1 = GpuImage::new(
+        let gbuffer1 = match GpuImage::new(
             device,
             allocator,
             &GpuImageDesc {
@@ -140,7 +168,16 @@ impl PrimaryRayPass {
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "gbuffer1",
             },
-        )?;
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                gbuffer0.destroy(device, allocator);
+                gbuffer_pos.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         // Write descriptor sets (one per frame slot)
         let ucvh_buffers = [
@@ -154,7 +191,7 @@ impl PrimaryRayPass {
             let ubo_info = vk::DescriptorBufferInfo::default()
                 .buffer(scene_ubo.buffer_handle(set_idx))
                 .offset(0)
-                .range(176);
+                .range(std::mem::size_of::<GpuSceneUniforms>() as u64);
 
             let ubo_write = vk::WriteDescriptorSet::default()
                 .dst_set(ds)
@@ -215,14 +252,35 @@ impl PrimaryRayPass {
         }
 
         // Pipeline (no push constant ranges)
-        let shader_module = create_shader_module(device, spirv_bytes)?;
-        let pipeline = ComputePipeline::new(
+        let shader_module = match create_shader_module(device, spirv_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                gbuffer1.destroy(device, allocator);
+                gbuffer0.destroy(device, allocator);
+                gbuffer_pos.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
+        let pipeline = match ComputePipeline::new(
             device,
             shader_module,
             c"main",
             &[descriptor_set_layout],
             &[], // no push constants
-        )?;
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.destroy_shader_module(shader_module, None) };
+                gbuffer1.destroy(device, allocator);
+                gbuffer0.destroy(device, allocator);
+                gbuffer_pos.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         Ok(Self {
@@ -383,5 +441,52 @@ impl PrimaryRayPass {
         self.gbuffer_pos.destroy(device, allocator);
         self.gbuffer0.destroy(device, allocator);
         self.gbuffer1.destroy(device, allocator);
+    }
+}
+
+#[cfg(test)]
+mod shader_source_tests {
+    #[test]
+    fn primary_ray_uses_shared_material_helpers_and_dynamic_ubo_range() {
+        let shader =
+            include_str!("../../../assets/shaders/passes/primary_ray.slang").replace("\r\n", "\n");
+        let rust = std::fs::read_to_string("src/render/passes/primary_ray.rs")
+            .expect("primary ray pass source should be readable");
+        let hardcoded_range = [".range(", "176)"].join("");
+
+        assert!(shader.contains("#include \"material_common.slang\""));
+        assert!(shader.contains("material_cell_albedo(hit.cell)"));
+        assert!(!shader.contains("static const float3 MATERIAL_ALBEDO"));
+        assert!(rust.contains("std::mem::size_of::<GpuSceneUniforms>() as u64"));
+        assert!(!rust.contains(&hardcoded_range));
+    }
+
+    #[test]
+    fn voxel_trace_returns_surface_hit_position_not_voxel_center() {
+        let traverse = include_str!("../../../assets/shaders/shared/voxel_traverse.slang")
+            .replace("\r\n", "\n");
+        let primary =
+            include_str!("../../../assets/shaders/passes/primary_ray.slang").replace("\r\n", "\n");
+
+        assert!(
+            traverse.contains("float current_t = t_enter;"),
+            "brick DDA should track entry distance for the current voxel"
+        );
+        assert!(
+            traverse.contains("hit_t = current_t;"),
+            "brick DDA should return the hit voxel entry distance, not its exit distance"
+        );
+        assert!(
+            traverse.contains("result.position = ray.origin + ray.direction * hit_t;"),
+            "primary trace hit.position should be the actual ray surface hit point"
+        );
+        assert!(
+            !traverse.contains("result.position = brick_origin + float3(hit_local) + 0.5;"),
+            "primary trace must not report voxel centers as surface hit points"
+        );
+        assert!(
+            primary.contains("xyz = surface hit point"),
+            "G-buffer position semantics should document the surface hit point"
+        );
     }
 }

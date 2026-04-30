@@ -4,11 +4,22 @@
 
 static const uint LIGHTING_FLAG_SHADOWS_ENABLED = 1u << 0;
 static const uint LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS = 1u << 1;
+static const uint LIGHTING_DEBUG_VIEW_SHIFT = 28u;
+static const uint LIGHTING_DEBUG_VIEW_MASK = 0xFu << LIGHTING_DEBUG_VIEW_SHIFT;
+static const uint LIGHTING_DEBUG_VIEW_FINAL = 0u;
+static const uint LIGHTING_DEBUG_VIEW_RC_INDIRECT = 1u;
+static const uint LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE = 2u;
+static const uint LIGHTING_DEBUG_VIEW_NORMAL = 3u;
+
+uint lighting_debug_view(uint flags) {
+    return (flags & LIGHTING_DEBUG_VIEW_MASK) >> LIGHTING_DEBUG_VIEW_SHIFT;
+}
 
 static const uint RC_NORMAL_STRATEGY_AXIS_NORMAL = 0u;
 static const uint RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT = 1u;
 
 static const uint RC_PROBE_QUALITY_FULL = 0u;
+static const uint RC_PROBE_QUALITY_FAST = 1u;
 
 struct SceneUniforms {
     float4x4 pixel_to_ray;   // 64B

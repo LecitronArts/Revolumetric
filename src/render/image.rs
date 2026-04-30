@@ -60,16 +60,27 @@ impl GpuImage {
 
         let requirements = unsafe { device.get_image_memory_requirements(handle) };
 
-        let allocation = allocator.allocate(&AllocationCreateDesc {
+        let allocation = match allocator.allocate(&AllocationCreateDesc {
             name: desc.name,
             requirements,
             location: MemoryLocation::GpuOnly,
             linear: false,
             allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-        })?;
+        }) {
+            Ok(allocation) => allocation,
+            Err(error) => {
+                unsafe { device.destroy_image(handle, None) };
+                return Err(error).context("failed to allocate image memory");
+            }
+        };
 
-        unsafe { device.bind_image_memory(handle, allocation.memory(), allocation.offset()) }
-            .context("failed to bind image memory")?;
+        if let Err(error) =
+            unsafe { device.bind_image_memory(handle, allocation.memory(), allocation.offset()) }
+        {
+            unsafe { device.destroy_image(handle, None) };
+            let _ = allocator.free(allocation);
+            return Err(error).context("failed to bind image memory");
+        }
 
         let view_type = if desc.depth > 1 {
             vk::ImageViewType::TYPE_3D
@@ -90,8 +101,14 @@ impl GpuImage {
                     .layer_count(1),
             );
 
-        let view = unsafe { device.create_image_view(&view_info, None) }
-            .context("failed to create image view")?;
+        let view = match unsafe { device.create_image_view(&view_info, None) } {
+            Ok(view) => view,
+            Err(error) => {
+                unsafe { device.destroy_image(handle, None) };
+                let _ = allocator.free(allocation);
+                return Err(error).context("failed to create image view");
+            }
+        };
 
         Ok(Self {
             handle,

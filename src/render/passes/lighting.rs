@@ -7,7 +7,7 @@ use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::rc_probe_buffer::RcProbeBuffer;
-use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct LightingPass {
@@ -110,12 +110,25 @@ impl LightingPass {
                 descriptor_count: 5 * frame_count as u32,
             },
         ];
-        let descriptor_pool = DescriptorPool::new(device, frame_count as u32, &pool_sizes)?;
+        let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let layouts: Vec<_> = (0..frame_count).map(|_| descriptor_set_layout).collect();
-        let descriptor_sets = descriptor_pool.allocate(device, &layouts)?;
+        let descriptor_sets = match descriptor_pool.allocate(device, &layouts) {
+            Ok(sets) => sets,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         // Output image (same size as G-buffer, RGBA8 for final color)
-        let output_image = GpuImage::new(
+        let output_image = match GpuImage::new(
             device,
             allocator,
             &GpuImageDesc {
@@ -127,7 +140,14 @@ impl LightingPass {
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "lighting_output",
             },
-        )?;
+        ) {
+            Ok(image) => image,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
 
         // UCVH buffers: config, l0, occupancy, materials
         let ucvh_buffers = [
@@ -142,7 +162,7 @@ impl LightingPass {
             let ubo_info = vk::DescriptorBufferInfo::default()
                 .buffer(scene_ubo.buffer_handle(set_idx))
                 .offset(0)
-                .range(176);
+                .range(std::mem::size_of::<GpuSceneUniforms>() as u64);
 
             let ubo_write = vk::WriteDescriptorSet::default()
                 .dst_set(ds)
@@ -207,7 +227,7 @@ impl LightingPass {
 
             // Binding 9: RC probe buffer (read current frame's merged data)
             let rc_info = vk::DescriptorBufferInfo::default()
-                .buffer(rc_probes.write_buffer())
+                .buffer(rc_probes.write_buffer(set_idx))
                 .offset(0)
                 .range(vk::WHOLE_SIZE);
             let rc_write = vk::WriteDescriptorSet::default()
@@ -221,14 +241,31 @@ impl LightingPass {
         }
 
         // Pipeline (no push constants)
-        let shader_module = create_shader_module(device, spirv_bytes)?;
-        let pipeline = ComputePipeline::new(
+        let shader_module = match create_shader_module(device, spirv_bytes) {
+            Ok(module) => module,
+            Err(error) => {
+                output_image.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
+        let pipeline = match ComputePipeline::new(
             device,
             shader_module,
             c"main",
             &[descriptor_set_layout],
             &[],
-        )?;
+        ) {
+            Ok(pipeline) => pipeline,
+            Err(error) => {
+                unsafe { device.destroy_shader_module(shader_module, None) };
+                output_image.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         unsafe { device.destroy_shader_module(shader_module, None) };
 
         Ok(Self {
@@ -380,7 +417,7 @@ impl LightingPass {
     ) {
         let ds = self.descriptor_sets[frame_slot];
         let rc_info = vk::DescriptorBufferInfo::default()
-            .buffer(rc_probes.write_buffer())
+            .buffer(rc_probes.write_buffer(frame_slot))
             .offset(0)
             .range(vk::WHOLE_SIZE);
         let rc_write = vk::WriteDescriptorSet::default()
@@ -401,10 +438,59 @@ impl LightingPass {
 
 #[cfg(test)]
 mod shader_source_tests {
+    fn normalized_source(path_source: &str) -> String {
+        path_source.replace("\r\n", "\n")
+    }
+
     #[test]
-    fn rc_gradient_normal_does_not_override_unrelated_hit_face() {
+    fn lighting_shader_uses_rc_probe_quality_for_indirect_integration() {
         let source =
             include_str!("../../../assets/shaders/passes/lighting.slang").replace("\r\n", "\n");
+        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
+            .replace("\r\n", "\n");
+
+        assert!(shared.contains("float3 integrate_probe_fast("));
+        assert!(shared.contains("float3 integrate_probe_quality("));
+        assert!(source.contains("scene.rc_probe_quality"));
+        assert!(source.contains("integrate_probe_quality(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid, scene.rc_probe_quality)"));
+    }
+
+    #[test]
+    fn fast_probe_face_selection_uses_dominant_axis_normals() {
+        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
+            .replace("\r\n", "\n");
+        let normal_to_face_start = shared
+            .find("uint normal_to_face(float3 n)")
+            .expect("radiance cascade shader should define normal_to_face");
+        let face_normals_start = shared
+            .find("// Face normals lookup for cosine weighting.")
+            .expect("normal_to_face should appear before face normal lookup");
+        let normal_to_face = &shared[normal_to_face_start..face_normals_start];
+
+        assert!(normal_to_face.contains("float3 a = abs(n);"));
+        assert!(normal_to_face.contains("if (a.x >= a.y && a.x >= a.z)"));
+        assert!(normal_to_face.contains("if (a.y >= a.z)"));
+        assert!(normal_to_face.contains("return (n.x >= 0.0) ? 0u : 1u;"));
+        assert!(normal_to_face.contains("return (n.y >= 0.0) ? 2u : 3u;"));
+        assert!(normal_to_face.contains("return (n.z >= 0.0) ? 4u : 5u;"));
+        assert!(!normal_to_face.contains("return encode_normal_id(n);"));
+    }
+
+    #[test]
+    fn descriptor_ubo_range_uses_rust_uniform_size() {
+        let source = std::fs::read_to_string("src/render/passes/lighting.rs")
+            .expect("lighting pass source should be readable");
+        let hardcoded_range = [".range(", "176)"].join("");
+
+        assert!(source.contains("std::mem::size_of::<GpuSceneUniforms>() as u64"));
+        assert!(!source.contains(&hardcoded_range));
+    }
+
+    #[test]
+    fn rc_gradient_normal_does_not_override_unrelated_hit_face() {
+        let source = normalized_source(include_str!(
+            "../../../assets/shaders/passes/lighting.slang"
+        ));
 
         source
             .find("float3 gradient_normal = compute_occupancy_gradient_normal")
@@ -415,5 +501,92 @@ mod shader_source_tests {
         source
             .find("return axis_normal;")
             .expect("lighting shader should fall back to DDA hit face normal");
+    }
+
+    #[test]
+    fn storage_image_formats_are_explicit_for_shader_abi() {
+        let primary = normalized_source(include_str!(
+            "../../../assets/shaders/passes/primary_ray.slang"
+        ));
+        let lighting = normalized_source(include_str!(
+            "../../../assets/shaders/passes/lighting.slang"
+        ));
+        let test_pattern = normalized_source(include_str!(
+            "../../../assets/shaders/passes/test_pattern.slang"
+        ));
+
+        assert!(
+            primary.contains("[[vk::image_format(\"rgba32f\")]]\nRWTexture2D<float4> gbuffer_pos;"),
+            "primary_ray gbuffer_pos must declare rgba32f storage image format"
+        );
+        assert!(
+            lighting
+                .contains("[[vk::image_format(\"rgba32f\")]]\nRWTexture2D<float4> gbuffer_pos;"),
+            "lighting gbuffer_pos must declare rgba32f storage image format"
+        );
+        assert!(
+            primary.contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> gbuffer0;"),
+            "primary_ray gbuffer0 must declare rgba8 storage image format"
+        );
+        assert!(
+            lighting.contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> gbuffer0;"),
+            "lighting gbuffer0 must declare rgba8 storage image format"
+        );
+        assert!(
+            lighting.contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> output_image;"),
+            "lighting output_image must declare rgba8 storage image format"
+        );
+        assert!(
+            test_pattern
+                .contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> output_image;"),
+            "test_pattern output_image must declare rgba8 storage image format"
+        );
+        assert!(
+            primary.contains("[[vk::image_format(\"rgba8ui\")]]\nRWTexture2D<uint4> gbuffer1;"),
+            "primary_ray gbuffer1 must keep rgba8ui storage image format"
+        );
+        assert!(
+            lighting.contains("[[vk::image_format(\"rgba8ui\")]]\nRWTexture2D<uint4> gbuffer1;"),
+            "lighting gbuffer1 must keep rgba8ui storage image format"
+        );
+    }
+
+    #[test]
+    fn lighting_shader_uses_runtime_debug_view_instead_of_manual_uncommenting() {
+        let common = normalized_source(include_str!(
+            "../../../assets/shaders/shared/scene_common.slang"
+        ));
+        let lighting = normalized_source(include_str!(
+            "../../../assets/shaders/passes/lighting.slang"
+        ));
+
+        assert!(
+            common.contains("LIGHTING_DEBUG_VIEW_SHIFT"),
+            "scene common shader constants must define the debug-view bit packing"
+        );
+        assert!(
+            common.contains("uint lighting_debug_view(uint flags)"),
+            "scene common shader must expose a helper for decoding debug view bits"
+        );
+        assert!(
+            lighting.contains("uint debug_view = lighting_debug_view(scene.lighting_flags);"),
+            "lighting shader must decode debug view from the scene flags at runtime"
+        );
+        assert!(
+            lighting.contains("debug_view == LIGHTING_DEBUG_VIEW_RC_INDIRECT"),
+            "lighting shader must support RC indirect/ambient-only debug output"
+        );
+        assert!(
+            lighting.contains("debug_view == LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE"),
+            "lighting shader must support direct diffuse-only debug output"
+        );
+        assert!(
+            lighting.contains("debug_view == LIGHTING_DEBUG_VIEW_NORMAL"),
+            "lighting shader must support normal visualization output"
+        );
+        assert!(
+            !lighting.contains("DEBUG: uncomment"),
+            "debug views should be runtime-switchable, not source edits"
+        );
     }
 }

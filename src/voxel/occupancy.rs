@@ -36,7 +36,13 @@ pub struct CascadedOccupancy {
 
 impl CascadedOccupancy {
     pub fn new(brick_grid_size: UVec3) -> Self {
-        let dims = std::array::from_fn(|i| brick_grid_size >> i as u32);
+        let dims = std::array::from_fn(|i| {
+            let mut dim = brick_grid_size;
+            for _ in 0..i {
+                dim = ceil_half_non_empty(dim);
+            }
+            dim
+        });
         let vol = |d: UVec3| (d.x * d.y * d.z) as usize;
         Self {
             level0: vec![EMPTY_L0; vol(dims[0])],
@@ -126,6 +132,14 @@ impl CascadedOccupancy {
     }
 }
 
+fn ceil_half_non_empty(dim: UVec3) -> UVec3 {
+    if dim.x == 0 || dim.y == 0 || dim.z == 0 {
+        UVec3::ZERO
+    } else {
+        UVec3::new(dim.x.div_ceil(2), dim.y.div_ceil(2), dim.z.div_ceil(2))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +158,15 @@ mod tests {
         assert_eq!(h.dims[2], UVec3::splat(4)); // L2
         assert_eq!(h.dims[3], UVec3::splat(2)); // L3
         assert_eq!(h.dims[4], UVec3::splat(1)); // L4
+    }
+
+    #[test]
+    fn odd_grid_far_corner_propagates_to_highest_level() {
+        let mut h = CascadedOccupancy::new(UVec3::splat(15));
+        h.set_l0(UVec3::splat(14), 0, true);
+        h.rebuild();
+
+        assert!(h.levels[3].iter().any(|node| node.flags & 1 != 0));
     }
 
     #[test]

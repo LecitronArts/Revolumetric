@@ -3,6 +3,7 @@
 // writes float4(weighted_radiance, ray_distance) to the probe buffer.
 
 #include "voxel_traverse.slang"
+#include "material_common.slang"
 #include "lighting_common.slang"
 #include "radiance_cascade.slang"
 
@@ -40,6 +41,19 @@ StructuredBuffer<float4> probe_read;
 [[vk::binding(6, 0)]]
 RWStructuredBuffer<float4> probe_write;
 
+static const float RC_TEMPORAL_BLEND = 0.18;
+
+bool rc_probe_history_is_uninitialized(float4 previous) {
+    return abs(previous.w) < 0.00001 && dot(abs(previous.xyz), float3(1.0)) < 0.00001;
+}
+
+float4 rc_temporal_blend(float4 current, float4 previous) {
+    if (current.w < -0.5) return current;
+    if (previous.w < -0.5) return current;
+    if (rc_probe_history_is_uninitialized(previous)) return current;
+    return float4(lerp(previous.xyz, current.xyz, RC_TEMPORAL_BLEND), current.w);
+}
+
 [shader("compute")]
 [numthreads(64, 1, 1)]
 void main(uint3 dtid : SV_DispatchThreadID) {
@@ -47,7 +61,6 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     uint grid_dim = push.probe_grid_dim;
     uint probe_size = push.probe_size;
     uint dirs_per_face = probe_size * probe_size;
-    uint grid_dim_l0 = ucvh_config[0].brick_grid_size.x;
 
     uint total = grid_dim * grid_dim * grid_dim * 6u * dirs_per_face;
     uint tid = dtid.x;
@@ -63,19 +76,9 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         probe_linear / (grid_dim * grid_dim)
     );
 
-    float lod_factor = float(1u << push.cascade_level);
-    float probe_spacing = 8.0 * lod_factor;
-    float3 probe_pos = (float3(probe_coord) + 0.5) * probe_spacing;
-
-    if (push.cascade_level == 0u) {
-        float3 relocated_probe_pos;
-        if (rc_find_nearest_empty_probe_position(probe_pos, 2.0, float3(19.0, 2.0, 7.0), float3(109.0, 87.0, 121.0),
-                                                 hierarchy_l0, brick_occupancy, grid_dim_l0, relocated_probe_pos)) {
-            probe_pos = relocated_probe_pos;
-        }
-    } else {
-        probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0);
-    }
+    uint3 brick_grid_size = ucvh_config[0].brick_grid_size.xyz;
+    uint3 world_size = ucvh_config[0].world_size.xyz;
+    float3 probe_pos = rc_probe_world_position(probe_coord, push.cascade_level);
 
     // Flag C0 probes outside the building interior as inside-geo.
     // Only for C0 — higher cascades use GeoOffset and their larger spacing
@@ -93,7 +96,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float3 face_normal, face_tangent, face_bitangent;
     get_face_tbn(face, face_normal, face_tangent, face_bitangent);
 
-    if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0)) {
+    if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, brick_grid_size, world_size)) {
         uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);
         probe_write[idx] = float4(0.0, 0.0, 0.0, -1.0);
         return;
@@ -110,19 +113,11 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     if (hit.hit) {
         result.w = hit.t;
 
-        float3 emissive = voxel_emissive(hit.cell);
-        if (emissive.x + emissive.y + emissive.z > 0.001) {
+        float3 emissive = material_emissive(hit.cell);
+        if (material_has_emissive(emissive)) {
             result.xyz = emissive * 8.0;  // HDR boost for probe radiance
         } else {
-            uint mat_id = voxel_material(hit.cell);
-            float3 albedo = float3(0.7, 0.7, 0.7);
-            if (mat_id == 1u) albedo = float3(0.65, 0.63, 0.60);
-            else if (mat_id == 2u) albedo = float3(0.70, 0.20, 0.20);
-            else if (mat_id == 3u) albedo = float3(0.20, 0.70, 0.20);
-            else if (mat_id == 4u) albedo = float3(0.35, 0.42, 0.65);
-            else if (mat_id == 5u) albedo = float3(0.55, 0.40, 0.30);
-            else if (mat_id == 6u) albedo = float3(0.40, 0.37, 0.34);
-            else if (mat_id == 7u) albedo = float3(0.45, 0.30, 0.18);
+            float3 albedo = material_cell_albedo(hit.cell);
 
             float3 hit_normal = hit.normal;
             float ndotl = max(dot(hit_normal, scene.sun_direction), 0.0);
@@ -166,5 +161,5 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     result.xyz *= cos_theta;
 
     uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);
-    probe_write[idx] = result;
+    probe_write[idx] = rc_temporal_blend(result, probe_read[idx]);
 }

@@ -17,6 +17,7 @@ By default, if `slangc` is missing, the build script writes empty placeholder `.
 ```powershell
 cargo test
 $env:REVOLUMETRIC_SHADER_COMPILE = "skip"; cargo test; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
+$env:REVOLUMETRIC_SHADER_COMPILE = "strict"; cargo test --lib; cargo build --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
 cargo clippy --all-targets -- -D warnings
 cargo build
 cargo run
@@ -27,8 +28,8 @@ cargo run
 Build-time shader compilation is controlled with `REVOLUMETRIC_SHADER_COMPILE`:
 
 - `auto` or unset: compile shaders with `slangc` when available. If `slangc` is not found, write empty placeholder `.spv` files and emit a Cargo warning.
-- `strict`: require `slangc`. Missing `slangc` or a shader compiler failure fails the build.
-- `skip`: do not invoke `slangc`; write empty placeholder `.spv` files. Use this for CPU-only test environments.
+- `strict`: require `slangc`. Missing `slangc` or a shader compiler failure fails the build. Use this mode for CI and release validation so shader ABI and compiler errors cannot be hidden by placeholder SPIR-V.
+- `skip`: do not invoke `slangc`; write empty placeholder `.spv` files. Use this only for CPU-only test environments.
 
 Invalid values fail the build instead of silently falling back to a default.
 

@@ -23,9 +23,9 @@ RWStructuredBuffer<float4> probe_buffer;
 // Compute visibility weight for a higher-cascade neighbor probe.
 // Reprojects direction from neighbor to current position onto the neighbor's
 // dominant face, finds the nearest traced direction, and checks ray distance.
-float neighbor_visibility(uint3 neighbor, float3 voxel_pos, float higher_lod_factor,
+float neighbor_visibility(uint3 neighbor, float3 voxel_pos,
                           uint h_grid, uint h_dirs, float h_probe_size_f) {
-    float3 neighbor_world = (float3(neighbor) + 0.5) * 8.0 * higher_lod_factor;
+    float3 neighbor_world = rc_probe_world_position(neighbor, push.cascade_level + 1u);
     float3 rPos = voxel_pos - neighbor_world;
     float dist = length(rPos);
     if (dist < 0.001) return 1.0;
@@ -83,8 +83,8 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     float lod_factor = float(1u << push.cascade_level);
     float higher_lod_factor = lod_factor * 2.0;
-    float probe_spacing = 8.0 * lod_factor;
-    float3 voxel_pos = (float3(probe_coord) + 0.5) * probe_spacing;
+    float probe_spacing = rc_probe_spacing(push.cascade_level);
+    float3 voxel_pos = rc_probe_world_position(probe_coord, push.cascade_level);
 
     uint h_grid = push.higher_grid_dim;
     uint h_dirs = push.higher_probe_size * push.higher_probe_size;
@@ -113,8 +113,7 @@ void main(uint3 dtid : SV_DispatchThreadID) {
         neighbor = clamp(neighbor, uint3(0), uint3(h_grid - 1));
 
         // Visibility: reproject face + direction from neighbor toward us
-        float vis_w = neighbor_visibility(neighbor, voxel_pos, higher_lod_factor,
-                                          h_grid, h_dirs, h_probe_size_f);
+        float vis_w = neighbor_visibility(neighbor, voxel_pos, h_grid, h_dirs, h_probe_size_f);
 
         // Sum the 4 matching directions from this neighbor
         uint base = rc_probe_index(neighbor, h_grid, h_dirs, face, 0u, push.higher_offset);

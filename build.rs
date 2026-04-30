@@ -11,6 +11,8 @@ enum ShaderCompileMode {
 
 fn main() {
     println!("cargo:rerun-if-env-changed=REVOLUMETRIC_SHADER_COMPILE");
+    println!("cargo:rerun-if-changed=assets/shaders");
+    println!("cargo:rerun-if-changed=assets/shaders/passes");
 
     let shader_dir = Path::new("assets/shaders");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders");
