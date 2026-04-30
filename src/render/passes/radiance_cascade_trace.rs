@@ -307,3 +307,40 @@ impl RcTracePass {
         unsafe { device.destroy_descriptor_set_layout(self.descriptor_set_layout, None) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rc_trace_relocates_c0_probes_before_inside_geo_rejection() {
+        let source =
+            include_str!("../../../assets/shaders/passes/rc_trace.slang").replace("\r\n", "\n");
+        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
+            .replace("\r\n", "\n");
+        let relocation = source
+            .find("if (push.cascade_level == 0u) {\n        float3 relocated_probe_pos;\n        if (rc_find_nearest_empty_probe_position")
+            .expect("rc_trace should relocate C0 probes near solid geometry");
+        let higher_cascade_offset = source
+            .find("} else {\n        probe_pos += rc_geo_offset")
+            .expect("rc_trace should keep geo offsets for higher cascades");
+        let inside_geo_rejection = source
+            .find("if (!rc_outside_geo(probe_pos")
+            .expect("rc_trace should still reject probes trapped inside geometry");
+
+        assert!(
+            relocation < inside_geo_rejection,
+            "probe relocation must run before inside-geometry rejection"
+        );
+        assert!(
+            higher_cascade_offset < inside_geo_rejection,
+            "higher-cascade geo offset must run before inside-geometry rejection"
+        );
+        assert!(
+            shared.contains("rc_probe_pos_inside_bounds(candidate, bounds_min, bounds_max)"),
+            "relocation candidates must stay inside the same C0 bounds used by rc_trace"
+        );
+        assert!(
+            shared.contains("best_dist_sq"),
+            "relocation should choose the nearest valid candidate, not the first loop hit"
+        );
+    }
+}

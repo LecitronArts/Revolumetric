@@ -139,4 +139,20 @@ mod tests {
         // Root should be non-empty
         assert_ne!(ucvh.hierarchy.levels[3][0].child_mask, 0);
     }
+
+    #[test]
+    fn sponza_emissive_voxels_survive_ucvh_generation() {
+        let mut ucvh = Ucvh::new(UcvhConfig::new(UVec3::splat(128)));
+
+        let count = generate_sponza_scene(&mut ucvh);
+        assert!(count > 0, "sponza should allocate bricks");
+
+        let sconce = ucvh.get_voxel(UVec3::new(20, 24, 19));
+        assert_ne!(sconce.material, 0, "wall sconce should be written");
+        assert_eq!(sconce.emissive, [255, 180, 80]);
+
+        let chandelier = ucvh.get_voxel(UVec3::new(64, 82, 64));
+        assert_ne!(chandelier.material, 0, "chandelier should be written");
+        assert_eq!(chandelier.emissive, [255, 220, 140]);
+    }
 }

@@ -100,6 +100,53 @@ float3 rc_geo_offset(float3 vertex,
     return float3(0.001);
 }
 
+bool rc_probe_pos_inside_bounds(float3 probe_pos, float3 bounds_min, float3 bounds_max) {
+    return all(probe_pos >= bounds_min) && all(probe_pos <= bounds_max);
+}
+
+bool rc_find_nearest_empty_probe_position(float3 center,
+                                          float search_radius,
+                                          float3 bounds_min,
+                                          float3 bounds_max,
+                                          StructuredBuffer<NodeL0> hierarchy_l0,
+                                          StructuredBuffer<BrickOccupancy> occupancy_buf,
+                                          uint grid_dim_l0,
+                                          out float3 probe_pos) {
+    if (rc_probe_pos_inside_bounds(center, bounds_min, bounds_max) &&
+        rc_outside_geo(center, hierarchy_l0, occupancy_buf, grid_dim_l0)) {
+        probe_pos = center;
+        return true;
+    }
+
+    float radius = max(search_radius, 0.5);
+    bool found = false;
+    float best_dist_sq = 1e30;
+    float3 best_probe_pos = center;
+
+    for (int z = -1; z <= 1; z++) {
+        for (int y = -1; y <= 1; y++) {
+            for (int x = -1; x <= 1; x++) {
+                int3 offset_i = int3(x, y, z);
+                if (all(offset_i == int3(0))) continue;
+
+                float3 candidate = center + float3(offset_i) * radius;
+                if (rc_probe_pos_inside_bounds(candidate, bounds_min, bounds_max) &&
+                    rc_outside_geo(candidate, hierarchy_l0, occupancy_buf, grid_dim_l0)) {
+                    float dist_sq = dot(candidate - center, candidate - center);
+                    if (!found || dist_sq < best_dist_sq) {
+                        found = true;
+                        best_dist_sq = dist_sq;
+                        best_probe_pos = candidate;
+                    }
+                }
+            }
+        }
+    }
+
+    probe_pos = best_probe_pos;
+    return found;
+}
+
 // --- integrate_probe (trilinear, multi-face blend, skip inside-geo probes) ---
 // Reads primary face (matching surface normal) + 4 adjacent faces to capture
 // light sources on the same wall plane (e.g., sconces next to a wall surface).

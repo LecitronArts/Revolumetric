@@ -67,6 +67,16 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     float probe_spacing = 8.0 * lod_factor;
     float3 probe_pos = (float3(probe_coord) + 0.5) * probe_spacing;
 
+    if (push.cascade_level == 0u) {
+        float3 relocated_probe_pos;
+        if (rc_find_nearest_empty_probe_position(probe_pos, 2.0, float3(19.0, 2.0, 7.0), float3(109.0, 87.0, 121.0),
+                                                 hierarchy_l0, brick_occupancy, grid_dim_l0, relocated_probe_pos)) {
+            probe_pos = relocated_probe_pos;
+        }
+    } else {
+        probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0);
+    }
+
     // Flag C0 probes outside the building interior as inside-geo.
     // Only for C0 — higher cascades use GeoOffset and their larger spacing
     // means centers can be outside bounds while still covering interior regions.
@@ -82,13 +92,6 @@ void main(uint3 dtid : SV_DispatchThreadID) {
 
     float3 face_normal, face_tangent, face_bitangent;
     get_face_tbn(face, face_normal, face_tangent, face_bitangent);
-
-    if (push.cascade_level > 0u) {
-        probe_pos += rc_geo_offset(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0);
-    }
-    // C0: no face_normal offset — all faces trace from the same position.
-    // This ensures consistent inside-geo flagging across all 6 faces,
-    // preventing per-face black line artifacts on curved surfaces.
 
     if (!rc_outside_geo(probe_pos, hierarchy_l0, brick_occupancy, grid_dim_l0)) {
         uint idx = rc_probe_index(probe_coord, grid_dim, dirs_per_face, face, dir_index, push.buffer_offset);
