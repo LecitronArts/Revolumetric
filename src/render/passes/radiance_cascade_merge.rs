@@ -231,3 +231,21 @@ impl RcMergePass {
         unsafe { device.destroy_descriptor_set_layout(self.descriptor_set_layout, None) };
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rc_merge_blends_by_world_probe_spacing() {
+        let source =
+            include_str!("../../../assets/shaders/passes/rc_merge.slang").replace("\r\n", "\n");
+
+        assert!(
+            source.contains("float probe_spacing = 8.0 * lod_factor;"),
+            "merge shader should compute the world-space probe spacing"
+        );
+        assert!(
+            source.contains("(own_data.w - probe_spacing) / (probe_spacing * 2.0)"),
+            "merge transition must use world probe spacing, not only cascade lod factor"
+        );
+    }
+}

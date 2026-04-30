@@ -140,11 +140,10 @@ void main(uint3 dtid : SV_DispatchThreadID) {
     }
 
     // Blend own (near-field) vs merged (far-field) based on ray distance.
-    // Reference: (t - lod) / (lod * 2). Our probes are 8x sparser, but the
-    // merge formula operates on ray distance in voxels, not probe spacings.
-    // Match reference scaling: start at lod_factor, fully at 3 * lod_factor.
-    // C0: transition 1-3 voxels. C1: transition 2-6 voxels.
-    float dist_interp = clamp((own_data.w - lod_factor) / (lod_factor * 2.0), 0.0, 1.0);
+    // Reference probes are one voxel apart at C0, so lod_factor is also the
+    // world-space probe spacing. Our C0 probes are 8 voxels apart; using only
+    // lod_factor would blend away near emissive hits before C0 can light them.
+    float dist_interp = clamp((own_data.w - probe_spacing) / (probe_spacing * 2.0), 0.0, 1.0);
     float3 final_radiance = lerp(own_data.xyz, merged_radiance, dist_interp);
 
     probe_buffer[own_idx] = float4(final_radiance, own_data.w);
