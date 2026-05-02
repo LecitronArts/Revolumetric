@@ -325,8 +325,10 @@ mod shader_source_tests {
 
     #[test]
     fn app_wires_lighting_through_postprocess_before_blit() {
-        let source = std::fs::read_to_string("src/app.rs")
-            .expect("app source should be readable for render-pipeline source test");
+        let source = normalized_source(
+            &std::fs::read_to_string("src/app.rs")
+                .expect("app source should be readable for render-pipeline source test"),
+        );
 
         assert!(source.contains("postprocess_pass: Option<PostprocessPass>"));
         assert!(source.contains("PostprocessPass::new"));
