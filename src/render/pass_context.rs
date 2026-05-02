@@ -1,4 +1,6 @@
-use crate::render::resource::{QueueType, ResourceDesc, ResourceHandle};
+use crate::render::resource::{
+    AccessKind, QueueType, ResourceAccess, ResourceDesc, ResourceHandle,
+};
 use ash::vk;
 
 pub struct PassBuilder {
@@ -6,6 +8,8 @@ pub struct PassBuilder {
     pub queue_type: QueueType,
     pub reads: Vec<ResourceHandle>,
     pub writes: Vec<ResourceHandle>,
+    pub accesses: Vec<ResourceAccess>,
+    pub final_accesses: Vec<ResourceAccess>,
     pub(crate) resource_descs: Vec<(ResourceHandle, ResourceDesc)>,
     pub(crate) next_resource_id: u32,
 }
@@ -17,13 +21,20 @@ impl PassBuilder {
             queue_type,
             reads: Vec::new(),
             writes: Vec::new(),
+            accesses: Vec::new(),
+            final_accesses: Vec::new(),
             resource_descs: Vec::new(),
             next_resource_id: next_id,
         }
     }
 
     pub fn read(&mut self, handle: ResourceHandle) {
+        self.read_as(handle, AccessKind::ComputeShaderRead);
+    }
+
+    pub fn read_as(&mut self, handle: ResourceHandle, kind: AccessKind) {
         self.reads.push(handle);
+        self.accesses.push(ResourceAccess { handle, kind });
     }
 
     pub fn create_image(
@@ -39,6 +50,10 @@ impl PassBuilder {
         };
         self.next_resource_id += 1;
         self.writes.push(handle);
+        self.accesses.push(ResourceAccess {
+            handle,
+            kind: AccessKind::ComputeShaderWrite,
+        });
         self.resource_descs.push((
             handle,
             ResourceDesc::Image {
@@ -62,18 +77,34 @@ impl PassBuilder {
         };
         self.next_resource_id += 1;
         self.writes.push(handle);
+        self.accesses.push(ResourceAccess {
+            handle,
+            kind: AccessKind::ComputeShaderWrite,
+        });
         self.resource_descs
             .push((handle, ResourceDesc::Buffer { size, usage }));
         handle
     }
 
     pub fn write(&mut self, handle: ResourceHandle) -> ResourceHandle {
+        self.write_as(handle, AccessKind::ComputeShaderWrite)
+    }
+
+    pub fn write_as(&mut self, handle: ResourceHandle, kind: AccessKind) -> ResourceHandle {
         let new = ResourceHandle {
             id: handle.id,
             version: handle.version + 1,
         };
+        if kind == AccessKind::ComputeShaderReadWrite {
+            self.reads.push(handle);
+        }
         self.writes.push(new);
+        self.accesses.push(ResourceAccess { handle: new, kind });
         new
+    }
+
+    pub fn finish_as(&mut self, handle: ResourceHandle, kind: AccessKind) {
+        self.final_accesses.push(ResourceAccess { handle, kind });
     }
 }
 

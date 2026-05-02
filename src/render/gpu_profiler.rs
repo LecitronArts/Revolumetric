@@ -72,40 +72,28 @@ impl GpuProfilerConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuProfileScope {
     PrimaryRay = 0,
-    RcClear = 1,
-    RcTraceC0 = 2,
-    RcTraceC1 = 3,
-    RcTraceC2 = 4,
-    RcMergeC2ToC1 = 5,
-    RcMergeC1ToC0 = 6,
-    Lighting = 7,
-    BlitToSwapchain = 8,
+    Lighting = 1,
+    Vpt = 2,
+    Postprocess = 3,
+    BlitToSwapchain = 4,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 9;
+    pub const COUNT: usize = 5;
     pub const ALL: [Self; Self::COUNT] = [
         Self::PrimaryRay,
-        Self::RcClear,
-        Self::RcTraceC0,
-        Self::RcTraceC1,
-        Self::RcTraceC2,
-        Self::RcMergeC2ToC1,
-        Self::RcMergeC1ToC0,
         Self::Lighting,
+        Self::Vpt,
+        Self::Postprocess,
         Self::BlitToSwapchain,
     ];
 
     pub fn log_name(self) -> &'static str {
         match self {
             Self::PrimaryRay => "PrimaryRay",
-            Self::RcClear => "RCClear",
-            Self::RcTraceC0 => "RC-C0",
-            Self::RcTraceC1 => "RC-C1",
-            Self::RcTraceC2 => "RC-C2",
-            Self::RcMergeC2ToC1 => "Merge C2->C1",
-            Self::RcMergeC1ToC0 => "Merge C1->C0",
             Self::Lighting => "Lighting",
+            Self::Vpt => "Vpt",
+            Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
         }
     }
@@ -113,13 +101,9 @@ impl GpuProfileScope {
     pub fn csv_column(self) -> &'static str {
         match self {
             Self::PrimaryRay => "primary_ray_ms",
-            Self::RcClear => "rc_clear_ms",
-            Self::RcTraceC0 => "rc_trace_c0_ms",
-            Self::RcTraceC1 => "rc_trace_c1_ms",
-            Self::RcTraceC2 => "rc_trace_c2_ms",
-            Self::RcMergeC2ToC1 => "rc_merge_c2_to_c1_ms",
-            Self::RcMergeC1ToC0 => "rc_merge_c1_to_c0_ms",
             Self::Lighting => "lighting_ms",
+            Self::Vpt => "vpt_ms",
+            Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
         }
     }
@@ -634,13 +618,16 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 9);
+        assert_eq!(GpuProfileScope::COUNT, 5);
         assert_eq!(names[0], "PrimaryRay");
-        assert_eq!(names[5], "Merge C2->C1");
-        assert_eq!(names[6], "Merge C1->C0");
-        assert_eq!(names[8], "Blit");
+        assert_eq!(names[1], "Lighting");
+        assert_eq!(names[2], "Vpt");
+        assert_eq!(names[3], "Postprocess");
+        assert_eq!(names[4], "Blit");
         assert_eq!(columns[0], "primary_ray_ms");
-        assert_eq!(columns[8], "blit_to_swapchain_ms");
+        assert_eq!(columns[2], "vpt_ms");
+        assert_eq!(columns[3], "postprocess_ms");
+        assert_eq!(columns[4], "blit_to_swapchain_ms");
     }
 
     #[test]
@@ -653,7 +640,7 @@ mod tests {
         );
         assert_eq!(layout.begin_query(0, GpuProfileScope::PrimaryRay), 0);
         assert_eq!(layout.end_query(0, GpuProfileScope::PrimaryRay), 1);
-        assert_eq!(layout.begin_query(0, GpuProfileScope::RcClear), 2);
+        assert_eq!(layout.begin_query(0, GpuProfileScope::Lighting), 2);
         assert_eq!(
             layout.begin_query(1, GpuProfileScope::PrimaryRay),
             (GpuProfileScope::COUNT * 2) as u32
@@ -767,11 +754,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,primary_ray_ms,rc_clear_ms,rc_trace_c0_ms,rc_trace_c1_ms,rc_trace_c2_ms,rc_merge_c2_to_c1_ms,rc_merge_c1_to_c0_ms,lighting_ms,blit_to_swapchain_ms,total_ms"
+            "frame,primary_ray_ms,lighting_ms,vpt_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,1.7500"
+            "42,1.2500,0.0000,0.0000,0.0000,0.5000,1.7500"
         );
     }
 }

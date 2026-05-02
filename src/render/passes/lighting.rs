@@ -6,7 +6,6 @@ use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::primary_ray::PrimaryRayPass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
-use crate::render::rc_probe_buffer::RcProbeBuffer;
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
@@ -29,9 +28,8 @@ impl LightingPass {
         primary_ray: &PrimaryRayPass,
         ucvh_gpu: &UcvhGpuResources,
         scene_ubo: &SceneUniformBuffer,
-        rc_probes: &RcProbeBuffer,
     ) -> Result<Self> {
-        // Descriptor layout: 1 UBO + 3 G-buffer (storage image) + 1 output (storage image) + 4 UCVH (SSBO)
+        // Descriptor layout: 1 UBO + 3 G-buffer inputs + 1 output + 4 UCVH SSBOs.
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
             .add_binding(
                 0,
@@ -87,12 +85,6 @@ impl LightingPass {
                 vk::ShaderStageFlags::COMPUTE,
                 1,
             )
-            .add_binding(
-                9,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
@@ -107,7 +99,7 @@ impl LightingPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 5 * frame_count as u32,
+                descriptor_count: 4 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -127,7 +119,7 @@ impl LightingPass {
             }
         };
 
-        // Output image (same size as G-buffer, RGBA8 for final color)
+        // Output image (same size as G-buffer, linear HDR for postprocess)
         let output_image = match GpuImage::new(
             device,
             allocator,
@@ -135,7 +127,7 @@ impl LightingPass {
                 width,
                 height,
                 depth: 1,
-                format: vk::Format::R8G8B8A8_UNORM,
+                format: vk::Format::R16G16B16A16_SFLOAT,
                 usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "lighting_output",
@@ -225,18 +217,6 @@ impl LightingPass {
             all_writes.extend(image_writes);
             all_writes.extend(buffer_writes);
 
-            // Binding 9: RC probe buffer (read current frame's merged data)
-            let rc_info = vk::DescriptorBufferInfo::default()
-                .buffer(rc_probes.write_buffer(set_idx))
-                .offset(0)
-                .range(vk::WHOLE_SIZE);
-            let rc_write = vk::WriteDescriptorSet::default()
-                .dst_set(ds)
-                .dst_binding(9)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&rc_info));
-            all_writes.push(rc_write);
-
             unsafe { device.update_descriptor_sets(&all_writes, &[]) };
         }
 
@@ -292,7 +272,7 @@ impl LightingPass {
                 width,
                 height,
                 depth: 1,
-                format: vk::Format::R8G8B8A8_UNORM,
+                format: vk::Format::R16G16B16A16_SFLOAT,
                 usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "lighting_output",
@@ -333,64 +313,10 @@ impl LightingPass {
         Ok(())
     }
 
-    /// Record the lighting pass. Inserts input barriers on G-buffer images before dispatch.
-    pub fn record(
-        &self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        frame_slot: usize,
-        gbuffer_images: [vk::Image; 3], // [gbuffer_pos, gbuffer0, gbuffer1]
-    ) {
+    /// Record the lighting pass. RenderGraph owns image layout transitions.
+    pub fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         let extent = self.output_image.extent;
 
-        // Barrier: G-buffer SHADER_WRITE → SHADER_READ + output to GENERAL
-        let mut barriers: Vec<vk::ImageMemoryBarrier> = gbuffer_images
-            .iter()
-            .map(|&image| {
-                vk::ImageMemoryBarrier::default()
-                    .old_layout(vk::ImageLayout::GENERAL)
-                    .new_layout(vk::ImageLayout::GENERAL)
-                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)
-                    .image(image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .level_count(1)
-                            .layer_count(1),
-                    )
-            })
-            .collect();
-
-        // Output image to GENERAL for compute write
-        barriers.push(
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .image(self.output_image.handle)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                ),
-        );
-
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            );
-        }
-
-        // Bind pipeline and per-frame descriptor set
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.handle);
             device.cmd_bind_descriptor_sets(
@@ -408,26 +334,6 @@ impl LightingPass {
         unsafe { device.cmd_dispatch(cmd, groups_x, groups_y, 1) };
     }
 
-    /// Only updates the given frame_slot to avoid writing in-flight descriptor sets.
-    pub fn update_rc_descriptor(
-        &self,
-        device: &ash::Device,
-        rc_probes: &RcProbeBuffer,
-        frame_slot: usize,
-    ) {
-        let ds = self.descriptor_sets[frame_slot];
-        let rc_info = vk::DescriptorBufferInfo::default()
-            .buffer(rc_probes.write_buffer(frame_slot))
-            .offset(0)
-            .range(vk::WHOLE_SIZE);
-        let rc_write = vk::WriteDescriptorSet::default()
-            .dst_set(ds)
-            .dst_binding(9)
-            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-            .buffer_info(std::slice::from_ref(&rc_info));
-        unsafe { device.update_descriptor_sets(&[rc_write], &[]) };
-    }
-
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
         self.pipeline.destroy(device);
         self.descriptor_pool.destroy(device);
@@ -443,64 +349,13 @@ mod shader_source_tests {
     }
 
     #[test]
-    fn lighting_shader_uses_rc_probe_quality_for_indirect_integration() {
-        let source =
-            include_str!("../../../assets/shaders/passes/lighting.slang").replace("\r\n", "\n");
-        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
-            .replace("\r\n", "\n");
-
-        assert!(shared.contains("float3 integrate_probe_fast("));
-        assert!(shared.contains("float3 integrate_probe_quality("));
-        assert!(source.contains("scene.rc_probe_quality"));
-        assert!(source.contains("integrate_probe_quality(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid, scene.rc_probe_quality)"));
-    }
-
-    #[test]
-    fn fast_probe_face_selection_uses_dominant_axis_normals() {
-        let shared = include_str!("../../../assets/shaders/shared/radiance_cascade.slang")
-            .replace("\r\n", "\n");
-        let normal_to_face_start = shared
-            .find("uint normal_to_face(float3 n)")
-            .expect("radiance cascade shader should define normal_to_face");
-        let face_normals_start = shared
-            .find("// Face normals lookup for cosine weighting.")
-            .expect("normal_to_face should appear before face normal lookup");
-        let normal_to_face = &shared[normal_to_face_start..face_normals_start];
-
-        assert!(normal_to_face.contains("float3 a = abs(n);"));
-        assert!(normal_to_face.contains("if (a.x >= a.y && a.x >= a.z)"));
-        assert!(normal_to_face.contains("if (a.y >= a.z)"));
-        assert!(normal_to_face.contains("return (n.x >= 0.0) ? 0u : 1u;"));
-        assert!(normal_to_face.contains("return (n.y >= 0.0) ? 2u : 3u;"));
-        assert!(normal_to_face.contains("return (n.z >= 0.0) ? 4u : 5u;"));
-        assert!(!normal_to_face.contains("return encode_normal_id(n);"));
-    }
-
-    #[test]
     fn descriptor_ubo_range_uses_rust_uniform_size() {
         let source = std::fs::read_to_string("src/render/passes/lighting.rs")
             .expect("lighting pass source should be readable");
-        let hardcoded_range = [".range(", "176)"].join("");
+        let hardcoded_range = [".range(", "160)"].join("");
 
         assert!(source.contains("std::mem::size_of::<GpuSceneUniforms>() as u64"));
         assert!(!source.contains(&hardcoded_range));
-    }
-
-    #[test]
-    fn rc_gradient_normal_does_not_override_unrelated_hit_face() {
-        let source = normalized_source(include_str!(
-            "../../../assets/shaders/passes/lighting.slang"
-        ));
-
-        source
-            .find("float3 gradient_normal = compute_occupancy_gradient_normal")
-            .expect("lighting shader should compute the optional RC gradient normal");
-        source
-            .find("if (dot(gradient_normal, axis_normal) > 0.5)")
-            .expect("gradient normal must be gated by the actual hit face normal");
-        source
-            .find("return axis_normal;")
-            .expect("lighting shader should fall back to DDA hit face normal");
     }
 
     #[test]
@@ -511,10 +366,6 @@ mod shader_source_tests {
         let lighting = normalized_source(include_str!(
             "../../../assets/shaders/passes/lighting.slang"
         ));
-        let test_pattern = normalized_source(include_str!(
-            "../../../assets/shaders/passes/test_pattern.slang"
-        ));
-
         assert!(
             primary.contains("[[vk::image_format(\"rgba32f\")]]\nRWTexture2D<float4> gbuffer_pos;"),
             "primary_ray gbuffer_pos must declare rgba32f storage image format"
@@ -533,13 +384,9 @@ mod shader_source_tests {
             "lighting gbuffer0 must declare rgba8 storage image format"
         );
         assert!(
-            lighting.contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> output_image;"),
-            "lighting output_image must declare rgba8 storage image format"
-        );
-        assert!(
-            test_pattern
-                .contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> output_image;"),
-            "test_pattern output_image must declare rgba8 storage image format"
+            lighting
+                .contains("[[vk::image_format(\"rgba16f\")]]\nRWTexture2D<float4> output_image;"),
+            "lighting output_image must declare rgba16f HDR storage image format"
         );
         assert!(
             primary.contains("[[vk::image_format(\"rgba8ui\")]]\nRWTexture2D<uint4> gbuffer1;"),
@@ -573,8 +420,8 @@ mod shader_source_tests {
             "lighting shader must decode debug view from the scene flags at runtime"
         );
         assert!(
-            lighting.contains("debug_view == LIGHTING_DEBUG_VIEW_RC_INDIRECT"),
-            "lighting shader must support RC indirect/ambient-only debug output"
+            common.contains("LIGHTING_DEBUG_VIEW_FINAL"),
+            "scene common shader constants must keep final debug view"
         );
         assert!(
             lighting.contains("debug_view == LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE"),
@@ -588,5 +435,33 @@ mod shader_source_tests {
             !lighting.contains("DEBUG: uncomment"),
             "debug views should be runtime-switchable, not source edits"
         );
+    }
+
+    #[test]
+    fn lighting_shader_has_no_rc_runtime_bindings_or_includes() {
+        let lighting = normalized_source(include_str!(
+            "../../../assets/shaders/passes/lighting.slang"
+        ));
+
+        assert!(!lighting.contains("radiance_cascade.slang"));
+        assert!(!lighting.contains("rc_probes"));
+        assert!(!lighting.contains("scene.rc_"));
+        assert!(!lighting.contains("[[vk::binding(9, 0)]]"));
+    }
+
+    #[test]
+    fn lighting_shader_uses_vct_common_for_default_indirect() {
+        let lighting = normalized_source(include_str!(
+            "../../../assets/shaders/passes/lighting.slang"
+        ));
+        let common = normalized_source(include_str!(
+            "../../../assets/shaders/shared/scene_common.slang"
+        ));
+
+        assert!(lighting.contains("#include \"vct_common.slang\""));
+        assert!(common.contains("LIGHTING_FLAG_VCT_ENABLED"));
+        assert!(lighting.contains("vct_trace_diffuse("));
+        assert!(lighting.contains("hemisphere_ambient("));
+        assert!(lighting.contains("if (vct_indirect.x + vct_indirect.y + vct_indirect.z > 0.0)"));
     }
 }

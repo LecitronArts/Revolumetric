@@ -1,5 +1,7 @@
 # App Orchestration Cleanup Implementation Plan
 
+> Superseded historical plan. The active rendering MVP is `docs/superpowers/plans/2026-05-02-vct-vpt-rendering-mvp.md`; do not restore RC-era scene uniform fields from this document.
+
 > **For agentic workers:** REQUIRED: Use superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Move pure per-frame orchestration logic out of `src/app.rs` while preserving runtime behavior.
@@ -54,8 +56,8 @@ Expected: tests pass.
 - [x] **Step 1: Write failing tests**
 
 Add tests in `src/render/scene_ubo.rs` for:
-- settings are applied to flags and RC strategy fields
-- resolution, sun fields, colors, time, and RC enable flag are copied into `GpuSceneUniforms`
+- settings are applied to flags and current VCT/VPT/postprocess fields
+- resolution, sun fields, colors, time, render mode, VPT bounce count, and exposure are copied into `GpuSceneUniforms`
 
 - [x] **Step 2: Verify red**
 

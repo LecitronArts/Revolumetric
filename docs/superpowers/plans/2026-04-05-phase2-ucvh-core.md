@@ -1,5 +1,7 @@
 # Phase 2: UCVH Core — Implementation Plan
 
+> Superseded historical plan. The active rendering MVP is `docs/superpowers/plans/2026-05-02-vct-vpt-rendering-mvp.md`; do not restore `TestPatternPass`, pass-local blit barriers, or RC-era wiring from this document.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the CPU-side brick pool with Morton-order storage, 5-level cascaded occupancy hierarchy, GPU upload pipeline, and a procedural sphere demo scene — producing SSBO data ready for Phase 3's ray tracer.

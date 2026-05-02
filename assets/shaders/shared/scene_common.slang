@@ -4,22 +4,18 @@
 
 static const uint LIGHTING_FLAG_SHADOWS_ENABLED = 1u << 0;
 static const uint LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS = 1u << 1;
+static const uint LIGHTING_FLAG_VCT_ENABLED = 1u << 2;
 static const uint LIGHTING_DEBUG_VIEW_SHIFT = 28u;
 static const uint LIGHTING_DEBUG_VIEW_MASK = 0xFu << LIGHTING_DEBUG_VIEW_SHIFT;
 static const uint LIGHTING_DEBUG_VIEW_FINAL = 0u;
-static const uint LIGHTING_DEBUG_VIEW_RC_INDIRECT = 1u;
-static const uint LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE = 2u;
-static const uint LIGHTING_DEBUG_VIEW_NORMAL = 3u;
+static const uint LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE = 1u;
+static const uint LIGHTING_DEBUG_VIEW_NORMAL = 2u;
+static const uint RENDER_MODE_VCT = 0u;
+static const uint RENDER_MODE_VPT = 1u;
 
 uint lighting_debug_view(uint flags) {
     return (flags & LIGHTING_DEBUG_VIEW_MASK) >> LIGHTING_DEBUG_VIEW_SHIFT;
 }
-
-static const uint RC_NORMAL_STRATEGY_AXIS_NORMAL = 0u;
-static const uint RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT = 1u;
-
-static const uint RC_PROBE_QUALITY_FULL = 0u;
-static const uint RC_PROBE_QUALITY_FAST = 1u;
 
 struct SceneUniforms {
     float4x4 pixel_to_ray;   // 64B
@@ -33,13 +29,10 @@ struct SceneUniforms {
     float    _pad3;           // 4B
     float3   ground_color;    // 12B
     float    time;            // 4B
-    // --- RC fields (individual uints to avoid uint3 16-byte alignment in std140) ---
-    uint     rc_c0_grid_x;    // 4B
-    uint     rc_c0_grid_y;    // 4B
-    uint     rc_c0_grid_z;    // 4B
-    uint     rc_c0_offset;    // 4B
-    uint     rc_enabled;      // 4B
     uint     lighting_flags;  // 4B
-    uint     rc_normal_strategy; // 4B
-    uint     rc_probe_quality; // 4B
+    float    exposure;        // 4B
+    uint     render_mode;     // 4B
+    uint     vpt_sample_index;// 4B
+    uint     vpt_max_bounces; // 4B
+    uint3    _pad4;           // 12B
 };                            // total: 176B, matches Rust repr(C) layout exactly

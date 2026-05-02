@@ -142,7 +142,7 @@ impl PrimaryRayPass {
                 height,
                 depth: 1,
                 format: vk::Format::R8G8B8A8_UNORM,
-                usage: vk::ImageUsageFlags::STORAGE,
+                usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "gbuffer0",
             },
@@ -322,7 +322,7 @@ impl PrimaryRayPass {
                 height,
                 depth: 1,
                 format: vk::Format::R8G8B8A8_UNORM,
-                usage: vk::ImageUsageFlags::STORAGE,
+                usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
                 aspect: vk::ImageAspectFlags::COLOR,
                 name: "gbuffer0",
             },
@@ -380,42 +380,6 @@ impl PrimaryRayPass {
     pub fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         let extent = self.gbuffer_pos.extent;
 
-        // Transition all 3 G-buffer images to GENERAL for compute write
-        let barriers: Vec<vk::ImageMemoryBarrier> = [
-            self.gbuffer_pos.handle,
-            self.gbuffer0.handle,
-            self.gbuffer1.handle,
-        ]
-        .iter()
-        .map(|&image| {
-            vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
-                .image(image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .level_count(1)
-                        .layer_count(1),
-                )
-        })
-        .collect();
-
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &barriers,
-            );
-        }
-
-        // Bind pipeline and per-frame descriptor set
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.handle);
             device.cmd_bind_descriptor_sets(
@@ -428,7 +392,6 @@ impl PrimaryRayPass {
             );
         }
 
-        // Dispatch (8x8 workgroups)
         let groups_x = extent.width.div_ceil(8);
         let groups_y = extent.height.div_ceil(8);
         unsafe { device.cmd_dispatch(cmd, groups_x, groups_y, 1) };
@@ -459,6 +422,18 @@ mod shader_source_tests {
         assert!(!shader.contains("static const float3 MATERIAL_ALBEDO"));
         assert!(rust.contains("std::mem::size_of::<GpuSceneUniforms>() as u64"));
         assert!(!rust.contains(&hardcoded_range));
+    }
+
+    #[test]
+    fn gbuffer0_can_be_used_as_raw_blit_fallback_source() {
+        let rust = std::fs::read_to_string("src/render/passes/primary_ray.rs")
+            .expect("primary ray pass source should be readable");
+        let app = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
+
+        assert!(rust.matches("name: \"gbuffer0\"").count() >= 2);
+        assert!(rust.matches("vk::ImageUsageFlags::TRANSFER_SRC").count() >= 3);
+        assert!(app.contains("let dep_handle = primary_ray_writes[1];"));
+        assert!(app.contains("vk::ImageUsageFlags::TRANSFER_SRC"));
     }
 
     #[test]

@@ -1,9 +1,9 @@
 // Deferred lighting compute shader.
-// Reads G-buffer, traces shadow rays, computes Lambert + hemisphere ambient + ACES tonemap.
+// Reads G-buffer, traces shadow rays, computes linear HDR lighting.
 
 #include "voxel_traverse.slang"
 #include "lighting_common.slang"
-#include "radiance_cascade.slang"
+#include "vct_common.slang"
 
 // Binding 0: Scene UBO
 [[vk::binding(0, 0)]]
@@ -22,9 +22,9 @@ RWTexture2D<float4> gbuffer0;
 [[vk::image_format("rgba8ui")]]
 RWTexture2D<uint4> gbuffer1;
 
-// Binding 4: output image
+// Binding 4: linear HDR output image
 [[vk::binding(4, 0)]]
-[[vk::image_format("rgba8")]]
+[[vk::image_format("rgba16f")]]
 RWTexture2D<float4> output_image;
 
 // Binding 5-8: UCVH buffers (for shadow ray tracing)
@@ -39,47 +39,6 @@ StructuredBuffer<BrickOccupancy> brick_occupancy;
 
 [[vk::binding(8, 0)]]
 StructuredBuffer<VoxelCell> brick_materials;
-
-// Binding 9: RC probe buffer (read-only for indirect lighting)
-[[vk::binding(9, 0)]]
-StructuredBuffer<float4> rc_probes;
-
-float3 compute_occupancy_gradient_normal(
-    float3 position,
-    float3 fallback_normal,
-    uint3 brick_grid_size,
-    uint3 world_size,
-    StructuredBuffer<NodeL0> hierarchy_l0,
-    StructuredBuffer<BrickOccupancy> brick_occupancy
-) {
-    int3 ip = int3(floor(position));
-    float3 grad;
-    grad.x = float(!rc_outside_geo(float3(ip) + float3(1,0,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
-           - float(!rc_outside_geo(float3(ip) + float3(-1,0,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
-    grad.y = float(!rc_outside_geo(float3(ip) + float3(0,1,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
-           - float(!rc_outside_geo(float3(ip) + float3(0,-1,0), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
-    grad.z = float(!rc_outside_geo(float3(ip) + float3(0,0,1), hierarchy_l0, brick_occupancy, brick_grid_size, world_size))
-           - float(!rc_outside_geo(float3(ip) + float3(0,0,-1), hierarchy_l0, brick_occupancy, brick_grid_size, world_size));
-    return (length(grad) > 0.001) ? normalize(-grad) : fallback_normal;
-}
-
-float3 select_rc_normal(
-    SceneUniforms scene,
-    float3 position,
-    float3 axis_normal,
-    uint3 brick_grid_size,
-    uint3 world_size,
-    StructuredBuffer<NodeL0> hierarchy_l0,
-    StructuredBuffer<BrickOccupancy> brick_occupancy
-) {
-    if (scene.rc_normal_strategy == RC_NORMAL_STRATEGY_OCCUPANCY_GRADIENT) {
-        float3 gradient_normal = compute_occupancy_gradient_normal(position, axis_normal, brick_grid_size, world_size, hierarchy_l0, brick_occupancy);
-        if (dot(gradient_normal, axis_normal) > 0.5) {
-            return gradient_normal;
-        }
-    }
-    return axis_normal;
-}
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
@@ -101,8 +60,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
         );
         float3 ray_dir = normalize(mul(float3(pixel, 1.0), dir_mat));
         float3 sky = sky_color_for_dir(ray_dir, scene);
-        sky = aces_tonemap(sky);
-        sky = pow(sky, float3(1.0 / 2.2));
         output_image[tid.xy] = float4(sky, 1.0);
         return;
     }
@@ -114,12 +71,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint normal_id = gb1.r;
     float3 normal = NORMAL_TABLE[min(normal_id, 5u)];
 
-    // Emissive early-out: Reinhard tonemap preserves warm color better than ACES at high values
+    // Emissive early-out: keep linear HDR for postprocess.
     uint3 emissive_raw = uint3(gb1.g, gb1.b, gb1.a);
     if (emissive_raw.x + emissive_raw.y + emissive_raw.z > 0u) {
         float3 emissive = float3(emissive_raw) / 255.0 * 3.0;
-        float3 mapped = emissive / (1.0 + emissive);
-        output_image[tid.xy] = float4(pow(mapped, float3(1.0 / 2.2)), 1.0);
+        output_image[tid.xy] = float4(emissive, 1.0);
         return;
     }
 
@@ -137,31 +93,30 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
     float3 diffuse = base_color * scene.sun_intensity * ndotl * shadow;
 
-    // Indirect: RC probes or hemisphere fallback
-    float3 ambient;
-    if (scene.rc_enabled > 0u) {
-        uint3 brick_grid_size = ucvh_config[0].brick_grid_size.xyz;
-        uint3 world_size = ucvh_config[0].world_size.xyz;
-        float3 rc_normal = select_rc_normal(scene, position, normal, brick_grid_size, world_size, hierarchy_l0, brick_occupancy);
-        uint3 c0_grid = uint3(scene.rc_c0_grid_x, scene.rc_c0_grid_y, scene.rc_c0_grid_z);
-        float3 indirect = integrate_probe_quality(position, rc_normal, rc_probes, scene.rc_c0_offset, c0_grid, scene.rc_probe_quality);
-        ambient = base_color * indirect;
-    } else {
-        ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
+    float3 ambient = base_color * hemisphere_ambient(normal, scene.sky_color, scene.ground_color);
+    float3 vct_indirect = float3(0.0);
+    if ((scene.lighting_flags & LIGHTING_FLAG_VCT_ENABLED) != 0u) {
+        vct_indirect = base_color * vct_trace_diffuse(
+            position,
+            normal,
+            scene,
+            ucvh_config,
+            hierarchy_l0,
+            brick_occupancy,
+            brick_materials
+        );
     }
-    float3 hdr_color = diffuse + ambient;
+    float3 indirect = ambient;
+    if (vct_indirect.x + vct_indirect.y + vct_indirect.z > 0.0) {
+        indirect = vct_indirect;
+    }
+    float3 hdr_color = diffuse + indirect;
     uint debug_view = lighting_debug_view(scene.lighting_flags);
-    if (debug_view == LIGHTING_DEBUG_VIEW_RC_INDIRECT) {
-        hdr_color = ambient;
-    } else if (debug_view == LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE) {
+    if (debug_view == LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE) {
         hdr_color = diffuse;
     } else if (debug_view == LIGHTING_DEBUG_VIEW_NORMAL) {
         hdr_color = float3(normal * 0.5 + 0.5);
     }
 
-    // Tonemap (ACES Filmic) + gamma correction
-    float3 mapped = aces_tonemap(hdr_color);
-    float3 ldr = pow(mapped, float3(1.0 / 2.2));
-
-    output_image[tid.xy] = float4(ldr, 1.0);
+    output_image[tid.xy] = float4(hdr_color, 1.0);
 }

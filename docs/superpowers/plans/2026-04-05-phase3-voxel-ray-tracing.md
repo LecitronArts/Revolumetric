@@ -1,5 +1,7 @@
 # Phase 3: Voxel Ray Tracing — Implementation Plan
 
+> Superseded historical plan. The active rendering MVP is `docs/superpowers/plans/2026-05-02-vct-vpt-rendering-mvp.md`; do not restore `TestPatternPass`, old `record_blit` barriers, or pre-graph pass wiring from this document.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Implement two-level hierarchical DDA ray tracing through the UCVH data structure, producing a flat-color rendered image of the voxel scene.

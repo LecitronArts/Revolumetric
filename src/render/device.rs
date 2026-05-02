@@ -338,6 +338,7 @@ impl RenderDevice {
             command_buffer,
             swapchain_image: self.swapchain.images[image_index],
             swapchain_image_index: image_index,
+            swapchain_image_layout: self.swapchain.image_layouts[image_index],
             swapchain_extent: self.swapchain.extent,
             swapchain_format: self.swapchain.format,
             image_available_semaphore,
