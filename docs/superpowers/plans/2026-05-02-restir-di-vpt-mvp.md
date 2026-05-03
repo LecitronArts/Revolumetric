@@ -890,7 +890,7 @@ Expected: VPT source tests pass, including the new ReSTIR-DI disabled-default ch
 - Modify: `src/render/passes/vpt.rs`
 - Modify: `src/render/passes/restir_di.rs`
 
-- [ ] **Step 1: Write failing shader source test**
+- [x] **Step 1: Write failing shader source test**
 
 Add a test that requires the VPT shader to include ReSTIR-DI and branch on enabled state:
 
@@ -904,7 +904,7 @@ fn vpt_shader_can_resolve_restir_di_direct_light_when_enabled() {
 }
 ```
 
-- [ ] **Step 2: Verify red**
+- [x] **Step 2: Verify red**
 
 Run:
 
@@ -914,7 +914,7 @@ cargo test render::passes::vpt::shader_source_tests::vpt_shader_can_resolve_rest
 
 Expected: failure because VPT does not include or use ReSTIR-DI.
 
-- [ ] **Step 3: Implement shader-side gated resolve**
+- [x] **Step 3: Implement shader-side gated resolve**
 
 Add ReSTIR-DI descriptor bindings after existing VPT bindings. Keep disabled behavior equivalent:
 
@@ -950,7 +950,7 @@ if (restir.enabled != 0u && bounce == 0u) {
 }
 ```
 
-- [ ] **Step 4: Verify green**
+- [x] **Step 4: Verify green**
 
 Run:
 

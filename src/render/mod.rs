@@ -1,4 +1,5 @@
 pub mod allocator;
+pub mod area_restir;
 pub mod buffer;
 pub mod camera;
 pub mod descriptor;
@@ -16,3 +17,4 @@ pub mod sampler;
 pub mod scene_ubo;
 pub mod shader;
 pub mod swapchain;
+pub mod vpt_history;

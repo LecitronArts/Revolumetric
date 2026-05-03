@@ -140,7 +140,7 @@ Add VPT-only environment settings through `LightingSettings` / `GpuSceneUniforms
 - `REVOLUMETRIC_RESTIR_DI_TEMPORAL=on|off|1|0|true|false`
   - Default: `on` when ReSTIR-DI is enabled.
 - `REVOLUMETRIC_RESTIR_DI_SPATIAL=on|off|1|0|true|false`
-  - Default: `on` when ReSTIR-DI is enabled.
+  - Default: `off` while the spatial reuse stage is still being stabilized. Enable explicitly for spatial-reuse debugging.
 - `REVOLUMETRIC_RESTIR_DI_SPATIAL_SAMPLES=0..8`
   - Default: `4`.
 - `REVOLUMETRIC_RESTIR_DI_HISTORY_LENGTH=1..64`
@@ -477,7 +477,8 @@ rg -n "RESTIR|restir|reservoir|REVOLUMETRIC_VPT_RESTIR" README.md docs src asset
 
 - Current UCVH traversal consumes dense SSBO resources and `hierarchy_l0`; ReSTIR-DI visibility must work within that traversal limit until deeper hierarchy traversal is implemented.
 - Current VPT has no denoiser.
-- Current renderer now has a CPU-built direct-light table for ReSTIR-DI, including sun and brick-clustered emissive voxels. It is not yet consumed by VPT reservoir resolve.
+- Current renderer now has a CPU-built direct-light table for ReSTIR-DI, including sun and brick-clustered emissive voxels. VPT consumes the final spatial reservoir for primary-bounce direct lighting when `REVOLUMETRIC_RENDER_MODE=vpt` and `REVOLUMETRIC_VPT_RESTIR_DI=on`.
+- Current ReSTIR-DI reservoir generation is an MVP direct-light estimator. It does not yet implement camera-motion reprojection, robust temporal history validation, or debug views, so it should not be treated as a complete denoising path.
 - Current RenderGraph emits buffer barriers for declared single-queue buffer accesses, but does not yet own transient buffer lifetime or descriptor automation.
 - Current descriptor ABI validation is source/test based, not generated from Slang reflection.
 - Same-pixel temporal reuse is only valid when camera and scene state are unchanged. Real camera motion needs reprojection data.

@@ -1,11 +1,12 @@
 use anyhow::Result;
 use ash::vk;
-use bytemuck::Zeroable;
 use gpu_allocator::MemoryLocation;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::image::GpuImage;
+use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::restir_di::{
     GpuDirectLight, GpuRestirDiReservoir, GpuRestirDiUniforms, RestirDiSettings,
@@ -25,6 +26,12 @@ pub struct RestirDiPass {
     height: u32,
     reservoir_count: u32,
     light_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestirDiHistorySource {
+    Temporal,
+    Spatial,
 }
 
 pub struct RestirDiPassCreateInfo<'a> {
@@ -76,6 +83,9 @@ impl RestirDiPass {
                 (0, vk::DescriptorType::UNIFORM_BUFFER),
                 (1, vk::DescriptorType::STORAGE_BUFFER),
                 (2, vk::DescriptorType::STORAGE_BUFFER),
+                (3, vk::DescriptorType::STORAGE_IMAGE),
+                (4, vk::DescriptorType::STORAGE_IMAGE),
+                (5, vk::DescriptorType::STORAGE_IMAGE),
             ],
             info.frame_count,
             &[
@@ -86,6 +96,10 @@ impl RestirDiPass {
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     descriptor_count: 2 * info.frame_count as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 3 * info.frame_count as u32,
                 },
             ],
         ) {
@@ -103,6 +117,13 @@ impl RestirDiPass {
                 (1, vk::DescriptorType::STORAGE_BUFFER),
                 (2, vk::DescriptorType::STORAGE_BUFFER),
                 (3, vk::DescriptorType::STORAGE_BUFFER),
+                (4, vk::DescriptorType::STORAGE_IMAGE),
+                (5, vk::DescriptorType::STORAGE_IMAGE),
+                (6, vk::DescriptorType::STORAGE_IMAGE),
+                (7, vk::DescriptorType::STORAGE_IMAGE),
+                (8, vk::DescriptorType::STORAGE_IMAGE),
+                (9, vk::DescriptorType::STORAGE_IMAGE),
+                (10, vk::DescriptorType::STORAGE_IMAGE),
             ],
             info.frame_count,
             &[
@@ -113,6 +134,10 @@ impl RestirDiPass {
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     descriptor_count: 3 * info.frame_count as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 8 * info.frame_count as u32,
                 },
             ],
         ) {
@@ -130,6 +155,9 @@ impl RestirDiPass {
                 (0, vk::DescriptorType::UNIFORM_BUFFER),
                 (1, vk::DescriptorType::STORAGE_BUFFER),
                 (2, vk::DescriptorType::STORAGE_BUFFER),
+                (3, vk::DescriptorType::STORAGE_IMAGE),
+                (4, vk::DescriptorType::STORAGE_IMAGE),
+                (5, vk::DescriptorType::STORAGE_IMAGE),
             ],
             info.frame_count,
             &[
@@ -140,6 +168,10 @@ impl RestirDiPass {
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
                     descriptor_count: 2 * info.frame_count as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 3 * info.frame_count as u32,
                 },
             ],
         ) {
@@ -180,6 +212,29 @@ impl RestirDiPass {
             self.height,
         );
         write_mapped(self.uniform_buffers[frame_slot].mapped_ptr(), &uniforms);
+    }
+
+    pub fn update_surface_descriptors(&self, device: &ash::Device, surface: &VptSurfacePass) {
+        let current_surface_images = [
+            &surface.surface_position_depth,
+            &surface.surface_normal_roughness,
+            &surface.surface_albedo_material,
+        ];
+        let temporal_surface_images = [
+            &surface.surface_position_depth,
+            &surface.surface_normal_roughness,
+            &surface.surface_albedo_material,
+            &surface.previous_surface_position_depth,
+            &surface.previous_surface_normal_roughness,
+            &surface.previous_surface_albedo_material,
+            &surface.motion_history,
+        ];
+        self.initial_stage
+            .write_image_descriptors(device, 3, &current_surface_images);
+        self.temporal_stage
+            .write_image_descriptors(device, 4, &temporal_surface_images);
+        self.spatial_stage
+            .write_image_descriptors(device, 3, &current_surface_images);
     }
 
     pub fn resize_buffers(
@@ -261,6 +316,30 @@ impl RestirDiPass {
             self.history_reservoirs.size,
             self.history_reservoirs.usage,
         )
+    }
+
+    pub fn record_history_update(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        _frame_slot: usize,
+        source: RestirDiHistorySource,
+    ) {
+        let source_buffer = match source {
+            RestirDiHistorySource::Temporal => &self.temporal_reservoirs,
+            RestirDiHistorySource::Spatial => &self.spatial_reservoirs,
+        };
+        unsafe {
+            device.cmd_copy_buffer(
+                cmd,
+                source_buffer.handle,
+                self.history_reservoirs.handle,
+                &[vk::BufferCopy::default()
+                    .src_offset(0)
+                    .dst_offset(0)
+                    .size(self.history_reservoirs.size)],
+            );
+        }
     }
 
     pub fn record_initial(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
@@ -510,6 +589,37 @@ impl RestirDiStage {
         }
     }
 
+    fn write_image_descriptors(
+        &self,
+        device: &ash::Device,
+        first_binding: u32,
+        images: &[&GpuImage],
+    ) {
+        let image_infos: Vec<vk::DescriptorImageInfo> = images
+            .iter()
+            .map(|image| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image.view)
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect();
+
+        for &ds in &self.descriptor_sets {
+            let writes: Vec<_> = image_infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(first_binding + idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
     fn record(
         &self,
         device: &ash::Device,
@@ -591,21 +701,16 @@ fn create_reservoir_buffer(
     name: &str,
 ) -> Result<GpuBuffer> {
     let count = reservoir_count.max(1) as usize;
-    let buffer = GpuBuffer::new(
+    GpuBuffer::new(
         device,
         allocator,
         (count * std::mem::size_of::<GpuRestirDiReservoir>()) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER,
-        MemoryLocation::CpuToGpu,
+        vk::BufferUsageFlags::STORAGE_BUFFER
+            | vk::BufferUsageFlags::TRANSFER_SRC
+            | vk::BufferUsageFlags::TRANSFER_DST,
+        MemoryLocation::GpuOnly,
         name,
-    )?;
-    let invalid_reservoir = GpuRestirDiReservoir {
-        sample_light_id: u32::MAX,
-        ..GpuRestirDiReservoir::zeroed()
-    };
-    let initial_data = vec![invalid_reservoir; count];
-    write_mapped_slice(buffer.mapped_ptr(), &initial_data);
-    Ok(buffer)
+    )
 }
 
 fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
@@ -654,6 +759,347 @@ mod shader_source_tests {
         assert!(initial.contains("StructuredBuffer<DirectLight>"));
         assert!(temporal.contains("history_reservoirs"));
         assert!(spatial.contains("temporal_reservoirs"));
+    }
+
+    #[test]
+    fn restir_di_initial_writes_valid_candidate_reservoirs() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+
+        assert!(initial.contains("restir.light_count == 0u"));
+        assert!(initial.contains("DirectLight light = direct_lights[light_id];"));
+        assert!(initial.contains("reservoir.sample_light_id = light_id;"));
+        assert!(initial.contains("reservoir.sample_flags ="));
+        assert!(initial.contains("reservoir.sample_count_m += 1u;"));
+        assert!(initial.contains("reservoir.weight_sum ="));
+        assert!(initial.contains("reservoir.selected_weight ="));
+        assert!(initial.contains("reservoir.sample_position_pdf ="));
+        assert!(initial.contains("reservoir.sample_radiance ="));
+    }
+
+    #[test]
+    fn restir_di_initial_computes_selected_weight_from_total_candidate_weight() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+
+        assert!(
+            initial.contains("reservoir.selected_weight = weight_sum /"),
+            "direct lighting resolve consumes selected_weight, so initial RIS must compute it from the total candidate weight"
+        );
+        assert!(initial.contains("reservoir.target_pdf * float(reservoir.sample_count_m)"));
+    }
+
+    #[test]
+    fn restir_di_target_pdf_matches_vpt_direct_light_measure() {
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+
+        for token in [
+            "restir_di_emissive_distance_attenuation",
+            "restir_di_sun_target_pdf",
+            "restir_di_emissive_target_pdf",
+            "distance_sq",
+            "return light_power * albedo_luma * light_term * attenuation;",
+        ] {
+            assert!(
+                common.contains(token),
+                "ReSTIR target PDF must include the same cosine and attenuation measure as VPT direct resolve: {token}"
+            );
+        }
+        assert!(
+            !common.contains("max(dot(surface_normal, light_dir), 0.05)"),
+            "target PDF must not assign positive probability to back-facing direct-light samples that resolve to zero"
+        );
+    }
+
+    #[test]
+    fn restir_di_initial_evaluates_sun_as_direction_not_world_position() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+
+        assert!(
+            initial.contains("restir_di_target_pdf_for_light_sample("),
+            "initial sampling should use the shared light target PDF evaluator"
+        );
+        assert!(
+            !initial
+                .contains("light.position_radius.xyz - current_surface_position_depth[pixel].xyz"),
+            "sun lights store a direction in position_radius.xyz, not a world-space point"
+        );
+    }
+
+    #[test]
+    fn restir_di_initial_samples_emissive_area_points_instead_of_centroids() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+
+        for token in [
+            "restir_di_sample_emissive_area_point",
+            "restir_di_emissive_area_pdf",
+            "light.position_radius.w",
+            "reservoir.sample_position_pdf = float4(sampled_position, sample_pdf)",
+            "candidate_weight = restir_di_target_pdf_for_light_sample(",
+        ] {
+            assert!(
+                initial.contains(token) || common.contains(token),
+                "Area ReSTIR direct-light candidate generation missing token {token}"
+            );
+        }
+
+        assert!(
+            !initial.contains("reservoir.sample_position_pdf = float4(light.position_radius.xyz, 1.0 / float(restir.light_count))"),
+            "emissive reservoirs must store a sampled area point and its PDF, not the centroid"
+        );
+    }
+
+    #[test]
+    fn restir_di_shaders_are_surface_aware() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+        let pass = source("src/render/passes/restir_di.rs");
+        let app = source("src/app.rs");
+        let compact_app = app.split_whitespace().collect::<String>();
+
+        for shader in [&initial, &temporal, &spatial] {
+            assert!(shader.contains("current_surface_position_depth"));
+            assert!(shader.contains("current_surface_normal_roughness"));
+            assert!(shader.contains("current_surface_albedo_material"));
+            assert!(shader.contains("surface_is_valid"));
+        }
+
+        assert!(initial.contains("output_reservoirs[index] = invalid_reservoir();"));
+        assert!(initial.contains("surface_is_valid(index)"));
+        assert!(initial.contains("current_surface_albedo_material"));
+        assert!(temporal.contains("compatible_temporal_surface"));
+        assert!(temporal.contains("uint previous_index"));
+        assert!(temporal.contains("RestirDiReservoir history_reservoir"));
+        assert!(temporal.contains("uint capped_history_m"));
+        assert!(temporal.contains("history_target_pdf"));
+        assert!(spatial.contains("compatible_spatial_surface"));
+        assert!(spatial.contains("normal_dot"));
+        assert!(spatial.contains("position_delta"));
+
+        assert!(pass.contains("update_surface_descriptors"));
+        assert!(pass.contains("VptSurfacePass"));
+        assert!(pass.contains("DescriptorType::STORAGE_IMAGE"));
+        assert!(app.contains("restir_di.update_surface_descriptors"));
+        assert!(
+            compact_app
+                .contains("builder.read_as(surface_writes[0],AccessKind::ComputeShaderRead)")
+        );
+    }
+
+    #[test]
+    fn restir_di_temporal_uses_explicit_history_surface_and_update_pass() {
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let pass = source("src/render/passes/restir_di.rs");
+        let app = source("src/app.rs");
+        let compact_app = app.split_whitespace().collect::<String>();
+
+        assert!(temporal.contains("previous_surface_position_depth"));
+        assert!(temporal.contains("previous_surface_normal_roughness"));
+        assert!(temporal.contains("previous_surface_albedo_material"));
+        assert!(temporal.contains("motion_history"));
+        assert!(temporal.contains("previous_pixel"));
+        assert!(temporal.contains("position_delta"));
+        assert!(
+            !temporal
+                .contains("dot(normalize(normal_roughness.xyz), normalize(normal_roughness.xyz))")
+        );
+
+        assert!(pass.contains("record_history_update"));
+        assert!(pass.contains("TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST"));
+        assert!(pass.contains("update_surface_descriptors"));
+
+        assert!(app.contains("restir_di_history_update"));
+        assert!(
+            compact_app
+                .contains("builder.read_as(selected_reservoir_dep,AccessKind::TransferRead)"),
+            "history update should copy the reservoir buffer selected by the spatial-enabled branch"
+        );
+        assert!(
+            compact_app.contains("builder.write_as(history_resource,AccessKind::TransferWrite)")
+        );
+    }
+
+    #[test]
+    fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() {
+        let app = source("src/app.rs");
+        let compact = app.split_whitespace().collect::<String>();
+        let needle = "restir_di.update_surface_descriptors(&device,vpt_surface);";
+        assert_eq!(
+            compact.matches(needle).count(),
+            1,
+            "surface descriptor rewrites must stay out of the per-frame render path"
+        );
+        assert!(compact.contains("vpt_surface.resize_images("));
+    }
+
+    #[test]
+    fn restir_di_temporal_combines_history_in_current_surface_measure_without_unbounded_weight_sum()
+    {
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+
+        assert!(temporal.contains("current_target_pdf"));
+        assert!(temporal.contains("history_target_pdf"));
+        assert!(
+            temporal.contains("restir_di_reservoir_stream_weight"),
+            "temporal reuse should convert current/history reservoirs into the current pixel's stream measure"
+        );
+        assert!(
+            temporal.contains("restir_di_finalize_reservoir_on_surface"),
+            "temporal reuse should rebuild selected_weight from capped combined M and current-surface weight"
+        );
+        assert!(
+            !temporal
+                .contains("float weight_sum = reservoir.weight_sum + history_reservoir.weight_sum"),
+            "temporal reuse must not keep adding historical weight_sum after sample_count_m is capped"
+        );
+        assert!(
+            !temporal.contains("reservoir.selected_weight = reservoir.weight_sum /"),
+            "temporal reuse should use the shared finalizer so weight_sum and selected_weight stay normalized together"
+        );
+    }
+
+    #[test]
+    fn restir_di_reuse_recomputes_selected_target_pdf_on_current_surface() {
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        assert!(common.contains("restir_di_target_pdf_for_reservoir"));
+        for shader in [temporal, spatial] {
+            assert!(
+                shader.contains("reservoir.target_pdf = restir_di_target_pdf_for_reservoir(")
+                    || shader.contains("restir_di_finalize_reservoir_on_surface("),
+                "reused reservoirs must be renormalized against the current pixel surface"
+            );
+        }
+    }
+
+    #[test]
+    fn restir_di_spatial_combines_neighbors_with_current_surface_stream_weights() {
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        assert!(common.contains("restir_di_reservoir_stream_weight"));
+        assert!(common.contains("restir_di_finalize_reservoir_on_surface"));
+        assert!(spatial.contains("neighbor_target_pdf"));
+        assert!(spatial.contains("accepted_neighbor_m"));
+        assert!(
+            !spatial.contains("float neighbor_weight = max(neighbor.weight_sum"),
+            "spatial reuse must not sample a neighbor using the neighbor surface's weight sum"
+        );
+        assert!(
+            !spatial.contains("float weight_sum = reservoir.weight_sum + neighbor.weight_sum"),
+            "spatial reuse must rebuild the combined stream weight in the current pixel's measure"
+        );
+    }
+
+    #[test]
+    fn vpt_restir_direct_resolve_tests_visibility_before_applying_selected_weight() {
+        let vpt = source("assets/shaders/passes/vpt.slang");
+
+        assert!(vpt.contains("restir_di_light_visible_from_hit"));
+        assert!(
+            vpt.contains("trace_primary_ray(shadow_ray")
+                && vpt.contains("return !occluder.hit")
+                && vpt.contains("occluder.t >= max_light_t"),
+            "ReSTIR direct resolve must reject occluded reservoirs before selected_weight creates bright leaks"
+        );
+        assert!(
+            vpt.find("restir_di_light_visible_from_hit")
+                .expect("VPT ReSTIR resolve should test visibility")
+                < vpt
+                    .find("sample.radiance = albedo * reservoir.sample_radiance.rgb")
+                    .expect("VPT ReSTIR resolve should assign radiance"),
+            "visibility must be tested before applying reservoir.selected_weight"
+        );
+    }
+
+    #[test]
+    fn restir_di_spatial_disabled_is_exact_temporal_passthrough() {
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        assert!(spatial.contains("if (restir.spatial_enabled == 0u)"));
+        assert!(spatial.contains("output_reservoirs[index] = reservoir;"));
+        assert!(
+            spatial.find("if (restir.spatial_enabled == 0u)")
+                < spatial.find("restir_di_reservoir_stream_weight")
+        );
+    }
+
+    #[test]
+    fn restir_di_hot_reservoir_buffers_are_gpu_only() {
+        let source = source("src/render/passes/restir_di.rs");
+        let reservoir_fn = source
+            .split("fn create_reservoir_buffer")
+            .nth(1)
+            .expect("create_reservoir_buffer should exist")
+            .split("fn write_mapped")
+            .next()
+            .expect("create_reservoir_buffer body should end before mapped writes");
+
+        assert!(reservoir_fn.contains("MemoryLocation::GpuOnly"));
+        assert!(
+            !reservoir_fn.contains("write_mapped_slice"),
+            "fullscreen reservoir buffers are GPU hot resources and should not require host-visible initialization"
+        );
+    }
+
+    #[test]
+    fn app_profiles_each_restir_di_compute_stage_separately() {
+        let app = source("src/app.rs");
+
+        for scope in [
+            "GpuProfileScope::RestirDiInitial",
+            "GpuProfileScope::RestirDiTemporal",
+            "GpuProfileScope::RestirDiSpatial",
+        ] {
+            assert!(
+                app.contains(scope),
+                "{scope} should be emitted around the matching ReSTIR graph pass"
+            );
+        }
+        assert!(
+            app.find("GpuProfileScope::RestirDiInitial") < app.find("restir_di.record_initial(")
+        );
+        assert!(
+            app.find("GpuProfileScope::RestirDiTemporal") < app.find("restir_di.record_temporal(")
+        );
+        assert!(
+            app.find("GpuProfileScope::RestirDiSpatial") < app.find("restir_di.record_spatial(")
+        );
+    }
+
+    #[test]
+    fn app_skips_spatial_passthrough_when_spatial_reuse_is_disabled() {
+        let app = source("src/app.rs");
+        let compact = app.split_whitespace().collect::<String>();
+
+        assert!(app.contains("RestirDiHistorySource::Temporal"));
+        assert!(app.contains("RestirDiHistorySource::Spatial"));
+        assert!(
+            compact.contains("ifself.restir_di_settings.spatial_enabled{"),
+            "the spatial graph pass should be created only when spatial reuse is enabled"
+        );
+        assert!(
+            compact.contains("(temporal_buffer,temporal_dep,RestirDiHistorySource::Temporal,)")
+                && compact
+                    .contains("vpt_restir_reads=Some((uniform_resource,selected_reservoir_dep))"),
+            "spatial-disabled ReSTIR should feed VPT from temporal reservoirs instead of a fullscreen spatial passthrough"
+        );
+    }
+
+    #[test]
+    fn restir_di_spatial_samples_multiple_neighbor_offsets_instead_of_one_right_neighbor() {
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        assert!(spatial.contains("spatial_sample_count"));
+        assert!(spatial.contains("int2 spatial_offsets"));
+        assert!(spatial.contains("sample < min(restir.spatial_sample_count, 8u)"));
+        assert!(spatial.contains("neighbor_offset"));
+        assert!(
+            !spatial.contains("uint neighbor_index = index + 1u;"),
+            "spatial reuse should not propagate only to the right-hand neighbor"
+        );
     }
 
     #[test]

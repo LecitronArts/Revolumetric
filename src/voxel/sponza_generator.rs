@@ -327,6 +327,7 @@ impl VoxelGenerator for SponzaGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene::camera::Camera;
     use crate::voxel::ucvh::UcvhConfig;
 
     #[test]
@@ -417,5 +418,28 @@ mod tests {
         let generator = SponzaGenerator;
         let data = generator.generate_brick(UVec3::new(2, 0, 8), &config);
         assert!(data.is_some(), "floor brick should be non-empty");
+    }
+
+    #[test]
+    fn default_camera_center_ray_looks_through_front_opening() {
+        let camera = Camera::default();
+        let front_wall_z = 6.0;
+        let t = (front_wall_z - camera.position.z) / camera.forward.z;
+        let entry = camera.position + camera.forward * t;
+
+        assert!(
+            entry.x > 54.0 && entry.x < 74.0,
+            "center ray should pass through the entrance x span, got x={}",
+            entry.x
+        );
+        assert!(
+            entry.y > 0.0 && entry.y < 40.0,
+            "center ray should pass through the entrance height, got y={}",
+            entry.y
+        );
+        assert!(
+            SponzaGenerator::eval_voxel(entry).is_none(),
+            "center ray should pass through open air at the entrance, got solid voxel at {entry:?}"
+        );
     }
 }

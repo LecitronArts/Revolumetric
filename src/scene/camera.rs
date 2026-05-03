@@ -9,15 +9,19 @@ pub struct Camera {
     pub forward: Vec3,
     pub up: Vec3,
     pub fov_y_radians: f32,
+    pub aperture_radius: f32,
+    pub focal_distance: f32,
 }
 
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            position: Vec3::new(64.0, 80.0, -40.0),
-            forward: Vec3::new(0.0, -0.152, 0.988).normalize(),
+            position: Vec3::new(64.0, 32.0, -40.0),
+            forward: Vec3::new(0.0, -0.03, 0.99955).normalize(),
             up: Vec3::Y,
             fov_y_radians: std::f32::consts::FRAC_PI_4, // 45°
+            aperture_radius: 0.0,
+            focal_distance: 128.0,
         }
     }
 }
@@ -67,10 +71,18 @@ mod tests {
     #[test]
     fn camera_default_matches_spec() {
         let cam = Camera::default();
-        assert!((cam.position - Vec3::new(64.0, 80.0, -40.0)).length() < 1e-3);
+        assert!((cam.position - Vec3::new(64.0, 32.0, -40.0)).length() < 1e-3);
         assert!((cam.fov_y_radians - std::f32::consts::FRAC_PI_4).abs() < 1e-5);
         assert!(cam.forward.z > 0.9, "should look along +Z");
         assert!(cam.forward.y < 0.0, "should look slightly down");
+    }
+
+    #[test]
+    fn camera_defaults_keep_pinhole_lens_disabled() {
+        let cam = Camera::default();
+
+        assert_eq!(cam.aperture_radius, 0.0);
+        assert!(cam.focal_distance > 0.0);
     }
 
     #[test]

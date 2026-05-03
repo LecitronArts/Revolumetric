@@ -1,6 +1,6 @@
 # Revolumetric
 
-Revolumetric is a Rust + Vulkan voxel rendering prototype. It builds a custom rendering stack around `ash`, `winit`, Slang compute shaders, a CPU/GPU Unified Cascaded Volume Hierarchy (UCVH), voxel ray tracing, VCT/VPT rendering experiments, post-processing, and GPU timing instrumentation.
+Revolumetric is a Rust + Vulkan voxel rendering prototype. It builds a custom rendering stack around `ash`, `winit`, Slang compute shaders, a CPU/GPU Unified Cascaded Volume Hierarchy (UCVH), voxel path tracing, post-processing, and GPU timing instrumentation.
 
 The project is currently an engine prototype, not a packaged application. The core code lives in `src/` and `assets/shaders/`; `reference/` is for external research material.
 
@@ -33,43 +33,58 @@ Build-time shader compilation is controlled with `REVOLUMETRIC_SHADER_COMPILE`:
 
 Invalid values fail the build instead of silently falling back to a default.
 
-Lighting settings can be overridden through environment variables:
+Rendering settings can be overridden through environment variables:
 
-- `REVOLUMETRIC_RENDER_MODE=vct|vpt`: selects the default VCT lighting path or optional VPT reference path. Default is `vct`.
-- `REVOLUMETRIC_VCT=on|off|1|0|true|false`: enables or disables VCT indirect contribution. Default is enabled.
+- `REVOLUMETRIC_RENDER_MODE=vpt`: accepted for compatibility; VPT is the only active renderer. Other values emit a parse warning and keep the VPT default.
 - `REVOLUMETRIC_VPT_MAX_BOUNCES=1..8`: bounds VPT path length. Default is `2`.
 - `REVOLUMETRIC_EXPOSURE=<finite non-negative float>`: postprocess exposure multiplier before tonemap. Default is `1.0`.
 - `REVOLUMETRIC_LIGHTING_SHADOWS=on|off|1|0|true|false`: enables direct-light shadow rays.
 - `REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS=on|off|1|0|true|false`: skips backface shadow hits when enabled.
 - `REVOLUMETRIC_LIGHTING_DEBUG_VIEW=final|off|diffuse|direct|normal`: selects runtime lighting debug output.
+- `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian`: selects VPT diagnostics. Area ReSTIR debug views are written through the final postprocess path without temporal smoothing.
 
-Invalid lighting environment values emit parse warnings and keep the default for the invalid setting.
+Invalid rendering environment values emit parse warnings and keep the default for the invalid setting.
 
-ReSTIR-DI is an experimental VPT-only path and is disabled by default:
+ReSTIR-DI is an experimental direct-light reuse layer and is disabled by default:
 
-- `REVOLUMETRIC_VPT_RESTIR_DI=on|off|1|0|true|false`: enables the ReSTIR-DI pass chain only when `REVOLUMETRIC_RENDER_MODE=vpt`. Default is `off`.
+- `REVOLUMETRIC_VPT_RESTIR_DI=on|off|1|0|true|false`: enables the ReSTIR-DI pass chain. Default is `off`.
 - `REVOLUMETRIC_RESTIR_DI_TEMPORAL=on|off|1|0|true|false`: enables temporal reservoir reuse when ReSTIR-DI is active. Default is `on`.
-- `REVOLUMETRIC_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables spatial reservoir reuse when ReSTIR-DI is active. Default is `on`.
+- `REVOLUMETRIC_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables spatial reservoir reuse when ReSTIR-DI is active. Default is `off` while the spatial reuse stage is still being stabilized.
 - `REVOLUMETRIC_RESTIR_DI_INITIAL_CANDIDATES=1..16`: candidate count for initial direct-light sampling. Default is `1`.
 - `REVOLUMETRIC_RESTIR_DI_SPATIAL_SAMPLES=0..8`: spatial neighbor sample count. Default is `4`.
 - `REVOLUMETRIC_RESTIR_DI_HISTORY_LENGTH=1..64`: temporal history length budget. Default is `20`.
 - `REVOLUMETRIC_RESTIR_DI_DEBUG=off|reservoir_weight|light_id|visibility|temporal_valid|spatial_neighbors`: selects a future ReSTIR-DI debug view. Default is `off`.
 
+Area ReSTIR is an experimental VPT sample-area reuse layer and is disabled by default. It is separate from ReSTIR-DI: Area ReSTIR chooses primary-ray film/lens sample state, while ReSTIR-DI chooses direct-light samples.
+
+- `REVOLUMETRIC_AREA_RESTIR=on|off|1|0|true|false`: enables the Area ReSTIR pass chain. Default is `off`.
+- `REVOLUMETRIC_AREA_RESTIR_TEMPORAL=on|off|1|0|true|false`: enables temporal sample-area reservoir reuse. Default is `on`.
+- `REVOLUMETRIC_AREA_RESTIR_SPATIAL=on|off|1|0|true|false`: enables spatial sample-area reservoir reuse. Default is `on`.
+- `REVOLUMETRIC_AREA_RESTIR_SUBPIXEL=on|off|1|0|true|false`: enables film/subpixel sample reuse. Default is `on`.
+- `REVOLUMETRIC_AREA_RESTIR_LENS=on|off|1|0|true|false`: enables lens sample reuse. Default is `on`, but the default camera aperture is zero so pinhole behavior is preserved unless aperture is explicitly changed in code.
+- `REVOLUMETRIC_AREA_RESTIR_INITIAL_CANDIDATES=1..16`: initial sample-area candidate count. Default is `4`.
+- `REVOLUMETRIC_AREA_RESTIR_SPATIAL_SAMPLES=0..8`: spatial neighbor sample count. Default is `4`.
+- `REVOLUMETRIC_AREA_RESTIR_HISTORY_LENGTH=1..64`: sample-area history length budget. Default is `20`.
+- `REVOLUMETRIC_AREA_RESTIR_DEBUG=off|subpixel|lens|weight|history_valid|rejection|jacobian`: selects an Area ReSTIR debug view and bridges it into the VPT final display path.
+
 GPU profiler behavior is configured in `src/render/gpu_profiler.rs`; CSV output is intended for profiling runs under `target/`.
 
-## Current Rendering MVP
+## Current Rendering Path
 
-The active renderer is VCT-first. The former Radiance Cascades path has been removed from runtime code and shaders; new documentation may mention it only as migration history or deletion boundary.
+The active renderer is VPT-only. The former Radiance Cascades and voxel cone tracing paths have been removed from active runtime code and shaders; older planning documents may mention them only as migration history.
 
 Default runtime flow:
 
 1. UCVH upload/update.
-2. Primary voxel ray pass writes G-buffer images.
-3. VCT lighting reads the G-buffer and UCVH resources, then writes linear HDR `rgba16f`.
-4. Postprocess applies exposure, ACES tonemap, and gamma, then writes LDR `rgba8`.
-5. Blit copies postprocess output to the swapchain.
+2. VPT surface state pass writes current/previous surface attributes and motion history.
+3. Optional ReSTIR-DI initial, temporal, and spatial passes build direct-light reservoirs.
+4. Optional Area ReSTIR initial, temporal, and spatial passes build primary-ray sample-area reservoirs.
+5. VPT traces bounded stochastic camera paths, optionally resolving ReSTIR-DI direct lighting and Area ReSTIR-selected primary-ray samples, then writes noisy HDR radiance and moments.
+6. VPT temporal denoise reprojects and clamps radiance history, while raw/direct/Area ReSTIR debug views bypass temporal smoothing.
+7. Postprocess applies exposure, ACES tonemap, and gamma, then writes LDR `rgba8`.
+8. Blit copies postprocess output to the swapchain.
 
-Optional VPT mode uses `REVOLUMETRIC_RENDER_MODE=vpt` to run a bounded, stochastic, progressive reference pass directly from camera rays. Its HDR accumulation image feeds the same postprocess pass. VPT is intended for reference/debug use and is not denoised. ReSTIR-DI can be enabled only inside this VPT mode; its current pass chain builds direct-light/reservoir buffers but VPT reservoir resolve is still future work.
+The current VPT path is still noisy and progressive. The active implementation plan is to replace simple progressive averaging with explicit VPT surface state, temporal reprojection, moments, and edge-aware denoising.
 
 RenderGraph currently supports imported resources, explicit access declarations, dependency validation, graph-owned image and buffer barrier emission for the active pass chains. It does not yet own full transient allocation, descriptor automation, or async compute scheduling.
 
@@ -79,7 +94,7 @@ Validation matrix for this MVP:
 $env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
 $env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo clippy --all-targets -- -D warnings; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
 $env:REVOLUMETRIC_SHADER_COMPILE='strict'; cargo test --lib; cargo build --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
-rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_VCT|REVOLUMETRIC_VPT_MAX_BOUNCES|REVOLUMETRIC_EXPOSURE|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
+rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_VPT_MAX_BOUNCES|REVOLUMETRIC_EXPOSURE|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
 ```
 
 ## Current Shape
@@ -91,16 +106,16 @@ Implemented pieces include:
 - Render-graph access declarations and a single-queue barrier planning model.
 - UCVH brick storage, occupancy hierarchy, dirty tracking, and GPU upload.
 - Procedural demo scene generation.
-- Primary voxel ray tracing, VCT-first deferred lighting, optional VPT reference mode, HDR lighting output, and explicit post-processing.
+- VPT rendering, surface state, temporal denoise, HDR output, explicit post-processing, and swapchain presentation.
 - VPT-only ReSTIR-DI settings, direct-light table construction, shader skeletons, reservoir resources, and graph-gated pass wiring.
+- VPT-owned Area ReSTIR settings, sample-area reservoir resources, temporal/spatial reuse shaders, primary-ray integration, and debug visualization routing.
 - Unit tests for the CPU-side data structures and ABI-sensitive uniform layout.
 
 Known prototype limits:
 
 - `app.rs` still owns too much runtime orchestration.
 - The render graph owns image access transitions, but it does not yet own real transient GPU resource allocation or descriptor automation.
-- VCT is an MVP shader path over existing UCVH traversal, not a production radiance-cache implementation.
-- VPT is a noisy progressive reference/debug path and currently has no denoiser.
+- VPT temporal denoising and Area ReSTIR are still experimental and need representative scene captures before visual quality can be considered validated.
 - Postprocess owns exposure/ACES/gamma, but bloom and richer display controls are not implemented.
 - External asset import is not implemented.
 - Some repository reference material is intentionally separate from the main engine code.

@@ -324,7 +324,7 @@ mod shader_source_tests {
     }
 
     #[test]
-    fn app_wires_lighting_through_postprocess_before_blit() {
+    fn app_wires_vpt_through_postprocess_before_blit() {
         let source = normalized_source(
             &std::fs::read_to_string("src/app.rs")
                 .expect("app source should be readable for render-pipeline source test"),
@@ -340,18 +340,18 @@ mod shader_source_tests {
         );
         assert!(source.contains("GpuProfileScope::Postprocess"));
 
-        let lighting_idx = source
-            .find("graph.add_pass(\"lighting\"")
-            .expect("lighting graph pass should exist");
-        let postprocess_idx = lighting_idx
-            + source[lighting_idx..]
+        let vpt_idx = source
+            .find("graph.add_pass(\"vpt\"")
+            .expect("VPT graph pass should exist");
+        let postprocess_idx = vpt_idx
+            + source[vpt_idx..]
                 .find("graph.add_pass(\"postprocess\"")
                 .or_else(|| {
-                    source[lighting_idx..].find(
+                    source[vpt_idx..].find(
                         "graph.add_pass(\n                                        \"postprocess\"",
                     )
                 })
-                .expect("postprocess graph pass should exist after lighting");
+                .expect("postprocess graph pass should exist after VPT");
         let blit_idx = postprocess_idx
             + source[postprocess_idx..]
                 .find("graph.add_pass(\"blit_to_swapchain\"")
@@ -361,7 +361,7 @@ mod shader_source_tests {
                 })
                 .expect("blit graph pass should exist");
 
-        assert!(lighting_idx < postprocess_idx);
+        assert!(vpt_idx < postprocess_idx);
         assert!(postprocess_idx < blit_idx);
     }
 }

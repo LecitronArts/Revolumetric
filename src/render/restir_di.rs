@@ -43,7 +43,7 @@ impl Default for RestirDiSettings {
         Self {
             enabled: false,
             temporal_enabled: true,
-            spatial_enabled: true,
+            spatial_enabled: false,
             initial_candidate_count: 1,
             spatial_sample_count: 4,
             history_length: 20,
@@ -297,6 +297,8 @@ fn build_direct_lights_from_emissive_iter(
     struct Cluster {
         position_sum: [f32; 3],
         radiance_sum: [f32; 3],
+        min_position: [f32; 3],
+        max_position: [f32; 3],
         count: u32,
     }
 
@@ -316,12 +318,16 @@ fn build_direct_lights_from_emissive_iter(
                 for (i, value) in radiance.iter().enumerate() {
                     cluster.position_sum[i] += voxel.world_position[i];
                     cluster.radiance_sum[i] += *value;
+                    cluster.min_position[i] = cluster.min_position[i].min(voxel.world_position[i]);
+                    cluster.max_position[i] = cluster.max_position[i].max(voxel.world_position[i]);
                 }
                 cluster.count += 1;
             })
             .or_insert(Cluster {
                 position_sum: voxel.world_position,
                 radiance_sum: radiance,
+                min_position: voxel.world_position,
+                max_position: voxel.world_position,
                 count: 1,
             });
     }
@@ -329,13 +335,21 @@ fn build_direct_lights_from_emissive_iter(
     for cluster in clusters.values() {
         let inv_count = 1.0 / cluster.count as f32;
         let power = cluster.radiance_sum[0] + cluster.radiance_sum[1] + cluster.radiance_sum[2];
+        let centroid = [
+            cluster.position_sum[0] * inv_count,
+            cluster.position_sum[1] * inv_count,
+            cluster.position_sum[2] * inv_count,
+        ];
+        let radius_sq = (0..3)
+            .map(|axis| {
+                let half_extent =
+                    (cluster.max_position[axis] - cluster.min_position[axis]).abs() * 0.5 + 0.5;
+                half_extent * half_extent
+            })
+            .sum::<f32>();
+        let area_radius = radius_sq.sqrt().max(0.75);
         lights.push(GpuDirectLight {
-            position_radius: [
-                cluster.position_sum[0] * inv_count,
-                cluster.position_sum[1] * inv_count,
-                cluster.position_sum[2] * inv_count,
-                1.0,
-            ],
+            position_radius: [centroid[0], centroid[1], centroid[2], area_radius],
             normal_type: [0.0, 0.0, 0.0, 1.0],
             color_power: [
                 cluster.radiance_sum[0],
@@ -445,7 +459,7 @@ mod tests {
         let settings = RestirDiSettings::default();
         assert!(!settings.enabled);
         assert!(settings.temporal_enabled);
-        assert!(settings.spatial_enabled);
+        assert!(!settings.spatial_enabled);
         assert_eq!(settings.initial_candidate_count, 1);
         assert_eq!(settings.spatial_sample_count, 4);
         assert_eq!(settings.history_length, 20);
@@ -552,6 +566,33 @@ mod tests {
         assert_eq!(lights[0].position_radius[0], 2.0);
         assert_eq!(lights[0].position_radius[1], 2.0);
         assert_eq!(lights[0].position_radius[2], 2.0);
+    }
+
+    #[test]
+    fn direct_light_table_emissive_clusters_expose_area_radius_not_point_radius() {
+        let voxels = [
+            EmissiveVoxelForTest {
+                brick_id: 11,
+                world_position: [0.0, 0.0, 0.0],
+                emissive: [255, 255, 255],
+            },
+            EmissiveVoxelForTest {
+                brick_id: 11,
+                world_position: [7.0, 3.0, 1.0],
+                emissive: [255, 255, 255],
+            },
+        ];
+
+        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 0.0, &voxels);
+        let area_light = lights
+            .iter()
+            .find(|light| light.normal_type[3] == 1.0)
+            .expect("expected emissive area light");
+
+        assert!(
+            area_light.position_radius[3] > 1.0,
+            "multi-voxel emissive cluster must carry a true area radius, not a unit point radius"
+        );
     }
 
     #[test]

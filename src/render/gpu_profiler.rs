@@ -73,16 +73,28 @@ impl GpuProfilerConfig {
 pub enum GpuProfileScope {
     PrimaryRay = 0,
     Lighting = 1,
-    Vpt = 2,
-    Postprocess = 3,
-    BlitToSwapchain = 4,
+    RestirDiInitial = 2,
+    RestirDiTemporal = 3,
+    RestirDiSpatial = 4,
+    AreaRestirInitial = 5,
+    AreaRestirTemporal = 6,
+    AreaRestirSpatial = 7,
+    Vpt = 8,
+    Postprocess = 9,
+    BlitToSwapchain = 10,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
         Self::PrimaryRay,
         Self::Lighting,
+        Self::RestirDiInitial,
+        Self::RestirDiTemporal,
+        Self::RestirDiSpatial,
+        Self::AreaRestirInitial,
+        Self::AreaRestirTemporal,
+        Self::AreaRestirSpatial,
         Self::Vpt,
         Self::Postprocess,
         Self::BlitToSwapchain,
@@ -92,6 +104,12 @@ impl GpuProfileScope {
         match self {
             Self::PrimaryRay => "PrimaryRay",
             Self::Lighting => "Lighting",
+            Self::RestirDiInitial => "RestirDiInitial",
+            Self::RestirDiTemporal => "RestirDiTemporal",
+            Self::RestirDiSpatial => "RestirDiSpatial",
+            Self::AreaRestirInitial => "AreaRestirInitial",
+            Self::AreaRestirTemporal => "AreaRestirTemporal",
+            Self::AreaRestirSpatial => "AreaRestirSpatial",
             Self::Vpt => "Vpt",
             Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
@@ -102,9 +120,31 @@ impl GpuProfileScope {
         match self {
             Self::PrimaryRay => "primary_ray_ms",
             Self::Lighting => "lighting_ms",
+            Self::RestirDiInitial => "restir_di_initial_ms",
+            Self::RestirDiTemporal => "restir_di_temporal_ms",
+            Self::RestirDiSpatial => "restir_di_spatial_ms",
+            Self::AreaRestirInitial => "area_restir_initial_ms",
+            Self::AreaRestirTemporal => "area_restir_temporal_ms",
+            Self::AreaRestirSpatial => "area_restir_spatial_ms",
             Self::Vpt => "vpt_ms",
             Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
+        }
+    }
+
+    pub fn timestamp_stage(self) -> vk::PipelineStageFlags {
+        match self {
+            Self::PrimaryRay
+            | Self::Lighting
+            | Self::RestirDiInitial
+            | Self::RestirDiTemporal
+            | Self::RestirDiSpatial
+            | Self::AreaRestirInitial
+            | Self::AreaRestirTemporal
+            | Self::AreaRestirSpatial
+            | Self::Vpt
+            | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
+            Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
         }
     }
 }
@@ -375,7 +415,7 @@ impl GpuProfiler {
         unsafe {
             device.cmd_write_timestamp(
                 command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
+                scope.timestamp_stage(),
                 self.query_pool,
                 self.layout.begin_query(frame_slot, scope),
             );
@@ -392,7 +432,7 @@ impl GpuProfiler {
         unsafe {
             device.cmd_write_timestamp(
                 command_buffer,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                scope.timestamp_stage(),
                 self.query_pool,
                 self.layout.end_query(frame_slot, scope),
             );
@@ -618,16 +658,51 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 5);
+        assert_eq!(GpuProfileScope::COUNT, 11);
         assert_eq!(names[0], "PrimaryRay");
         assert_eq!(names[1], "Lighting");
-        assert_eq!(names[2], "Vpt");
-        assert_eq!(names[3], "Postprocess");
-        assert_eq!(names[4], "Blit");
+        assert_eq!(names[2], "RestirDiInitial");
+        assert_eq!(names[3], "RestirDiTemporal");
+        assert_eq!(names[4], "RestirDiSpatial");
+        assert_eq!(names[5], "AreaRestirInitial");
+        assert_eq!(names[6], "AreaRestirTemporal");
+        assert_eq!(names[7], "AreaRestirSpatial");
+        assert_eq!(names[8], "Vpt");
+        assert_eq!(names[9], "Postprocess");
+        assert_eq!(names[10], "Blit");
         assert_eq!(columns[0], "primary_ray_ms");
-        assert_eq!(columns[2], "vpt_ms");
-        assert_eq!(columns[3], "postprocess_ms");
-        assert_eq!(columns[4], "blit_to_swapchain_ms");
+        assert_eq!(columns[2], "restir_di_initial_ms");
+        assert_eq!(columns[3], "restir_di_temporal_ms");
+        assert_eq!(columns[4], "restir_di_spatial_ms");
+        assert_eq!(columns[5], "area_restir_initial_ms");
+        assert_eq!(columns[6], "area_restir_temporal_ms");
+        assert_eq!(columns[7], "area_restir_spatial_ms");
+        assert_eq!(columns[8], "vpt_ms");
+        assert_eq!(columns[9], "postprocess_ms");
+        assert_eq!(columns[10], "blit_to_swapchain_ms");
+    }
+
+    #[test]
+    fn scopes_use_work_stage_timestamps_instead_of_queue_boundary_timestamps() {
+        for scope in [
+            GpuProfileScope::RestirDiInitial,
+            GpuProfileScope::RestirDiTemporal,
+            GpuProfileScope::RestirDiSpatial,
+            GpuProfileScope::AreaRestirInitial,
+            GpuProfileScope::AreaRestirTemporal,
+            GpuProfileScope::AreaRestirSpatial,
+            GpuProfileScope::Vpt,
+            GpuProfileScope::Postprocess,
+        ] {
+            assert_eq!(
+                scope.timestamp_stage(),
+                vk::PipelineStageFlags::COMPUTE_SHADER
+            );
+        }
+        assert_eq!(
+            GpuProfileScope::BlitToSwapchain.timestamp_stage(),
+            vk::PipelineStageFlags::TRANSFER
+        );
     }
 
     #[test]
@@ -754,11 +829,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,primary_ray_ms,lighting_ms,vpt_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
+            "frame,primary_ray_ms,lighting_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.0000,0.0000,0.0000,0.5000,1.7500"
+            "42,1.2500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,1.7500"
         );
     }
 }
