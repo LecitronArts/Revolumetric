@@ -21,19 +21,11 @@ pub struct AreaRestirPass {
     uniform_buffers: Vec<GpuBuffer>,
     initial_reservoirs: GpuBuffer,
     temporal_reservoirs: GpuBuffer,
-    spatial_reservoirs: GpuBuffer,
-    history_reservoirs: GpuBuffer,
+    selected_reservoirs: Vec<GpuBuffer>,
     pub debug_image: GpuImage,
     width: u32,
     height: u32,
     reservoir_count: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AreaRestirHistorySource {
-    Initial,
-    Temporal,
-    Spatial,
 }
 
 pub struct AreaRestirPassCreateInfo<'a> {
@@ -51,16 +43,14 @@ struct AreaRestirBuffers {
     uniform_buffers: Vec<GpuBuffer>,
     initial_reservoirs: GpuBuffer,
     temporal_reservoirs: GpuBuffer,
-    spatial_reservoirs: GpuBuffer,
-    history_reservoirs: GpuBuffer,
+    selected_reservoirs: Vec<GpuBuffer>,
     debug_image: GpuImage,
 }
 
 struct AreaRestirResizeResources {
     initial_reservoirs: GpuBuffer,
     temporal_reservoirs: GpuBuffer,
-    spatial_reservoirs: GpuBuffer,
-    history_reservoirs: GpuBuffer,
+    selected_reservoirs: Vec<GpuBuffer>,
     debug_image: GpuImage,
 }
 
@@ -166,8 +156,7 @@ impl AreaRestirPass {
             uniform_buffers: buffers.uniform_buffers,
             initial_reservoirs: buffers.initial_reservoirs,
             temporal_reservoirs: buffers.temporal_reservoirs,
-            spatial_reservoirs: buffers.spatial_reservoirs,
-            history_reservoirs: buffers.history_reservoirs,
+            selected_reservoirs: buffers.selected_reservoirs,
             debug_image: buffers.debug_image,
             width: info.width,
             height: info.height,
@@ -225,16 +214,23 @@ impl AreaRestirPass {
         height: u32,
     ) -> Result<()> {
         let reservoir_count = width.saturating_mul(height);
-        let resized = AreaRestirResizeResources::new(device, allocator, width, height)?;
+        let resized = AreaRestirResizeResources::new(
+            device,
+            allocator,
+            width,
+            height,
+            self.selected_reservoirs.len(),
+        )?;
 
         std::mem::replace(&mut self.initial_reservoirs, resized.initial_reservoirs)
             .destroy(device, allocator);
         std::mem::replace(&mut self.temporal_reservoirs, resized.temporal_reservoirs)
             .destroy(device, allocator);
-        std::mem::replace(&mut self.spatial_reservoirs, resized.spatial_reservoirs)
-            .destroy(device, allocator);
-        std::mem::replace(&mut self.history_reservoirs, resized.history_reservoirs)
-            .destroy(device, allocator);
+        destroy_buffers(
+            std::mem::replace(&mut self.selected_reservoirs, resized.selected_reservoirs),
+            device,
+            allocator,
+        );
         std::mem::replace(&mut self.debug_image, resized.debug_image).destroy(device, allocator);
 
         self.width = width;
@@ -276,20 +272,20 @@ impl AreaRestirPass {
         )
     }
 
-    pub fn spatial_buffer(&self) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
-        (
-            &self.spatial_reservoirs,
-            self.spatial_reservoirs.size,
-            self.spatial_reservoirs.usage,
-        )
+    pub fn selected_current_buffer(
+        &self,
+        frame_slot: usize,
+    ) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
+        let buffer = &self.selected_reservoirs[self.selected_current_slot(frame_slot)];
+        (buffer, buffer.size, buffer.usage)
     }
 
-    pub fn history_buffer(&self) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
-        (
-            &self.history_reservoirs,
-            self.history_reservoirs.size,
-            self.history_reservoirs.usage,
-        )
+    pub fn selected_history_buffer(
+        &self,
+        frame_slot: usize,
+    ) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
+        let buffer = &self.selected_reservoirs[self.selected_history_slot(frame_slot)];
+        (buffer, buffer.size, buffer.usage)
     }
 
     pub fn record_initial(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
@@ -307,28 +303,43 @@ impl AreaRestirPass {
             .record(device, cmd, frame_slot, self.width, self.height);
     }
 
-    pub fn record_history_update(
+    pub fn update_frame_descriptors(
         &self,
         device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        source: AreaRestirHistorySource,
+        frame_slot: usize,
+        selected_history: &GpuBuffer,
+        selected_current: &GpuBuffer,
+        temporal_enabled: bool,
+        spatial_enabled: bool,
     ) {
-        let source_buffer = match source {
-            AreaRestirHistorySource::Initial => &self.initial_reservoirs,
-            AreaRestirHistorySource::Temporal => &self.temporal_reservoirs,
-            AreaRestirHistorySource::Spatial => &self.spatial_reservoirs,
+        let initial_output = if temporal_enabled {
+            &self.initial_reservoirs
+        } else {
+            selected_current
         };
-        unsafe {
-            device.cmd_copy_buffer(
-                cmd,
-                source_buffer.handle,
-                self.history_reservoirs.handle,
-                &[vk::BufferCopy::default()
-                    .src_offset(0)
-                    .dst_offset(0)
-                    .size(self.history_reservoirs.size)],
-            );
-        }
+        let temporal_output = if spatial_enabled {
+            &self.temporal_reservoirs
+        } else {
+            selected_current
+        };
+        self.initial_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            1,
+            &[initial_output],
+        );
+        self.temporal_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            1,
+            &[&self.initial_reservoirs, selected_history, temporal_output],
+        );
+        self.spatial_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            1,
+            &[&self.temporal_reservoirs, selected_current],
+        );
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
@@ -338,8 +349,7 @@ impl AreaRestirPass {
         destroy_buffers(self.uniform_buffers, device, allocator);
         self.initial_reservoirs.destroy(device, allocator);
         self.temporal_reservoirs.destroy(device, allocator);
-        self.spatial_reservoirs.destroy(device, allocator);
-        self.history_reservoirs.destroy(device, allocator);
+        destroy_buffers(self.selected_reservoirs, device, allocator);
         self.debug_image.destroy(device, allocator);
     }
 
@@ -356,17 +366,29 @@ impl AreaRestirPass {
             &self.uniform_buffers,
             &[
                 &self.initial_reservoirs,
-                &self.history_reservoirs,
+                &self.selected_reservoirs[self.selected_history_slot(0)],
                 &self.temporal_reservoirs,
             ],
         );
         self.spatial_stage.write_buffer_descriptors(
             device,
             &self.uniform_buffers,
-            &[&self.temporal_reservoirs, &self.spatial_reservoirs],
+            &[
+                &self.temporal_reservoirs,
+                &self.selected_reservoirs[self.selected_current_slot(0)],
+            ],
         );
         self.spatial_stage
             .write_image_descriptors(device, 6, &[&self.debug_image]);
+    }
+
+    fn selected_current_slot(&self, frame_slot: usize) -> usize {
+        frame_slot % self.selected_reservoirs.len()
+    }
+
+    fn selected_history_slot(&self, frame_slot: usize) -> usize {
+        (self.selected_current_slot(frame_slot) + self.selected_reservoirs.len() - 1)
+            % self.selected_reservoirs.len()
     }
 
     fn write_scene_descriptors(&self, device: &ash::Device, scene_ubo: &SceneUniformBuffer) {
@@ -427,29 +449,15 @@ impl AreaRestirBuffers {
                 return Err(error);
             }
         };
-        let spatial_reservoirs = match create_reservoir_buffer(
+        let selected_reservoirs = match create_selected_reservoir_buffers(
             device,
             allocator,
+            frame_count,
             reservoir_count,
-            "area_restir_spatial",
+            "area_restir_selected",
         ) {
-            Ok(buffer) => buffer,
+            Ok(buffers) => buffers,
             Err(error) => {
-                temporal_reservoirs.destroy(device, allocator);
-                initial_reservoirs.destroy(device, allocator);
-                destroy_buffers(uniform_buffers, device, allocator);
-                return Err(error);
-            }
-        };
-        let history_reservoirs = match create_reservoir_buffer(
-            device,
-            allocator,
-            reservoir_count,
-            "area_restir_history",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                spatial_reservoirs.destroy(device, allocator);
                 temporal_reservoirs.destroy(device, allocator);
                 initial_reservoirs.destroy(device, allocator);
                 destroy_buffers(uniform_buffers, device, allocator);
@@ -459,8 +467,7 @@ impl AreaRestirBuffers {
         let debug_image = match create_debug_image(device, allocator, width, height) {
             Ok(image) => image,
             Err(error) => {
-                history_reservoirs.destroy(device, allocator);
-                spatial_reservoirs.destroy(device, allocator);
+                destroy_buffers(selected_reservoirs, device, allocator);
                 temporal_reservoirs.destroy(device, allocator);
                 initial_reservoirs.destroy(device, allocator);
                 destroy_buffers(uniform_buffers, device, allocator);
@@ -472,8 +479,7 @@ impl AreaRestirBuffers {
             uniform_buffers,
             initial_reservoirs,
             temporal_reservoirs,
-            spatial_reservoirs,
-            history_reservoirs,
+            selected_reservoirs,
             debug_image,
         })
     }
@@ -482,8 +488,7 @@ impl AreaRestirBuffers {
         destroy_buffers(self.uniform_buffers, device, allocator);
         self.initial_reservoirs.destroy(device, allocator);
         self.temporal_reservoirs.destroy(device, allocator);
-        self.spatial_reservoirs.destroy(device, allocator);
-        self.history_reservoirs.destroy(device, allocator);
+        destroy_buffers(self.selected_reservoirs, device, allocator);
         self.debug_image.destroy(device, allocator);
     }
 }
@@ -494,21 +499,24 @@ impl AreaRestirResizeResources {
         allocator: &GpuAllocator,
         width: u32,
         height: u32,
+        selected_slot_count: usize,
     ) -> Result<Self> {
         let reservoir_count = width.saturating_mul(height);
         let initial_reservoirs =
             create_reservoir_buffer(device, allocator, reservoir_count, "area_restir_initial")?;
         let temporal_reservoirs =
             create_reservoir_buffer(device, allocator, reservoir_count, "area_restir_temporal")?;
-        let spatial_reservoirs =
-            create_reservoir_buffer(device, allocator, reservoir_count, "area_restir_spatial")?;
-        let history_reservoirs =
-            create_reservoir_buffer(device, allocator, reservoir_count, "area_restir_history")?;
+        let selected_reservoirs = create_selected_reservoir_buffers(
+            device,
+            allocator,
+            selected_slot_count,
+            reservoir_count,
+            "area_restir_selected",
+        )?;
         let debug_image = match create_debug_image(device, allocator, width, height) {
             Ok(image) => image,
             Err(error) => {
-                history_reservoirs.destroy(device, allocator);
-                spatial_reservoirs.destroy(device, allocator);
+                destroy_buffers(selected_reservoirs, device, allocator);
                 temporal_reservoirs.destroy(device, allocator);
                 initial_reservoirs.destroy(device, allocator);
                 return Err(error);
@@ -518,8 +526,7 @@ impl AreaRestirResizeResources {
         Ok(Self {
             initial_reservoirs,
             temporal_reservoirs,
-            spatial_reservoirs,
-            history_reservoirs,
+            selected_reservoirs,
             debug_image,
         })
     }
@@ -654,6 +661,39 @@ impl AreaRestirStage {
             }));
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
+    }
+
+    fn write_storage_descriptors_for_frame(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        first_binding: u32,
+        storage_buffers: &[&GpuBuffer],
+    ) {
+        let Some(&ds) = self.descriptor_sets.get(frame_slot) else {
+            return;
+        };
+        let storage_infos: Vec<_> = storage_buffers
+            .iter()
+            .map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.handle)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+        let writes: Vec<_> = storage_infos
+            .iter()
+            .enumerate()
+            .map(|(idx, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(first_binding + idx as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     fn write_image_descriptors(
@@ -799,12 +839,35 @@ fn create_reservoir_buffer(
         device,
         allocator,
         (count * std::mem::size_of::<GpuAreaRestirReservoir>()) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
         MemoryLocation::GpuOnly,
         name,
     )
+}
+
+fn create_selected_reservoir_buffers(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    frame_count: usize,
+    reservoir_count: u32,
+    name_prefix: &str,
+) -> Result<Vec<GpuBuffer>> {
+    let mut buffers = Vec::with_capacity(frame_count.max(2));
+    for slot in 0..frame_count.max(2) {
+        match create_reservoir_buffer(
+            device,
+            allocator,
+            reservoir_count,
+            &format!("{name_prefix}_{slot}"),
+        ) {
+            Ok(buffer) => buffers.push(buffer),
+            Err(error) => {
+                destroy_buffers(buffers, device, allocator);
+                return Err(error);
+            }
+        }
+    }
+    Ok(buffers)
 }
 
 fn create_debug_image(
@@ -867,16 +930,17 @@ mod shader_source_tests {
             "pub struct AreaRestirPass",
             "initial_reservoirs",
             "temporal_reservoirs",
-            "spatial_reservoirs",
-            "history_reservoirs",
+            "selected_reservoirs",
             "debug_image",
             "MemoryLocation::GpuOnly",
             "resize_buffers",
             "update_surface_descriptors",
+            "selected_current_buffer",
+            "selected_history_buffer",
+            "update_frame_descriptors",
             "record_initial",
             "record_temporal",
             "record_spatial",
-            "record_history_update",
             "update_ucvh_descriptors",
             "write_ucvh_descriptors",
         ] {
@@ -887,9 +951,13 @@ mod shader_source_tests {
         }
 
         assert!(!implementation.contains("cmd_pipeline_barrier"));
+        assert!(!implementation.contains("cmd_copy_buffer"));
         assert!(!implementation.contains("ImageMemoryBarrier"));
         assert!(!implementation.contains("BufferMemoryBarrier"));
         assert!(!implementation.contains("GpuRestirDiReservoir"));
+        assert!(!implementation.contains("spatial_reservoirs"));
+        assert!(!implementation.contains("history_reservoirs"));
+        assert!(!implementation.contains("AreaRestirHistorySource"));
     }
 
     #[test]
@@ -907,6 +975,7 @@ mod shader_source_tests {
             "fn destroy(self, device: &ash::Device, allocator: &GpuAllocator)",
             "let resized = AreaRestirResizeResources::new(",
             "std::mem::replace(&mut self.initial_reservoirs, resized.initial_reservoirs)",
+            "std::mem::replace(&mut self.selected_reservoirs, resized.selected_reservoirs)",
             "std::mem::replace(&mut self.debug_image, resized.debug_image)",
         ] {
             assert!(
@@ -924,12 +993,13 @@ mod shader_source_tests {
         for token in [
             "letarea_temporal_active=area_restir_settings.temporal_enabled;",
             "letarea_spatial_active=area_temporal_active&&area_restir_settings.spatial_enabled;",
+            "letarea_initial_output_resource=ifarea_temporal_active{area_initial_resource}else{area_selected_current_resource};",
             "letarea_temporal_dep=ifarea_temporal_active{",
             "graph.add_pass(\"area_restir_temporal\"",
             "}else{area_initial_dep};",
+            "letarea_temporal_output_resource=ifarea_spatial_active{area_temporal_resource}else{area_selected_current_resource};",
             ")=ifarea_spatial_active{",
             "graph.add_pass(\"area_restir_spatial\"",
-            "AreaRestirHistorySource::Initial",
             "vpt.update_area_restir_descriptors(",
         ] {
             assert!(
@@ -953,22 +1023,34 @@ mod shader_source_tests {
     }
 
     #[test]
-    fn app_uses_one_area_restir_selected_reservoir_policy_for_init_resize_and_frame() {
+    fn app_uses_area_restir_selected_frame_ring_for_history_and_vpt_reads() {
         let app = source("src/app.rs");
         let compact = app.split_whitespace().collect::<String>();
 
         for token in [
             "fnarea_restir_effective_settings(settings:AreaRestirSettings,history_initialized:bool,)->AreaRestirSettings{",
-            "fnarea_restir_selected_reservoir(",
-            "area_restir_effective_settings(self.area_restir_settings,false)",
+            "area_restir.selected_current_buffer(",
+            "area_restir.selected_history_buffer(",
+            "area_selected_current_resource",
+            "area_selected_history_resource",
             "area_restir_effective_settings(self.area_restir_settings,self.area_restir_history_initialized",
-            "area_restir_selected_reservoir(area_restir,area_restir_settings)",
+            "builder.read_as(area_selected_history_resource,",
+            "builder.write_as(area_selected_current_resource,",
+            "vpt_area_restir_reads=Some((area_uniform_resource,area_selected_reservoir_resource));",
         ] {
             assert!(
                 compact.contains(token),
-                "app Area ReSTIR selected-reservoir policy missing token {token}"
+                "app Area ReSTIR selected frame-ring policy missing token {token}"
             );
         }
+        assert!(
+            !compact.contains("area_restir_selected_reservoir("),
+            "Area ReSTIR final reservoir selection must not point VPT/history at intermediate buffers"
+        );
+        assert!(
+            !app.contains("area_restir_history_update"),
+            "Area ReSTIR graph must not add a transfer history update pass"
+        );
     }
 
     #[test]

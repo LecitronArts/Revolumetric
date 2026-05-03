@@ -20,14 +20,10 @@ use crate::render::camera::compute_pixel_to_ray;
 use crate::render::device::RenderDevice;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler, GpuProfilerConfig};
 use crate::render::graph::RenderGraph;
-use crate::render::passes::area_restir::{
-    AreaRestirHistorySource, AreaRestirPass, AreaRestirPassCreateInfo,
-};
+use crate::render::passes::area_restir::{AreaRestirPass, AreaRestirPassCreateInfo};
 use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::postprocess::PostprocessPass;
-use crate::render::passes::restir_di::{
-    RestirDiHistorySource, RestirDiPass, RestirDiPassCreateInfo,
-};
+use crate::render::passes::restir_di::{RestirDiPass, RestirDiPassCreateInfo};
 use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
@@ -82,21 +78,16 @@ fn area_restir_effective_settings(
     settings
 }
 
-fn area_restir_selected_reservoir(
-    pass: &AreaRestirPass,
-    settings: AreaRestirSettings,
-) -> (
-    &crate::render::buffer::GpuBuffer,
-    vk::DeviceSize,
-    vk::BufferUsageFlags,
-) {
-    if settings.temporal_enabled && settings.spatial_enabled {
-        pass.spatial_buffer()
-    } else if settings.temporal_enabled {
-        pass.temporal_buffer()
-    } else {
-        pass.initial_buffer()
+fn restir_di_effective_settings(
+    settings: RestirDiSettings,
+    history_initialized: bool,
+) -> RestirDiSettings {
+    let mut settings = settings;
+    if !history_initialized {
+        settings.temporal_enabled = false;
     }
+    settings.spatial_enabled = settings.temporal_enabled && settings.spatial_enabled;
+    settings
 }
 
 fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
@@ -335,17 +326,15 @@ impl RevolumetricApp {
                 area_restir.update_ucvh_descriptors(&device, ucvh_gpu);
             }
             if let (Some(vpt), Some(scene_ubo)) = (&self.vpt_pass, &self.scene_ubo) {
-                let area_restir_settings =
-                    area_restir_effective_settings(self.area_restir_settings, false);
-                let (area_selected_reservoir_buffer, _, _) =
-                    area_restir_selected_reservoir(area_restir, area_restir_settings);
                 for slot in 0..scene_ubo.frame_count() {
                     let (area_uniform_buffer, _, _) = area_restir.uniform_buffer(slot);
+                    let (area_selected_current_buffer, _, _) =
+                        area_restir.selected_current_buffer(slot);
                     vpt.update_area_restir_descriptors(
                         &device,
                         slot,
                         area_uniform_buffer,
-                        area_selected_reservoir_buffer,
+                        area_selected_current_buffer,
                     );
                 }
             }
@@ -461,8 +450,8 @@ impl RevolumetricApp {
                 let mut graph = RenderGraph::new();
                 let profiler = self.gpu_profiler.as_ref();
                 let mut vpt_accumulation_written = false;
-                let mut restir_di_history_updated = false;
-                let mut area_restir_history_updated = false;
+                let mut restir_di_selected_written = false;
+                let mut area_restir_selected_written = false;
                 let mut current_vpt_view_proj: Option<glam::Mat4> = None;
 
                 if ucvh_ready {
@@ -729,9 +718,13 @@ impl RevolumetricApp {
 
                         let mut vpt_restir_reads = None;
                         if restir_di_enabled && let Some(restir_di) = &self.restir_di_pass {
+                            let restir_di_settings = restir_di_effective_settings(
+                                self.restir_di_settings,
+                                self.restir_di_history_initialized,
+                            );
                             restir_di.update_uniforms(
                                 frame.frame_slot,
-                                self.restir_di_settings,
+                                restir_di_settings,
                                 frame.frame_index,
                             );
 
@@ -743,10 +736,23 @@ impl RevolumetricApp {
                                 restir_di.initial_buffer();
                             let (temporal_buffer, temporal_size, temporal_usage) =
                                 restir_di.temporal_buffer();
-                            let (spatial_buffer, spatial_size, spatial_usage) =
-                                restir_di.spatial_buffer();
-                            let (history_buffer, history_size, history_usage) =
-                                restir_di.history_buffer();
+                            let (
+                                selected_current_buffer,
+                                selected_current_size,
+                                selected_current_usage,
+                            ) = restir_di.selected_current_buffer(frame.frame_slot);
+                            let (
+                                selected_history_buffer,
+                                selected_history_size,
+                                selected_history_usage,
+                            ) = restir_di.selected_history_buffer(frame.frame_slot);
+                            restir_di.update_frame_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                selected_history_buffer,
+                                selected_current_buffer,
+                                restir_di_settings.spatial_enabled,
+                            );
 
                             let initial_resource = graph.import_buffer_with_access(
                                 initial_buffer.handle,
@@ -760,18 +766,18 @@ impl RevolumetricApp {
                                 temporal_usage,
                                 AccessKind::Undefined,
                             );
-                            let spatial_resource = graph.import_buffer_with_access(
-                                spatial_buffer.handle,
-                                spatial_size,
-                                spatial_usage,
+                            let selected_current_resource = graph.import_buffer_with_access(
+                                selected_current_buffer.handle,
+                                selected_current_size,
+                                selected_current_usage,
                                 AccessKind::Undefined,
                             );
-                            let history_resource = graph.import_buffer_with_access(
-                                history_buffer.handle,
-                                history_size,
-                                history_usage,
+                            let selected_history_resource = graph.import_buffer_with_access(
+                                selected_history_buffer.handle,
+                                selected_history_size,
+                                selected_history_usage,
                                 if self.restir_di_history_initialized {
-                                    AccessKind::TransferWrite
+                                    AccessKind::ComputeShaderWrite
                                 } else {
                                     AccessKind::Undefined
                                 },
@@ -861,10 +867,18 @@ impl RevolumetricApp {
                                         AccessKind::ComputeShaderRead,
                                     );
                                     builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(history_resource, AccessKind::ComputeShaderRead);
+                                    builder.read_as(
+                                        selected_history_resource,
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    let temporal_output_resource =
+                                        if restir_di_settings.spatial_enabled {
+                                            temporal_resource
+                                        } else {
+                                            selected_current_resource
+                                        };
                                     builder.write_as(
-                                        temporal_resource,
+                                        temporal_output_resource,
                                         AccessKind::ComputeShaderWrite,
                                     );
                                     Box::new(move |ctx| {
@@ -893,99 +907,70 @@ impl RevolumetricApp {
                                 },
                             );
                             let temporal_dep = temporal_writes[0];
-                            let (selected_reservoir_buffer, selected_reservoir_dep, history_source) =
-                                if self.restir_di_settings.spatial_enabled {
-                                    let spatial_writes = graph.add_pass(
-                                        "restir_di_spatial",
-                                        QueueType::Compute,
-                                        |builder| {
-                                            builder.read_as(
-                                                uniform_resource,
-                                                AccessKind::ComputeShaderRead,
-                                            );
-                                            builder.read_as(
-                                                surface_writes[0],
-                                                AccessKind::ComputeShaderRead,
-                                            );
-                                            builder.read_as(
-                                                surface_writes[1],
-                                                AccessKind::ComputeShaderRead,
-                                            );
-                                            builder.read_as(
-                                                surface_writes[2],
-                                                AccessKind::ComputeShaderRead,
-                                            );
-                                            builder.read_as(
-                                                temporal_dep,
-                                                AccessKind::ComputeShaderRead,
-                                            );
-                                            builder.write_as(
-                                                spatial_resource,
-                                                AccessKind::ComputeShaderWrite,
-                                            );
-                                            Box::new(move |ctx| {
-                                                if let Some(profiler) = profiler {
-                                                    profiler.begin_scope(
-                                                        ctx.device,
-                                                        ctx.command_buffer,
-                                                        slot,
-                                                        GpuProfileScope::RestirDiSpatial,
-                                                    );
-                                                }
-                                                restir_di.record_spatial(
+                            let selected_current_dep = if restir_di_settings.spatial_enabled {
+                                let spatial_writes = graph.add_pass(
+                                    "restir_di_spatial",
+                                    QueueType::Compute,
+                                    |builder| {
+                                        builder.read_as(
+                                            uniform_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            surface_writes[0],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            surface_writes[1],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            surface_writes[2],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder
+                                            .read_as(temporal_dep, AccessKind::ComputeShaderRead);
+                                        builder.write_as(
+                                            selected_current_resource,
+                                            AccessKind::ComputeShaderWrite,
+                                        );
+                                        Box::new(move |ctx| {
+                                            if let Some(profiler) = profiler {
+                                                profiler.begin_scope(
                                                     ctx.device,
                                                     ctx.command_buffer,
                                                     slot,
+                                                    GpuProfileScope::RestirDiSpatial,
                                                 );
-                                                if let Some(profiler) = profiler {
-                                                    profiler.end_scope(
-                                                        ctx.device,
-                                                        ctx.command_buffer,
-                                                        slot,
-                                                        GpuProfileScope::RestirDiSpatial,
-                                                    );
-                                                }
-                                            })
-                                        },
-                                    );
-                                    (
-                                        spatial_buffer,
-                                        spatial_writes[0],
-                                        RestirDiHistorySource::Spatial,
-                                    )
-                                } else {
-                                    (
-                                        temporal_buffer,
-                                        temporal_dep,
-                                        RestirDiHistorySource::Temporal,
-                                    )
-                                };
-                            graph.add_pass(
-                                "restir_di_history_update",
-                                QueueType::Transfer,
-                                |builder| {
-                                    builder
-                                        .read_as(selected_reservoir_dep, AccessKind::TransferRead);
-                                    builder.write_as(history_resource, AccessKind::TransferWrite);
-                                    let slot = frame.frame_slot;
-                                    Box::new(move |ctx| {
-                                        restir_di.record_history_update(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            history_source,
-                                        );
-                                    })
-                                },
-                            );
-                            restir_di_history_updated = true;
+                                            }
+                                            restir_di.record_spatial(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                            );
+                                            if let Some(profiler) = profiler {
+                                                profiler.end_scope(
+                                                    ctx.device,
+                                                    ctx.command_buffer,
+                                                    slot,
+                                                    GpuProfileScope::RestirDiSpatial,
+                                                );
+                                            }
+                                        })
+                                    },
+                                );
+                                spatial_writes[0]
+                            } else {
+                                temporal_dep
+                            };
+                            restir_di_selected_written = true;
                             vpt.update_restir_di_descriptors(
                                 renderer.device(),
                                 frame.frame_slot,
                                 uniform_buffer,
-                                selected_reservoir_buffer,
+                                selected_current_buffer,
                             );
-                            vpt_restir_reads = Some((uniform_resource, selected_reservoir_dep));
+                            vpt_restir_reads = Some((uniform_resource, selected_current_dep));
                         }
 
                         let mut vpt_area_restir_reads = None;
@@ -1009,10 +994,24 @@ impl RevolumetricApp {
                                 area_restir.initial_buffer();
                             let (area_temporal_buffer, area_temporal_size, area_temporal_usage) =
                                 area_restir.temporal_buffer();
-                            let (area_spatial_buffer, area_spatial_size, area_spatial_usage) =
-                                area_restir.spatial_buffer();
-                            let (area_history_buffer, area_history_size, area_history_usage) =
-                                area_restir.history_buffer();
+                            let (
+                                area_selected_current_buffer,
+                                area_selected_current_size,
+                                area_selected_current_usage,
+                            ) = area_restir.selected_current_buffer(frame.frame_slot);
+                            let (
+                                area_selected_history_buffer,
+                                area_selected_history_size,
+                                area_selected_history_usage,
+                            ) = area_restir.selected_history_buffer(frame.frame_slot);
+                            area_restir.update_frame_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                area_selected_history_buffer,
+                                area_selected_current_buffer,
+                                area_temporal_active,
+                                area_spatial_active,
+                            );
 
                             let area_uniform_resource = graph.import_buffer_with_access(
                                 area_uniform_buffer.handle,
@@ -1032,18 +1031,18 @@ impl RevolumetricApp {
                                 area_temporal_usage,
                                 AccessKind::Undefined,
                             );
-                            let area_spatial_resource = graph.import_buffer_with_access(
-                                area_spatial_buffer.handle,
-                                area_spatial_size,
-                                area_spatial_usage,
+                            let area_selected_current_resource = graph.import_buffer_with_access(
+                                area_selected_current_buffer.handle,
+                                area_selected_current_size,
+                                area_selected_current_usage,
                                 AccessKind::Undefined,
                             );
-                            let area_history_resource = graph.import_buffer_with_access(
-                                area_history_buffer.handle,
-                                area_history_size,
-                                area_history_usage,
+                            let area_selected_history_resource = graph.import_buffer_with_access(
+                                area_selected_history_buffer.handle,
+                                area_selected_history_size,
+                                area_selected_history_usage,
                                 if self.area_restir_history_initialized {
-                                    AccessKind::TransferWrite
+                                    AccessKind::ComputeShaderWrite
                                 } else {
                                     AccessKind::Undefined
                                 },
@@ -1074,8 +1073,13 @@ impl RevolumetricApp {
                                         .read_as(surface_writes[1], AccessKind::ComputeShaderRead);
                                     builder
                                         .read_as(surface_writes[2], AccessKind::ComputeShaderRead);
+                                    let area_initial_output_resource = if area_temporal_active {
+                                        area_initial_resource
+                                    } else {
+                                        area_selected_current_resource
+                                    };
                                     builder.write_as(
-                                        area_initial_resource,
+                                        area_initial_output_resource,
                                         AccessKind::ComputeShaderWrite,
                                     );
                                     builder.write_as(
@@ -1123,7 +1127,7 @@ impl RevolumetricApp {
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
-                                            area_history_resource,
+                                            area_selected_history_resource,
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
@@ -1154,8 +1158,13 @@ impl RevolumetricApp {
                                             previous_surface_albedo_resource,
                                             AccessKind::ComputeShaderRead,
                                         );
+                                        let area_temporal_output_resource = if area_spatial_active {
+                                            area_temporal_resource
+                                        } else {
+                                            area_selected_current_resource
+                                        };
                                         builder.write_as(
-                                            area_temporal_resource,
+                                            area_temporal_output_resource,
                                             AccessKind::ComputeShaderWrite,
                                         );
                                         Box::new(move |ctx| {
@@ -1187,118 +1196,80 @@ impl RevolumetricApp {
                             } else {
                                 area_initial_dep
                             };
-                            let (
-                                area_selected_reservoir_buffer,
-                                area_selected_reservoir_resource,
-                                area_history_source,
-                                area_final_debug_dep,
-                            ) = if area_spatial_active {
-                                let area_spatial_writes = graph.add_pass(
-                                    "area_restir_spatial",
-                                    QueueType::Compute,
-                                    |builder| {
-                                        builder.read_as(
-                                            area_uniform_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            area_temporal_dep,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[0],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[1],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[2],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.write_as(
-                                            area_spatial_resource,
-                                            AccessKind::ComputeShaderWrite,
-                                        );
-                                        builder.write_as(
-                                            area_debug_dep,
-                                            AccessKind::ComputeShaderWrite,
-                                        );
-                                        Box::new(move |ctx| {
-                                            if let Some(profiler) = profiler {
-                                                profiler.begin_scope(
-                                                    ctx.device,
-                                                    ctx.command_buffer,
-                                                    slot,
-                                                    GpuProfileScope::AreaRestirSpatial,
-                                                );
-                                            }
-                                            area_restir.record_spatial(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
+                            let (area_selected_reservoir_resource, area_final_debug_dep) =
+                                if area_spatial_active {
+                                    let area_spatial_writes = graph.add_pass(
+                                        "area_restir_spatial",
+                                        QueueType::Compute,
+                                        |builder| {
+                                            builder.read_as(
+                                                area_uniform_resource,
+                                                AccessKind::ComputeShaderRead,
                                             );
-                                            if let Some(profiler) = profiler {
-                                                profiler.end_scope(
+                                            builder.read_as(
+                                                area_temporal_dep,
+                                                AccessKind::ComputeShaderRead,
+                                            );
+                                            builder.read_as(
+                                                surface_writes[0],
+                                                AccessKind::ComputeShaderRead,
+                                            );
+                                            builder.read_as(
+                                                surface_writes[1],
+                                                AccessKind::ComputeShaderRead,
+                                            );
+                                            builder.read_as(
+                                                surface_writes[2],
+                                                AccessKind::ComputeShaderRead,
+                                            );
+                                            builder.write_as(
+                                                area_selected_current_resource,
+                                                AccessKind::ComputeShaderWrite,
+                                            );
+                                            builder.write_as(
+                                                area_debug_dep,
+                                                AccessKind::ComputeShaderWrite,
+                                            );
+                                            Box::new(move |ctx| {
+                                                if let Some(profiler) = profiler {
+                                                    profiler.begin_scope(
+                                                        ctx.device,
+                                                        ctx.command_buffer,
+                                                        slot,
+                                                        GpuProfileScope::AreaRestirSpatial,
+                                                    );
+                                                }
+                                                area_restir.record_spatial(
                                                     ctx.device,
                                                     ctx.command_buffer,
                                                     slot,
-                                                    GpuProfileScope::AreaRestirSpatial,
                                                 );
-                                            }
-                                        })
-                                    },
-                                );
-                                (
-                                    area_spatial_buffer,
-                                    area_spatial_writes[0],
-                                    AreaRestirHistorySource::Spatial,
-                                    area_spatial_writes[1],
-                                )
-                            } else {
-                                if area_temporal_active {
-                                    (
-                                        area_temporal_buffer,
-                                        area_temporal_dep,
-                                        AreaRestirHistorySource::Temporal,
-                                        area_debug_dep,
-                                    )
-                                } else {
-                                    (
-                                        area_initial_buffer,
-                                        area_initial_dep,
-                                        AreaRestirHistorySource::Initial,
-                                        area_debug_dep,
-                                    )
-                                }
-                            };
-                            let _ = area_final_debug_dep;
-                            graph.add_pass(
-                                "area_restir_history_update",
-                                QueueType::Transfer,
-                                |builder| {
-                                    builder.read_as(
-                                        area_selected_reservoir_resource,
-                                        AccessKind::TransferRead,
+                                                if let Some(profiler) = profiler {
+                                                    profiler.end_scope(
+                                                        ctx.device,
+                                                        ctx.command_buffer,
+                                                        slot,
+                                                        GpuProfileScope::AreaRestirSpatial,
+                                                    );
+                                                }
+                                            })
+                                        },
                                     );
-                                    builder
-                                        .write_as(area_history_resource, AccessKind::TransferWrite);
-                                    Box::new(move |ctx| {
-                                        area_restir.record_history_update(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            area_history_source,
-                                        );
-                                    })
-                                },
-                            );
-                            area_restir_history_updated = true;
+                                    (area_spatial_writes[0], area_spatial_writes[1])
+                                } else {
+                                    if area_temporal_active {
+                                        (area_temporal_dep, area_debug_dep)
+                                    } else {
+                                        (area_initial_dep, area_debug_dep)
+                                    }
+                                };
+                            let _ = area_final_debug_dep;
+                            area_restir_selected_written = true;
                             vpt.update_area_restir_descriptors(
                                 renderer.device(),
                                 frame.frame_slot,
                                 area_uniform_buffer,
-                                area_selected_reservoir_buffer,
+                                area_selected_current_buffer,
                             );
                             vpt_area_restir_reads =
                                 Some((area_uniform_resource, area_selected_reservoir_resource));
@@ -1662,10 +1633,10 @@ impl RevolumetricApp {
                     self.vpt_temporal_history_initialized = true;
                     self.postprocess_output_initialized = true;
                 }
-                if restir_di_history_updated {
+                if restir_di_selected_written {
                     self.restir_di_history_initialized = true;
                 }
-                if area_restir_history_updated {
+                if area_restir_selected_written {
                     self.area_restir_history_initialized = true;
                 }
                 renderer.end_frame(frame)?;
@@ -2018,17 +1989,15 @@ impl ApplicationHandler for RevolumetricApp {
                         if let (Some(area_restir), Some(vpt)) =
                             (&self.area_restir_pass, &self.vpt_pass)
                         {
-                            let area_restir_settings =
-                                area_restir_effective_settings(self.area_restir_settings, false);
-                            let (area_selected_reservoir_buffer, _, _) =
-                                area_restir_selected_reservoir(area_restir, area_restir_settings);
                             for slot in 0..scene_ubo_ref.frame_count() {
                                 let (area_uniform_buffer, _, _) = area_restir.uniform_buffer(slot);
+                                let (area_selected_current_buffer, _, _) =
+                                    area_restir.selected_current_buffer(slot);
                                 vpt.update_area_restir_descriptors(
                                     renderer.device(),
                                     slot,
                                     area_uniform_buffer,
-                                    area_selected_reservoir_buffer,
+                                    area_selected_current_buffer,
                                 );
                             }
                         }

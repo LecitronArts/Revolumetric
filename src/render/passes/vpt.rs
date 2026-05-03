@@ -1558,7 +1558,8 @@ mod shader_source_tests {
             "\"area_restir_initial\"",
             "\"area_restir_temporal\"",
             "\"area_restir_spatial\"",
-            "\"area_restir_history_update\"",
+            "area_restir.selected_current_buffer",
+            "area_restir.selected_history_buffer",
             "vpt.update_area_restir_descriptors",
             "vpt_area_restir_reads",
         ] {
@@ -1587,6 +1588,10 @@ mod shader_source_tests {
         assert!(compact_source.contains(
             "builder.read_as(area_selected_reservoir_resource,AccessKind::ComputeShaderRead"
         ));
+        assert!(
+            !source.contains("\"area_restir_history_update\""),
+            "Area ReSTIR selected reservoirs must not be copied through a transfer history pass"
+        );
     }
 
     #[test]

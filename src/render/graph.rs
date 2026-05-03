@@ -1039,7 +1039,7 @@ mod tests {
     }
 
     #[test]
-    fn compile_plans_restir_di_buffer_chain_with_uniform_and_light_reads() {
+    fn compile_plans_restir_di_selected_frame_ring_chain_with_uniform_and_light_reads() {
         let mut graph = RenderGraph::new();
         let uniform = graph.import_buffer_with_access(
             fake_buffer(120),
@@ -1065,13 +1065,13 @@ mod tests {
             vk::BufferUsageFlags::STORAGE_BUFFER,
             AccessKind::Undefined,
         );
-        let spatial = graph.import_buffer_with_access(
+        let selected_history = graph.import_buffer_with_access(
             fake_buffer(124),
             8192,
             vk::BufferUsageFlags::STORAGE_BUFFER,
-            AccessKind::Undefined,
+            AccessKind::ComputeShaderWrite,
         );
-        let history = graph.import_buffer_with_access(
+        let selected_current = graph.import_buffer_with_access(
             fake_buffer(125),
             8192,
             vk::BufferUsageFlags::STORAGE_BUFFER,
@@ -1087,14 +1087,14 @@ mod tests {
         let temporal_writes = graph.add_pass("restir_di_temporal", QueueType::Compute, |builder| {
             builder.read_as(uniform, AccessKind::ComputeShaderRead);
             builder.read_as(initial_writes[0], AccessKind::ComputeShaderRead);
-            builder.read_as(history, AccessKind::ComputeShaderRead);
+            builder.read_as(selected_history, AccessKind::ComputeShaderRead);
             builder.write_as(temporal, AccessKind::ComputeShaderWrite);
             Box::new(|_ctx| {})
         });
         let spatial_writes = graph.add_pass("restir_di_spatial", QueueType::Compute, |builder| {
             builder.read_as(uniform, AccessKind::ComputeShaderRead);
             builder.read_as(temporal_writes[0], AccessKind::ComputeShaderRead);
-            builder.write_as(spatial, AccessKind::ComputeShaderWrite);
+            builder.write_as(selected_current, AccessKind::ComputeShaderWrite);
             Box::new(|_ctx| {})
         });
         graph.add_pass("vpt", QueueType::Compute, |builder| {
@@ -1112,8 +1112,8 @@ mod tests {
         assert_eq!(barriers[1].resource.id, initial.id);
         assert_eq!(barriers[1].from, AccessKind::ComputeShaderWrite);
         assert_eq!(barriers[1].to, AccessKind::ComputeShaderRead);
-        assert_eq!(barriers[2].resource.id, history.id);
-        assert_eq!(barriers[2].from, AccessKind::Undefined);
+        assert_eq!(barriers[2].resource.id, selected_history.id);
+        assert_eq!(barriers[2].from, AccessKind::ComputeShaderWrite);
         assert_eq!(barriers[2].to, AccessKind::ComputeShaderRead);
         assert_eq!(barriers[3].resource.id, temporal.id);
         assert_eq!(barriers[3].from, AccessKind::Undefined);
@@ -1121,10 +1121,10 @@ mod tests {
         assert_eq!(barriers[4].resource.id, temporal.id);
         assert_eq!(barriers[4].from, AccessKind::ComputeShaderWrite);
         assert_eq!(barriers[4].to, AccessKind::ComputeShaderRead);
-        assert_eq!(barriers[5].resource.id, spatial.id);
+        assert_eq!(barriers[5].resource.id, selected_current.id);
         assert_eq!(barriers[5].from, AccessKind::Undefined);
         assert_eq!(barriers[5].to, AccessKind::ComputeShaderWrite);
-        assert_eq!(barriers[6].resource.id, spatial.id);
+        assert_eq!(barriers[6].resource.id, selected_current.id);
         assert_eq!(barriers[6].from, AccessKind::ComputeShaderWrite);
         assert_eq!(barriers[6].to, AccessKind::ComputeShaderRead);
     }

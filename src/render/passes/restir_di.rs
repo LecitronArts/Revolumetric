@@ -20,18 +20,11 @@ pub struct RestirDiPass {
     direct_lights: GpuBuffer,
     initial_reservoirs: GpuBuffer,
     temporal_reservoirs: GpuBuffer,
-    spatial_reservoirs: GpuBuffer,
-    history_reservoirs: GpuBuffer,
+    selected_reservoirs: Vec<GpuBuffer>,
     width: u32,
     height: u32,
     reservoir_count: u32,
     light_count: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RestirDiHistorySource {
-    Temporal,
-    Spatial,
 }
 
 pub struct RestirDiPassCreateInfo<'a> {
@@ -49,8 +42,7 @@ struct RestirDiBuffers {
     direct_lights: GpuBuffer,
     initial_reservoirs: GpuBuffer,
     temporal_reservoirs: GpuBuffer,
-    spatial_reservoirs: GpuBuffer,
-    history_reservoirs: GpuBuffer,
+    selected_reservoirs: Vec<GpuBuffer>,
 }
 
 struct RestirDiStage {
@@ -192,8 +184,7 @@ impl RestirDiPass {
             direct_lights: buffers.direct_lights,
             initial_reservoirs: buffers.initial_reservoirs,
             temporal_reservoirs: buffers.temporal_reservoirs,
-            spatial_reservoirs: buffers.spatial_reservoirs,
-            history_reservoirs: buffers.history_reservoirs,
+            selected_reservoirs: buffers.selected_reservoirs,
             width: info.width,
             height: info.height,
             reservoir_count,
@@ -249,19 +240,23 @@ impl RestirDiPass {
             create_reservoir_buffer(device, allocator, reservoir_count, "restir_di_initial")?;
         let temporal_reservoirs =
             create_reservoir_buffer(device, allocator, reservoir_count, "restir_di_temporal")?;
-        let spatial_reservoirs =
-            create_reservoir_buffer(device, allocator, reservoir_count, "restir_di_spatial")?;
-        let history_reservoirs =
-            create_reservoir_buffer(device, allocator, reservoir_count, "restir_di_history")?;
+        let selected_reservoirs = create_selected_reservoir_buffers(
+            device,
+            allocator,
+            self.selected_reservoirs.len(),
+            reservoir_count,
+            "restir_di_selected",
+        )?;
 
         std::mem::replace(&mut self.initial_reservoirs, initial_reservoirs)
             .destroy(device, allocator);
         std::mem::replace(&mut self.temporal_reservoirs, temporal_reservoirs)
             .destroy(device, allocator);
-        std::mem::replace(&mut self.spatial_reservoirs, spatial_reservoirs)
-            .destroy(device, allocator);
-        std::mem::replace(&mut self.history_reservoirs, history_reservoirs)
-            .destroy(device, allocator);
+        destroy_buffers(
+            std::mem::replace(&mut self.selected_reservoirs, selected_reservoirs),
+            device,
+            allocator,
+        );
 
         self.width = width;
         self.height = height;
@@ -302,44 +297,47 @@ impl RestirDiPass {
         )
     }
 
-    pub fn spatial_buffer(&self) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
-        (
-            &self.spatial_reservoirs,
-            self.spatial_reservoirs.size,
-            self.spatial_reservoirs.usage,
-        )
+    pub fn selected_current_buffer(
+        &self,
+        frame_slot: usize,
+    ) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
+        let buffer = &self.selected_reservoirs[self.selected_current_slot(frame_slot)];
+        (buffer, buffer.size, buffer.usage)
     }
 
-    pub fn history_buffer(&self) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
-        (
-            &self.history_reservoirs,
-            self.history_reservoirs.size,
-            self.history_reservoirs.usage,
-        )
+    pub fn selected_history_buffer(
+        &self,
+        frame_slot: usize,
+    ) -> (&GpuBuffer, vk::DeviceSize, vk::BufferUsageFlags) {
+        let buffer = &self.selected_reservoirs[self.selected_history_slot(frame_slot)];
+        (buffer, buffer.size, buffer.usage)
     }
 
-    pub fn record_history_update(
+    pub fn update_frame_descriptors(
         &self,
         device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        _frame_slot: usize,
-        source: RestirDiHistorySource,
+        frame_slot: usize,
+        selected_history: &GpuBuffer,
+        selected_current: &GpuBuffer,
+        spatial_enabled: bool,
     ) {
-        let source_buffer = match source {
-            RestirDiHistorySource::Temporal => &self.temporal_reservoirs,
-            RestirDiHistorySource::Spatial => &self.spatial_reservoirs,
+        let temporal_output = if spatial_enabled {
+            &self.temporal_reservoirs
+        } else {
+            selected_current
         };
-        unsafe {
-            device.cmd_copy_buffer(
-                cmd,
-                source_buffer.handle,
-                self.history_reservoirs.handle,
-                &[vk::BufferCopy::default()
-                    .src_offset(0)
-                    .dst_offset(0)
-                    .size(self.history_reservoirs.size)],
-            );
-        }
+        self.temporal_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            1,
+            &[&self.initial_reservoirs, selected_history, temporal_output],
+        );
+        self.spatial_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            1,
+            &[&self.temporal_reservoirs, selected_current],
+        );
     }
 
     pub fn record_initial(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
@@ -367,8 +365,7 @@ impl RestirDiPass {
         self.direct_lights.destroy(device, allocator);
         self.initial_reservoirs.destroy(device, allocator);
         self.temporal_reservoirs.destroy(device, allocator);
-        self.spatial_reservoirs.destroy(device, allocator);
-        self.history_reservoirs.destroy(device, allocator);
+        destroy_buffers(self.selected_reservoirs, device, allocator);
     }
 
     fn write_descriptor_sets(&self, device: &ash::Device) {
@@ -382,15 +379,27 @@ impl RestirDiPass {
             &self.uniform_buffers,
             &[
                 &self.initial_reservoirs,
-                &self.history_reservoirs,
+                &self.selected_reservoirs[self.selected_history_slot(0)],
                 &self.temporal_reservoirs,
             ],
         );
         self.spatial_stage.write_descriptors(
             device,
             &self.uniform_buffers,
-            &[&self.temporal_reservoirs, &self.spatial_reservoirs],
+            &[
+                &self.temporal_reservoirs,
+                &self.selected_reservoirs[self.selected_current_slot(0)],
+            ],
         );
+    }
+
+    fn selected_current_slot(&self, frame_slot: usize) -> usize {
+        frame_slot % self.selected_reservoirs.len()
+    }
+
+    fn selected_history_slot(&self, frame_slot: usize) -> usize {
+        (self.selected_current_slot(frame_slot) + self.selected_reservoirs.len() - 1)
+            % self.selected_reservoirs.len()
     }
 }
 
@@ -434,30 +443,15 @@ impl RestirDiBuffers {
                     return Err(error);
                 }
             };
-        let spatial_reservoirs = match create_reservoir_buffer(
+        let selected_reservoirs = match create_selected_reservoir_buffers(
             device,
             allocator,
+            frame_count,
             reservoir_count,
-            "restir_di_spatial",
+            "restir_di_selected",
         ) {
-            Ok(buffer) => buffer,
+            Ok(buffers) => buffers,
             Err(error) => {
-                temporal_reservoirs.destroy(device, allocator);
-                initial_reservoirs.destroy(device, allocator);
-                direct_lights.destroy(device, allocator);
-                destroy_buffers(uniform_buffers, device, allocator);
-                return Err(error);
-            }
-        };
-        let history_reservoirs = match create_reservoir_buffer(
-            device,
-            allocator,
-            reservoir_count,
-            "restir_di_history",
-        ) {
-            Ok(buffer) => buffer,
-            Err(error) => {
-                spatial_reservoirs.destroy(device, allocator);
                 temporal_reservoirs.destroy(device, allocator);
                 initial_reservoirs.destroy(device, allocator);
                 direct_lights.destroy(device, allocator);
@@ -471,8 +465,7 @@ impl RestirDiBuffers {
             direct_lights,
             initial_reservoirs,
             temporal_reservoirs,
-            spatial_reservoirs,
-            history_reservoirs,
+            selected_reservoirs,
         })
     }
 
@@ -481,8 +474,7 @@ impl RestirDiBuffers {
         self.direct_lights.destroy(device, allocator);
         self.initial_reservoirs.destroy(device, allocator);
         self.temporal_reservoirs.destroy(device, allocator);
-        self.spatial_reservoirs.destroy(device, allocator);
-        self.history_reservoirs.destroy(device, allocator);
+        destroy_buffers(self.selected_reservoirs, device, allocator);
     }
 }
 
@@ -587,6 +579,39 @@ impl RestirDiStage {
 
             unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
+    }
+
+    fn write_storage_descriptors_for_frame(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        first_binding: u32,
+        storage_buffers: &[&GpuBuffer],
+    ) {
+        let Some(&ds) = self.descriptor_sets.get(frame_slot) else {
+            return;
+        };
+        let storage_infos: Vec<_> = storage_buffers
+            .iter()
+            .map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.handle)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+        let writes: Vec<_> = storage_infos
+            .iter()
+            .enumerate()
+            .map(|(idx, info)| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(ds)
+                    .dst_binding(first_binding + idx as u32)
+                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .buffer_info(std::slice::from_ref(info))
+            })
+            .collect();
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     fn write_image_descriptors(
@@ -705,12 +730,35 @@ fn create_reservoir_buffer(
         device,
         allocator,
         (count * std::mem::size_of::<GpuRestirDiReservoir>()) as u64,
-        vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::BufferUsageFlags::STORAGE_BUFFER,
         MemoryLocation::GpuOnly,
         name,
     )
+}
+
+fn create_selected_reservoir_buffers(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    frame_count: usize,
+    reservoir_count: u32,
+    name_prefix: &str,
+) -> Result<Vec<GpuBuffer>> {
+    let mut buffers = Vec::with_capacity(frame_count.max(2));
+    for slot in 0..frame_count.max(2) {
+        match create_reservoir_buffer(
+            device,
+            allocator,
+            reservoir_count,
+            &format!("{name_prefix}_{slot}"),
+        ) {
+            Ok(buffer) => buffers.push(buffer),
+            Err(error) => {
+                destroy_buffers(buffers, device, allocator);
+                return Err(error);
+            }
+        }
+    }
+    Ok(buffers)
 }
 
 fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
@@ -932,9 +980,13 @@ mod shader_source_tests {
     }
 
     #[test]
-    fn restir_di_temporal_uses_explicit_history_surface_and_update_pass() {
+    fn restir_di_temporal_uses_explicit_history_surface_and_selected_frame_ring() {
         let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
         let pass = source("src/render/passes/restir_di.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
         let app = source("src/app.rs");
         let compact_app = app.split_whitespace().collect::<String>();
 
@@ -949,18 +1001,36 @@ mod shader_source_tests {
                 .contains("dot(normalize(normal_roughness.xyz), normalize(normal_roughness.xyz))")
         );
 
-        assert!(pass.contains("record_history_update"));
-        assert!(pass.contains("TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST"));
-        assert!(pass.contains("update_surface_descriptors"));
-
-        assert!(app.contains("restir_di_history_update"));
+        assert!(pass_impl.contains("selected_reservoirs"));
+        assert!(pass_impl.contains("selected_current_buffer"));
+        assert!(pass_impl.contains("selected_history_buffer"));
+        assert!(pass_impl.contains("update_frame_descriptors"));
+        assert!(pass_impl.contains("update_surface_descriptors"));
         assert!(
-            compact_app
-                .contains("builder.read_as(selected_reservoir_dep,AccessKind::TransferRead)"),
-            "history update should copy the reservoir buffer selected by the spatial-enabled branch"
+            !pass_impl.contains("record_history_update"),
+            "ReSTIR-DI selected history must be maintained by a selected reservoir frame ring, not a fullscreen copy"
         );
         assert!(
-            compact_app.contains("builder.write_as(history_resource,AccessKind::TransferWrite)")
+            !pass_impl.contains("cmd_copy_buffer"),
+            "ReSTIR-DI pass must not issue a per-frame history copy"
+        );
+
+        assert!(
+            !app.contains("restir_di_history_update"),
+            "ReSTIR-DI graph must not add a transfer history update pass"
+        );
+        assert!(
+            compact_app.contains("selected_current_resource")
+                && compact_app.contains("selected_history_resource")
+                && compact_app.contains("builder.write_as(selected_current_resource,")
+                && compact_app.contains("AccessKind::ComputeShaderWrite,);")
+                && compact_app
+                    .contains("vpt_restir_reads=Some((uniform_resource,selected_current_dep))"),
+            "ReSTIR-DI graph must write the current selected slot and feed that exact resource to VPT"
+        );
+        assert!(
+            !compact_app.contains("builder.read_as(selected_current_dep,AccessKind::TransferRead)"),
+            "ReSTIR-DI current selected resource must not be copied through the transfer queue"
         );
     }
 
@@ -1183,6 +1253,10 @@ mod shader_source_tests {
 
         assert!(reservoir_fn.contains("MemoryLocation::GpuOnly"));
         assert!(
+            !reservoir_fn.contains("TRANSFER_SRC") && !reservoir_fn.contains("TRANSFER_DST"),
+            "ReSTIR-DI reservoirs are no longer copied on the transfer queue"
+        );
+        assert!(
             !reservoir_fn.contains("write_mapped_slice"),
             "fullscreen reservoir buffers are GPU hot resources and should not require host-visible initialization"
         );
@@ -1218,17 +1292,16 @@ mod shader_source_tests {
         let app = source("src/app.rs");
         let compact = app.split_whitespace().collect::<String>();
 
-        assert!(app.contains("RestirDiHistorySource::Temporal"));
-        assert!(app.contains("RestirDiHistorySource::Spatial"));
         assert!(
-            compact.contains("ifself.restir_di_settings.spatial_enabled{"),
+            compact.contains("ifrestir_di_settings.spatial_enabled{"),
             "the spatial graph pass should be created only when spatial reuse is enabled"
         );
         assert!(
-            compact.contains("(temporal_buffer,temporal_dep,RestirDiHistorySource::Temporal,)")
-                && compact
-                    .contains("vpt_restir_reads=Some((uniform_resource,selected_reservoir_dep))"),
-            "spatial-disabled ReSTIR should feed VPT from temporal reservoirs instead of a fullscreen spatial passthrough"
+            compact.contains("lettemporal_output_resource=ifrestir_di_settings.spatial_enabled{temporal_resource}else{selected_current_resource};")
+                && compact.contains("letselected_current_dep=ifrestir_di_settings.spatial_enabled{")
+                && compact.contains("}else{temporal_dep};")
+                && compact.contains("vpt_restir_reads=Some((uniform_resource,selected_current_dep))"),
+            "spatial-disabled ReSTIR should write the temporal output directly into the current selected slot"
         );
     }
 
