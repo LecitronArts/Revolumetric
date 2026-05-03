@@ -110,7 +110,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
             sampled_position
         );
         float candidate_weight = target_pdf / max(light_selection_pdf, 1.0e-6);
+        if (!restir_di_candidate_finite(candidate_weight)) {
+            continue;
+        }
         float next_weight_sum = weight_sum + candidate_weight;
+        if (!restir_di_candidate_finite(next_weight_sum)) {
+            continue;
+        }
 
         if (reservoir.sample_light_id == 0xffffffffu || rand01(rng_state) * next_weight_sum <= candidate_weight) {
             reservoir.sample_light_id = light_id;
@@ -128,8 +134,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     reservoir.weight_sum = weight_sum;
     if (reservoir.sample_light_id != 0xffffffffu && reservoir.target_pdf > 0.0 && reservoir.sample_count_m > 0u) {
-        reservoir.selected_weight = weight_sum / max(reservoir.target_pdf * float(reservoir.sample_count_m), 1.0e-4);
-        reservoir.confidence = weight_sum;
+        reservoir.weight_sum = min(reservoir.weight_sum, RESTIR_DI_MAX_STREAM_WEIGHT);
+        reservoir.selected_weight = min(
+            reservoir.weight_sum / max(reservoir.target_pdf * float(reservoir.sample_count_m), 1.0e-4),
+            RESTIR_DI_MAX_SELECTED_WEIGHT
+        );
+        reservoir.confidence = reservoir.weight_sum;
     }
     output_reservoirs[index] = reservoir;
 }

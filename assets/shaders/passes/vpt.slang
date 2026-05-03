@@ -85,6 +85,11 @@ RestirDirectLightSample empty_restir_direct_light_sample() {
     return sample;
 }
 
+float3 analytic_sun_direct(HitResult hit, SceneUniforms scene) {
+    float sun_term = max(dot(hit.normal, scene.sun_direction), 0.0);
+    return material_cell_albedo(hit.cell) * scene.sun_intensity * sun_term * 0.2;
+}
+
 VptTraceSample empty_vpt_trace_sample() {
     VptTraceSample sample;
     sample.radiance = float3(0.0);
@@ -213,10 +218,32 @@ RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hi
     }
 
     RestirDiReservoir reservoir = restir_reservoirs[index];
-    if (reservoir.sample_light_id == 0xffffffffu || reservoir.weight_sum <= 0.0 || reservoir.selected_weight <= 0.0) {
+    if (reservoir.sample_light_id == 0xffffffffu || reservoir.weight_sum <= 0.0) {
         return sample;
     }
-    sample.selected_weight = reservoir.selected_weight;
+    float4 hit_position_depth = float4(hit.position, max(hit.t, 0.0));
+    float4 hit_normal_roughness = float4(normalize(hit.normal), 0.0);
+    float4 hit_albedo_material = float4(material_cell_albedo(hit.cell), float(voxel_material(hit.cell)));
+    float hit_target_pdf = restir_di_target_pdf_for_reservoir(
+        hit_position_depth,
+        hit_normal_roughness,
+        hit_albedo_material,
+        reservoir
+    );
+    if (!restir_di_candidate_finite(hit_target_pdf)) {
+        return sample;
+    }
+    RestirDiReservoir hit_reservoir = reservoir;
+    hit_reservoir.target_pdf = hit_target_pdf;
+    hit_reservoir.selected_weight = min(
+        reservoir.weight_sum / max(hit_target_pdf * float(max(reservoir.sample_count_m, 1u)), 1.0e-4),
+        RESTIR_DI_MAX_SELECTED_WEIGHT
+    );
+    float selected_weight = restir_di_bounded_selected_weight(hit_reservoir);
+    if (selected_weight <= 0.0) {
+        return sample;
+    }
+    sample.selected_weight = selected_weight;
 
     if (!restir_di_light_visible_from_hit(hit, reservoir)) {
         return sample;
@@ -225,12 +252,12 @@ RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hi
     float3 albedo = material_cell_albedo(hit.cell);
     if (reservoir.sample_flags == 0u) {
         float sun_term = max(dot(hit.normal, scene.sun_direction), 0.0);
-        sample.radiance = albedo * reservoir.sample_radiance.rgb * sun_term * reservoir.selected_weight * 0.2;
+        sample.radiance = albedo * reservoir.sample_radiance.rgb * sun_term * selected_weight * 0.2;
         return sample;
     }
 
     float geometry_term = restir_di_emissive_geometry_term(hit.position, hit.normal, reservoir.sample_position_pdf.xyz);
-    sample.radiance = albedo * reservoir.sample_radiance.rgb * geometry_term * reservoir.selected_weight;
+    sample.radiance = albedo * reservoir.sample_radiance.rgb * geometry_term * selected_weight;
     return sample;
 }
 
@@ -266,13 +293,15 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
 
         if (restir.enabled != 0u && bounce == 0u) {
             RestirDirectLightSample direct = resolve_restir_di_direct_light(pixel, hit, scene);
-            float3 contribution = throughput * direct.radiance;
+            float3 direct_radiance = direct.selected_weight > 0.0
+                ? direct.radiance
+                : analytic_sun_direct(hit, scene);
+            float3 contribution = throughput * direct_radiance;
             sample.radiance += contribution;
             sample.direct_radiance += contribution;
             sample.reservoir_weight = direct.selected_weight;
         } else {
-            float sun_term = max(dot(hit.normal, scene.sun_direction), 0.0);
-            float3 contribution = throughput * material_cell_albedo(hit.cell) * scene.sun_intensity * sun_term * 0.2;
+            float3 contribution = throughput * analytic_sun_direct(hit, scene);
             sample.radiance += contribution;
             if (bounce == 0u) {
                 sample.direct_radiance += contribution;

@@ -1383,6 +1383,12 @@ mod shader_source_tests {
             "restir_di_emissive_geometry_term",
             "reservoir.sample_radiance.rgb * geometry_term",
             "restir_di_light_visible_from_hit(hit, reservoir)",
+            "float4 hit_position_depth = float4(hit.position, max(hit.t, 0.0));",
+            "float4 hit_normal_roughness = float4(normalize(hit.normal), 0.0);",
+            "float4 hit_albedo_material = float4(material_cell_albedo(hit.cell), float(voxel_material(hit.cell)));",
+            "restir_di_target_pdf_for_reservoir(",
+            "hit_reservoir.target_pdf = hit_target_pdf;",
+            "float selected_weight = restir_di_bounded_selected_weight(hit_reservoir);",
         ] {
             assert!(
                 source.contains(token),
@@ -1498,6 +1504,8 @@ mod shader_source_tests {
             "reservoir.sample_state.lens_uv",
             "if (area_restir.enabled != 0u",
             "fallback jitter",
+            "float4 hit_position_depth = float4(hit.position, max(hit.t, 0.0));",
+            "hit_reservoir.target_pdf = hit_target_pdf;",
         ] {
             assert!(
                 source.contains(token),
@@ -1511,6 +1519,11 @@ mod shader_source_tests {
         assert!(
             !source.contains("float2(pixel) + reservoir.sample_state.subpixel_uv"),
             "VPT must not shift Area ReSTIR samples by half a pixel; use the shared pixel-sample conversion"
+        );
+        assert!(
+            !source.contains("current_surface_position_depth")
+                && !source.contains("restir_di_surface_compatible_with_hit"),
+            "VPT must not reject Area ReSTIR subpixel/lens hits by comparing them against the center-pixel surface buffer"
         );
         let area_common = include_str!("../../../assets/shaders/shared/area_restir_common.slang");
         assert!(

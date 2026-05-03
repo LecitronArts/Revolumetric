@@ -319,13 +319,25 @@ impl RestirDiPass {
         frame_slot: usize,
         selected_history: &GpuBuffer,
         selected_current: &GpuBuffer,
+        temporal_enabled: bool,
         spatial_enabled: bool,
     ) {
+        let initial_output = if temporal_enabled {
+            &self.initial_reservoirs
+        } else {
+            selected_current
+        };
         let temporal_output = if spatial_enabled {
             &self.temporal_reservoirs
         } else {
             selected_current
         };
+        self.initial_stage.write_storage_descriptors_for_frame(
+            device,
+            frame_slot,
+            2,
+            &[initial_output],
+        );
         self.temporal_stage.write_storage_descriptors_for_frame(
             device,
             frame_slot,
@@ -830,10 +842,15 @@ mod shader_source_tests {
         let initial = source("assets/shaders/passes/restir_di_initial.slang");
 
         assert!(
-            initial.contains("reservoir.selected_weight = weight_sum /"),
+            initial.contains("reservoir.selected_weight = min(")
+                && initial.contains("reservoir.weight_sum /"),
             "direct lighting resolve consumes selected_weight, so initial RIS must compute it from the total candidate weight"
         );
         assert!(initial.contains("reservoir.target_pdf * float(reservoir.sample_count_m)"));
+        assert!(
+            initial.contains("reservoir.confidence = reservoir.weight_sum;"),
+            "initial debug confidence should reflect the bounded reservoir weight, not the unclamped pre-firefly-clamp stream sum"
+        );
     }
 
     #[test]
@@ -1035,6 +1052,39 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn app_restir_di_dispatches_only_enabled_reuse_stages() {
+        let app = source("src/app.rs");
+        let compact = app.split_whitespace().collect::<String>();
+        let pass = source("src/render/passes/restir_di.rs");
+
+        for token in [
+            "letrestir_di_temporal_active=restir_di_settings.temporal_enabled;",
+            "letrestir_di_spatial_active=restir_di_temporal_active&&restir_di_settings.spatial_enabled;",
+            "restir_di.update_frame_descriptors(renderer.device(),frame.frame_slot,selected_history_buffer,selected_current_buffer,restir_di_temporal_active,restir_di_spatial_active,);",
+            "letinitial_output_resource=ifrestir_di_temporal_active{initial_resource}else{selected_current_resource};",
+            "lettemporal_dep=ifrestir_di_temporal_active{",
+            "letselected_current_dep=ifrestir_di_spatial_active",
+        ] {
+            assert!(
+                compact.contains(token),
+                "ReSTIR-DI app graph must gate disabled reuse stages and keep selected-current descriptors in sync: {token}"
+            );
+        }
+        assert!(
+            pass.contains("temporal_enabled: bool")
+                && pass.contains("let initial_output = if temporal_enabled")
+                && pass.contains("self.initial_stage.write_storage_descriptors_for_frame(\n            device,\n            frame_slot,\n            2,\n            &[initial_output],\n        );"),
+            "when temporal reuse is disabled, ReSTIR-DI initial must write the selected current slot that VPT reads"
+        );
+        assert!(
+            !compact.contains(
+                "letinitial_dep=initial_writes[0];lettemporal_writes=graph.add_pass(\"restir_di_temporal\""
+            ),
+            "ReSTIR-DI must not run temporal or graph-read selected history when temporal reuse is disabled"
+        );
+    }
+
+    #[test]
     fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() {
         let app = source("src/app.rs");
         let compact = app.split_whitespace().collect::<String>();
@@ -1229,6 +1279,54 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn restir_di_shaders_reject_nonfinite_reservoir_weights_before_vpt_resolve() {
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+        let vpt = source("assets/shaders/passes/vpt.slang");
+
+        for token in [
+            "static const float RESTIR_DI_MAX_SELECTED_WEIGHT",
+            "bool restir_di_candidate_finite(float value)",
+            "restir_di_bounded_selected_weight",
+            "restir_di_is_valid_reservoir(RestirDiReservoir reservoir)",
+            "restir_di_candidate_finite(reservoir.target_pdf)",
+            "restir_di_candidate_finite(reservoir.weight_sum)",
+            "restir_di_candidate_finite(reservoir.selected_weight)",
+        ] {
+            assert!(
+                common.contains(token),
+                "ReSTIR-DI common shader must bound invalid/overlarge reservoir state before reuse: {token}"
+            );
+        }
+        assert!(
+            vpt.contains(
+                "float selected_weight = restir_di_bounded_selected_weight(hit_reservoir);"
+            ) && vpt.contains("if (selected_weight <= 0.0)")
+                && vpt.contains("sample.selected_weight = selected_weight;")
+                && vpt.contains("* selected_weight"),
+            "VPT direct resolve must consume a finite bounded ReSTIR-DI weight evaluated on the actual VPT hit, not raw reservoir.selected_weight"
+        );
+        assert!(
+            !vpt.contains("* reservoir.selected_weight"),
+            "raw selected_weight can turn bad reservoirs into persistent white fireflies"
+        );
+    }
+
+    #[test]
+    fn vpt_restir_di_falls_back_to_analytic_direct_when_reservoir_unusable() {
+        let vpt = source("assets/shaders/passes/vpt.slang");
+
+        assert!(
+            vpt.contains("float3 analytic_sun_direct(HitResult hit, SceneUniforms scene)")
+                && vpt.contains("direct.selected_weight > 0.0")
+                && vpt.contains(": analytic_sun_direct(hit, scene);")
+                && vpt.contains(
+                    "float3 contribution = throughput * analytic_sun_direct(hit, scene);"
+                ),
+            "invalid or incompatible ReSTIR-DI reservoirs should fall back to analytic sun direct instead of turning first-bounce direct light into black blocks"
+        );
+    }
+
+    #[test]
     fn restir_di_spatial_disabled_is_exact_temporal_passthrough() {
         let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
 
@@ -1293,12 +1391,12 @@ mod shader_source_tests {
         let compact = app.split_whitespace().collect::<String>();
 
         assert!(
-            compact.contains("ifrestir_di_settings.spatial_enabled{"),
+            compact.contains("ifrestir_di_spatial_active{"),
             "the spatial graph pass should be created only when spatial reuse is enabled"
         );
         assert!(
-            compact.contains("lettemporal_output_resource=ifrestir_di_settings.spatial_enabled{temporal_resource}else{selected_current_resource};")
-                && compact.contains("letselected_current_dep=ifrestir_di_settings.spatial_enabled{")
+            compact.contains("lettemporal_output_resource=ifrestir_di_spatial_active{temporal_resource}else{selected_current_resource};")
+                && compact.contains("letselected_current_dep=ifrestir_di_spatial_active{")
                 && compact.contains("}else{temporal_dep};")
                 && compact.contains("vpt_restir_reads=Some((uniform_resource,selected_current_dep))"),
             "spatial-disabled ReSTIR should write the temporal output directly into the current selected slot"

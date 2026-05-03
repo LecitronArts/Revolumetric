@@ -1,3 +1,6 @@
+static const float RESTIR_DI_MAX_SELECTED_WEIGHT = 64.0;
+static const float RESTIR_DI_MAX_STREAM_WEIGHT = 1.0e5;
+
 struct RestirDiUniforms {
     uint enabled;
     uint temporal_enabled;
@@ -86,6 +89,17 @@ float restir_di_emissive_geometry_term(
     float3 light_dir = to_light * rsqrt(distance_sq);
     float light_term = max(dot(surface_normal, light_dir), 0.0);
     return light_term * restir_di_emissive_distance_attenuation(distance_sq);
+}
+
+bool restir_di_candidate_finite(float value) {
+    return value == value && value > 0.0 && value < 1.0e20;
+}
+
+float restir_di_bounded_selected_weight(RestirDiReservoir reservoir) {
+    if (!restir_di_candidate_finite(reservoir.selected_weight)) {
+        return 0.0;
+    }
+    return min(reservoir.selected_weight, RESTIR_DI_MAX_SELECTED_WEIGHT);
 }
 
 float restir_di_target_pdf_for_light(
@@ -177,7 +191,9 @@ float restir_di_target_pdf_for_reservoir(
 bool restir_di_is_valid_reservoir(RestirDiReservoir reservoir) {
     return reservoir.sample_light_id != 0xffffffffu
         && reservoir.sample_count_m > 0u
-        && reservoir.selected_weight > 0.0;
+        && restir_di_candidate_finite(reservoir.target_pdf)
+        && restir_di_candidate_finite(reservoir.weight_sum)
+        && restir_di_candidate_finite(reservoir.selected_weight);
 }
 
 float restir_di_reservoir_stream_weight(
@@ -189,7 +205,13 @@ float restir_di_reservoir_stream_weight(
         return 0.0;
     }
 
-    return target_pdf * max(reservoir.selected_weight, 0.0) * float(sample_count_m);
+    float stream_weight = target_pdf
+        * restir_di_bounded_selected_weight(reservoir)
+        * float(sample_count_m);
+    if (!restir_di_candidate_finite(stream_weight)) {
+        return 0.0;
+    }
+    return min(stream_weight, RESTIR_DI_MAX_STREAM_WEIGHT);
 }
 
 void restir_di_finalize_reservoir_on_surface_with_target(
@@ -218,9 +240,12 @@ void restir_di_finalize_reservoir_on_surface_with_target(
         reservoir.confidence = 0.0;
         return;
     }
-    reservoir.weight_sum = combined_weight_sum;
+    reservoir.weight_sum = min(combined_weight_sum, RESTIR_DI_MAX_STREAM_WEIGHT);
     reservoir.sample_count_m = combined_sample_count_m;
-    reservoir.selected_weight = combined_weight_sum / max(reservoir.target_pdf * float(combined_sample_count_m), 1.0e-4);
+    reservoir.selected_weight = min(
+        reservoir.weight_sum / max(reservoir.target_pdf * float(combined_sample_count_m), 1.0e-4),
+        RESTIR_DI_MAX_SELECTED_WEIGHT
+    );
     reservoir.confidence = float(combined_sample_count_m);
 }
 
