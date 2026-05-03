@@ -48,6 +48,21 @@ bool surface_is_valid(uint index) {
     return current_surface_position_depth[pixel].w >= 0.0;
 }
 
+uint sample_direct_light_id(float random01) {
+    uint lo = 0u;
+    uint hi = restir.light_count;
+    [loop]
+    while (lo < hi) {
+        uint mid = (lo + hi) >> 1u;
+        if (random01 <= direct_lights[mid].sampling.x) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+    return min(lo, restir.light_count - 1u);
+}
+
 [shader("compute")]
 [numthreads(8, 8, 1)]
 void main(uint3 tid : SV_DispatchThreadID) {
@@ -74,10 +89,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float weight_sum = 0.0;
 
     for (uint candidate = 0u; candidate < candidate_count; candidate++) {
-        uint light_id = hash_u32(rng_state ^ candidate * 747796405u) % restir.light_count;
+        uint light_id = sample_direct_light_id(rand01(rng_state));
         DirectLight light = direct_lights[light_id];
         float3 sampled_position = light.position_radius.xyz;
-        float sample_pdf = 1.0 / float(restir.light_count);
+        float light_selection_pdf = max(light.sampling.y, 1.0e-8);
+        float sample_pdf = light_selection_pdf;
         if (light.normal_type.w != 0.0) {
             sampled_position = restir_di_sample_emissive_area_point(
                 light.position_radius.xyz,
@@ -86,19 +102,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
             );
             sample_pdf *= restir_di_emissive_area_pdf(light.position_radius.w);
         }
-        float candidate_weight = restir_di_target_pdf_for_light_sample(
+        float target_pdf = restir_di_target_pdf_for_light_sample(
             surface_position_depth,
             surface_normal_roughness,
             surface_albedo_material,
             light,
             sampled_position
         );
+        float candidate_weight = target_pdf / max(light_selection_pdf, 1.0e-6);
         float next_weight_sum = weight_sum + candidate_weight;
 
         if (reservoir.sample_light_id == 0xffffffffu || rand01(rng_state) * next_weight_sum <= candidate_weight) {
             reservoir.sample_light_id = light_id;
             reservoir.sample_flags = uint(round(light.normal_type.w));
-            reservoir.target_pdf = candidate_weight;
+            reservoir.target_pdf = target_pdf;
             reservoir.selected_weight = 0.0;
             reservoir.confidence = candidate_weight;
             reservoir.sample_position_pdf = float4(sampled_position, sample_pdf);

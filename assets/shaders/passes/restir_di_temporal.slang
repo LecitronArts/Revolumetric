@@ -60,13 +60,16 @@ bool surface_is_valid(uint index) {
     return current_surface_position_depth[pixel].w >= 0.0;
 }
 
-bool compatible_temporal_surface(uint index, uint2 previous_pixel) {
-    uint2 pixel = uint2(index % restir.width, index / restir.width);
-    float4 current_position = current_surface_position_depth[pixel];
+bool compatible_temporal_surface(
+    float4 current_position,
+    float4 current_normal_roughness,
+    float4 current_albedo_material,
+    uint2 previous_pixel
+) {
     float4 previous_position = previous_surface_position_depth[previous_pixel];
-    float3 current_normal = normalize(current_surface_normal_roughness[pixel].xyz);
+    float3 current_normal = normalize(current_normal_roughness.xyz);
     float3 previous_normal = normalize(previous_surface_normal_roughness[previous_pixel].xyz);
-    float current_material = current_surface_albedo_material[pixel].a;
+    float current_material = current_albedo_material.a;
     float previous_material = previous_surface_albedo_material[previous_pixel].a;
     float normal_dot = dot(current_normal, previous_normal);
     float position_delta = length(current_position.xyz - previous_position.xyz);
@@ -107,7 +110,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         uint previous_index = previous_pixel.y * restir.width + previous_pixel.x;
         RestirDiReservoir history_reservoir = history_reservoirs[previous_index];
         if (restir_di_is_valid_reservoir(history_reservoir)
-            && compatible_temporal_surface(index, previous_pixel)) {
+            && compatible_temporal_surface(surface_position_depth, surface_normal_roughness, surface_albedo_material, previous_pixel)) {
             uint history_m_limit = max(restir.history_length, 1u);
             uint current_m = min(reservoir.sample_count_m, history_m_limit);
             float current_target_pdf = restir_di_target_pdf_for_reservoir(

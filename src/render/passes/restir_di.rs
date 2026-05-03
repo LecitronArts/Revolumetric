@@ -767,6 +767,7 @@ mod shader_source_tests {
 
         assert!(initial.contains("restir.light_count == 0u"));
         assert!(initial.contains("DirectLight light = direct_lights[light_id];"));
+        assert!(initial.contains("sample_direct_light_id(rand01(rng_state))"));
         assert!(initial.contains("reservoir.sample_light_id = light_id;"));
         assert!(initial.contains("reservoir.sample_flags ="));
         assert!(initial.contains("reservoir.sample_count_m += 1u;"));
@@ -834,7 +835,7 @@ mod shader_source_tests {
             "restir_di_emissive_area_pdf",
             "light.position_radius.w",
             "reservoir.sample_position_pdf = float4(sampled_position, sample_pdf)",
-            "candidate_weight = restir_di_target_pdf_for_light_sample(",
+            "target_pdf = restir_di_target_pdf_for_light_sample(",
         ] {
             assert!(
                 initial.contains(token) || common.contains(token),
@@ -845,6 +846,43 @@ mod shader_source_tests {
         assert!(
             !initial.contains("reservoir.sample_position_pdf = float4(light.position_radius.xyz, 1.0 / float(restir.light_count))"),
             "emissive reservoirs must store a sampled area point and its PDF, not the centroid"
+        );
+    }
+
+    #[test]
+    fn restir_di_initial_weights_candidates_by_light_selection_pdf() {
+        let initial = source("assets/shaders/passes/restir_di_initial.slang");
+
+        for token in [
+            "uint sample_direct_light_id(float random01)",
+            "while (lo < hi)",
+            "direct_lights[mid].sampling.x",
+            "float light_selection_pdf = max(light.sampling.y, 1.0e-8);",
+            "float target_pdf = restir_di_target_pdf_for_light_sample(",
+            "float candidate_weight = target_pdf / max(light_selection_pdf, 1.0e-6);",
+            "float next_weight_sum = weight_sum + candidate_weight;",
+            "reservoir.target_pdf = target_pdf;",
+        ] {
+            assert!(
+                initial.contains(token),
+                "ReSTIR-DI initial RIS must compensate the discrete light-selection proposal PDF: {token}"
+            );
+        }
+        assert!(
+            !initial.contains("float candidate_weight = restir_di_target_pdf_for_light_sample("),
+            "target PDF alone underestimates direct lighting by the light proposal probability"
+        );
+        assert!(
+            !initial.contains("hash_u32(rng_state ^ candidate * 747796405u) % restir.light_count"),
+            "uniform light-id sampling causes high-variance direct lighting when the light table is large"
+        );
+        assert!(
+            !initial.contains("while (lo + 1u < hi)"),
+            "CDF lower_bound must compare the final one-element interval instead of returning light 0 early"
+        );
+        assert!(
+            !initial.contains("candidate_weight = target_pdf / max(sample_pdf"),
+            "the current emissive cluster target is not an area-density measure; area PDF amplification reintroduces bright fireflies"
         );
     }
 
@@ -972,6 +1010,30 @@ mod shader_source_tests {
                 "reused reservoirs must be renormalized against the current pixel surface"
             );
         }
+    }
+
+    #[test]
+    fn restir_di_reuse_shaders_cache_center_surface_reads() {
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        assert!(
+            temporal.contains(
+                "compatible_temporal_surface(surface_position_depth, surface_normal_roughness, surface_albedo_material, previous_pixel)"
+            ),
+            "temporal reuse should pass cached center surface values into compatibility checks"
+        );
+        assert!(
+            spatial.contains(
+                "compatible_spatial_surface(surface_position_depth, surface_normal_roughness, surface_albedo_material, neighbor_index)"
+            ),
+            "spatial reuse should pass cached center surface values into compatibility checks"
+        );
+        assert!(
+            !temporal.contains("compatible_temporal_surface(index, previous_pixel)")
+                && !spatial.contains("compatible_spatial_surface(index, neighbor_index)"),
+            "reuse shaders must not reload the center surface in each compatibility check"
+        );
     }
 
     #[test]

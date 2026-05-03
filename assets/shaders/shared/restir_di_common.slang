@@ -17,6 +17,7 @@ struct DirectLight {
     float4 position_radius;
     float4 normal_type;
     float4 color_power;
+    float4 sampling;
 };
 
 struct RestirDiReservoir {

@@ -52,14 +52,17 @@ bool surface_is_valid(uint index) {
     return current_surface_position_depth[pixel].w >= 0.0;
 }
 
-bool compatible_spatial_surface(uint center_index, uint neighbor_index) {
-    uint2 center_pixel = uint2(center_index % restir.width, center_index / restir.width);
+bool compatible_spatial_surface(
+    float4 center_position,
+    float4 center_normal_roughness,
+    float4 center_albedo_material,
+    uint neighbor_index
+) {
     uint2 neighbor_pixel = uint2(neighbor_index % restir.width, neighbor_index / restir.width);
-    float4 center_position = current_surface_position_depth[center_pixel];
     float4 neighbor_position = current_surface_position_depth[neighbor_pixel];
-    float3 center_normal = normalize(current_surface_normal_roughness[center_pixel].xyz);
+    float3 center_normal = normalize(center_normal_roughness.xyz);
     float3 neighbor_normal = normalize(current_surface_normal_roughness[neighbor_pixel].xyz);
-    float center_material = current_surface_albedo_material[center_pixel].a;
+    float center_material = center_albedo_material.a;
     float neighbor_material = current_surface_albedo_material[neighbor_pixel].a;
     float normal_dot = dot(center_normal, neighbor_normal);
     float position_delta = length(center_position.xyz - neighbor_position.xyz);
@@ -127,7 +130,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         uint2 neighbor_pixel = uint2(neighbor_pixel_i);
         uint neighbor_index = neighbor_pixel.y * restir.width + neighbor_pixel.x;
         RestirDiReservoir neighbor = temporal_reservoirs[neighbor_index];
-        if (!compatible_spatial_surface(index, neighbor_index)
+        if (!compatible_spatial_surface(surface_position_depth, surface_normal_roughness, surface_albedo_material, neighbor_index)
             || !restir_di_is_valid_reservoir(neighbor)) {
             continue;
         }

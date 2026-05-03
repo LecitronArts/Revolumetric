@@ -197,6 +197,7 @@ pub struct GpuDirectLight {
     pub position_radius: [f32; 4],
     pub normal_type: [f32; 4],
     pub color_power: [f32; 4],
+    pub sampling: [f32; 4],
 }
 
 #[repr(C)]
@@ -226,11 +227,13 @@ pub fn build_direct_lights_for_test(
     sun_intensity: f32,
     emissive_voxels: &[EmissiveVoxelForTest],
 ) -> Vec<GpuDirectLight> {
-    build_direct_lights_from_emissive_iter(
+    let mut lights = build_direct_lights_from_emissive_iter(
         sun_direction,
         sun_intensity,
         emissive_voxels.iter().copied(),
-    )
+    );
+    assign_power_weighted_sampling(&mut lights);
+    lights
 }
 
 pub fn build_direct_lights_from_ucvh(
@@ -276,6 +279,7 @@ pub fn build_direct_lights_from_ucvh(
         build_direct_lights_from_emissive_iter(sun_direction, sun_intensity, emissive_voxels);
     lights.sort_by(|a, b| b.color_power[3].total_cmp(&a.color_power[3]));
     lights.truncate(max_lights);
+    assign_power_weighted_sampling(&mut lights);
     lights
 }
 
@@ -290,6 +294,7 @@ fn build_direct_lights_from_emissive_iter(
             position_radius: [sun_direction[0], sun_direction[1], sun_direction[2], 0.0],
             normal_type: [sun_direction[0], sun_direction[1], sun_direction[2], 0.0],
             color_power: [sun_intensity, sun_intensity, sun_intensity, sun_intensity],
+            sampling: [0.0; 4],
         });
     }
 
@@ -357,10 +362,44 @@ fn build_direct_lights_from_emissive_iter(
                 cluster.radiance_sum[2],
                 power,
             ],
+            sampling: [0.0; 4],
         });
     }
 
     lights
+}
+
+fn assign_power_weighted_sampling(lights: &mut [GpuDirectLight]) {
+    let total_power = lights
+        .iter()
+        .map(|light| light.color_power[3].max(0.0))
+        .sum::<f32>();
+    if lights.is_empty() {
+        return;
+    }
+
+    if total_power <= 0.0 {
+        let uniform_pdf = 1.0 / lights.len() as f32;
+        let mut cdf = 0.0;
+        for light in lights.iter_mut() {
+            cdf += uniform_pdf;
+            light.sampling = [cdf.min(1.0), uniform_pdf, 0.0, 0.0];
+        }
+        if let Some(last) = lights.last_mut() {
+            last.sampling[0] = 1.0;
+        }
+        return;
+    }
+
+    let mut cdf = 0.0;
+    for light in lights.iter_mut() {
+        let pdf = light.color_power[3].max(0.0) / total_power;
+        cdf += pdf;
+        light.sampling = [cdf.min(1.0), pdf.max(1.0e-8), 0.0, 0.0];
+    }
+    if let Some(last) = lights.last_mut() {
+        last.sampling[0] = 1.0;
+    }
 }
 
 fn parse_bool(
@@ -508,11 +547,12 @@ mod tests {
     #[test]
     fn gpu_struct_layout_is_stable() {
         assert_eq!(std::mem::size_of::<GpuRestirDiUniforms>(), 48);
-        assert_eq!(std::mem::size_of::<GpuDirectLight>(), 48);
+        assert_eq!(std::mem::size_of::<GpuDirectLight>(), 64);
         assert_eq!(std::mem::size_of::<GpuRestirDiReservoir>(), 64);
         assert_eq!(std::mem::offset_of!(GpuRestirDiUniforms, enabled), 0);
         assert_eq!(std::mem::offset_of!(GpuRestirDiUniforms, light_count), 36);
         assert_eq!(std::mem::offset_of!(GpuDirectLight, color_power), 32);
+        assert_eq!(std::mem::offset_of!(GpuDirectLight, sampling), 48);
         assert_eq!(
             std::mem::offset_of!(GpuRestirDiReservoir, sample_position_pdf),
             32
@@ -528,6 +568,7 @@ mod tests {
         assert!(source.contains("uint light_count;"));
         assert!(source.contains("struct DirectLight"));
         assert!(source.contains("float4 color_power;"));
+        assert!(source.contains("float4 sampling;"));
         assert!(source.contains("struct RestirDiReservoir"));
         assert!(source.contains("uint sample_count_m;"));
         assert!(source.contains("float4 sample_radiance;"));
@@ -539,6 +580,36 @@ mod tests {
         assert_eq!(lights.len(), 1);
         assert_eq!(lights[0].normal_type[3], 0.0);
         assert!(lights[0].color_power[3] > 0.0);
+    }
+
+    #[test]
+    fn direct_light_table_stores_power_weighted_sampling_cdf_and_pdf() {
+        let voxels = [
+            EmissiveVoxelForTest {
+                brick_id: 1,
+                world_position: [0.0, 0.0, 0.0],
+                emissive: [255, 0, 0],
+            },
+            EmissiveVoxelForTest {
+                brick_id: 2,
+                world_position: [8.0, 0.0, 0.0],
+                emissive: [255, 255, 255],
+            },
+        ];
+        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 3.0, &voxels);
+        assert_eq!(lights.len(), 3);
+
+        let mut previous_cdf = 0.0;
+        let mut pdf_sum = 0.0;
+        for light in &lights {
+            assert!(light.sampling[0] >= previous_cdf);
+            assert!(light.sampling[0] <= 1.0);
+            assert!(light.sampling[1] > 0.0);
+            previous_cdf = light.sampling[0];
+            pdf_sum += light.sampling[1];
+        }
+        assert!((lights.last().unwrap().sampling[0] - 1.0).abs() < 1.0e-5);
+        assert!((pdf_sum - 1.0).abs() < 1.0e-5);
     }
 
     #[test]
