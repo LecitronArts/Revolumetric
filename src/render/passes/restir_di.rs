@@ -1282,6 +1282,48 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn vpt_restir_direct_resolve_keeps_occluded_reservoirs_unselected_for_fallback() {
+        let vpt = source("assets/shaders/passes/vpt.slang");
+
+        assert!(
+            vpt.find("if (!restir_di_light_visible_from_hit(hit, reservoir))")
+                .expect("VPT ReSTIR resolve should reject occluded light samples")
+                < vpt
+                    .find("sample.selected_weight = selected_weight;")
+                    .expect("VPT ReSTIR resolve should only mark usable samples as selected"),
+            "occluded ReSTIR-DI reservoirs must keep selected_weight at zero so VPT falls back to analytic direct light instead of writing black direct-light blocks"
+        );
+    }
+
+    #[test]
+    fn restir_di_light_table_excludes_analytic_sun_and_preserves_emissive_sampling_power() {
+        let app = source("src/app.rs");
+        let restir = source("src/render/restir_di.rs");
+        let vpt = source("assets/shaders/passes/vpt.slang");
+
+        assert!(
+            app.contains("build_direct_lights_from_ucvh(ucvh"),
+            "ReSTIR-DI direct-light setup should build a finite-emissive light table; the analytic sun is evaluated separately in VPT"
+        );
+        assert!(
+            !app.contains("light.intensity.max_element().max(0.0)")
+                && !app.contains("let (sun_direction, sun_intensity)"),
+            "collapsing the directional light to max_element before ReSTIR-DI lets one reservoir sample replace the deterministic RGB sun and creates over-bright direct-light blocks"
+        );
+        assert!(
+            restir.contains("pub fn build_direct_lights_from_ucvh")
+                && restir.contains("ucvh: &Ucvh")
+                && restir.contains("max_lights: usize"),
+            "ReSTIR-DI direct-light builders must not include the analytic sun in the stochastic finite-light reservoir table"
+        );
+        assert!(
+            vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene);")
+                && vpt.contains("float3 direct_radiance = analytic_direct + direct.radiance;"),
+            "VPT must always keep deterministic sun direct light and add finite-light ReSTIR-DI only when a reservoir is usable"
+        );
+    }
+
+    #[test]
     fn restir_di_shaders_reject_nonfinite_reservoir_weights_before_vpt_resolve() {
         let common = source("assets/shaders/shared/restir_di_common.slang");
         let vpt = source("assets/shaders/passes/vpt.slang");
@@ -1320,12 +1362,12 @@ mod shader_source_tests {
 
         assert!(
             vpt.contains("float3 analytic_sun_direct(HitResult hit, SceneUniforms scene)")
-                && vpt.contains("direct.selected_weight > 0.0")
-                && vpt.contains(": analytic_sun_direct(hit, scene);")
+                && vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene);")
+                && vpt.contains("float3 direct_radiance = analytic_direct + direct.radiance;")
                 && vpt.contains(
                     "float3 contribution = throughput * analytic_sun_direct(hit, scene);"
                 ),
-            "invalid or incompatible ReSTIR-DI reservoirs should fall back to analytic sun direct instead of turning first-bounce direct light into black blocks"
+            "invalid or incompatible ReSTIR-DI reservoirs should still keep analytic sun direct instead of turning first-bounce direct light into black blocks"
         );
     }
 

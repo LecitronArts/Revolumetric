@@ -223,25 +223,14 @@ pub struct EmissiveVoxelForTest {
 }
 
 pub fn build_direct_lights_for_test(
-    sun_direction: [f32; 3],
-    sun_intensity: f32,
     emissive_voxels: &[EmissiveVoxelForTest],
 ) -> Vec<GpuDirectLight> {
-    let mut lights = build_direct_lights_from_emissive_iter(
-        sun_direction,
-        sun_intensity,
-        emissive_voxels.iter().copied(),
-    );
+    let mut lights = build_direct_lights_from_emissive_iter(emissive_voxels.iter().copied());
     assign_power_weighted_sampling(&mut lights);
     lights
 }
 
-pub fn build_direct_lights_from_ucvh(
-    ucvh: &Ucvh,
-    sun_direction: [f32; 3],
-    sun_intensity: f32,
-    max_lights: usize,
-) -> Vec<GpuDirectLight> {
+pub fn build_direct_lights_from_ucvh(ucvh: &Ucvh, max_lights: usize) -> Vec<GpuDirectLight> {
     let mut emissive_voxels = Vec::new();
     let grid = ucvh.config.brick_grid_size;
     let materials = ucvh.pool.material_pool();
@@ -275,8 +264,7 @@ pub fn build_direct_lights_from_ucvh(
         }
     }
 
-    let mut lights =
-        build_direct_lights_from_emissive_iter(sun_direction, sun_intensity, emissive_voxels);
+    let mut lights = build_direct_lights_from_emissive_iter(emissive_voxels);
     lights.sort_by(|a, b| b.color_power[3].total_cmp(&a.color_power[3]));
     lights.truncate(max_lights);
     assign_power_weighted_sampling(&mut lights);
@@ -284,19 +272,9 @@ pub fn build_direct_lights_from_ucvh(
 }
 
 fn build_direct_lights_from_emissive_iter(
-    sun_direction: [f32; 3],
-    sun_intensity: f32,
     emissive_voxels: impl IntoIterator<Item = EmissiveVoxelForTest>,
 ) -> Vec<GpuDirectLight> {
     let mut lights = Vec::new();
-    if sun_intensity > 0.0 {
-        lights.push(GpuDirectLight {
-            position_radius: [sun_direction[0], sun_direction[1], sun_direction[2], 0.0],
-            normal_type: [sun_direction[0], sun_direction[1], sun_direction[2], 0.0],
-            color_power: [sun_intensity, sun_intensity, sun_intensity, sun_intensity],
-            sampling: [0.0; 4],
-        });
-    }
 
     #[derive(Clone, Copy)]
     struct Cluster {
@@ -340,6 +318,11 @@ fn build_direct_lights_from_emissive_iter(
     for cluster in clusters.values() {
         let inv_count = 1.0 / cluster.count as f32;
         let power = cluster.radiance_sum[0] + cluster.radiance_sum[1] + cluster.radiance_sum[2];
+        let average_radiance = [
+            cluster.radiance_sum[0] * inv_count,
+            cluster.radiance_sum[1] * inv_count,
+            cluster.radiance_sum[2] * inv_count,
+        ];
         let centroid = [
             cluster.position_sum[0] * inv_count,
             cluster.position_sum[1] * inv_count,
@@ -357,9 +340,9 @@ fn build_direct_lights_from_emissive_iter(
             position_radius: [centroid[0], centroid[1], centroid[2], area_radius],
             normal_type: [0.0, 0.0, 0.0, 1.0],
             color_power: [
-                cluster.radiance_sum[0],
-                cluster.radiance_sum[1],
-                cluster.radiance_sum[2],
+                average_radiance[0],
+                average_radiance[1],
+                average_radiance[2],
                 power,
             ],
             sampling: [0.0; 4],
@@ -575,11 +558,12 @@ mod tests {
     }
 
     #[test]
-    fn direct_light_table_includes_sun_when_power_is_positive() {
-        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 2.0, &[]);
-        assert_eq!(lights.len(), 1);
-        assert_eq!(lights[0].normal_type[3], 0.0);
-        assert!(lights[0].color_power[3] > 0.0);
+    fn direct_light_table_excludes_analytic_sun() {
+        let lights = build_direct_lights_for_test(&[]);
+        assert!(
+            lights.is_empty(),
+            "ReSTIR-DI finite-light table must not include the analytic sun"
+        );
     }
 
     #[test]
@@ -596,8 +580,8 @@ mod tests {
                 emissive: [255, 255, 255],
             },
         ];
-        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 3.0, &voxels);
-        assert_eq!(lights.len(), 3);
+        let lights = build_direct_lights_for_test(&voxels);
+        assert_eq!(lights.len(), 2);
 
         let mut previous_cdf = 0.0;
         let mut pdf_sum = 0.0;
@@ -631,12 +615,41 @@ mod tests {
                 emissive: [0, 0, 0],
             },
         ];
-        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 0.0, &voxels);
+        let lights = build_direct_lights_for_test(&voxels);
         assert_eq!(lights.len(), 1);
         assert_eq!(lights[0].normal_type[3], 1.0);
         assert_eq!(lights[0].position_radius[0], 2.0);
         assert_eq!(lights[0].position_radius[1], 2.0);
         assert_eq!(lights[0].position_radius[2], 2.0);
+    }
+
+    #[test]
+    fn direct_light_table_uses_average_radiance_and_total_power_for_clusters() {
+        let voxels = [
+            EmissiveVoxelForTest {
+                brick_id: 13,
+                world_position: [0.0, 0.0, 0.0],
+                emissive: [255, 0, 0],
+            },
+            EmissiveVoxelForTest {
+                brick_id: 13,
+                world_position: [2.0, 0.0, 0.0],
+                emissive: [0, 128, 255],
+            },
+        ];
+
+        let lights = build_direct_lights_for_test(&voxels);
+        assert_eq!(lights.len(), 1);
+        let light = lights[0];
+        let expected_green = (128.0 / 255.0 * 3.0) * 0.5;
+
+        assert!((light.color_power[0] - 1.5).abs() < 1.0e-5);
+        assert!((light.color_power[1] - expected_green).abs() < 1.0e-5);
+        assert!((light.color_power[2] - 1.5).abs() < 1.0e-5);
+        assert!(
+            (light.color_power[3] - (3.0 + 128.0 / 255.0 * 3.0 + 3.0)).abs() < 1.0e-5,
+            "color_power.w must retain total cluster power for light sampling"
+        );
     }
 
     #[test]
@@ -654,7 +667,7 @@ mod tests {
             },
         ];
 
-        let lights = build_direct_lights_for_test([0.0, -1.0, 0.0], 0.0, &voxels);
+        let lights = build_direct_lights_for_test(&voxels);
         let area_light = lights
             .iter()
             .find(|light| light.normal_type[3] == 1.0)
@@ -674,7 +687,7 @@ mod tests {
         let count = crate::voxel::generator::generate_sponza_scene(&mut ucvh);
         assert!(count > 0, "sponza should allocate bricks");
         ucvh.rebuild_hierarchy();
-        let lights = build_direct_lights_from_ucvh(&ucvh, [0.0, -1.0, 0.0], 0.0, 4096);
+        let lights = build_direct_lights_from_ucvh(&ucvh, 4096);
         assert!(
             lights
                 .iter()

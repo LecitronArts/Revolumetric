@@ -2179,17 +2179,7 @@ impl ApplicationHandler for RevolumetricApp {
             if initial_spirv.is_empty() || temporal_spirv.is_empty() || spatial_spirv.is_empty() {
                 tracing::warn!("ReSTIR-DI shaders are empty; slangc may not be installed");
             } else {
-                let (sun_direction, sun_intensity) = self
-                    .world
-                    .resource::<DirectionalLight>()
-                    .map_or(([0.5, 1.0, 0.25], 2.0), |light| {
-                        (
-                            light.direction.to_array(),
-                            light.intensity.max_element().max(0.0),
-                        )
-                    });
-                let direct_lights =
-                    build_direct_lights_from_ucvh(ucvh, sun_direction, sun_intensity, 4096);
+                let direct_lights = build_direct_lights_from_ucvh(ucvh, 4096);
                 match RestirDiPass::new(
                     renderer.device(),
                     renderer.allocator(),

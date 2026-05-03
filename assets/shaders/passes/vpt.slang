@@ -228,11 +228,10 @@ RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hi
     if (selected_weight <= 0.0) {
         return sample;
     }
-    sample.selected_weight = selected_weight;
-
     if (!restir_di_light_visible_from_hit(hit, reservoir)) {
         return sample;
     }
+    sample.selected_weight = selected_weight;
 
     float3 albedo = material_cell_albedo(hit.cell);
     if (reservoir.sample_flags == 0u) {
@@ -278,9 +277,8 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
 
         if (restir.enabled != 0u && bounce == 0u) {
             RestirDirectLightSample direct = resolve_restir_di_direct_light(pixel, hit, scene);
-            float3 direct_radiance = direct.selected_weight > 0.0
-                ? direct.radiance
-                : analytic_sun_direct(hit, scene);
+            float3 analytic_direct = analytic_sun_direct(hit, scene);
+            float3 direct_radiance = analytic_direct + direct.radiance;
             float3 contribution = throughput * direct_radiance;
             sample.radiance += contribution;
             sample.direct_radiance += contribution;
