@@ -446,6 +446,8 @@ mod tests {
             "struct AreaRestirReservoir",
             "area_restir_invalid_reservoir",
             "area_restir_is_valid_reservoir",
+            "area_restir_pixel_sample",
+            "return float2(pixel) + sample_state.subpixel_uv - 0.5;",
             "area_restir_surface_compatible",
             "area_restir_finalize_reservoir",
         ] {

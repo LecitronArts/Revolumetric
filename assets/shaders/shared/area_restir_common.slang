@@ -150,6 +150,10 @@ float area_restir_replay_target_pdf(
     return area_restir_context_target_luma(current_context) * domain_pdf;
 }
 
+float2 area_restir_pixel_sample(uint2 pixel, AreaRestirSampleState sample_state) {
+    return float2(pixel) + sample_state.subpixel_uv - 0.5;
+}
+
 void area_restir_reservoir_update(
     inout AreaRestirReservoir reservoir,
     AreaRestirReservoir candidate,

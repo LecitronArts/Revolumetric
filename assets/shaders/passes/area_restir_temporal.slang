@@ -60,15 +60,6 @@ AreaRestirEvalContext current_context(uint2 pixel) {
     return context;
 }
 
-AreaRestirEvalContext previous_context(uint2 pixel) {
-    AreaRestirEvalContext context;
-    context.position_depth = previous_surface_position_depth[pixel];
-    context.normal_roughness = previous_surface_normal_roughness[pixel];
-    context.albedo_material = previous_surface_albedo_material[pixel];
-    context.motion_history = float4(0.0);
-    return context;
-}
-
 uint area_restir_temporal_hash(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352du;
@@ -89,6 +80,31 @@ bool area_restir_history_tap_inside(int2 previous_pixel, uint width, uint height
         && previous_pixel.y >= 0
         && previous_pixel.x < int(width)
         && previous_pixel.y < int(height);
+}
+
+bool area_restir_temporal_surface_compatible(
+    AreaRestirEvalContext center,
+    uint2 previous_pixel
+) {
+    float4 previous_position = previous_surface_position_depth[previous_pixel];
+    if (center.position_depth.w < 0.0 || previous_position.w < 0.0) {
+        return false;
+    }
+
+    float position_delta = distance(center.position_depth.xyz, previous_position.xyz);
+    float depth_scale = max(center.position_depth.w, 1.0);
+    if (position_delta > max(1.0, depth_scale * area_restir.depth_threshold)) {
+        return false;
+    }
+
+    float4 previous_albedo = previous_surface_albedo_material[previous_pixel];
+    if (abs(center.albedo_material.w - previous_albedo.w) > 0.5) {
+        return false;
+    }
+
+    float3 center_normal = normalize(center.normal_roughness.xyz);
+    float3 previous_normal = normalize(previous_surface_normal_roughness[previous_pixel].xyz);
+    return dot(center_normal, previous_normal) >= area_restir.normal_threshold;
 }
 
 [shader("compute")]
@@ -152,13 +168,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             continue;
         }
 
-        bool compatible = area_restir_surface_compatible(
-            center_context,
-            previous_context(previous_pixel),
-            area_restir.normal_threshold,
-            area_restir.depth_threshold
-        );
-        if (!compatible) {
+        if (!area_restir_temporal_surface_compatible(center_context, previous_pixel)) {
             continue;
         }
 

@@ -1003,13 +1003,42 @@ mod shader_source_tests {
         let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
 
         assert!(common.contains("restir_di_target_pdf_for_reservoir"));
+        assert!(common.contains("restir_di_finalize_reservoir_on_surface_with_target"));
         for shader in [temporal, spatial] {
             assert!(
-                shader.contains("reservoir.target_pdf = restir_di_target_pdf_for_reservoir(")
+                shader.contains("selected_target_pdf")
                     || shader.contains("restir_di_finalize_reservoir_on_surface("),
                 "reused reservoirs must be renormalized against the current pixel surface"
             );
         }
+    }
+
+    #[test]
+    fn restir_di_temporal_reuses_selected_target_pdf_without_finalizer_recompute() {
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let common = source("assets/shaders/shared/restir_di_common.slang");
+
+        for token in [
+            "float selected_target_pdf = current_target_pdf;",
+            "selected_target_pdf = history_target_pdf;",
+            "restir_di_finalize_reservoir_on_surface_with_target(",
+            "selected_target_pdf,",
+            "if (reservoir.sample_light_id != 0xffffffffu && reservoir.sample_count_m > 0u && reservoir.target_pdf <= 0.0)",
+        ] {
+            assert!(
+                temporal.contains(token),
+                "temporal shader missing selected-target reuse token {token}"
+            );
+        }
+        assert!(
+            common.contains("void restir_di_finalize_reservoir_on_surface_with_target("),
+            "shared ReSTIR-DI common must expose finalizer that accepts a precomputed selected target"
+        );
+        assert!(
+            !temporal
+                .contains("restir_di_finalize_reservoir_on_surface(\n                reservoir,"),
+            "temporal pass must not call the recomputing finalizer after it already computed current/history target PDFs"
+        );
     }
 
     #[test]
@@ -1061,10 +1090,12 @@ mod shader_source_tests {
 
         assert!(vpt.contains("restir_di_light_visible_from_hit"));
         assert!(
-            vpt.contains("trace_primary_ray(shadow_ray")
-                && vpt.contains("return !occluder.hit")
-                && vpt.contains("occluder.t >= max_light_t"),
-            "ReSTIR direct resolve must reject occluded reservoirs before selected_weight creates bright leaks"
+            vpt.contains("trace_any_hit_ray(") && vpt.contains("return !shadow_occluded;"),
+            "ReSTIR direct resolve must reject occluded reservoirs with an any-hit visibility query before selected_weight creates bright leaks"
+        );
+        assert!(
+            !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),
+            "ReSTIR visibility should not use full material-returning traversal for shadow rays"
         );
         assert!(
             vpt.find("restir_di_light_visible_from_hit")

@@ -166,7 +166,7 @@ ScenePrimaryRay resolve_area_restir_primary_ray(uint2 pixel, SceneUniforms scene
         if (area_restir_is_valid_reservoir(reservoir)) {
             return scene_primary_ray_from_area_sample(
                 scene,
-                float2(pixel) + reservoir.sample_state.subpixel_uv,
+                area_restir_pixel_sample(pixel, reservoir.sample_state),
                 reservoir.sample_state.lens_uv
             );
         }
@@ -195,8 +195,14 @@ bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir
     }
 
     Ray shadow_ray = make_ray(hit.position + hit.normal * 0.05 + shadow_dir * 0.05, shadow_dir);
-    HitResult occluder = trace_primary_ray(shadow_ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials);
-    return !occluder.hit || occluder.t >= max_light_t;
+    bool shadow_occluded = trace_any_hit_ray(
+        shadow_ray,
+        max_light_t,
+        ucvh_config,
+        hierarchy_l0,
+        brick_occupancy
+    );
+    return !shadow_occluded;
 }
 
 RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hit, SceneUniforms scene) {

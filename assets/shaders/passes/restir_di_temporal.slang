@@ -124,6 +124,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 reservoir,
                 current_m
             );
+            float selected_target_pdf = current_target_pdf;
 
             uint capped_history_m = min(
                 history_reservoir.sample_count_m,
@@ -147,20 +148,19 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 && rand01(rng_state) * max(combined_weight_sum, 1.0e-4) <= history_weight) {
                 reservoir = history_reservoir;
                 reservoir.target_pdf = history_target_pdf;
+                selected_target_pdf = history_target_pdf;
             }
 
             uint combined_m = min(current_m + capped_history_m, history_m_limit);
-            restir_di_finalize_reservoir_on_surface(
+            restir_di_finalize_reservoir_on_surface_with_target(
                 reservoir,
-                surface_position_depth,
-                surface_normal_roughness,
-                surface_albedo_material,
+                selected_target_pdf,
                 combined_weight_sum,
                 combined_m
             );
         }
     }
-    if (reservoir.sample_light_id != 0xffffffffu && reservoir.sample_count_m > 0u) {
+    if (reservoir.sample_light_id != 0xffffffffu && reservoir.sample_count_m > 0u && reservoir.target_pdf <= 0.0) {
         reservoir.target_pdf = restir_di_target_pdf_for_reservoir(
             surface_position_depth,
             surface_normal_roughness,

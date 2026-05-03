@@ -1396,6 +1396,45 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn vpt_restir_di_visibility_uses_any_hit_shadow_traversal() {
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+        let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+            .expect("voxel traversal shader should be readable");
+
+        for token in [
+            "bool trace_any_hit_ray(",
+            "bool brick_any_hit(",
+            "float max_t",
+            "BrickOccupancy occ",
+            " - ray.origin.x) * inv_dir.x",
+            " - ray.origin.y) * inv_dir.y",
+            " - ray.origin.z) * inv_dir.z",
+            "StructuredBuffer<BrickOccupancy> occupancy_buf",
+        ] {
+            assert!(
+                traverse.contains(token),
+                "voxel traversal shader missing any-hit token {token}"
+            );
+        }
+        assert!(
+            !traverse.contains(
+                "bool trace_any_hit_ray(\n    Ray ray,\n    float max_t,\n    StructuredBuffer<UcvhConfig> config_buf,\n    StructuredBuffer<NodeL0> hierarchy_l0,\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    StructuredBuffer<VoxelCell> material_buf"
+            ),
+            "any-hit shadow traversal must not bind or read material cells"
+        );
+        assert!(
+            vpt.contains("bool shadow_occluded = trace_any_hit_ray(")
+                && vpt.contains("return !shadow_occluded;"),
+            "VPT ReSTIR-DI visibility should use boolean any-hit shadow traversal"
+        );
+        assert!(
+            !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),
+            "VPT ReSTIR-DI visibility must not run full material-returning primary traversal for shadow rays"
+        );
+    }
+
+    #[test]
     fn vpt_pass_binds_restir_di_uniform_and_reservoir_resources() {
         let source =
             std::fs::read_to_string("src/render/passes/vpt.rs").expect("vpt source is readable");
@@ -1455,7 +1494,7 @@ mod shader_source_tests {
             "resolve_area_restir_primary_ray",
             "area_restir_is_valid_reservoir",
             "scene_primary_ray_from_area_sample",
-            "float2(pixel) + reservoir.sample_state.subpixel_uv",
+            "area_restir_pixel_sample(pixel, reservoir.sample_state)",
             "reservoir.sample_state.lens_uv",
             "if (area_restir.enabled != 0u",
             "fallback jitter",
@@ -1468,6 +1507,10 @@ mod shader_source_tests {
         assert!(
             !source.contains("reservoir.sample_state.pixel_sample"),
             "VPT must not replay a history/neighbor reservoir's source pixel; only its subpixel/lens state is reusable"
+        );
+        assert!(
+            !source.contains("float2(pixel) + reservoir.sample_state.subpixel_uv"),
+            "VPT must not shift Area ReSTIR samples by half a pixel; use the shared pixel-sample conversion"
         );
         let area_common = include_str!("../../../assets/shaders/shared/area_restir_common.slang");
         assert!(

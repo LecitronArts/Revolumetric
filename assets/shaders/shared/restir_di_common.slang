@@ -192,11 +192,9 @@ float restir_di_reservoir_stream_weight(
     return target_pdf * max(reservoir.selected_weight, 0.0) * float(sample_count_m);
 }
 
-void restir_di_finalize_reservoir_on_surface(
+void restir_di_finalize_reservoir_on_surface_with_target(
     inout RestirDiReservoir reservoir,
-    float4 surface_position_depth,
-    float4 surface_normal_roughness,
-    float4 surface_albedo_material,
+    float selected_target_pdf,
     float combined_weight_sum,
     uint combined_sample_count_m
 ) {
@@ -210,12 +208,7 @@ void restir_di_finalize_reservoir_on_surface(
         return;
     }
 
-    reservoir.target_pdf = restir_di_target_pdf_for_reservoir(
-        surface_position_depth,
-        surface_normal_roughness,
-        surface_albedo_material,
-        reservoir
-    );
+    reservoir.target_pdf = selected_target_pdf;
     if (reservoir.target_pdf <= 0.0 || combined_weight_sum <= 0.0) {
         reservoir.sample_light_id = 0xffffffffu;
         reservoir.sample_count_m = 0u;
@@ -229,4 +222,26 @@ void restir_di_finalize_reservoir_on_surface(
     reservoir.sample_count_m = combined_sample_count_m;
     reservoir.selected_weight = combined_weight_sum / max(reservoir.target_pdf * float(combined_sample_count_m), 1.0e-4);
     reservoir.confidence = float(combined_sample_count_m);
+}
+
+void restir_di_finalize_reservoir_on_surface(
+    inout RestirDiReservoir reservoir,
+    float4 surface_position_depth,
+    float4 surface_normal_roughness,
+    float4 surface_albedo_material,
+    float combined_weight_sum,
+    uint combined_sample_count_m
+) {
+    float selected_target_pdf = restir_di_target_pdf_for_reservoir(
+        surface_position_depth,
+        surface_normal_roughness,
+        surface_albedo_material,
+        reservoir
+    );
+    restir_di_finalize_reservoir_on_surface_with_target(
+        reservoir,
+        selected_target_pdf,
+        combined_weight_sum,
+        combined_sample_count_m
+    );
 }

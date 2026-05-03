@@ -98,7 +98,7 @@ AreaRestirCandidateSurface evaluate_area_restir_candidate_surface(
     uint2 pixel,
     AreaRestirSampleState sample_state
 ) {
-    float2 pixel_sample = float2(pixel) + sample_state.subpixel_uv;
+    float2 pixel_sample = area_restir_pixel_sample(pixel, sample_state);
     ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(
         scene,
         pixel_sample,

@@ -1006,7 +1006,7 @@ mod shader_source_tests {
         for token in [
             "StructuredBuffer<AreaRestirReservoir> history_reservoirs",
             "motion_history",
-            "area_restir_surface_compatible",
+            "area_restir_temporal_surface_compatible",
             "history_length",
         ] {
             assert!(temporal.contains(token), "temporal shader missing {token}");
@@ -1089,7 +1089,7 @@ mod shader_source_tests {
             "HitResult hit = trace_primary_ray(",
             "make_ray(primary_ray.origin, primary_ray.direction)",
             "float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);",
-            "float2 pixel_sample = float2(pixel) + sample_state.subpixel_uv;",
+            "float2 pixel_sample = area_restir_pixel_sample(pixel, sample_state);",
             "surface.position_depth = float4(hit.position, hit.t);",
         ] {
             assert!(
@@ -1110,6 +1110,10 @@ mod shader_source_tests {
             !initial.contains("float target_pdf = target_luma;")
                 && !initial.contains("float target_luma = surface_target_luma("),
             "initial shader must not assign every candidate the same center-surface target"
+        );
+        assert!(
+            !initial.contains("float2 pixel_sample = float2(pixel) + sample_state.subpixel_uv;"),
+            "Area ReSTIR subpixel_uv is stored in [0,1) and must be converted to a pixel-center-relative sample before tracing"
         );
         assert!(
             !initial.contains("sample_state.pixel_sample")
@@ -1180,6 +1184,7 @@ mod shader_source_tests {
             "area_restir_replay_target_pdf(center_context, history.sample_state",
             "float history_candidate_weight_sum",
             "area_restir_reservoir_update(",
+            "area_restir_temporal_surface_compatible(center_context, previous_pixel)",
             "AREA_RESTIR_SAMPLE_HISTORY_VALID",
             "history.rejection_reason = 0u",
             "history.debug_flags",
@@ -1221,6 +1226,29 @@ mod shader_source_tests {
         assert!(
             !temporal.contains("if (combined > 0.0 && history_weight >= current_weight)"),
             "temporal reuse must use weighted reservoir update instead of max-weight replacement"
+        );
+    }
+
+    #[test]
+    fn area_restir_temporal_rejects_history_with_staged_previous_surface_reads() {
+        let temporal = source("assets/shaders/passes/area_restir_temporal.slang");
+
+        for token in [
+            "bool area_restir_temporal_surface_compatible(",
+            "float4 previous_position = previous_surface_position_depth[previous_pixel];",
+            "if (center.position_depth.w < 0.0 || previous_position.w < 0.0)",
+            "float position_delta = distance(center.position_depth.xyz, previous_position.xyz);",
+            "float4 previous_albedo = previous_surface_albedo_material[previous_pixel];",
+            "float3 previous_normal = normalize(previous_surface_normal_roughness[previous_pixel].xyz);",
+        ] {
+            assert!(
+                temporal.contains(token),
+                "temporal shader missing staged previous-surface token {token}"
+            );
+        }
+        assert!(
+            !temporal.contains("previous_context(previous_pixel)"),
+            "temporal reuse should not construct a full previous context before cheap rejection tests"
         );
     }
 
