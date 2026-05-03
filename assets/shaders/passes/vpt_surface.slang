@@ -2,6 +2,8 @@
 #include "voxel_traverse.slang"
 #include "material_common.slang"
 #include "vpt_history_common.slang"
+#include "area_restir_common.slang"
+#include "vpt_primary_sample_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<SceneUniforms> scene_ubo;
@@ -37,14 +39,11 @@ StructuredBuffer<VoxelCell> brick_materials;
 [[vk::binding(9, 0)]]
 ConstantBuffer<VptHistoryUniforms> vpt_history;
 
-float3 primary_ray_direction(SceneUniforms scene, uint2 pixel) {
-    float3x3 dir_mat = float3x3(
-        scene.pixel_to_ray[0].xyz,
-        scene.pixel_to_ray[1].xyz,
-        scene.pixel_to_ray[2].xyz
-    );
-    return normalize(mul(float3(float2(pixel), 1.0), dir_mat));
-}
+[[vk::binding(10, 0)]]
+ConstantBuffer<AreaRestirUniforms> area_restir;
+
+[[vk::binding(11, 0)]]
+StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;
 
 void write_miss(uint2 pixel) {
     float4 position_depth = float4(0.0, 0.0, 0.0, -1.0);
@@ -86,10 +85,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= scene.resolution.x || tid.y >= scene.resolution.y) return;
 
     uint2 pixel = tid.xy;
-    float3 origin = scene.pixel_to_ray[3].xyz;
-    float3 ray_dir = primary_ray_direction(scene, pixel);
+    uint index = pixel.y * scene.resolution.x + pixel.x;
+    AreaRestirReservoir reservoir = index < area_restir.reservoir_count
+        ? area_restir_reservoirs[index]
+        : area_restir_invalid_reservoir();
+    ScenePrimaryRay primary_ray = vpt_resolve_surface_primary_ray(pixel, scene, area_restir, reservoir, index);
     HitResult hit = trace_primary_ray(
-        make_ray(origin, ray_dir),
+        make_ray(primary_ray.origin, primary_ray.direction),
         ucvh_config,
         hierarchy_l0,
         brick_occupancy,

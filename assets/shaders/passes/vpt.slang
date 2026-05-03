@@ -6,6 +6,7 @@
 #include "lighting_common.slang"
 #include "restir_di_common.slang"
 #include "area_restir_common.slang"
+#include "vpt_primary_sample_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<SceneUniforms> scene_ubo;
@@ -43,17 +44,11 @@ ConstantBuffer<AreaRestirUniforms> area_restir;
 StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;
 
 uint hash_u32(uint x) {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
-    x ^= x >> 16;
-    return x;
+    return vpt_primary_hash_u32(x);
 }
 
 float rand01(inout uint state) {
-    state = hash_u32(state);
-    return float(state & 0x00ffffffu) / 16777216.0;
+    return vpt_primary_rand01(state);
 }
 
 float3 cosine_hemisphere(float3 normal, inout uint state) {
@@ -166,20 +161,10 @@ bool is_area_restir_debug_view(uint debug_view) {
 
 ScenePrimaryRay resolve_area_restir_primary_ray(uint2 pixel, SceneUniforms scene, inout uint rng_state) {
     uint index = pixel.y * scene.resolution.x + pixel.x;
-    if (area_restir.enabled != 0u && index < area_restir.reservoir_count) {
-        AreaRestirReservoir reservoir = area_restir_reservoirs[index];
-        if (area_restir_is_valid_reservoir(reservoir)) {
-            return scene_primary_ray_from_area_sample(
-                scene,
-                area_restir_pixel_sample(pixel, reservoir.sample_state),
-                reservoir.sample_state.lens_uv
-            );
-        }
-    }
-
-    // fallback jitter: preserve the existing stochastic VPT ray when Area ReSTIR is disabled or invalid.
-    float2 fallback_jitter = float2(rand01(rng_state), rand01(rng_state)) - 0.5;
-    return scene_primary_ray_from_area_sample(scene, float2(pixel) + fallback_jitter, float2(0.5, 0.5));
+    AreaRestirReservoir reservoir = index < area_restir.reservoir_count
+        ? area_restir_reservoirs[index]
+        : area_restir_invalid_reservoir();
+    return vpt_resolve_area_restir_primary_ray(pixel, scene, area_restir, reservoir, index, rng_state);
 }
 
 bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir) {
@@ -322,12 +307,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     SceneUniforms scene = scene_ubo;
     if (tid.x >= scene.resolution.x || tid.y >= scene.resolution.y) return;
 
-    uint rng_state = hash_u32(
-        tid.x * 1973u ^
-        tid.y * 9277u ^
-        scene.vpt_sample_index * 26699u ^
-        uint(scene.time * 1000.0)
-    );
+    uint rng_state = vpt_primary_rng_seed(tid.xy, scene);
     ScenePrimaryRay primary_ray = resolve_area_restir_primary_ray(tid.xy, scene, rng_state);
     VptTraceSample sample = trace_path(
         make_ray(primary_ray.origin, primary_ray.direction),

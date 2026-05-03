@@ -718,11 +718,15 @@ mod shader_source_tests {
     #[test]
     fn vpt_shader_declares_stochastic_accumulating_reference_path() {
         let source = normalized_source(include_str!("../../../assets/shaders/passes/vpt.slang"));
+        let primary_sample_common = normalized_source(include_str!(
+            "../../../assets/shaders/shared/vpt_primary_sample_common.slang"
+        ));
 
         assert!(source.contains("RWTexture2D<float4> noisy_radiance_image;"));
         assert!(source.contains("RWTexture2D<float4> noisy_moments_image;"));
         assert!(source.contains("hash_u32("));
-        assert!(source.contains("scene.vpt_sample_index"));
+        assert!(source.contains("#include \"vpt_primary_sample_common.slang\""));
+        assert!(primary_sample_common.contains("scene.vpt_sample_index"));
         assert!(source.contains("scene.vpt_max_bounces"));
         assert!(source.contains("trace_primary_ray("));
         assert!(source.contains("VptTraceSample sample = trace_path("));
@@ -1327,20 +1331,41 @@ mod shader_source_tests {
     fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT surface graph test");
-        let surface_idx = source
-            .find("graph.add_pass(\"vpt_surface\"")
-            .expect("VPT surface graph pass should exist");
-        let vpt_idx = surface_idx
-            + source[surface_idx..]
+        let bootstrap_surface_idx = source
+            .find("\"vpt_surface_bootstrap\"")
+            .expect("VPT bootstrap surface graph pass should exist");
+        let selected_surface_idx = source
+            .find("\"vpt_surface_selected\"")
+            .expect("VPT selected surface graph pass should exist");
+        let vpt_idx = selected_surface_idx
+            + source[selected_surface_idx..]
                 .find("graph.add_pass(\"vpt\"")
-                .expect("VPT trace graph pass should exist after VPT surface");
+                .expect("VPT trace graph pass should exist after selected VPT surface");
 
         assert!(source.contains("vpt_surface_pass: Option<VptSurfacePass>"));
         assert!(source.contains("VptSurfacePass::new"));
-        assert!(surface_idx < vpt_idx);
+        assert!(bootstrap_surface_idx < selected_surface_idx);
+        assert!(selected_surface_idx < vpt_idx);
         if let Some(restir_idx) = source.find("graph.add_pass(\"restir_di_initial\"") {
-            assert!(surface_idx < restir_idx);
+            assert!(selected_surface_idx < restir_idx);
         }
+    }
+
+    #[test]
+    fn app_profiles_bootstrap_and_selected_vpt_surface_with_distinct_query_scopes() {
+        let source = std::fs::read_to_string("src/app.rs")
+            .expect("app source should be readable for VPT surface profiler test");
+        let profiler = std::fs::read_to_string("src/render/gpu_profiler.rs")
+            .expect("GPU profiler source should be readable");
+
+        assert!(profiler.contains("VptSurfaceBootstrap"));
+        assert!(profiler.contains("VptSurfaceSelected"));
+        assert!(source.contains("GpuProfileScope::VptSurfaceBootstrap"));
+        assert!(source.contains("GpuProfileScope::VptSurfaceSelected"));
+        assert!(
+            !source.contains("GpuProfileScope::VptSurface,"),
+            "bootstrap and selected surface passes must not reuse one timestamp query scope"
+        );
     }
 
     #[test]
@@ -1492,9 +1517,14 @@ mod shader_source_tests {
     #[test]
     fn vpt_shader_uses_area_restir_reservoir_to_override_primary_ray_when_valid() {
         let source = normalized_source(include_str!("../../../assets/shaders/passes/vpt.slang"));
+        let primary_sample_common = normalized_source(include_str!(
+            "../../../assets/shaders/shared/vpt_primary_sample_common.slang"
+        ));
+        let combined_source = format!("{source}\n{primary_sample_common}");
 
         for token in [
             "#include \"area_restir_common.slang\"",
+            "#include \"vpt_primary_sample_common.slang\"",
             "ConstantBuffer<AreaRestirUniforms> area_restir;",
             "StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;",
             "resolve_area_restir_primary_ray",
@@ -1502,13 +1532,13 @@ mod shader_source_tests {
             "scene_primary_ray_from_area_sample",
             "area_restir_pixel_sample(pixel, reservoir.sample_state)",
             "reservoir.sample_state.lens_uv",
-            "if (area_restir.enabled != 0u",
+            "if (area.enabled != 0u",
             "fallback jitter",
             "float4 hit_position_depth = float4(hit.position, max(hit.t, 0.0));",
             "hit_reservoir.target_pdf = hit_target_pdf;",
         ] {
             assert!(
-                source.contains(token),
+                combined_source.contains(token),
                 "VPT shader missing Area ReSTIR primary-ray token {token}"
             );
         }
@@ -1531,6 +1561,198 @@ mod shader_source_tests {
                 && !area_common.contains("float4 selected_radiance"),
             "Area ReSTIR reservoir ABI must not carry unused pixel-sample or radiance payload"
         );
+    }
+
+    #[test]
+    fn vpt_surface_and_trace_share_area_restir_primary_sample_contract() {
+        let surface = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
+            .expect("VPT surface shader should exist");
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("VPT trace shader should exist");
+        let common =
+            std::fs::read_to_string("assets/shaders/shared/vpt_primary_sample_common.slang")
+                .expect("shared VPT primary sample contract should exist");
+
+        for (name, source) in [("surface", surface.as_str()), ("vpt", vpt.as_str())] {
+            assert!(
+                source.contains("#include \"vpt_primary_sample_common.slang\""),
+                "{name} shader must include the shared VPT primary-sample contract"
+            );
+            assert!(
+                !source.contains("float3 primary_ray_direction(SceneUniforms scene, uint2 pixel)"),
+                "{name} shader must not keep a private pixel-center primary-ray path"
+            );
+        }
+        assert!(
+            surface.contains("vpt_resolve_surface_primary_ray"),
+            "surface shader must replay selected Area ReSTIR samples through the stable surface resolver"
+        );
+        assert!(
+            vpt.contains("vpt_resolve_area_restir_primary_ray"),
+            "trace shader must replay selected Area ReSTIR samples while preserving stochastic VPT fallback"
+        );
+
+        for token in [
+            "uint vpt_primary_rng_seed",
+            "ScenePrimaryRay vpt_center_primary_ray",
+            "ScenePrimaryRay vpt_fallback_primary_ray",
+            "ScenePrimaryRay vpt_primary_ray_from_area_reservoir",
+            "ScenePrimaryRay vpt_resolve_area_restir_primary_ray",
+            "ScenePrimaryRay vpt_resolve_surface_primary_ray",
+            "area_restir_pixel_sample(pixel, reservoir.sample_state)",
+            "scene_primary_ray_from_area_sample",
+        ] {
+            assert!(
+                common.contains(token),
+                "shared VPT primary-sample contract missing {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn vpt_surface_fallback_keeps_stable_center_ray_for_history_guides() {
+        let surface = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
+            .expect("VPT surface shader should exist");
+        let common =
+            std::fs::read_to_string("assets/shaders/shared/vpt_primary_sample_common.slang")
+                .expect("shared VPT primary sample contract should exist");
+
+        assert!(
+            common.contains("ScenePrimaryRay vpt_center_primary_ray"),
+            "shared contract must expose a deterministic center-ray guide for surface history"
+        );
+        assert!(
+            common.contains("ScenePrimaryRay vpt_resolve_surface_primary_ray"),
+            "surface pass must have a resolver that replays valid Area ReSTIR samples but does not jitter invalid fallback"
+        );
+        assert!(
+            common.contains("return vpt_center_primary_ray(pixel, scene);"),
+            "surface fallback must return the stable center ray, not a stochastic VPT sample"
+        );
+        assert!(
+            surface.contains("vpt_resolve_surface_primary_ray"),
+            "VPT surface shader must use the stable surface resolver"
+        );
+        assert!(
+            !surface.contains("vpt_resolve_area_restir_primary_ray"),
+            "VPT surface shader must not use the stochastic VPT trace fallback resolver"
+        );
+    }
+
+    #[test]
+    fn vpt_surface_pass_binds_area_restir_selected_primary_sample() {
+        let surface_shader = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
+            .expect("VPT surface shader should exist");
+        let pass_source = std::fs::read_to_string("src/render/passes/vpt_surface.rs")
+            .expect("VPT surface pass should exist");
+        let implementation = pass_source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+
+        for token in [
+            "#include \"area_restir_common.slang\"",
+            "#include \"vpt_primary_sample_common.slang\"",
+            "ConstantBuffer<AreaRestirUniforms> area_restir;",
+            "StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;",
+            "vpt_resolve_surface_primary_ray",
+            "make_ray(primary_ray.origin, primary_ray.direction)",
+        ] {
+            assert!(
+                surface_shader.contains(token),
+                "VPT surface shader missing Area ReSTIR selected-primary token {token}"
+            );
+        }
+
+        for token in [
+            ".add_binding(\n                10,",
+            ".add_binding(\n                11,",
+            "bootstrap_descriptor_sets",
+            "selected_descriptor_sets",
+            "disabled_area_restir_uniform_buffers",
+            "disabled_area_restir_reservoir_buffer",
+            "update_area_restir_descriptors",
+            "record_bootstrap",
+            "record_selected",
+            "write_area_restir_descriptor_sets",
+            "GpuAreaRestirUniforms",
+            "GpuAreaRestirReservoir",
+        ] {
+            assert!(
+                implementation.contains(token),
+                "VPT surface pass missing selected-primary descriptor token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_uses_selected_vpt_surface_after_area_restir_for_di_trace_and_temporal() {
+        let source = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
+        let compact = source.split_whitespace().collect::<String>();
+        let assert_compute_read = |resource: &str| {
+            let single_line = format!("builder.read_as({resource},AccessKind::ComputeShaderRead);");
+            let trailing_comma =
+                format!("builder.read_as({resource},AccessKind::ComputeShaderRead,);");
+            assert!(
+                compact.contains(&single_line) || compact.contains(&trailing_comma),
+                "app graph must route {resource} as a compute read dependency"
+            );
+        };
+
+        for token in [
+            "\"vpt_surface_bootstrap\"",
+            "\"vpt_surface_selected\"",
+            "vpt_surface.record_bootstrap",
+            "vpt_surface.record_selected",
+            "vpt_surface.update_area_restir_descriptors",
+            "final_surface_writes",
+            "let bootstrap_surface_writes",
+        ] {
+            assert!(
+                source.contains(token),
+                "app graph missing selected-surface token {token}"
+            );
+        }
+
+        let bootstrap_idx = source
+            .find("\"vpt_surface_bootstrap\"")
+            .expect("bootstrap surface pass should exist");
+        let area_idx = source
+            .find("\"area_restir_initial\"")
+            .expect("Area ReSTIR initial pass should exist");
+        let selected_idx = source
+            .find("\"vpt_surface_selected\"")
+            .expect("selected surface pass should exist");
+        let restir_idx = source.find("\"restir_di_initial\"").unwrap_or(usize::MAX);
+        let vpt_idx = source
+            .find("graph.add_pass(\"vpt\"")
+            .expect("VPT pass should exist");
+        let temporal_idx = source
+            .find("graph.add_pass(\"vpt_temporal\"")
+            .expect("VPT temporal pass should exist");
+        let history_update_idx = source
+            .find("\"vpt_surface_history_update\"")
+            .expect("VPT surface history update pass should exist");
+
+        assert!(bootstrap_idx < area_idx);
+        assert!(area_idx < selected_idx);
+        if restir_idx != usize::MAX {
+            assert!(selected_idx < restir_idx);
+        }
+        assert!(selected_idx < vpt_idx);
+        assert!(selected_idx < temporal_idx);
+        assert!(selected_idx < history_update_idx);
+
+        for resource in [
+            "area_uniform_resource",
+            "area_selected_reservoir_resource",
+            "final_surface_writes[0]",
+            "final_surface_writes[1]",
+            "final_surface_writes[2]",
+            "final_surface_writes[3]",
+        ] {
+            assert_compute_read(resource);
+        }
     }
 
     #[test]
@@ -1582,17 +1804,21 @@ mod shader_source_tests {
             );
         }
 
-        let surface_idx = source
-            .find("graph.add_pass(\"vpt_surface\"")
-            .expect("surface pass should exist");
+        let bootstrap_surface_idx = source
+            .find("\"vpt_surface_bootstrap\"")
+            .expect("bootstrap surface pass should exist");
         let area_initial_idx = source
             .find("\"area_restir_initial\"")
             .expect("Area ReSTIR initial pass should exist");
+        let selected_surface_idx = source
+            .find("\"vpt_surface_selected\"")
+            .expect("selected surface pass should exist");
         let vpt_idx = source
             .find("graph.add_pass(\"vpt\"")
             .expect("VPT pass should exist");
-        assert!(surface_idx < area_initial_idx);
-        assert!(area_initial_idx < vpt_idx);
+        assert!(bootstrap_surface_idx < area_initial_idx);
+        assert!(area_initial_idx < selected_surface_idx);
+        assert!(selected_surface_idx < vpt_idx);
 
         assert!(
             compact_source

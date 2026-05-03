@@ -992,7 +992,10 @@ mod shader_source_tests {
         assert!(app.contains("restir_di.update_surface_descriptors"));
         assert!(
             compact_app
-                .contains("builder.read_as(surface_writes[0],AccessKind::ComputeShaderRead)")
+                .contains("builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead)")
+                || compact_app.contains(
+                    "builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead,)"
+                )
         );
     }
 

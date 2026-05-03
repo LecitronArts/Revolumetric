@@ -30,7 +30,7 @@ use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
     VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
 };
-use crate::render::resource::{AccessKind, QueueType};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::{RestirDiSettings, build_direct_lights_from_ucvh};
 use crate::render::scene_ubo::{
     LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, build_scene_uniforms,
@@ -693,8 +693,10 @@ impl RevolumetricApp {
                             previous_surface_access,
                         );
                         let slot = frame.frame_slot;
-                        let surface_writes =
-                            graph.add_pass("vpt_surface", QueueType::Compute, |builder| {
+                        let bootstrap_surface_writes = graph.add_pass(
+                            "vpt_surface_bootstrap",
+                            QueueType::Compute,
+                            |builder| {
                                 builder.write_as(
                                     surface_position_resource,
                                     AccessKind::ComputeShaderWrite,
@@ -717,312 +719,43 @@ impl RevolumetricApp {
                                             ctx.device,
                                             ctx.command_buffer,
                                             slot,
-                                            GpuProfileScope::VptSurface,
+                                            GpuProfileScope::VptSurfaceBootstrap,
                                         );
                                     }
-                                    vpt_surface.record(ctx.device, ctx.command_buffer, slot);
+                                    vpt_surface.record_bootstrap(
+                                        ctx.device,
+                                        ctx.command_buffer,
+                                        slot,
+                                    );
                                     if let Some(profiler) = profiler {
                                         profiler.end_scope(
                                             ctx.device,
                                             ctx.command_buffer,
                                             slot,
-                                            GpuProfileScope::VptSurface,
+                                            GpuProfileScope::VptSurfaceBootstrap,
                                         );
                                     }
                                 })
-                            });
+                            },
+                        );
                         let surface_images = [
                             vpt_surface.surface_position_depth.handle,
                             vpt_surface.surface_normal_roughness.handle,
                             vpt_surface.surface_albedo_material.handle,
                             vpt_surface.motion_history.handle,
                         ];
-                        for (&resource, &image) in surface_writes.iter().zip(surface_images.iter())
+                        for (&resource, &image) in
+                            bootstrap_surface_writes.iter().zip(surface_images.iter())
                         {
                             graph.bind_image(resource, image);
                         }
 
-                        let mut vpt_restir_reads = None;
-                        if restir_di_enabled && let Some(restir_di) = &self.restir_di_pass {
-                            let restir_di_settings = restir_di_effective_settings(
-                                self.restir_di_settings,
-                                self.restir_di_history_initialized,
-                            );
-                            restir_di.update_uniforms(
-                                frame.frame_slot,
-                                restir_di_settings,
-                                frame.frame_index,
-                            );
-
-                            let (uniform_buffer, uniform_size, uniform_usage) =
-                                restir_di.uniform_buffer(frame.frame_slot);
-                            let (direct_light_buffer, direct_light_size, direct_light_usage) =
-                                restir_di.direct_light_buffer();
-                            let (initial_buffer, initial_size, initial_usage) =
-                                restir_di.initial_buffer();
-                            let (temporal_buffer, temporal_size, temporal_usage) =
-                                restir_di.temporal_buffer();
-                            let (
-                                selected_current_buffer,
-                                selected_current_size,
-                                selected_current_usage,
-                            ) = restir_di.selected_current_buffer(frame.frame_slot);
-                            let (
-                                selected_history_buffer,
-                                selected_history_size,
-                                selected_history_usage,
-                            ) = restir_di.selected_history_buffer(frame.frame_slot);
-                            let restir_di_temporal_active = restir_di_settings.temporal_enabled;
-                            let restir_di_spatial_active =
-                                restir_di_temporal_active && restir_di_settings.spatial_enabled;
-                            restir_di.update_frame_descriptors(
-                                renderer.device(),
-                                frame.frame_slot,
-                                selected_history_buffer,
-                                selected_current_buffer,
-                                restir_di_temporal_active,
-                                restir_di_spatial_active,
-                            );
-
-                            let initial_resource = graph.import_buffer_with_access(
-                                initial_buffer.handle,
-                                initial_size,
-                                initial_usage,
-                                AccessKind::Undefined,
-                            );
-                            let temporal_resource = graph.import_buffer_with_access(
-                                temporal_buffer.handle,
-                                temporal_size,
-                                temporal_usage,
-                                AccessKind::Undefined,
-                            );
-                            let selected_current_resource = graph.import_buffer_with_access(
-                                selected_current_buffer.handle,
-                                selected_current_size,
-                                selected_current_usage,
-                                AccessKind::Undefined,
-                            );
-                            let selected_history_resource = graph.import_buffer_with_access(
-                                selected_history_buffer.handle,
-                                selected_history_size,
-                                selected_history_usage,
-                                if self.restir_di_history_initialized {
-                                    AccessKind::ComputeShaderWrite
-                                } else {
-                                    AccessKind::Undefined
-                                },
-                            );
-                            let uniform_resource = graph.import_buffer_with_access(
-                                uniform_buffer.handle,
-                                uniform_size,
-                                uniform_usage,
-                                AccessKind::ComputeShaderRead,
-                            );
-                            let direct_light_resource = graph.import_buffer_with_access(
-                                direct_light_buffer.handle,
-                                direct_light_size,
-                                direct_light_usage,
-                                AccessKind::ComputeShaderRead,
-                            );
-
-                            let slot = frame.frame_slot;
-                            let initial_writes = graph.add_pass(
-                                "restir_di_initial",
-                                QueueType::Compute,
-                                |builder| {
-                                    builder
-                                        .read_as(uniform_resource, AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(surface_writes[0], AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(surface_writes[1], AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(surface_writes[2], AccessKind::ComputeShaderRead);
-                                    builder.read_as(
-                                        direct_light_resource,
-                                        AccessKind::ComputeShaderRead,
-                                    );
-                                    let initial_output_resource = if restir_di_temporal_active {
-                                        initial_resource
-                                    } else {
-                                        selected_current_resource
-                                    };
-                                    builder.write_as(
-                                        initial_output_resource,
-                                        AccessKind::ComputeShaderWrite,
-                                    );
-                                    Box::new(move |ctx| {
-                                        if let Some(profiler) = profiler {
-                                            profiler.begin_scope(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                                GpuProfileScope::RestirDiInitial,
-                                            );
-                                        }
-                                        restir_di.record_initial(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                        );
-                                        if let Some(profiler) = profiler {
-                                            profiler.end_scope(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                                GpuProfileScope::RestirDiInitial,
-                                            );
-                                        }
-                                    })
-                                },
-                            );
-                            let initial_dep = initial_writes[0];
-                            let temporal_dep = if restir_di_temporal_active {
-                                let temporal_writes = graph.add_pass(
-                                    "restir_di_temporal",
-                                    QueueType::Compute,
-                                    |builder| {
-                                        builder.read_as(
-                                            uniform_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[0],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[1],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[2],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[3],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            previous_surface_position_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            previous_surface_normal_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            previous_surface_albedo_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
-                                        builder.read_as(
-                                            selected_history_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        let temporal_output_resource = if restir_di_spatial_active {
-                                            temporal_resource
-                                        } else {
-                                            selected_current_resource
-                                        };
-                                        builder.write_as(
-                                            temporal_output_resource,
-                                            AccessKind::ComputeShaderWrite,
-                                        );
-                                        Box::new(move |ctx| {
-                                            if let Some(profiler) = profiler {
-                                                profiler.begin_scope(
-                                                    ctx.device,
-                                                    ctx.command_buffer,
-                                                    slot,
-                                                    GpuProfileScope::RestirDiTemporal,
-                                                );
-                                            }
-                                            restir_di.record_temporal(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                            );
-                                            if let Some(profiler) = profiler {
-                                                profiler.end_scope(
-                                                    ctx.device,
-                                                    ctx.command_buffer,
-                                                    slot,
-                                                    GpuProfileScope::RestirDiTemporal,
-                                                );
-                                            }
-                                        })
-                                    },
-                                );
-                                temporal_writes[0]
-                            } else {
-                                initial_dep
-                            };
-                            let selected_current_dep = if restir_di_spatial_active {
-                                let spatial_writes = graph.add_pass(
-                                    "restir_di_spatial",
-                                    QueueType::Compute,
-                                    |builder| {
-                                        builder.read_as(
-                                            uniform_resource,
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[0],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[1],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder.read_as(
-                                            surface_writes[2],
-                                            AccessKind::ComputeShaderRead,
-                                        );
-                                        builder
-                                            .read_as(temporal_dep, AccessKind::ComputeShaderRead);
-                                        builder.write_as(
-                                            selected_current_resource,
-                                            AccessKind::ComputeShaderWrite,
-                                        );
-                                        Box::new(move |ctx| {
-                                            if let Some(profiler) = profiler {
-                                                profiler.begin_scope(
-                                                    ctx.device,
-                                                    ctx.command_buffer,
-                                                    slot,
-                                                    GpuProfileScope::RestirDiSpatial,
-                                                );
-                                            }
-                                            restir_di.record_spatial(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                            );
-                                            if let Some(profiler) = profiler {
-                                                profiler.end_scope(
-                                                    ctx.device,
-                                                    ctx.command_buffer,
-                                                    slot,
-                                                    GpuProfileScope::RestirDiSpatial,
-                                                );
-                                            }
-                                        })
-                                    },
-                                );
-                                spatial_writes[0]
-                            } else {
-                                temporal_dep
-                            };
-                            restir_di_selected_written = true;
-                            vpt.update_restir_di_descriptors(
-                                renderer.device(),
-                                frame.frame_slot,
-                                uniform_buffer,
-                                selected_current_buffer,
-                            );
-                            vpt_restir_reads = Some((uniform_resource, selected_current_dep));
-                        }
-
+                        let mut final_surface_writes: [ResourceHandle; 4] = [
+                            bootstrap_surface_writes[0],
+                            bootstrap_surface_writes[1],
+                            bootstrap_surface_writes[2],
+                            bootstrap_surface_writes[3],
+                        ];
                         let mut vpt_area_restir_reads = None;
                         if area_restir_enabled && let Some(area_restir) = &self.area_restir_pass {
                             let area_restir_settings = area_restir_effective_settings(
@@ -1117,12 +850,18 @@ impl RevolumetricApp {
                                         area_uniform_resource,
                                         AccessKind::ComputeShaderRead,
                                     );
-                                    builder
-                                        .read_as(surface_writes[0], AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(surface_writes[1], AccessKind::ComputeShaderRead);
-                                    builder
-                                        .read_as(surface_writes[2], AccessKind::ComputeShaderRead);
+                                    builder.read_as(
+                                        bootstrap_surface_writes[0],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        bootstrap_surface_writes[1],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        bootstrap_surface_writes[2],
+                                        AccessKind::ComputeShaderRead,
+                                    );
                                     let area_initial_output_resource = if area_temporal_active {
                                         area_initial_resource
                                     } else {
@@ -1181,19 +920,19 @@ impl RevolumetricApp {
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
-                                            surface_writes[0],
+                                            bootstrap_surface_writes[0],
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
-                                            surface_writes[1],
+                                            bootstrap_surface_writes[1],
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
-                                            surface_writes[2],
+                                            bootstrap_surface_writes[2],
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
-                                            surface_writes[3],
+                                            bootstrap_surface_writes[3],
                                             AccessKind::ComputeShaderRead,
                                         );
                                         builder.read_as(
@@ -1261,15 +1000,15 @@ impl RevolumetricApp {
                                                 AccessKind::ComputeShaderRead,
                                             );
                                             builder.read_as(
-                                                surface_writes[0],
+                                                bootstrap_surface_writes[0],
                                                 AccessKind::ComputeShaderRead,
                                             );
                                             builder.read_as(
-                                                surface_writes[1],
+                                                bootstrap_surface_writes[1],
                                                 AccessKind::ComputeShaderRead,
                                             );
                                             builder.read_as(
-                                                surface_writes[2],
+                                                bootstrap_surface_writes[2],
                                                 AccessKind::ComputeShaderRead,
                                             );
                                             builder.write_as(
@@ -1321,8 +1060,360 @@ impl RevolumetricApp {
                                 area_uniform_buffer,
                                 area_selected_current_buffer,
                             );
+                            vpt_surface.update_area_restir_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                area_uniform_buffer,
+                                area_selected_current_buffer,
+                            );
+                            let selected_surface_writes = graph.add_pass(
+                                "vpt_surface_selected",
+                                QueueType::Compute,
+                                |builder| {
+                                    builder.read_as(
+                                        area_uniform_resource,
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        area_selected_reservoir_resource,
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.write_as(
+                                        bootstrap_surface_writes[0],
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    builder.write_as(
+                                        bootstrap_surface_writes[1],
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    builder.write_as(
+                                        bootstrap_surface_writes[2],
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    builder.write_as(
+                                        bootstrap_surface_writes[3],
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    Box::new(move |ctx| {
+                                        if let Some(profiler) = profiler {
+                                            profiler.begin_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::VptSurfaceSelected,
+                                            );
+                                        }
+                                        vpt_surface.record_selected(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                        );
+                                        if let Some(profiler) = profiler {
+                                            profiler.end_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::VptSurfaceSelected,
+                                            );
+                                        }
+                                    })
+                                },
+                            );
+                            final_surface_writes = [
+                                selected_surface_writes[0],
+                                selected_surface_writes[1],
+                                selected_surface_writes[2],
+                                selected_surface_writes[3],
+                            ];
                             vpt_area_restir_reads =
                                 Some((area_uniform_resource, area_selected_reservoir_resource));
+                        }
+
+                        let mut vpt_restir_reads = None;
+                        if restir_di_enabled && let Some(restir_di) = &self.restir_di_pass {
+                            let restir_di_settings = restir_di_effective_settings(
+                                self.restir_di_settings,
+                                self.restir_di_history_initialized,
+                            );
+                            restir_di.update_uniforms(
+                                frame.frame_slot,
+                                restir_di_settings,
+                                frame.frame_index,
+                            );
+
+                            let (uniform_buffer, uniform_size, uniform_usage) =
+                                restir_di.uniform_buffer(frame.frame_slot);
+                            let (direct_light_buffer, direct_light_size, direct_light_usage) =
+                                restir_di.direct_light_buffer();
+                            let (initial_buffer, initial_size, initial_usage) =
+                                restir_di.initial_buffer();
+                            let (temporal_buffer, temporal_size, temporal_usage) =
+                                restir_di.temporal_buffer();
+                            let (
+                                selected_current_buffer,
+                                selected_current_size,
+                                selected_current_usage,
+                            ) = restir_di.selected_current_buffer(frame.frame_slot);
+                            let (
+                                selected_history_buffer,
+                                selected_history_size,
+                                selected_history_usage,
+                            ) = restir_di.selected_history_buffer(frame.frame_slot);
+                            let restir_di_temporal_active = restir_di_settings.temporal_enabled;
+                            let restir_di_spatial_active =
+                                restir_di_temporal_active && restir_di_settings.spatial_enabled;
+                            restir_di.update_frame_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                selected_history_buffer,
+                                selected_current_buffer,
+                                restir_di_temporal_active,
+                                restir_di_spatial_active,
+                            );
+
+                            let initial_resource = graph.import_buffer_with_access(
+                                initial_buffer.handle,
+                                initial_size,
+                                initial_usage,
+                                AccessKind::Undefined,
+                            );
+                            let temporal_resource = graph.import_buffer_with_access(
+                                temporal_buffer.handle,
+                                temporal_size,
+                                temporal_usage,
+                                AccessKind::Undefined,
+                            );
+                            let selected_current_resource = graph.import_buffer_with_access(
+                                selected_current_buffer.handle,
+                                selected_current_size,
+                                selected_current_usage,
+                                AccessKind::Undefined,
+                            );
+                            let selected_history_resource = graph.import_buffer_with_access(
+                                selected_history_buffer.handle,
+                                selected_history_size,
+                                selected_history_usage,
+                                if self.restir_di_history_initialized {
+                                    AccessKind::ComputeShaderWrite
+                                } else {
+                                    AccessKind::Undefined
+                                },
+                            );
+                            let uniform_resource = graph.import_buffer_with_access(
+                                uniform_buffer.handle,
+                                uniform_size,
+                                uniform_usage,
+                                AccessKind::ComputeShaderRead,
+                            );
+                            let direct_light_resource = graph.import_buffer_with_access(
+                                direct_light_buffer.handle,
+                                direct_light_size,
+                                direct_light_usage,
+                                AccessKind::ComputeShaderRead,
+                            );
+
+                            let slot = frame.frame_slot;
+                            let initial_writes = graph.add_pass(
+                                "restir_di_initial",
+                                QueueType::Compute,
+                                |builder| {
+                                    builder
+                                        .read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                                    builder.read_as(
+                                        final_surface_writes[0],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        final_surface_writes[1],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        final_surface_writes[2],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        direct_light_resource,
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    let initial_output_resource = if restir_di_temporal_active {
+                                        initial_resource
+                                    } else {
+                                        selected_current_resource
+                                    };
+                                    builder.write_as(
+                                        initial_output_resource,
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    Box::new(move |ctx| {
+                                        if let Some(profiler) = profiler {
+                                            profiler.begin_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::RestirDiInitial,
+                                            );
+                                        }
+                                        restir_di.record_initial(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                        );
+                                        if let Some(profiler) = profiler {
+                                            profiler.end_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::RestirDiInitial,
+                                            );
+                                        }
+                                    })
+                                },
+                            );
+                            let initial_dep = initial_writes[0];
+                            let temporal_dep = if restir_di_temporal_active {
+                                let temporal_writes = graph.add_pass(
+                                    "restir_di_temporal",
+                                    QueueType::Compute,
+                                    |builder| {
+                                        builder.read_as(
+                                            uniform_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[0],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[1],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[2],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[3],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            previous_surface_position_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            previous_surface_normal_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            previous_surface_albedo_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
+                                        builder.read_as(
+                                            selected_history_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        let temporal_output_resource = if restir_di_spatial_active {
+                                            temporal_resource
+                                        } else {
+                                            selected_current_resource
+                                        };
+                                        builder.write_as(
+                                            temporal_output_resource,
+                                            AccessKind::ComputeShaderWrite,
+                                        );
+                                        Box::new(move |ctx| {
+                                            if let Some(profiler) = profiler {
+                                                profiler.begin_scope(
+                                                    ctx.device,
+                                                    ctx.command_buffer,
+                                                    slot,
+                                                    GpuProfileScope::RestirDiTemporal,
+                                                );
+                                            }
+                                            restir_di.record_temporal(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                            );
+                                            if let Some(profiler) = profiler {
+                                                profiler.end_scope(
+                                                    ctx.device,
+                                                    ctx.command_buffer,
+                                                    slot,
+                                                    GpuProfileScope::RestirDiTemporal,
+                                                );
+                                            }
+                                        })
+                                    },
+                                );
+                                temporal_writes[0]
+                            } else {
+                                initial_dep
+                            };
+                            let selected_current_dep = if restir_di_spatial_active {
+                                let spatial_writes = graph.add_pass(
+                                    "restir_di_spatial",
+                                    QueueType::Compute,
+                                    |builder| {
+                                        builder.read_as(
+                                            uniform_resource,
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[0],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[1],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder.read_as(
+                                            final_surface_writes[2],
+                                            AccessKind::ComputeShaderRead,
+                                        );
+                                        builder
+                                            .read_as(temporal_dep, AccessKind::ComputeShaderRead);
+                                        builder.write_as(
+                                            selected_current_resource,
+                                            AccessKind::ComputeShaderWrite,
+                                        );
+                                        Box::new(move |ctx| {
+                                            if let Some(profiler) = profiler {
+                                                profiler.begin_scope(
+                                                    ctx.device,
+                                                    ctx.command_buffer,
+                                                    slot,
+                                                    GpuProfileScope::RestirDiSpatial,
+                                                );
+                                            }
+                                            restir_di.record_spatial(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                            );
+                                            if let Some(profiler) = profiler {
+                                                profiler.end_scope(
+                                                    ctx.device,
+                                                    ctx.command_buffer,
+                                                    slot,
+                                                    GpuProfileScope::RestirDiSpatial,
+                                                );
+                                            }
+                                        })
+                                    },
+                                );
+                                spatial_writes[0]
+                            } else {
+                                temporal_dep
+                            };
+                            restir_di_selected_written = true;
+                            vpt.update_restir_di_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                uniform_buffer,
+                                selected_current_buffer,
+                            );
+                            vpt_restir_reads = Some((uniform_resource, selected_current_dep));
                         }
 
                         postprocess.update_input_image(
@@ -1471,10 +1562,22 @@ impl RevolumetricApp {
                             graph.add_pass("vpt_temporal", QueueType::Compute, |builder| {
                                 builder.read_as(noisy_radiance_dep, AccessKind::ComputeShaderRead);
                                 builder.read_as(noisy_moments_dep, AccessKind::ComputeShaderRead);
-                                builder.read_as(surface_writes[0], AccessKind::ComputeShaderRead);
-                                builder.read_as(surface_writes[1], AccessKind::ComputeShaderRead);
-                                builder.read_as(surface_writes[2], AccessKind::ComputeShaderRead);
-                                builder.read_as(surface_writes[3], AccessKind::ComputeShaderRead);
+                                builder.read_as(
+                                    final_surface_writes[0],
+                                    AccessKind::ComputeShaderRead,
+                                );
+                                builder.read_as(
+                                    final_surface_writes[1],
+                                    AccessKind::ComputeShaderRead,
+                                );
+                                builder.read_as(
+                                    final_surface_writes[2],
+                                    AccessKind::ComputeShaderRead,
+                                );
+                                builder.read_as(
+                                    final_surface_writes[3],
+                                    AccessKind::ComputeShaderRead,
+                                );
                                 builder.read_as(
                                     previous_surface_position_resource,
                                     AccessKind::ComputeShaderRead,
@@ -1525,37 +1628,43 @@ impl RevolumetricApp {
                             });
                         let temporal_radiance_dep = temporal_writes[0];
                         let temporal_moments_dep = temporal_writes[1];
-                        graph.add_pass("vpt_history_update", QueueType::Transfer, |builder| {
-                            builder.read_as(temporal_radiance_dep, AccessKind::TransferRead);
-                            builder.read_as(temporal_moments_dep, AccessKind::TransferRead);
-                            builder.write_as(
-                                previous_temporal_radiance_resource,
-                                AccessKind::TransferWrite,
-                            );
-                            builder.write_as(
-                                previous_temporal_moments_resource,
-                                AccessKind::TransferWrite,
-                            );
-                            builder.read_as(surface_writes[0], AccessKind::TransferRead);
-                            builder.read_as(surface_writes[1], AccessKind::TransferRead);
-                            builder.read_as(surface_writes[2], AccessKind::TransferRead);
-                            builder.write_as(
-                                previous_surface_position_resource,
-                                AccessKind::TransferWrite,
-                            );
-                            builder.write_as(
-                                previous_surface_normal_resource,
-                                AccessKind::TransferWrite,
-                            );
-                            builder.write_as(
-                                previous_surface_albedo_resource,
-                                AccessKind::TransferWrite,
-                            );
-                            Box::new(move |ctx| {
-                                vpt_temporal.record_history_update(ctx.device, ctx.command_buffer);
-                                vpt_surface.record_history_update(ctx.device, ctx.command_buffer);
-                            })
-                        });
+                        graph.add_pass(
+                            "vpt_surface_history_update",
+                            QueueType::Transfer,
+                            |builder| {
+                                builder.read_as(temporal_radiance_dep, AccessKind::TransferRead);
+                                builder.read_as(temporal_moments_dep, AccessKind::TransferRead);
+                                builder.write_as(
+                                    previous_temporal_radiance_resource,
+                                    AccessKind::TransferWrite,
+                                );
+                                builder.write_as(
+                                    previous_temporal_moments_resource,
+                                    AccessKind::TransferWrite,
+                                );
+                                builder.read_as(final_surface_writes[0], AccessKind::TransferRead);
+                                builder.read_as(final_surface_writes[1], AccessKind::TransferRead);
+                                builder.read_as(final_surface_writes[2], AccessKind::TransferRead);
+                                builder.write_as(
+                                    previous_surface_position_resource,
+                                    AccessKind::TransferWrite,
+                                );
+                                builder.write_as(
+                                    previous_surface_normal_resource,
+                                    AccessKind::TransferWrite,
+                                );
+                                builder.write_as(
+                                    previous_surface_albedo_resource,
+                                    AccessKind::TransferWrite,
+                                );
+                                Box::new(move |ctx| {
+                                    vpt_temporal
+                                        .record_history_update(ctx.device, ctx.command_buffer);
+                                    vpt_surface
+                                        .record_history_update(ctx.device, ctx.command_buffer);
+                                })
+                            },
+                        );
 
                         let postprocess_initial_access = if self.postprocess_output_initialized {
                             AccessKind::TransferRead
@@ -2148,14 +2257,22 @@ impl ApplicationHandler for RevolumetricApp {
                             "initialized Area ReSTIR VPT sample-area pass"
                         );
                         self.area_restir_pass = Some(pass);
-                        if let (Some(area_restir), Some(vpt)) =
-                            (&self.area_restir_pass, &self.vpt_pass)
-                        {
+                        if let (Some(area_restir), Some(vpt), Some(vpt_surface)) = (
+                            &self.area_restir_pass,
+                            &self.vpt_pass,
+                            &self.vpt_surface_pass,
+                        ) {
                             for slot in 0..scene_ubo_ref.frame_count() {
                                 let (area_uniform_buffer, _, _) = area_restir.uniform_buffer(slot);
                                 let (area_selected_current_buffer, _, _) =
                                     area_restir.selected_current_buffer(slot);
                                 vpt.update_area_restir_descriptors(
+                                    renderer.device(),
+                                    slot,
+                                    area_uniform_buffer,
+                                    area_selected_current_buffer,
+                                );
+                                vpt_surface.update_area_restir_descriptors(
                                     renderer.device(),
                                     slot,
                                     area_uniform_buffer,
