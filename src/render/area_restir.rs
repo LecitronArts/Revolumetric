@@ -232,7 +232,6 @@ pub struct GpuAreaRestirUniforms {
 pub struct GpuAreaRestirSampleState {
     pub subpixel_uv: [f32; 2],
     pub lens_uv: [f32; 2],
-    pub pixel_sample: [f32; 2],
     pub path_sample: u32,
     pub flags: u32,
 }
@@ -260,8 +259,6 @@ pub struct GpuAreaRestirReservoir {
     pub contribution_luma: f32,
     pub rejection_reason: u32,
     pub debug_flags: u32,
-    pub pad1: [u32; 2],
-    pub selected_radiance: [f32; 4],
 }
 
 fn parse_bool(
@@ -414,9 +411,9 @@ mod tests {
     #[test]
     fn gpu_area_restir_layout_is_stable() {
         assert_eq!(std::mem::size_of::<GpuAreaRestirUniforms>(), 64);
-        assert_eq!(std::mem::size_of::<GpuAreaRestirSampleState>(), 32);
+        assert_eq!(std::mem::size_of::<GpuAreaRestirSampleState>(), 24);
         assert_eq!(std::mem::size_of::<GpuAreaRestirEvalContext>(), 64);
-        assert_eq!(std::mem::size_of::<GpuAreaRestirReservoir>(), 96);
+        assert_eq!(std::mem::size_of::<GpuAreaRestirReservoir>(), 64);
         assert_eq!(std::mem::offset_of!(GpuAreaRestirUniforms, enabled), 0);
         assert_eq!(
             std::mem::offset_of!(GpuAreaRestirUniforms, spatial_radius),
@@ -428,8 +425,8 @@ mod tests {
         );
         assert_eq!(std::mem::offset_of!(GpuAreaRestirSampleState, lens_uv), 8);
         assert_eq!(
-            std::mem::offset_of!(GpuAreaRestirReservoir, selected_radiance),
-            80
+            std::mem::offset_of!(GpuAreaRestirReservoir, contribution_luma),
+            52
         );
     }
 

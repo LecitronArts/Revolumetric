@@ -697,7 +697,23 @@ impl RevolumetricApp {
                                     AccessKind::ComputeShaderWrite,
                                 );
                                 Box::new(move |ctx| {
+                                    if let Some(profiler) = profiler {
+                                        profiler.begin_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::VptSurface,
+                                        );
+                                    }
                                     vpt_surface.record(ctx.device, ctx.command_buffer, slot);
+                                    if let Some(profiler) = profiler {
+                                        profiler.end_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::VptSurface,
+                                        );
+                                    }
                                 })
                             });
                         let surface_images = [
@@ -1467,7 +1483,23 @@ impl RevolumetricApp {
                                     AccessKind::ComputeShaderWrite,
                                 );
                                 Box::new(move |ctx| {
+                                    if let Some(profiler) = profiler {
+                                        profiler.begin_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::VptTemporal,
+                                        );
+                                    }
                                     vpt_temporal.record(ctx.device, ctx.command_buffer, slot);
+                                    if let Some(profiler) = profiler {
+                                        profiler.end_scope(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            GpuProfileScope::VptTemporal,
+                                        );
+                                    }
                                 })
                             });
                         let temporal_radiance_dep = temporal_writes[0];

@@ -1083,11 +1083,14 @@ mod shader_source_tests {
             "float4 center_position_depth = surface_position_depth[pixel];",
             "AreaRestirCandidateSurface center_surface = read_center_surface(pixel);",
             "AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(",
+            "uint2 pixel,\n    AreaRestirSampleState sample_state",
+            "evaluate_area_restir_candidate_surface(scene_ubo, pixel, sample_state)",
             "ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(",
             "HitResult hit = trace_primary_ray(",
             "make_ray(primary_ray.origin, primary_ray.direction)",
             "float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);",
-            "reservoir.selected_radiance = float4(candidate_surface.albedo_material.rgb, 1.0);",
+            "float2 pixel_sample = float2(pixel) + sample_state.subpixel_uv;",
+            "surface.position_depth = float4(hit.position, hit.t);",
         ] {
             assert!(
                 initial.contains(token),
@@ -1109,10 +1112,29 @@ mod shader_source_tests {
             "initial shader must not assign every candidate the same center-surface target"
         );
         assert!(
+            !initial.contains("sample_state.pixel_sample")
+                && !initial.contains("reservoir.selected_radiance")
+                && !initial.contains("distance(primary_ray.origin, hit.position)"),
+            "initial shader must not preserve unused reservoir payload or recompute hit depth"
+        );
+        assert!(
             temporal.contains("float4 motion = center_context.motion_history;")
                 && !temporal.contains("float4 motion = motion_history.Load(int3(pixel, 0));"),
             "temporal shader must reuse motion already loaded into center_context"
         );
+    }
+
+    #[test]
+    fn area_restir_debug_writes_are_gated_by_debug_view() {
+        let initial = source("assets/shaders/passes/area_restir_initial.slang");
+        let spatial = source("assets/shaders/passes/area_restir_spatial.slang");
+
+        for (name, shader) in [("initial", initial.as_str()), ("spatial", spatial.as_str())] {
+            assert!(
+                shader.contains("if (area_restir.debug_view != 0u)"),
+                "{name} shader must not write the debug image on the default debug-off path"
+            );
+        }
     }
 
     #[test]
@@ -1210,7 +1232,9 @@ mod shader_source_tests {
         for token in [
             "area_restir_spatial_hash",
             "uint rotated_tap",
-            "area_restir_replay_target_pdf(center, neighbor.sample_state",
+            "if (area_restir.enabled == 0u || area_restir.spatial_enabled == 0u || area_restir.spatial_sample_count == 0u",
+            "float center_target_pdf = area_restir_replay_target_pdf(center, center_reservoir.sample_state);",
+            "float neighbor_target_pdf = center_target_pdf;",
             "float neighbor_candidate_weight_sum",
             "area_restir_reservoir_update(",
             "reservoir.jacobian",
@@ -1243,6 +1267,10 @@ mod shader_source_tests {
         assert!(
             !spatial.contains("if (neighbor.weight_sum > reservoir.weight_sum)"),
             "spatial reuse must not select neighbors by stale raw weight_sum"
+        );
+        assert!(
+            !spatial.contains("area_restir_replay_target_pdf(center, neighbor.sample_state"),
+            "spatial reuse should not recompute a neighbor replay target when the current-pixel target is already known"
         );
     }
 }

@@ -71,15 +71,15 @@ impl GpuProfilerConfig {
 #[repr(usize)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GpuProfileScope {
-    PrimaryRay = 0,
-    Lighting = 1,
+    VptSurface = 0,
+    Vpt = 1,
     RestirDiInitial = 2,
     RestirDiTemporal = 3,
     RestirDiSpatial = 4,
     AreaRestirInitial = 5,
     AreaRestirTemporal = 6,
     AreaRestirSpatial = 7,
-    Vpt = 8,
+    VptTemporal = 8,
     Postprocess = 9,
     BlitToSwapchain = 10,
 }
@@ -87,30 +87,30 @@ pub enum GpuProfileScope {
 impl GpuProfileScope {
     pub const COUNT: usize = 11;
     pub const ALL: [Self; Self::COUNT] = [
-        Self::PrimaryRay,
-        Self::Lighting,
+        Self::VptSurface,
+        Self::Vpt,
         Self::RestirDiInitial,
         Self::RestirDiTemporal,
         Self::RestirDiSpatial,
         Self::AreaRestirInitial,
         Self::AreaRestirTemporal,
         Self::AreaRestirSpatial,
-        Self::Vpt,
+        Self::VptTemporal,
         Self::Postprocess,
         Self::BlitToSwapchain,
     ];
 
     pub fn log_name(self) -> &'static str {
         match self {
-            Self::PrimaryRay => "PrimaryRay",
-            Self::Lighting => "Lighting",
+            Self::VptSurface => "VptSurface",
+            Self::Vpt => "Vpt",
             Self::RestirDiInitial => "RestirDiInitial",
             Self::RestirDiTemporal => "RestirDiTemporal",
             Self::RestirDiSpatial => "RestirDiSpatial",
             Self::AreaRestirInitial => "AreaRestirInitial",
             Self::AreaRestirTemporal => "AreaRestirTemporal",
             Self::AreaRestirSpatial => "AreaRestirSpatial",
-            Self::Vpt => "Vpt",
+            Self::VptTemporal => "VptTemporal",
             Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
         }
@@ -118,15 +118,15 @@ impl GpuProfileScope {
 
     pub fn csv_column(self) -> &'static str {
         match self {
-            Self::PrimaryRay => "primary_ray_ms",
-            Self::Lighting => "lighting_ms",
+            Self::VptSurface => "vpt_surface_ms",
+            Self::Vpt => "vpt_ms",
             Self::RestirDiInitial => "restir_di_initial_ms",
             Self::RestirDiTemporal => "restir_di_temporal_ms",
             Self::RestirDiSpatial => "restir_di_spatial_ms",
             Self::AreaRestirInitial => "area_restir_initial_ms",
             Self::AreaRestirTemporal => "area_restir_temporal_ms",
             Self::AreaRestirSpatial => "area_restir_spatial_ms",
-            Self::Vpt => "vpt_ms",
+            Self::VptTemporal => "vpt_temporal_ms",
             Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
         }
@@ -134,15 +134,15 @@ impl GpuProfileScope {
 
     pub fn timestamp_stage(self) -> vk::PipelineStageFlags {
         match self {
-            Self::PrimaryRay
-            | Self::Lighting
+            Self::VptSurface
+            | Self::Vpt
             | Self::RestirDiInitial
             | Self::RestirDiTemporal
             | Self::RestirDiSpatial
             | Self::AreaRestirInitial
             | Self::AreaRestirTemporal
             | Self::AreaRestirSpatial
-            | Self::Vpt
+            | Self::VptTemporal
             | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
             Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
         }
@@ -659,25 +659,26 @@ mod tests {
             .collect();
 
         assert_eq!(GpuProfileScope::COUNT, 11);
-        assert_eq!(names[0], "PrimaryRay");
-        assert_eq!(names[1], "Lighting");
+        assert_eq!(names[0], "VptSurface");
+        assert_eq!(names[1], "Vpt");
         assert_eq!(names[2], "RestirDiInitial");
         assert_eq!(names[3], "RestirDiTemporal");
         assert_eq!(names[4], "RestirDiSpatial");
         assert_eq!(names[5], "AreaRestirInitial");
         assert_eq!(names[6], "AreaRestirTemporal");
         assert_eq!(names[7], "AreaRestirSpatial");
-        assert_eq!(names[8], "Vpt");
+        assert_eq!(names[8], "VptTemporal");
         assert_eq!(names[9], "Postprocess");
         assert_eq!(names[10], "Blit");
-        assert_eq!(columns[0], "primary_ray_ms");
+        assert_eq!(columns[0], "vpt_surface_ms");
+        assert_eq!(columns[1], "vpt_ms");
         assert_eq!(columns[2], "restir_di_initial_ms");
         assert_eq!(columns[3], "restir_di_temporal_ms");
         assert_eq!(columns[4], "restir_di_spatial_ms");
         assert_eq!(columns[5], "area_restir_initial_ms");
         assert_eq!(columns[6], "area_restir_temporal_ms");
         assert_eq!(columns[7], "area_restir_spatial_ms");
-        assert_eq!(columns[8], "vpt_ms");
+        assert_eq!(columns[8], "vpt_temporal_ms");
         assert_eq!(columns[9], "postprocess_ms");
         assert_eq!(columns[10], "blit_to_swapchain_ms");
     }
@@ -685,13 +686,15 @@ mod tests {
     #[test]
     fn scopes_use_work_stage_timestamps_instead_of_queue_boundary_timestamps() {
         for scope in [
+            GpuProfileScope::VptSurface,
+            GpuProfileScope::Vpt,
             GpuProfileScope::RestirDiInitial,
             GpuProfileScope::RestirDiTemporal,
             GpuProfileScope::RestirDiSpatial,
             GpuProfileScope::AreaRestirInitial,
             GpuProfileScope::AreaRestirTemporal,
             GpuProfileScope::AreaRestirSpatial,
-            GpuProfileScope::Vpt,
+            GpuProfileScope::VptTemporal,
             GpuProfileScope::Postprocess,
         ] {
             assert_eq!(
@@ -713,11 +716,11 @@ mod tests {
             layout.query_count(),
             (GpuProfileScope::COUNT * 2 * 2) as u32
         );
-        assert_eq!(layout.begin_query(0, GpuProfileScope::PrimaryRay), 0);
-        assert_eq!(layout.end_query(0, GpuProfileScope::PrimaryRay), 1);
-        assert_eq!(layout.begin_query(0, GpuProfileScope::Lighting), 2);
+        assert_eq!(layout.begin_query(0, GpuProfileScope::VptSurface), 0);
+        assert_eq!(layout.end_query(0, GpuProfileScope::VptSurface), 1);
+        assert_eq!(layout.begin_query(0, GpuProfileScope::Vpt), 2);
         assert_eq!(
-            layout.begin_query(1, GpuProfileScope::PrimaryRay),
+            layout.begin_query(1, GpuProfileScope::VptSurface),
             (GpuProfileScope::COUNT * 2) as u32
         );
     }
@@ -734,21 +737,21 @@ mod tests {
     fn summary_accumulates_and_resets_on_interval() {
         let mut accumulator = SummaryAccumulator::new(2);
         let mut first = [0.0; GpuProfileScope::COUNT];
-        first[GpuProfileScope::PrimaryRay as usize] = 1.0;
-        first[GpuProfileScope::Lighting as usize] = 3.0;
+        first[GpuProfileScope::VptSurface as usize] = 1.0;
+        first[GpuProfileScope::Vpt as usize] = 3.0;
         let mut second = [0.0; GpuProfileScope::COUNT];
-        second[GpuProfileScope::PrimaryRay as usize] = 3.0;
-        second[GpuProfileScope::Lighting as usize] = 5.0;
+        second[GpuProfileScope::VptSurface as usize] = 3.0;
+        second[GpuProfileScope::Vpt as usize] = 5.0;
 
         assert!(accumulator.push(&GpuFrameTimings::new(1, first)).is_none());
         let summary = accumulator.push(&GpuFrameTimings::new(2, second)).unwrap();
 
         assert_eq!(summary.frame_count, 2);
         assert_eq!(
-            summary.average_ms[GpuProfileScope::PrimaryRay as usize],
+            summary.average_ms[GpuProfileScope::VptSurface as usize],
             2.0
         );
-        assert_eq!(summary.average_ms[GpuProfileScope::Lighting as usize], 4.0);
+        assert_eq!(summary.average_ms[GpuProfileScope::Vpt as usize], 4.0);
         assert_eq!(summary.total_ms(), 6.0);
         assert!(accumulator.push(&GpuFrameTimings::new(3, first)).is_none());
     }
@@ -766,17 +769,17 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut writer = CsvWriter::new(Some(path.clone()), 2).unwrap();
         let mut timings = [0.0; GpuProfileScope::COUNT];
-        timings[GpuProfileScope::PrimaryRay as usize] = 2.5;
+        timings[GpuProfileScope::VptSurface as usize] = 2.5;
 
         writer.write_row(&GpuFrameTimings::new(7, timings));
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("frame,primary_ray_ms"));
+        assert!(contents.contains("frame,vpt_surface_ms"));
         assert!(!contents.contains("7,2.5000"));
 
         writer.write_row(&GpuFrameTimings::new(8, timings));
 
         let contents = std::fs::read_to_string(&path).unwrap();
-        assert!(contents.contains("frame,primary_ray_ms"));
+        assert!(contents.contains("frame,vpt_surface_ms"));
         assert!(contents.contains("7,2.5000"));
         assert!(contents.contains("8,2.5000"));
         let _ = std::fs::remove_file(&path);
@@ -823,13 +826,13 @@ mod tests {
     #[test]
     fn csv_header_and_rows_match_scope_order() {
         let mut timings = [0.0; GpuProfileScope::COUNT];
-        timings[GpuProfileScope::PrimaryRay as usize] = 1.25;
+        timings[GpuProfileScope::VptSurface as usize] = 1.25;
         timings[GpuProfileScope::BlitToSwapchain as usize] = 0.5;
         let frame = GpuFrameTimings::new(42, timings);
 
         assert_eq!(
             csv_header(),
-            "frame,primary_ray_ms,lighting_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
+            "frame,vpt_surface_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),

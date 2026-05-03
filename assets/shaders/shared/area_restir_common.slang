@@ -33,7 +33,6 @@ struct AreaRestirUniforms {
 struct AreaRestirSampleState {
     float2 subpixel_uv;
     float2 lens_uv;
-    float2 pixel_sample;
     uint path_sample;
     uint flags;
 };
@@ -57,15 +56,12 @@ struct AreaRestirReservoir {
     float contribution_luma;
     uint rejection_reason;
     uint debug_flags;
-    uint2 pad1;
-    float4 selected_radiance;
 };
 
 AreaRestirReservoir area_restir_invalid_reservoir() {
     AreaRestirReservoir reservoir = (AreaRestirReservoir)0;
     reservoir.sample_state.subpixel_uv = float2(-1.0, -1.0);
     reservoir.sample_state.lens_uv = float2(-1.0, -1.0);
-    reservoir.sample_state.pixel_sample = float2(-1.0, -1.0);
     reservoir.sample_state.path_sample = 0xffffffffu;
     reservoir.sample_state.flags = 0u;
     reservoir.sample_count_m = 0u;
@@ -204,7 +200,6 @@ AreaRestirSampleState area_restir_sample_pixel_state(
     AreaRestirSampleState state;
     state.subpixel_uv = subpixel_uv;
     state.lens_uv = lens_uv;
-    state.pixel_sample = float2(pixel) + subpixel_uv;
     state.path_sample = path_sample;
     state.flags = AREA_RESTIR_SAMPLE_VALID;
     return state;

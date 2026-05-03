@@ -95,11 +95,13 @@ AreaRestirEvalContext candidate_surface_context(AreaRestirCandidateSurface surfa
 
 AreaRestirCandidateSurface evaluate_area_restir_candidate_surface(
     SceneUniforms scene,
+    uint2 pixel,
     AreaRestirSampleState sample_state
 ) {
+    float2 pixel_sample = float2(pixel) + sample_state.subpixel_uv;
     ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(
         scene,
-        sample_state.pixel_sample,
+        pixel_sample,
         sample_state.lens_uv
     );
     HitResult hit = trace_primary_ray(
@@ -114,7 +116,7 @@ AreaRestirCandidateSurface evaluate_area_restir_candidate_surface(
     }
 
     AreaRestirCandidateSurface surface;
-    surface.position_depth = float4(hit.position, distance(primary_ray.origin, hit.position));
+    surface.position_depth = float4(hit.position, hit.t);
     float emissive_luma = dot(material_emissive(hit.cell), float3(0.2126, 0.7152, 0.0722));
     surface.normal_roughness = float4(normalize(hit.normal), emissive_luma);
     surface.albedo_material = float4(material_cell_albedo(hit.cell), float(voxel_material(hit.cell)));
@@ -149,7 +151,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
     AreaRestirCandidateSurface center_surface = read_center_surface(pixel);
     if (area_restir.enabled == 0u || center_position_depth.w < 0.0) {
         output_reservoirs[index] = area_restir_invalid_reservoir();
-        area_restir_debug[pixel] = float4(0.0);
+        if (area_restir.debug_view != 0u) {
+            area_restir_debug[pixel] = float4(0.0);
+        }
         return;
     }
 
@@ -167,7 +171,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             : float2(0.5, 0.5);
 
         AreaRestirSampleState sample_state = area_restir_sample_pixel_state(pixel, subpixel_uv, lens_uv, candidate);
-        AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(scene_ubo, sample_state);
+        AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(scene_ubo, pixel, sample_state);
         float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);
         if (target_pdf <= 0.0) {
             continue;
@@ -176,7 +180,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
         if (!area_restir_is_valid_reservoir(reservoir) || area_restir_rand01(rng) * next_weight_sum <= target_pdf) {
             reservoir.sample_state = sample_state;
             reservoir.target_pdf = target_pdf;
-            reservoir.selected_radiance = float4(candidate_surface.albedo_material.rgb, 1.0);
             reservoir.contribution_luma = target_pdf;
         }
         weight_sum = next_weight_sum;
@@ -187,5 +190,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     reservoir.confidence = float(candidate_count);
     area_restir_finalize_reservoir(reservoir, area_restir.history_length);
     output_reservoirs[index] = reservoir;
-    area_restir_debug[pixel] = float4(reservoir.sample_state.subpixel_uv, reservoir.selected_weight > 0.0 ? 1.0 : 0.0, 1.0);
+    if (area_restir.debug_view != 0u) {
+        area_restir_debug[pixel] = float4(reservoir.sample_state.subpixel_uv, reservoir.selected_weight > 0.0 ? 1.0 : 0.0, 1.0);
+    }
 }

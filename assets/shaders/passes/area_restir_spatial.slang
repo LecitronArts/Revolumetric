@@ -66,7 +66,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     }
 
     AreaRestirReservoir center_reservoir = temporal_reservoirs[index];
-    if (area_restir.enabled == 0u || area_restir.spatial_enabled == 0u || !area_restir_is_valid_reservoir(center_reservoir)) {
+    if (area_restir.enabled == 0u || area_restir.spatial_enabled == 0u || area_restir.spatial_sample_count == 0u || !area_restir_is_valid_reservoir(center_reservoir)) {
         output_reservoirs[index] = center_reservoir;
         return;
     }
@@ -108,7 +108,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             continue;
         }
 
-        float neighbor_target_pdf = area_restir_replay_target_pdf(center, neighbor.sample_state);
+        float neighbor_target_pdf = center_target_pdf;
         float distance_weight = 1.0 / max(length(float2(offset)), 1.0);
         float neighbor_candidate_weight_sum = neighbor_target_pdf
             * area_restir_reservoir_reuse_weight(neighbor)
@@ -131,5 +131,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     reservoir.debug_flags |= 8u;
     area_restir_finalize_reservoir(reservoir, area_restir.history_length);
     output_reservoirs[index] = reservoir;
-    area_restir_debug[pixel] = float4(reservoir.selected_weight, reservoir.confidence, reservoir.jacobian, 1.0);
+    if (area_restir.debug_view != 0u) {
+        area_restir_debug[pixel] = float4(reservoir.selected_weight, reservoir.confidence, reservoir.jacobian, 1.0);
+    }
 }

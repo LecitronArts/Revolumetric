@@ -665,7 +665,6 @@ fn create_disabled_area_restir_reservoir_buffer(
     let mut invalid_reservoir = GpuAreaRestirReservoir::zeroed();
     invalid_reservoir.sample_state.subpixel_uv = [-1.0, -1.0];
     invalid_reservoir.sample_state.lens_uv = [-1.0, -1.0];
-    invalid_reservoir.sample_state.pixel_sample = [-1.0, -1.0];
     invalid_reservoir.sample_state.path_sample = u32::MAX;
     write_mapped(buffer.mapped_ptr(), &invalid_reservoir);
     Ok(buffer)
@@ -1073,9 +1072,14 @@ mod shader_source_tests {
             "trace_primary_ray(",
             "position_depth = float4(0.0, 0.0, 0.0, -1.0)",
             "voxel_material(hit.cell)",
+            "surface_position_depth[pixel] = float4(hit.position, hit.t);",
         ] {
             assert!(shader.contains(token), "VPT surface shader missing {token}");
         }
+        assert!(
+            !shader.contains("distance(origin, hit.position)"),
+            "VPT surface pass should use DDA hit.t instead of recomputing hit distance"
+        );
 
         for token in [
             "pub struct VptSurfacePass",
@@ -1464,6 +1468,12 @@ mod shader_source_tests {
         assert!(
             !source.contains("reservoir.sample_state.pixel_sample"),
             "VPT must not replay a history/neighbor reservoir's source pixel; only its subpixel/lens state is reusable"
+        );
+        let area_common = include_str!("../../../assets/shaders/shared/area_restir_common.slang");
+        assert!(
+            !area_common.contains("float2 pixel_sample")
+                && !area_common.contains("float4 selected_radiance"),
+            "Area ReSTIR reservoir ABI must not carry unused pixel-sample or radiance payload"
         );
     }
 

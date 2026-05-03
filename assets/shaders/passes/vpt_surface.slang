@@ -101,12 +101,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    float linear_depth = distance(origin, hit.position);
     float material_id = float(voxel_material(hit.cell));
     float3 albedo = material_cell_albedo(hit.cell);
     float emissive_luma = dot(material_emissive(hit.cell), float3(0.2126, 0.7152, 0.0722));
 
-    surface_position_depth[pixel] = float4(hit.position, linear_depth);
+    surface_position_depth[pixel] = float4(hit.position, hit.t);
     surface_normal_roughness[pixel] = float4(normalize(hit.normal), emissive_luma);
     surface_albedo_material[pixel] = float4(albedo, material_id);
     motion_history[pixel] = project_previous_pixel(hit.position);
