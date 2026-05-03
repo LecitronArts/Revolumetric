@@ -67,7 +67,13 @@ Area ReSTIR is an experimental VPT sample-area reuse layer and is disabled by de
 - `REVOLUMETRIC_AREA_RESTIR_HISTORY_LENGTH=1..64`: sample-area history length budget. Default is `20`.
 - `REVOLUMETRIC_AREA_RESTIR_DEBUG=off|subpixel|lens|weight|history_valid|rejection|jacobian`: selects an Area ReSTIR debug view and bridges it into the VPT final display path.
 
-GPU profiler behavior is configured in `src/render/gpu_profiler.rs`; CSV output is intended for profiling runs under `target/`.
+GPU profiler behavior is configured in `src/render/gpu_profiler.rs`; CSV output is intended for profiling runs under `target/`. For comparable ReSTIR performance runs, prefer the checked-in profiling wrapper instead of hand-setting environment variables:
+
+```powershell
+.\tools\profile_restir_area.ps1 -Frames 120 -WarmupFrames 20 -Csv target\profile-restir-area.csv
+```
+
+The wrapper enables strict shader compilation, GPU CSV timing, ReSTIR-DI, ReSTIR-DI spatial reuse, and Area ReSTIR together. This matters because `REVOLUMETRIC_VPT_RESTIR_DI=on` does not enable `REVOLUMETRIC_RESTIR_DI_SPATIAL=on` by itself.
 
 ## Current Rendering Path
 
