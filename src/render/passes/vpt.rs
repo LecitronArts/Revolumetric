@@ -1451,7 +1451,7 @@ mod shader_source_tests {
             "resolve_area_restir_primary_ray",
             "area_restir_is_valid_reservoir",
             "scene_primary_ray_from_area_sample",
-            "reservoir.sample_state.pixel_sample",
+            "float2(pixel) + reservoir.sample_state.subpixel_uv",
             "reservoir.sample_state.lens_uv",
             "if (area_restir.enabled != 0u",
             "fallback jitter",
@@ -1461,6 +1461,10 @@ mod shader_source_tests {
                 "VPT shader missing Area ReSTIR primary-ray token {token}"
             );
         }
+        assert!(
+            !source.contains("reservoir.sample_state.pixel_sample"),
+            "VPT must not replay a history/neighbor reservoir's source pixel; only its subpixel/lens state is reusable"
+        );
     }
 
     #[test]
@@ -1494,7 +1498,9 @@ mod shader_source_tests {
             "area_restir_history_initialized",
             "AreaRestirPass::new",
             "AreaRestirPassCreateInfo",
+            "ucvh_gpu",
             "area_restir.update_surface_descriptors",
+            "area_restir.update_ucvh_descriptors",
             "area_restir.update_uniforms",
             "\"area_restir_initial\"",
             "\"area_restir_temporal\"",

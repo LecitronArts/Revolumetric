@@ -12,6 +12,7 @@ use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
+use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct AreaRestirPass {
     initial_stage: AreaRestirStage,
@@ -43,6 +44,7 @@ pub struct AreaRestirPassCreateInfo<'a> {
     pub temporal_spirv: &'a [u8],
     pub spatial_spirv: &'a [u8],
     pub scene_ubo: &'a SceneUniformBuffer,
+    pub ucvh_gpu: &'a UcvhGpuResources,
 }
 
 struct AreaRestirBuffers {
@@ -96,6 +98,10 @@ impl AreaRestirPass {
                 (4, vk::DescriptorType::STORAGE_IMAGE),
                 (5, vk::DescriptorType::STORAGE_IMAGE),
                 (6, vk::DescriptorType::UNIFORM_BUFFER),
+                (7, vk::DescriptorType::STORAGE_BUFFER),
+                (8, vk::DescriptorType::STORAGE_BUFFER),
+                (9, vk::DescriptorType::STORAGE_BUFFER),
+                (10, vk::DescriptorType::STORAGE_BUFFER),
             ],
             info.frame_count,
         ) {
@@ -169,6 +175,7 @@ impl AreaRestirPass {
         };
         pass.write_descriptor_sets(device);
         pass.write_scene_descriptors(device, info.scene_ubo);
+        pass.write_ucvh_descriptors(device, info.ucvh_gpu);
         Ok(pass)
     }
 
@@ -239,6 +246,10 @@ impl AreaRestirPass {
 
     pub fn update_scene_descriptors(&self, device: &ash::Device, scene_ubo: &SceneUniformBuffer) {
         self.write_scene_descriptors(device, scene_ubo);
+    }
+
+    pub fn update_ucvh_descriptors(&self, device: &ash::Device, ucvh_gpu: &UcvhGpuResources) {
+        self.write_ucvh_descriptors(device, ucvh_gpu);
     }
 
     pub fn uniform_buffer(
@@ -364,6 +375,19 @@ impl AreaRestirPass {
             6,
             scene_ubo,
             std::mem::size_of::<GpuSceneUniforms>() as u64,
+        );
+    }
+
+    fn write_ucvh_descriptors(&self, device: &ash::Device, ucvh_gpu: &UcvhGpuResources) {
+        self.initial_stage.write_storage_buffer_descriptors(
+            device,
+            7,
+            &[
+                &ucvh_gpu.config_buffer,
+                &ucvh_gpu.hierarchy_l0_buffer,
+                &ucvh_gpu.occupancy_buffer,
+                &ucvh_gpu.material_buffer,
+            ],
         );
     }
 }
@@ -684,6 +708,38 @@ impl AreaRestirStage {
         }
     }
 
+    fn write_storage_buffer_descriptors(
+        &self,
+        device: &ash::Device,
+        first_binding: u32,
+        buffers: &[&GpuBuffer],
+    ) {
+        let buffer_infos: Vec<_> = buffers
+            .iter()
+            .map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.handle)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+
+        for &ds in &self.descriptor_sets {
+            let writes: Vec<_> = buffer_infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(first_binding + idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+    }
+
     fn record(
         &self,
         device: &ash::Device,
@@ -821,6 +877,8 @@ mod shader_source_tests {
             "record_temporal",
             "record_spatial",
             "record_history_update",
+            "update_ucvh_descriptors",
+            "write_ucvh_descriptors",
         ] {
             assert!(
                 implementation.contains(token),
@@ -931,6 +989,10 @@ mod shader_source_tests {
         for token in [
             "RWStructuredBuffer<AreaRestirReservoir> output_reservoirs",
             "ConstantBuffer<SceneUniforms> scene_ubo",
+            "StructuredBuffer<UcvhConfig> ucvh_config",
+            "StructuredBuffer<NodeL0> hierarchy_l0",
+            "StructuredBuffer<BrickOccupancy> brick_occupancy",
+            "StructuredBuffer<VoxelCell> brick_materials",
             "area_restir_invalid_reservoir",
         ] {
             assert!(initial.contains(token), "initial shader missing {token}");
@@ -1019,21 +1081,32 @@ mod shader_source_tests {
 
         for token in [
             "float4 center_position_depth = surface_position_depth[pixel];",
-            "float4 center_albedo_material = surface_albedo_material[pixel];",
-            "float surface_target_luma(float4 position_depth, float4 albedo_material)",
-            "float target_luma = surface_target_luma(center_position_depth, center_albedo_material);",
-            "float target_pdf = target_luma;",
-            "reservoir.selected_radiance = float4(center_albedo_material.rgb, 1.0);",
+            "AreaRestirCandidateSurface center_surface = read_center_surface(pixel);",
+            "AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(",
+            "ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(",
+            "HitResult hit = trace_primary_ray(",
+            "make_ray(primary_ray.origin, primary_ray.direction)",
+            "float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);",
+            "reservoir.selected_radiance = float4(candidate_surface.albedo_material.rgb, 1.0);",
         ] {
             assert!(
                 initial.contains(token),
-                "initial shader missing cached surface-read token {token}"
+                "initial shader missing ray-evaluated candidate token {token}"
             );
         }
         assert!(
-            !initial.contains("scene_primary_ray_from_area_sample(scene_ubo")
-                && !initial.contains("length(primary_ray.direction)"),
-            "initial shader must not rebuild camera rays only to perturb the target PDF"
+            initial.contains("#include \"voxel_traverse.slang\"")
+                && initial.contains("#include \"material_common.slang\"")
+                && initial.contains("StructuredBuffer<UcvhConfig> ucvh_config")
+                && initial.contains("StructuredBuffer<NodeL0> hierarchy_l0")
+                && initial.contains("StructuredBuffer<BrickOccupancy> brick_occupancy")
+                && initial.contains("StructuredBuffer<VoxelCell> brick_materials"),
+            "initial shader must bind UCVH resources to evaluate each area candidate ray"
+        );
+        assert!(
+            !initial.contains("float target_pdf = target_luma;")
+                && !initial.contains("float target_luma = surface_target_luma("),
+            "initial shader must not assign every candidate the same center-surface target"
         );
         assert!(
             temporal.contains("float4 motion = center_context.motion_history;")

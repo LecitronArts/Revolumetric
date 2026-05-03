@@ -166,7 +166,7 @@ ScenePrimaryRay resolve_area_restir_primary_ray(uint2 pixel, SceneUniforms scene
         if (area_restir_is_valid_reservoir(reservoir)) {
             return scene_primary_ray_from_area_sample(
                 scene,
-                reservoir.sample_state.pixel_sample,
+                float2(pixel) + reservoir.sample_state.subpixel_uv,
                 reservoir.sample_state.lens_uv
             );
         }

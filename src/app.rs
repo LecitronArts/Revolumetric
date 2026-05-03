@@ -331,6 +331,9 @@ impl RevolumetricApp {
             if let Some(scene_ubo) = &self.scene_ubo {
                 area_restir.update_scene_descriptors(&device, scene_ubo);
             }
+            if let Some(ucvh_gpu) = &self.ucvh_gpu {
+                area_restir.update_ucvh_descriptors(&device, ucvh_gpu);
+            }
             if let (Some(vpt), Some(scene_ubo)) = (&self.vpt_pass, &self.scene_ubo) {
                 let area_restir_settings =
                     area_restir_effective_settings(self.area_restir_settings, false);
@@ -1944,7 +1947,7 @@ impl ApplicationHandler for RevolumetricApp {
 
         if self.area_restir_pass.is_none()
             && self.area_restir_vpt_enabled()
-            && let Some(scene_ubo_ref) = &self.scene_ubo
+            && let (Some(scene_ubo_ref), Some(ucvh_gpu)) = (&self.scene_ubo, &self.ucvh_gpu)
         {
             let renderer = self.renderer.as_ref().unwrap();
             let extent = renderer.swapchain_extent();
@@ -1970,6 +1973,7 @@ impl ApplicationHandler for RevolumetricApp {
                         temporal_spirv,
                         spatial_spirv,
                         scene_ubo: scene_ubo_ref,
+                        ucvh_gpu,
                     },
                 ) {
                     Ok(pass) => {
