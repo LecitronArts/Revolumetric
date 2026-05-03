@@ -17,6 +17,7 @@ use crate::platform::time::Time;
 use crate::platform::window::WindowDescriptor;
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 use crate::render::camera::compute_pixel_to_ray;
+use crate::render::capture::{CaptureMetadata, RenderCapture};
 use crate::render::device::RenderDevice;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler, GpuProfilerConfig};
 use crate::render::graph::RenderGraph;
@@ -63,6 +64,28 @@ fn area_restir_debug_to_vpt_debug_view(debug_view: AreaRestirDebugView) -> Optio
         AreaRestirDebugView::HistoryValid => Some(VptDebugView::AreaHistoryValid),
         AreaRestirDebugView::Rejection => Some(VptDebugView::AreaRejection),
         AreaRestirDebugView::Jacobian => Some(VptDebugView::AreaJacobian),
+    }
+}
+
+fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
+    match debug_view {
+        VptDebugView::Final => "final",
+        VptDebugView::Raw => "raw",
+        VptDebugView::Temporal => "temporal",
+        VptDebugView::Variance => "variance",
+        VptDebugView::HistoryValid => "history_valid",
+        VptDebugView::Motion => "motion",
+        VptDebugView::Normal => "normal",
+        VptDebugView::Depth => "depth",
+        VptDebugView::ReservoirWeight => "reservoir_weight",
+        VptDebugView::Direct => "direct",
+        VptDebugView::Indirect => "indirect",
+        VptDebugView::AreaSubpixel => "area_subpixel",
+        VptDebugView::AreaLens => "area_lens",
+        VptDebugView::AreaWeight => "area_weight",
+        VptDebugView::AreaHistoryValid => "area_history_valid",
+        VptDebugView::AreaRejection => "area_rejection",
+        VptDebugView::AreaJacobian => "area_jacobian",
     }
 }
 
@@ -176,6 +199,7 @@ struct RevolumetricApp {
     schedule: Schedule,
     renderer: Option<RenderDevice>,
     gpu_profiler: Option<GpuProfiler>,
+    capture: Option<RenderCapture>,
     postprocess_pass: Option<PostprocessPass>,
     vpt_surface_pass: Option<VptSurfacePass>,
     vpt_pass: Option<VptPass>,
@@ -229,6 +253,7 @@ impl RevolumetricApp {
             schedule,
             renderer: None,
             gpu_profiler: None,
+            capture: None,
             postprocess_pass: None,
             vpt_surface_pass: None,
             vpt_pass: None,
@@ -419,6 +444,7 @@ impl RevolumetricApp {
 
         let restir_di_enabled = self.restir_di_vpt_enabled();
         let area_restir_enabled = self.area_restir_vpt_enabled();
+        let mut pending_capture = None;
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = renderer.begin_frame()?;
             if frame.should_render {
@@ -1580,6 +1606,82 @@ impl RevolumetricApp {
                         let dst_image = frame.swapchain_image;
                         let dst_extent = frame.swapchain_extent;
                         let dep_handle = postprocess_writes[0];
+                        let mut capture_dependency = None;
+                        let capture_frame = self
+                            .capture
+                            .as_ref()
+                            .is_some_and(|capture| capture.should_capture(frame.frame_index));
+                        if capture_frame && let Some(capture) = &mut self.capture {
+                            let restir_di_temporal_enabled =
+                                restir_di_enabled && self.restir_di_settings.temporal_enabled;
+                            let restir_di_spatial_enabled = restir_di_temporal_enabled
+                                && self.restir_di_settings.spatial_enabled;
+                            let area_restir_temporal_enabled =
+                                area_restir_enabled && self.area_restir_settings.temporal_enabled;
+                            let area_restir_spatial_enabled = area_restir_temporal_enabled
+                                && self.area_restir_settings.spatial_enabled;
+                            let readback = capture.ensure_readback(
+                                renderer.device(),
+                                renderer.allocator(),
+                                postprocess_extent.width,
+                                postprocess_extent.height,
+                            )?;
+                            let readback_buffer = readback.handle;
+                            let readback_size = readback.size;
+                            let readback_usage = readback.usage;
+                            let readback_resource = graph.import_buffer_with_access(
+                                readback_buffer,
+                                readback_size,
+                                readback_usage,
+                                AccessKind::Undefined,
+                            );
+                            let capture_writes = graph.add_pass(
+                                "capture_postprocess",
+                                QueueType::Transfer,
+                                |builder| {
+                                    builder.read_as(dep_handle, AccessKind::TransferRead);
+                                    builder.write_as(readback_resource, AccessKind::TransferWrite);
+                                    Box::new(move |ctx| {
+                                        crate::render::capture::cmd_copy_image_to_buffer(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            src_image,
+                                            src_extent,
+                                            readback_buffer,
+                                        );
+                                    })
+                                },
+                            );
+                            let capture_dep = capture_writes[0];
+                            let paths = capture.config().paths_for_frame(frame.frame_index);
+                            pending_capture = Some(CaptureMetadata {
+                                frame_index: frame.frame_index,
+                                vpt_sample_index: scene_vpt_sample_index,
+                                width: postprocess_extent.width,
+                                height: postprocess_extent.height,
+                                source: "postprocess_output",
+                                ppm_path: paths.ppm_path,
+                                json_path: paths.json_path,
+                                restir_di_enabled,
+                                restir_di_temporal_enabled,
+                                restir_di_spatial_enabled,
+                                area_restir_enabled,
+                                area_restir_temporal_enabled,
+                                area_restir_spatial_enabled,
+                                vpt_debug_view: vpt_debug_view_name(
+                                    self.lighting_settings.vpt_debug_view,
+                                ),
+                                denoiser_enabled: self.lighting_settings.denoiser_enabled,
+                            });
+                            tracing::info!(
+                                frame_index = frame.frame_index,
+                                width = postprocess_extent.width,
+                                height = postprocess_extent.height,
+                                "queued postprocess capture"
+                            );
+                            capture_dependency = Some(capture_dep);
+                        }
+
                         let swapchain_dep = graph.import_image_with_access(
                             dst_image,
                             dst_extent.width,
@@ -1590,6 +1692,9 @@ impl RevolumetricApp {
                         );
                         graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
                             builder.read_as(dep_handle, AccessKind::TransferRead);
+                            if let Some(capture_dep) = capture_dependency {
+                                builder.depend_on(capture_dep);
+                            }
                             builder.write_as(swapchain_dep, AccessKind::TransferWrite);
                             builder.finish_as(swapchain_dep, AccessKind::Present);
                             Box::new(move |ctx| {
@@ -1663,7 +1768,20 @@ impl RevolumetricApp {
                 if area_restir_selected_written {
                     self.area_restir_history_initialized = true;
                 }
+                let submitted_fence = frame.in_flight_fence;
                 renderer.end_frame(frame)?;
+                if let Some(metadata) = pending_capture.take() {
+                    renderer.wait_for_fence(submitted_fence)?;
+                    if let Some(capture) = &self.capture {
+                        capture.write_rgba8_capture(&metadata)?;
+                        tracing::info!(
+                            frame_index = metadata.frame_index,
+                            ppm = %metadata.ppm_path.display(),
+                            json = %metadata.json_path.display(),
+                            "wrote postprocess capture"
+                        );
+                    }
+                }
             }
         }
 
@@ -1684,6 +1802,9 @@ impl Drop for RevolumetricApp {
             unsafe { renderer.device().device_wait_idle().ok() };
             if let Some(profiler) = self.gpu_profiler.take() {
                 profiler.destroy(renderer.device());
+            }
+            if let Some(capture) = self.capture.take() {
+                capture.destroy(renderer.device(), renderer.allocator());
             }
             if let Some(pass) = self.postprocess_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
@@ -1799,6 +1920,23 @@ impl ApplicationHandler for RevolumetricApp {
             Ok(profiler) => profiler,
             Err(error) => {
                 tracing::warn!(%error, "failed to initialize GPU profiler; continuing without profiling");
+                None
+            }
+        };
+        self.capture = match RenderCapture::from_env() {
+            Ok(capture) => {
+                if let Some(capture) = &capture {
+                    tracing::info!(
+                        target_frame = ?capture.config().target_frame,
+                        output_dir = %capture.config().output_dir.display(),
+                        prefix = %capture.config().prefix,
+                        "enabled postprocess capture"
+                    );
+                }
+                capture
+            }
+            Err(error) => {
+                tracing::warn!(%error, "invalid postprocess capture configuration; capture disabled");
                 None
             }
         };

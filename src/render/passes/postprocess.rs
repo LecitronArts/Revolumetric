@@ -331,6 +331,7 @@ mod shader_source_tests {
         );
 
         assert!(source.contains("postprocess_pass: Option<PostprocessPass>"));
+        assert!(source.contains("capture: Option<RenderCapture>"));
         assert!(source.contains("PostprocessPass::new"));
         assert!(
             source.contains("graph.add_pass(\"postprocess\"")
@@ -352,6 +353,10 @@ mod shader_source_tests {
                     )
                 })
                 .expect("postprocess graph pass should exist after VPT");
+        let capture_idx = postprocess_idx
+            + source[postprocess_idx..]
+                .find("\"capture_postprocess\"")
+                .expect("capture graph pass should exist after postprocess");
         let blit_idx = postprocess_idx
             + source[postprocess_idx..]
                 .find("graph.add_pass(\"blit_to_swapchain\"")
@@ -363,5 +368,9 @@ mod shader_source_tests {
 
         assert!(vpt_idx < postprocess_idx);
         assert!(postprocess_idx < blit_idx);
+        assert!(postprocess_idx < capture_idx);
+        assert!(capture_idx < blit_idx);
+        assert!(source.contains("cmd_copy_image_to_buffer"));
+        assert!(source.contains("renderer.wait_for_fence"));
     }
 }

@@ -411,6 +411,14 @@ impl RenderDevice {
         Ok(())
     }
 
+    pub fn wait_for_fence(&self, fence: vk::Fence) -> Result<()> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[fence], true, u64::MAX)
+                .context("failed to wait for Vulkan fence")
+        }
+    }
+
     pub fn surface(&self) -> vk::SurfaceKHR {
         self.surface
     }

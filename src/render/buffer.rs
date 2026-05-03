@@ -75,4 +75,9 @@ impl GpuBuffer {
             .and_then(|a| a.mapped_ptr())
             .map(|p| p.as_ptr() as *mut u8)
     }
+
+    /// Returns a mapped read-only slice if the buffer is host-visible.
+    pub fn mapped_slice(&self) -> Option<&[u8]> {
+        self.allocation.as_ref().and_then(|a| a.mapped_slice())
+    }
 }

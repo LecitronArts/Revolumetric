@@ -1166,6 +1166,90 @@ mod tests {
     }
 
     #[test]
+    fn compile_plans_postprocess_capture_copy_before_blit() {
+        let mut graph = RenderGraph::new();
+        let postprocess = graph.import_image_with_access(
+            fake_image(47),
+            320,
+            180,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let readback = graph.import_buffer_with_access(
+            fake_buffer(48),
+            320 * 180 * 4,
+            vk::BufferUsageFlags::TRANSFER_DST,
+            AccessKind::Undefined,
+        );
+
+        let postprocess_writes = graph.add_pass("postprocess", QueueType::Compute, |builder| {
+            builder.write_as(postprocess, AccessKind::ComputeShaderWrite);
+            Box::new(|_ctx| {})
+        });
+        let postprocess_output = postprocess_writes[0];
+
+        let capture_writes =
+            graph.add_pass("capture_postprocess", QueueType::Transfer, |builder| {
+                builder.read_as(postprocess_output, AccessKind::TransferRead);
+                builder.write_as(readback, AccessKind::TransferWrite);
+                Box::new(|_ctx| {})
+            });
+
+        let swapchain = graph.import_image_with_access(
+            fake_image(49),
+            320,
+            180,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::Present,
+        );
+        graph.add_pass("blit", QueueType::Graphics, |builder| {
+            builder.read_as(postprocess_output, AccessKind::TransferRead);
+            builder.depend_on(capture_writes[0]);
+            builder.write_as(swapchain, AccessKind::TransferWrite);
+            builder.finish_as(swapchain, AccessKind::Present);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile().unwrap();
+
+        let capture_index = graph
+            .passes
+            .iter()
+            .position(|pass| pass.decl.name == "capture_postprocess")
+            .expect("capture pass should exist");
+        let blit_index = graph
+            .passes
+            .iter()
+            .position(|pass| pass.decl.name == "blit")
+            .expect("blit pass should exist");
+        let capture_order = graph
+            .sorted_order
+            .iter()
+            .position(|&pass| pass == capture_index)
+            .expect("capture pass should be sorted");
+        let blit_order = graph
+            .sorted_order
+            .iter()
+            .position(|&pass| pass == blit_index)
+            .expect("blit pass should be sorted");
+        assert!(capture_order < blit_order);
+
+        let barriers = graph.barrier_plan();
+        assert!(barriers.iter().any(|barrier| {
+            barrier.resource == postprocess_output
+                && barrier.from == AccessKind::ComputeShaderWrite
+                && barrier.to == AccessKind::TransferRead
+        }));
+        assert!(barriers.iter().any(|barrier| {
+            barrier.resource.id == readback.id
+                && barrier.from == AccessKind::Undefined
+                && barrier.to == AccessKind::TransferWrite
+        }));
+    }
+
+    #[test]
     fn imported_images_can_be_read_by_passes() {
         let mut graph = RenderGraph::new();
         let imported = graph.import_image(

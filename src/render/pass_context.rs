@@ -37,6 +37,10 @@ impl PassBuilder {
         self.accesses.push(ResourceAccess { handle, kind });
     }
 
+    pub fn depend_on(&mut self, handle: ResourceHandle) {
+        self.reads.push(handle);
+    }
+
     pub fn create_image(
         &mut self,
         width: u32,

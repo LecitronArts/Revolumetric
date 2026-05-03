@@ -2,6 +2,7 @@ pub mod allocator;
 pub mod area_restir;
 pub mod buffer;
 pub mod camera;
+pub mod capture;
 pub mod descriptor;
 pub mod device;
 pub mod frame;
