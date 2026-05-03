@@ -125,7 +125,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     AreaRestirEvalContext center_context = current_context(pixel);
     uint rng = area_restir_temporal_hash(index ^ (area_restir.frame_index * 2246822519u));
     AreaRestirReservoir reservoir = area_restir_invalid_reservoir();
-    float current_target_pdf = area_restir_replay_target_pdf(center_context, current.sample_state);
+    float center_target_luma = area_restir_context_target_luma(center_context);
+    float current_target_pdf = center_target_luma;
     float current_candidate_weight_sum = current_target_pdf
         * area_restir_reservoir_reuse_weight(current)
         * float(max(current.sample_count_m, 1u));
@@ -172,7 +173,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             continue;
         }
 
-        float history_target_pdf = area_restir_replay_target_pdf(center_context, history.sample_state);
+        float history_target_pdf = center_target_luma;
         float bilinear_confidence = max(tap_weight, 0.05);
         float history_candidate_weight_sum = history_target_pdf
             * area_restir_reservoir_reuse_weight(history)

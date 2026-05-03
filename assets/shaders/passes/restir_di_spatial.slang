@@ -47,11 +47,6 @@ float rand01(inout uint state) {
     return float(state & 0x00ffffffu) / 16777216.0;
 }
 
-bool surface_is_valid(uint index) {
-    uint2 pixel = uint2(index % restir.width, index / restir.width);
-    return current_surface_position_depth[pixel].w >= 0.0;
-}
-
 bool compatible_spatial_surface(
     float4 center_position,
     float4 center_normal_roughness,
@@ -60,17 +55,22 @@ bool compatible_spatial_surface(
 ) {
     uint2 neighbor_pixel = uint2(neighbor_index % restir.width, neighbor_index / restir.width);
     float4 neighbor_position = current_surface_position_depth[neighbor_pixel];
-    float3 center_normal = normalize(center_normal_roughness.xyz);
-    float3 neighbor_normal = normalize(current_surface_normal_roughness[neighbor_pixel].xyz);
+    if (center_position.w < 0.0 || neighbor_position.w < 0.0) {
+        return false;
+    }
+    float position_delta = length(center_position.xyz - neighbor_position.xyz);
+    if (position_delta >= 2.0) {
+        return false;
+    }
     float center_material = center_albedo_material.a;
     float neighbor_material = current_surface_albedo_material[neighbor_pixel].a;
+    if (abs(center_material - neighbor_material) >= 0.5) {
+        return false;
+    }
+    float3 center_normal = normalize(center_normal_roughness.xyz);
+    float3 neighbor_normal = normalize(current_surface_normal_roughness[neighbor_pixel].xyz);
     float normal_dot = dot(center_normal, neighbor_normal);
-    float position_delta = length(center_position.xyz - neighbor_position.xyz);
-    return center_position.w >= 0.0
-        && neighbor_position.w >= 0.0
-        && normal_dot > 0.85
-        && position_delta < 2.0
-        && abs(center_material - neighbor_material) < 0.5;
+    return normal_dot > 0.85;
 }
 
 [shader("compute")]
@@ -85,15 +85,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
-    if (!surface_is_valid(index)) {
+    uint2 pixel = tid.xy;
+    float4 surface_position_depth = current_surface_position_depth[pixel];
+    if (surface_position_depth.w < 0.0) {
         reservoir.sample_light_id = 0xffffffffu;
         reservoir.sample_count_m = 0u;
         output_reservoirs[index] = reservoir;
         return;
     }
 
-    uint2 pixel = tid.xy;
-    float4 surface_position_depth = current_surface_position_depth[pixel];
     float4 surface_normal_roughness = current_surface_normal_roughness[pixel];
     float4 surface_albedo_material = current_surface_albedo_material[pixel];
 
@@ -110,6 +110,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
         reservoir,
         combined_m
     );
+    float selected_target_pdf = center_target_pdf;
 
     uint rng_state = hash_u32(index * 1973u ^ restir.frame_index * 9277u);
     uint offset_rotation = hash_u32(rng_state) & 7u;
@@ -156,17 +157,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
         if (rand01(rng_state) * max(next_weight_sum, 1.0e-4) <= neighbor_weight) {
             reservoir = neighbor;
             reservoir.target_pdf = neighbor_target_pdf;
+            selected_target_pdf = neighbor_target_pdf;
         }
 
         combined_weight_sum = next_weight_sum;
         combined_m += accepted_neighbor_m;
     }
 
-    restir_di_finalize_reservoir_on_surface(
+    restir_di_finalize_reservoir_on_surface_with_target(
         reservoir,
-        surface_position_depth,
-        surface_normal_roughness,
-        surface_albedo_material,
+        selected_target_pdf,
         combined_weight_sum,
         combined_m
     );

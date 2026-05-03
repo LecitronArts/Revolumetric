@@ -899,11 +899,18 @@ mod shader_source_tests {
             assert!(shader.contains("current_surface_position_depth"));
             assert!(shader.contains("current_surface_normal_roughness"));
             assert!(shader.contains("current_surface_albedo_material"));
-            assert!(shader.contains("surface_is_valid"));
         }
 
         assert!(initial.contains("output_reservoirs[index] = invalid_reservoir();"));
         assert!(initial.contains("surface_is_valid(index)"));
+        assert!(
+            temporal
+                .contains("float4 surface_position_depth = current_surface_position_depth[pixel];")
+                && spatial.contains(
+                    "float4 surface_position_depth = current_surface_position_depth[pixel];"
+                ),
+            "temporal and spatial reuse should validate with the cached center surface load"
+        );
         assert!(initial.contains("current_surface_albedo_material"));
         assert!(temporal.contains("compatible_temporal_surface"));
         assert!(temporal.contains("uint previous_index"));
@@ -1039,6 +1046,50 @@ mod shader_source_tests {
                 .contains("restir_di_finalize_reservoir_on_surface(\n                reservoir,"),
             "temporal pass must not call the recomputing finalizer after it already computed current/history target PDFs"
         );
+    }
+
+    #[test]
+    fn restir_di_spatial_reuses_selected_target_pdf_without_finalizer_recompute() {
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        for token in [
+            "float selected_target_pdf = center_target_pdf;",
+            "selected_target_pdf = neighbor_target_pdf;",
+            "restir_di_finalize_reservoir_on_surface_with_target(",
+            "selected_target_pdf,",
+        ] {
+            assert!(
+                spatial.contains(token),
+                "spatial shader missing selected-target reuse token {token}"
+            );
+        }
+        assert!(
+            !spatial.contains("restir_di_finalize_reservoir_on_surface(\n        reservoir,"),
+            "spatial pass must not recompute the selected target PDF after it already evaluated the chosen candidate"
+        );
+    }
+
+    #[test]
+    fn restir_di_reuse_shaders_validate_with_cached_center_position() {
+        let temporal = source("assets/shaders/passes/restir_di_temporal.slang");
+        let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+
+        for (name, shader) in [
+            ("temporal", temporal.as_str()),
+            ("spatial", spatial.as_str()),
+        ] {
+            let compact = shader.split_whitespace().collect::<String>();
+            assert!(
+                compact.contains(
+                    "float4surface_position_depth=current_surface_position_depth[pixel];if(surface_position_depth.w<0.0){"
+                ),
+                "{name} shader should validate the center surface using the cached position/depth load"
+            );
+            assert!(
+                !shader.contains("if (!surface_is_valid(index))"),
+                "{name} shader must not read current_surface_position_depth once for surface_is_valid and again for the center surface"
+            );
+        }
     }
 
     #[test]

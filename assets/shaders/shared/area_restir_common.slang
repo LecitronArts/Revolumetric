@@ -74,7 +74,9 @@ bool area_restir_is_valid_reservoir(AreaRestirReservoir reservoir) {
         && reservoir.sample_count_m > 0u
         && reservoir.target_pdf > 0.0
         && all(reservoir.sample_state.subpixel_uv >= 0.0)
-        && all(reservoir.sample_state.lens_uv >= 0.0);
+        && all(reservoir.sample_state.subpixel_uv < 1.0)
+        && all(reservoir.sample_state.lens_uv >= 0.0)
+        && all(reservoir.sample_state.lens_uv < 1.0);
 }
 
 bool area_restir_surface_compatible(

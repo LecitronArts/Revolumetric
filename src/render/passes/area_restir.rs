@@ -1181,7 +1181,9 @@ mod shader_source_tests {
             "int2 tap_pixel_i = previous_base_pixel + area_restir_history_tap_offsets[tap]",
             "float tap_weight = area_restir_history_tap_weight(tap, history_fraction)",
             "tap_weight < AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT",
-            "area_restir_replay_target_pdf(center_context, history.sample_state",
+            "float center_target_luma = area_restir_context_target_luma(center_context);",
+            "float current_target_pdf = center_target_luma;",
+            "float history_target_pdf = center_target_luma;",
             "float history_candidate_weight_sum",
             "area_restir_reservoir_update(",
             "area_restir_temporal_surface_compatible(center_context, previous_pixel)",
@@ -1224,6 +1226,13 @@ mod shader_source_tests {
             "temporal history taps must reuse the already-loaded center context instead of rereading current surface textures"
         );
         assert!(
+            !temporal
+                .contains("area_restir_replay_target_pdf(center_context, history.sample_state")
+                && !temporal
+                    .contains("area_restir_replay_target_pdf(center_context, current.sample_state"),
+            "valid current/history reservoirs can reuse cached center target luma instead of repeating replay-domain checks"
+        );
+        assert!(
             !temporal.contains("if (combined > 0.0 && history_weight >= current_weight)"),
             "temporal reuse must use weighted reservoir update instead of max-weight replacement"
         );
@@ -1261,7 +1270,7 @@ mod shader_source_tests {
             "area_restir_spatial_hash",
             "uint rotated_tap",
             "if (area_restir.enabled == 0u || area_restir.spatial_enabled == 0u || area_restir.spatial_sample_count == 0u",
-            "float center_target_pdf = area_restir_replay_target_pdf(center, center_reservoir.sample_state);",
+            "float center_target_pdf = area_restir_context_target_luma(center);",
             "float neighbor_target_pdf = center_target_pdf;",
             "float neighbor_candidate_weight_sum",
             "area_restir_reservoir_update(",
@@ -1299,6 +1308,11 @@ mod shader_source_tests {
         assert!(
             !spatial.contains("area_restir_replay_target_pdf(center, neighbor.sample_state"),
             "spatial reuse should not recompute a neighbor replay target when the current-pixel target is already known"
+        );
+        assert!(
+            !spatial
+                .contains("area_restir_replay_target_pdf(center, center_reservoir.sample_state"),
+            "valid center reservoirs can reuse cached center target luma instead of repeating replay-domain checks"
         );
     }
 }

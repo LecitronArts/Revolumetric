@@ -74,7 +74,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     AreaRestirEvalContext center = spatial_context(pixel);
     uint rng = area_restir_spatial_hash(index ^ (area_restir.frame_index * 3266489917u));
     AreaRestirReservoir reservoir = area_restir_invalid_reservoir();
-    float center_target_pdf = area_restir_replay_target_pdf(center, center_reservoir.sample_state);
+    float center_target_pdf = area_restir_context_target_luma(center);
     float center_candidate_weight_sum = center_target_pdf
         * area_restir_reservoir_reuse_weight(center_reservoir)
         * float(max(center_reservoir.sample_count_m, 1u));

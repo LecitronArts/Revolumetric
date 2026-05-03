@@ -55,11 +55,6 @@ float rand01(inout uint state) {
     return float(state & 0x00ffffffu) / 16777216.0;
 }
 
-bool surface_is_valid(uint index) {
-    uint2 pixel = uint2(index % restir.width, index / restir.width);
-    return current_surface_position_depth[pixel].w >= 0.0;
-}
-
 bool compatible_temporal_surface(
     float4 current_position,
     float4 current_normal_roughness,
@@ -67,17 +62,21 @@ bool compatible_temporal_surface(
     uint2 previous_pixel
 ) {
     float4 previous_position = previous_surface_position_depth[previous_pixel];
-    float3 current_normal = normalize(current_normal_roughness.xyz);
-    float3 previous_normal = normalize(previous_surface_normal_roughness[previous_pixel].xyz);
+    if (current_position.w < 0.0 || previous_position.w < 0.0) {
+        return false;
+    }
+    float position_delta = length(current_position.xyz - previous_position.xyz);
+    if (position_delta >= 2.0) {
+        return false;
+    }
     float current_material = current_albedo_material.a;
     float previous_material = previous_surface_albedo_material[previous_pixel].a;
-    float normal_dot = dot(current_normal, previous_normal);
-    float position_delta = length(current_position.xyz - previous_position.xyz);
-    return current_position.w >= 0.0
-        && previous_position.w >= 0.0
-        && normal_dot > 0.85
-        && position_delta < 2.0
-        && abs(current_material - previous_material) < 0.5;
+    if (abs(current_material - previous_material) >= 0.5) {
+        return false;
+    }
+    float3 current_normal = normalize(current_normal_roughness.xyz);
+    float3 previous_normal = normalize(previous_surface_normal_roughness[previous_pixel].xyz);
+    return dot(current_normal, previous_normal) > 0.85;
 }
 
 [shader("compute")]
@@ -86,16 +85,17 @@ void main(uint3 tid : SV_DispatchThreadID) {
     uint index = tid.y * restir.width + tid.x;
     if (tid.x >= restir.width || tid.y >= restir.height || index >= restir.reservoir_count) return;
 
-    RestirDiReservoir reservoir = input_reservoirs[index];
-    if (!surface_is_valid(index)) {
+    uint2 pixel = tid.xy;
+    float4 surface_position_depth = current_surface_position_depth[pixel];
+    if (surface_position_depth.w < 0.0) {
+        RestirDiReservoir reservoir = input_reservoirs[index];
         reservoir.sample_light_id = 0xffffffffu;
         reservoir.sample_count_m = 0u;
         output_reservoirs[index] = reservoir;
         return;
     }
 
-    uint2 pixel = tid.xy;
-    float4 surface_position_depth = current_surface_position_depth[pixel];
+    RestirDiReservoir reservoir = input_reservoirs[index];
     float4 surface_normal_roughness = current_surface_normal_roughness[pixel];
     float4 surface_albedo_material = current_surface_albedo_material[pixel];
     float4 motion = motion_history[tid.xy];
