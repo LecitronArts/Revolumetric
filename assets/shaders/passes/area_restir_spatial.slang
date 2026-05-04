@@ -126,7 +126,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
         );
     }
 
-    reservoir.sample_count_m = min(reservoir.sample_count_m, area_restir.history_length);
     reservoir.jacobian = max(reservoir.jacobian, 1.0);
     reservoir.debug_flags |= 8u;
     area_restir_finalize_reservoir(reservoir, area_restir.history_length);

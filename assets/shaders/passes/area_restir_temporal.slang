@@ -43,6 +43,8 @@ RWTexture2D<float4> previous_surface_albedo_material;
 RWTexture2D<float4> motion_history;
 
 static const float AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT = 0.0625;
+static const uint AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID = 1u;
+static const uint AREA_RESTIR_TEMPORAL_REJECTION_HISTORY_INVALID = 2u;
 
 static const int2 area_restir_history_tap_offsets[4] = {
     int2(0, 0),
@@ -141,66 +143,69 @@ void main(uint3 tid : SV_DispatchThreadID) {
         rng
     );
 
+    bool accepted_history = false;
+    uint history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_HISTORY_INVALID;
     float4 motion = center_context.motion_history;
     if (motion.w == 0.0) {
-        reservoir.rejection_reason = 1u;
-        output_reservoirs[index] = reservoir;
-        return;
-    }
+        history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID;
+    } else {
+        float2 history_sample = motion.xy - 0.5;
+        int2 previous_base_pixel = int2(floor(history_sample));
+        float2 history_fraction = saturate(history_sample - float2(previous_base_pixel));
 
-    float2 history_sample = motion.xy - 0.5;
-    int2 previous_base_pixel = int2(floor(history_sample));
-    float2 history_fraction = saturate(history_sample - float2(previous_base_pixel));
-    bool accepted_history = false;
+        [unroll]
+        for (uint tap = 0u; tap < 4u; tap++) {
+            int2 tap_pixel_i = previous_base_pixel + area_restir_history_tap_offsets[tap];
+            float tap_weight = area_restir_history_tap_weight(tap, history_fraction);
+            if (tap_weight < AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT
+                || !area_restir_history_tap_inside(tap_pixel_i, area_restir.width, area_restir.height)) {
+                continue;
+            }
 
-    [unroll]
-    for (uint tap = 0u; tap < 4u; tap++) {
-        int2 tap_pixel_i = previous_base_pixel + area_restir_history_tap_offsets[tap];
-        float tap_weight = area_restir_history_tap_weight(tap, history_fraction);
-        if (tap_weight < AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT
-            || !area_restir_history_tap_inside(tap_pixel_i, area_restir.width, area_restir.height)) {
-            continue;
+            uint2 previous_pixel = uint2(tap_pixel_i);
+            uint previous_index = previous_pixel.y * area_restir.width + previous_pixel.x;
+            AreaRestirReservoir history = history_reservoirs[previous_index];
+            if (!area_restir_is_valid_reservoir(history)) {
+                continue;
+            }
+
+            if (!area_restir_temporal_surface_compatible(center_context, previous_pixel)) {
+                continue;
+            }
+
+            float2 shifted_subpixel_uv = float2(tap_pixel_i - previous_base_pixel) + history.sample_state.subpixel_uv - history_fraction;
+            if (any(shifted_subpixel_uv < 0.0) || any(shifted_subpixel_uv >= 1.0)) {
+                continue;
+            }
+
+            float history_target_pdf = center_target_luma;
+            float bilinear_confidence = max(tap_weight, 0.05);
+            float history_candidate_weight_sum = history_target_pdf
+                * area_restir_reservoir_reuse_weight(history)
+                * float(max(history.sample_count_m, 1u))
+                * bilinear_confidence;
+            history.sample_state.subpixel_uv = shifted_subpixel_uv;
+            history.sample_state.flags |= AREA_RESTIR_SAMPLE_HISTORY_VALID;
+            history.rejection_reason = 0u;
+            history.debug_flags |= AREA_RESTIR_SAMPLE_HISTORY_VALID;
+            area_restir_reservoir_update(
+                reservoir,
+                history,
+                history_target_pdf,
+                history_candidate_weight_sum,
+                max(history.sample_count_m, 1u),
+                rng
+            );
+            accepted_history = true;
         }
-
-        uint2 previous_pixel = uint2(tap_pixel_i);
-        uint previous_index = previous_pixel.y * area_restir.width + previous_pixel.x;
-        AreaRestirReservoir history = history_reservoirs[previous_index];
-        if (!area_restir_is_valid_reservoir(history)) {
-            continue;
-        }
-
-        if (!area_restir_temporal_surface_compatible(center_context, previous_pixel)) {
-            continue;
-        }
-
-        float history_target_pdf = center_target_luma;
-        float bilinear_confidence = max(tap_weight, 0.05);
-        float history_candidate_weight_sum = history_target_pdf
-            * area_restir_reservoir_reuse_weight(history)
-            * float(max(history.sample_count_m, 1u))
-            * bilinear_confidence;
-        history.sample_state.flags |= AREA_RESTIR_SAMPLE_HISTORY_VALID;
-        history.rejection_reason = 0u;
-        history.debug_flags |= AREA_RESTIR_SAMPLE_HISTORY_VALID;
-        area_restir_reservoir_update(
-            reservoir,
-            history,
-            history_target_pdf,
-            history_candidate_weight_sum,
-            max(history.sample_count_m, 1u),
-            rng
-        );
-        accepted_history = true;
     }
 
     if (!accepted_history) {
-        reservoir.rejection_reason = 2u;
-        output_reservoirs[index] = reservoir;
-        return;
+        reservoir.rejection_reason = history_rejection_reason;
+    } else {
+        reservoir.confidence = min(max(current.confidence, reservoir.confidence) + 1.0, float(area_restir.history_length));
     }
 
-    reservoir.sample_count_m = min(reservoir.sample_count_m, area_restir.history_length);
-    reservoir.confidence = min(max(current.confidence, reservoir.confidence) + 1.0, float(area_restir.history_length));
     area_restir_finalize_reservoir(reservoir, area_restir.history_length);
     output_reservoirs[index] = reservoir;
 }

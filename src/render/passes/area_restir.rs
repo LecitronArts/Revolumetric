@@ -1344,6 +1344,73 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn area_restir_temporal_preserves_current_reservoir_when_history_rejects() {
+        let temporal = source("assets/shaders/passes/area_restir_temporal.slang");
+
+        assert!(
+            temporal.contains("uint history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_HISTORY_INVALID;")
+                && temporal.contains(
+                    "history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID;"
+                )
+                && temporal.contains("if (!accepted_history) {")
+                && temporal.contains("reservoir.rejection_reason = history_rejection_reason;")
+                && temporal.contains("reservoir.confidence = min(max(current.confidence, reservoir.confidence) + 1.0, float(area_restir.history_length));")
+                && temporal.contains("area_restir_finalize_reservoir(reservoir, area_restir.history_length);"),
+            "temporal history rejection must preserve the already-merged current reservoir, avoid history-confidence growth, and continue through finalization"
+        );
+        assert!(
+            !temporal.contains(
+                "if (motion.w == 0.0) {\n        reservoir.rejection_reason = 1u;\n        output_reservoirs[index] = reservoir;\n        return;\n    }"
+            ),
+            "temporal history rejection must not early-return before finalizing the current reservoir"
+        );
+        assert!(
+            !temporal.contains("if (motion.w == 0.0) {\n        reservoir.rejection_reason = 1u;\n        output_reservoirs[index] = reservoir;\n        return;\n    }"),
+            "missing motion history must not early-return before finalizing the current reservoir"
+        );
+    }
+
+    #[test]
+    fn area_restir_temporal_shifts_history_subpixel_into_current_pixel_domain() {
+        let temporal = source("assets/shaders/passes/area_restir_temporal.slang");
+
+        for token in [
+            "float2 shifted_subpixel_uv = float2(tap_pixel_i - previous_base_pixel) + history.sample_state.subpixel_uv - history_fraction;",
+            "if (any(shifted_subpixel_uv < 0.0) || any(shifted_subpixel_uv >= 1.0))",
+            "history.sample_state.subpixel_uv = shifted_subpixel_uv;",
+        ] {
+            assert!(
+                temporal.contains(token),
+                "temporal shader must shift reused history subpixel samples into the current pixel domain; missing {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn area_restir_reuse_passes_let_finalize_apply_history_length_weight_scaling() {
+        let temporal = source("assets/shaders/passes/area_restir_temporal.slang");
+        let spatial = source("assets/shaders/passes/area_restir_spatial.slang");
+
+        for (name, shader) in [
+            ("temporal", temporal.as_str()),
+            ("spatial", spatial.as_str()),
+        ] {
+            assert!(
+                !shader.contains(
+                    "reservoir.sample_count_m = min(reservoir.sample_count_m, area_restir.history_length);"
+                ),
+                "{name} pass must not pre-cap sample_count_m before area_restir_finalize_reservoir scales weight_sum"
+            );
+            assert!(
+                shader.contains(
+                    "area_restir_finalize_reservoir(reservoir, area_restir.history_length);"
+                ),
+                "{name} pass must leave history-length capping to area_restir_finalize_reservoir"
+            );
+        }
+    }
+
+    #[test]
     fn area_restir_spatial_reuses_neighbors_in_current_pixel_measure() {
         let spatial = source("assets/shaders/passes/area_restir_spatial.slang");
         let common = source("assets/shaders/shared/area_restir_common.slang");
