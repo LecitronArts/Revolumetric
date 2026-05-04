@@ -38,7 +38,7 @@ struct SceneUniforms {
     uint2    resolution;      // 8B
     uint2    _pad0;           // 8B
     float3   sun_direction;   // 12B
-    float    _pad1;           // 4B
+    float    sun_angular_radius; // 4B
     float3   sun_intensity;   // 12B
     float    _pad2;           // 4B
     float3   sky_color;       // 12B

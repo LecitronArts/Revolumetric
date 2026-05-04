@@ -1286,7 +1286,7 @@ mod shader_source_tests {
         let vpt = source("assets/shaders/passes/vpt.slang");
 
         assert!(
-            vpt.find("if (!restir_di_light_visible_from_hit(hit, reservoir))")
+            vpt.find("if (!restir_di_light_visible_from_hit(hit, reservoir, scene))")
                 .expect("VPT ReSTIR resolve should reject occluded light samples")
                 < vpt
                     .find("sample.selected_weight = selected_weight;")
@@ -1317,7 +1317,7 @@ mod shader_source_tests {
             "ReSTIR-DI direct-light builders must not include the analytic sun in the stochastic finite-light reservoir table"
         );
         assert!(
-            vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene);")
+            vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene, rng_state);")
                 && vpt.contains("float3 direct_radiance = analytic_direct + direct.radiance;"),
             "VPT must always keep deterministic sun direct light and add finite-light ReSTIR-DI only when a reservoir is usable"
         );
@@ -1361,11 +1361,13 @@ mod shader_source_tests {
         let vpt = source("assets/shaders/passes/vpt.slang");
 
         assert!(
-            vpt.contains("float3 analytic_sun_direct(HitResult hit, SceneUniforms scene)")
-                && vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene);")
+            vpt.contains(
+                "float3 analytic_sun_direct(HitResult hit, SceneUniforms scene, inout uint rng_state)"
+            )
+                && vpt.contains("float3 analytic_direct = analytic_sun_direct(hit, scene, rng_state);")
                 && vpt.contains("float3 direct_radiance = analytic_direct + direct.radiance;")
                 && vpt.contains(
-                    "float3 contribution = throughput * analytic_sun_direct(hit, scene);"
+                    "float3 contribution = throughput * analytic_sun_direct(hit, scene, rng_state);"
                 ),
             "invalid or incompatible ReSTIR-DI reservoirs should still keep analytic sun direct instead of turning first-bounce direct light into black blocks"
         );

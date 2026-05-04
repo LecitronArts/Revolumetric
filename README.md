@@ -39,6 +39,7 @@ Rendering settings can be overridden through environment variables:
 - `REVOLUMETRIC_VPT_MAX_BOUNCES=1..8`: bounds VPT path length. Default is `2`.
 - `REVOLUMETRIC_EXPOSURE=<finite non-negative float>`: postprocess exposure multiplier before tonemap. Default is `1.0`.
 - `REVOLUMETRIC_LIGHTING_SHADOWS=on|off|1|0|true|false`: enables direct-light shadow rays.
+- `REVOLUMETRIC_SUN_ANGULAR_RADIUS=<finite float in 0.0..=0.25>`: analytic sun disk radius in radians for VPT soft shadow edges. Default is `0.02`.
 - `REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS=on|off|1|0|true|false`: skips backface shadow hits when enabled.
 - `REVOLUMETRIC_LIGHTING_DEBUG_VIEW=final|off|diffuse|direct|normal`: selects runtime lighting debug output.
 - `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian`: selects VPT diagnostics. Area ReSTIR debug views are written through the final postprocess path without temporal smoothing.

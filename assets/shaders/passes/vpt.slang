@@ -8,6 +8,9 @@
 #include "area_restir_common.slang"
 #include "vpt_primary_sample_common.slang"
 
+static const float VPT_RAY_SURFACE_BIAS = 0.01;
+static const float VPT_LIGHT_ENDPOINT_BIAS = 0.01;
+
 [[vk::binding(0, 0)]]
 ConstantBuffer<SceneUniforms> scene_ubo;
 
@@ -51,6 +54,26 @@ float rand01(inout uint state) {
     return vpt_primary_rand01(state);
 }
 
+float3 sample_sun_direction(SceneUniforms scene, inout uint rng_state) {
+    float sun_radius = max(scene.sun_angular_radius, 0.0);
+    if (sun_radius <= 0.0) {
+        return scene.sun_direction;
+    }
+
+    float cos_min = cos(sun_radius);
+    float cos_theta = lerp(cos_min, 1.0, rand01(rng_state));
+    float sin_theta = sqrt(max(1.0 - cos_theta * cos_theta, 0.0));
+    float phi = 6.28318530718 * rand01(rng_state);
+    float3 sun_forward = normalize(scene.sun_direction);
+    float3 sun_right = normalize(abs(sun_forward.y) < 0.95 ? cross(sun_forward, float3(0, 1, 0)) : cross(sun_forward, float3(1, 0, 0)));
+    float3 sun_up = normalize(cross(sun_right, sun_forward));
+    return normalize(
+        sun_right * (cos(phi) * sin_theta) +
+        sun_up * (sin(phi) * sin_theta) +
+        sun_forward * cos_theta
+    );
+}
+
 float3 cosine_hemisphere(float3 normal, inout uint state) {
     float r1 = rand01(state);
     float r2 = rand01(state);
@@ -80,9 +103,30 @@ RestirDirectLightSample empty_restir_direct_light_sample() {
     return sample;
 }
 
-float3 analytic_sun_direct(HitResult hit, SceneUniforms scene) {
-    float sun_term = max(dot(hit.normal, scene.sun_direction), 0.0);
-    return material_cell_albedo(hit.cell) * scene.sun_intensity * sun_term * 0.2;
+bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 sun_dir) {
+    if ((scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u) {
+        return true;
+    }
+
+    Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, sun_dir);
+    bool sun_occluded = trace_any_hit_ray(
+        shadow_ray,
+        1.0e20,
+        ucvh_config,
+        hierarchy_l0,
+        brick_occupancy
+    );
+    return !sun_occluded;
+}
+
+float3 analytic_sun_direct(HitResult hit, SceneUniforms scene, inout uint rng_state) {
+    float3 sun_dir = sample_sun_direction(scene, rng_state);
+    float sun_term = max(dot(hit.normal, sun_dir), 0.0);
+    if (sun_term <= 0.0 || !analytic_sun_visible_from_hit(hit, scene, sun_dir)) {
+        return float3(0.0);
+    }
+    float3 albedo = material_cell_albedo(hit.cell);
+    return albedo * scene.sun_intensity * sun_term * 0.2;
 }
 
 VptTraceSample empty_vpt_trace_sample() {
@@ -167,7 +211,11 @@ ScenePrimaryRay resolve_area_restir_primary_ray(uint2 pixel, SceneUniforms scene
     return vpt_resolve_area_restir_primary_ray(pixel, scene, area_restir, reservoir, index, rng_state);
 }
 
-bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir) {
+bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir, SceneUniforms scene) {
+    if ((scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u) {
+        return true;
+    }
+
     float3 shadow_dir;
     float max_light_t;
     if (reservoir.sample_flags == 0u) {
@@ -181,10 +229,10 @@ bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir
         }
         float light_distance = sqrt(distance_sq);
         shadow_dir = to_light / light_distance;
-        max_light_t = max(light_distance - 1.0, 0.0);
+        max_light_t = max(light_distance - VPT_LIGHT_ENDPOINT_BIAS, 0.0);
     }
 
-    Ray shadow_ray = make_ray(hit.position + hit.normal * 0.05 + shadow_dir * 0.05, shadow_dir);
+    Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, shadow_dir);
     bool shadow_occluded = trace_any_hit_ray(
         shadow_ray,
         max_light_t,
@@ -228,7 +276,7 @@ RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hi
     if (selected_weight <= 0.0) {
         return sample;
     }
-    if (!restir_di_light_visible_from_hit(hit, reservoir)) {
+    if (!restir_di_light_visible_from_hit(hit, reservoir, scene)) {
         return sample;
     }
     sample.selected_weight = selected_weight;
@@ -277,14 +325,14 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
 
         if (restir.enabled != 0u && bounce == 0u) {
             RestirDirectLightSample direct = resolve_restir_di_direct_light(pixel, hit, scene);
-            float3 analytic_direct = analytic_sun_direct(hit, scene);
+            float3 analytic_direct = analytic_sun_direct(hit, scene, rng_state);
             float3 direct_radiance = analytic_direct + direct.radiance;
             float3 contribution = throughput * direct_radiance;
             sample.radiance += contribution;
             sample.direct_radiance += contribution;
             sample.reservoir_weight = direct.selected_weight;
         } else {
-            float3 contribution = throughput * analytic_sun_direct(hit, scene);
+            float3 contribution = throughput * analytic_sun_direct(hit, scene, rng_state);
             sample.radiance += contribution;
             if (bounce == 0u) {
                 sample.direct_radiance += contribution;
@@ -293,7 +341,7 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
             }
         }
         throughput *= material_cell_albedo(hit.cell);
-        ray = make_ray(hit.position + hit.normal * 0.75, cosine_hemisphere(hit.normal, rng_state));
+        ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, cosine_hemisphere(hit.normal, rng_state));
     }
 
     return sample;

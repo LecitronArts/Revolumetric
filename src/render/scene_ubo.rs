@@ -114,6 +114,7 @@ pub struct LightingSettings {
     pub skip_backface_shadows: bool,
     pub render_mode: RenderMode,
     pub vpt_max_bounces: u32,
+    pub sun_angular_radius: f32,
     pub debug_view: LightingDebugView,
     pub exposure: f32,
     pub denoiser_enabled: bool,
@@ -141,6 +142,7 @@ impl Default for LightingSettings {
             skip_backface_shadows: false,
             render_mode: RenderMode::Vpt,
             vpt_max_bounces: 2,
+            sun_angular_radius: 0.02,
             debug_view: LightingDebugView::Final,
             exposure: 1.0,
             denoiser_enabled: true,
@@ -166,6 +168,7 @@ impl LightingSettings {
         let denoiser_atrous_iterations =
             std::env::var("REVOLUMETRIC_DENOISER_ATROUS_ITERATIONS").ok();
         let vpt_debug_view = std::env::var("REVOLUMETRIC_VPT_DEBUG_VIEW").ok();
+        let sun_angular_radius = std::env::var("REVOLUMETRIC_SUN_ANGULAR_RADIUS").ok();
         Self::from_values_report_with_denoiser(
             shadows.as_deref(),
             skip_backface.as_deref(),
@@ -176,6 +179,7 @@ impl LightingSettings {
             denoiser.as_deref(),
             denoiser_atrous_iterations.as_deref(),
             vpt_debug_view.as_deref(),
+            sun_angular_radius.as_deref(),
         )
     }
 
@@ -216,6 +220,7 @@ impl LightingSettings {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -230,6 +235,7 @@ impl LightingSettings {
         denoiser: Option<&str>,
         denoiser_atrous_iterations: Option<&str>,
         vpt_debug_view: Option<&str>,
+        sun_angular_radius: Option<&str>,
     ) -> LightingSettingsParseResult {
         let mut settings = Self::default();
         let mut warnings = Vec::new();
@@ -304,6 +310,14 @@ impl LightingSettings {
             "REVOLUMETRIC_VPT_DEBUG_VIEW",
             "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian",
             parse_vpt_debug_view,
+            &mut warnings,
+        );
+        apply_optional_override(
+            &mut settings.sun_angular_radius,
+            sun_angular_radius,
+            "REVOLUMETRIC_SUN_ANGULAR_RADIUS",
+            "finite float in 0.0..=0.25 radians",
+            parse_sun_angular_radius,
             &mut warnings,
         );
 
@@ -419,6 +433,11 @@ fn parse_vpt_max_bounces(value: &str) -> Option<u32> {
     (1..=8).contains(&parsed).then_some(parsed)
 }
 
+fn parse_sun_angular_radius(value: &str) -> Option<f32> {
+    let parsed = value.trim().parse::<f32>().ok()?;
+    (parsed.is_finite() && (0.0..=0.25).contains(&parsed)).then_some(parsed)
+}
+
 fn parse_exposure(value: &str) -> Option<f32> {
     let parsed = value.trim().parse::<f32>().ok()?;
     (parsed.is_finite() && parsed >= 0.0).then_some(parsed)
@@ -455,7 +474,7 @@ pub struct GpuSceneUniforms {
     pub resolution: [u32; 2],        // 8B
     pub _pad0: [u32; 2],             // 8B
     pub sun_direction: [f32; 3],     // 12B — normalized, world space, points TOWARD sun
-    pub _pad1: f32,                  // 4B
+    pub sun_angular_radius: f32,     // 4B
     pub sun_intensity: [f32; 3],     // 12B — HDR color * intensity
     pub _pad2: f32,                  // 4B
     pub sky_color: [f32; 3],         // 12B — hemisphere ambient upper
@@ -484,6 +503,7 @@ impl GpuSceneUniforms {
         self.exposure = settings.exposure;
         self.render_mode = settings.render_mode.as_gpu_value();
         self.vpt_max_bounces = settings.vpt_max_bounces;
+        self.sun_angular_radius = settings.sun_angular_radius;
         self.denoiser_flags = settings.denoiser_flags();
         self.denoiser_atrous_iterations = settings.denoiser_atrous_iterations;
         self.vpt_debug_view = settings.vpt_debug_view.as_gpu_value();
@@ -513,7 +533,7 @@ pub fn build_scene_uniforms(inputs: SceneUniformInputs) -> GpuSceneUniforms {
         resolution: inputs.resolution,
         _pad0: [0; 2],
         sun_direction: inputs.sun_direction.to_array(),
-        _pad1: 0.0,
+        sun_angular_radius: inputs.lighting_settings.sun_angular_radius,
         sun_intensity: inputs.sun_intensity.to_array(),
         _pad2: 0.0,
         sky_color: inputs.sky_color,
@@ -609,6 +629,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, pixel_to_ray), 0);
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, resolution), 64);
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, sun_direction), 80);
+        assert_eq!(
+            std::mem::offset_of!(GpuSceneUniforms, sun_angular_radius),
+            92
+        );
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, ground_color), 128);
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, lighting_flags), 144);
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, exposure), 148);
@@ -653,6 +677,38 @@ mod tests {
     }
 
     #[test]
+    fn scene_uniforms_expose_sun_angular_radius_without_growing_abi() {
+        let source = std::fs::read_to_string("assets/shaders/shared/scene_common.slang")
+            .expect("scene_common.slang should be readable");
+
+        assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 224);
+        assert_eq!(
+            std::mem::offset_of!(GpuSceneUniforms, sun_angular_radius),
+            92
+        );
+        assert!(source.contains("float    sun_angular_radius;"));
+
+        let settings = LightingSettings::from_values_report_with_denoiser(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0.02"),
+        )
+        .settings;
+        let mut uniforms = GpuSceneUniforms::zeroed();
+        uniforms.apply_lighting_settings(settings);
+
+        assert!((settings.sun_angular_radius - 0.02).abs() < f32::EPSILON);
+        assert!((uniforms.sun_angular_radius - 0.02).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn gpu_scene_uniforms_is_zeroable() {
         let u = GpuSceneUniforms::zeroed();
         assert_eq!(u.resolution, [0, 0]);
@@ -667,6 +723,7 @@ mod tests {
         assert!(!settings.skip_backface_shadows);
         assert_eq!(settings.render_mode, RenderMode::Vpt);
         assert_eq!(settings.vpt_max_bounces, 2);
+        assert_eq!(settings.sun_angular_radius, 0.02);
         assert_eq!(settings.debug_view, LightingDebugView::Final);
         assert_eq!(settings.exposure, 1.0);
     }
@@ -747,6 +804,7 @@ mod tests {
             skip_backface_shadows: true,
             render_mode: RenderMode::Vpt,
             vpt_max_bounces: 2,
+            sun_angular_radius: 0.02,
             debug_view: LightingDebugView::Final,
             exposure: 1.0,
             denoiser_enabled: true,
@@ -837,6 +895,7 @@ mod tests {
                 skip_backface_shadows: true,
                 render_mode: RenderMode::Vpt,
                 vpt_max_bounces: 2,
+                sun_angular_radius: 0.02,
                 debug_view,
                 exposure: 1.0,
                 denoiser_enabled: true,
@@ -898,6 +957,7 @@ mod tests {
             Some("off"),
             Some("4"),
             Some("history_valid"),
+            None,
         );
         let settings = result.settings;
         let mut uniforms = GpuSceneUniforms::zeroed();
@@ -934,6 +994,7 @@ mod tests {
                 None,
                 None,
                 Some(raw),
+                None,
             );
             let mut uniforms = GpuSceneUniforms::zeroed();
             uniforms.apply_lighting_settings(result.settings);
@@ -958,6 +1019,7 @@ mod tests {
             Some("maybe"),
             Some("9"),
             Some("beauty"),
+            None,
         );
 
         assert_eq!(result.settings, LightingSettings::default());
@@ -978,6 +1040,30 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.variable == "REVOLUMETRIC_VPT_DEBUG_VIEW")
+        );
+    }
+
+    #[test]
+    fn lighting_settings_warn_invalid_sun_angular_radius() {
+        let result = LightingSettings::from_values_report_with_denoiser(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("0.5"),
+        );
+
+        assert_eq!(result.settings.sun_angular_radius, 0.02);
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|warning| warning.variable == "REVOLUMETRIC_SUN_ANGULAR_RADIUS")
         );
     }
 }

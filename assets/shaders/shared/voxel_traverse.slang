@@ -28,11 +28,7 @@ bool brick_dda(
     hit_normal = float3(0);
     hit_t = 0.0;
 
-    float3 inv_dir = float3(
-        abs(ray_dir.x) > 1e-8 ? 1.0 / ray_dir.x : sign(ray_dir.x) * 1e8,
-        abs(ray_dir.y) > 1e-8 ? 1.0 / ray_dir.y : sign(ray_dir.y) * 1e8,
-        abs(ray_dir.z) > 1e-8 ? 1.0 / ray_dir.z : sign(ray_dir.z) * 1e8
-    );
+    float3 inv_dir = ray_safe_inv_dir(ray_dir);
 
     // Entry into [0, 8] box
     float2 box_t = intersect_aabb(ray_origin, inv_dir, AABB(float3(0), float3(8)));
@@ -41,7 +37,7 @@ bool brick_dda(
 
     float3 pos = ray_origin + ray_dir * (t_enter + 0.001);
     int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
-    int3 step_dir = int3(sign(ray_dir));
+    int3 step_dir = ray_step_dir(ray_dir);
     float current_t = t_enter;
 
     // Entry face normal: use brick AABB slab intersection to find which face was entered.
@@ -55,12 +51,16 @@ bool brick_dda(
         hit_normal = float3(0, -float(step_dir.y), 0);
     else
         hit_normal = float3(0, 0, -float(step_dir.z));
-    float3 t_delta = abs(inv_dir);   // distance in t to cross one voxel
+    float3 t_delta = float3(
+        ray_axis_t_delta(ray_dir.x, inv_dir.x, 1.0),
+        ray_axis_t_delta(ray_dir.y, inv_dir.y, 1.0),
+        ray_axis_t_delta(ray_dir.z, inv_dir.z, 1.0)
+    ); // distance in t to cross one voxel
     // t_max: distance to next voxel boundary along each axis
     float3 t_max = float3(
-        ((step_dir.x > 0 ? coord.x + 1 : coord.x) - ray_origin.x) * inv_dir.x,
-        ((step_dir.y > 0 ? coord.y + 1 : coord.y) - ray_origin.y) * inv_dir.y,
-        ((step_dir.z > 0 ? coord.z + 1 : coord.z) - ray_origin.z) * inv_dir.z
+        ray_axis_t_max(ray_origin.x, ray_dir.x, inv_dir.x, coord.x + 1, coord.x),
+        ray_axis_t_max(ray_origin.y, ray_dir.y, inv_dir.y, coord.y + 1, coord.y),
+        ray_axis_t_max(ray_origin.z, ray_dir.z, inv_dir.z, coord.z + 1, coord.z)
     );
 
     // Load the full BrickOccupancy once (80 bytes, fits in registers)
@@ -117,11 +117,7 @@ bool brick_any_hit(
         return false;
     }
 
-    float3 inv_dir = float3(
-        abs(ray_dir.x) > 1e-8 ? 1.0 / ray_dir.x : sign(ray_dir.x) * 1e8,
-        abs(ray_dir.y) > 1e-8 ? 1.0 / ray_dir.y : sign(ray_dir.y) * 1e8,
-        abs(ray_dir.z) > 1e-8 ? 1.0 / ray_dir.z : sign(ray_dir.z) * 1e8
-    );
+    float3 inv_dir = ray_safe_inv_dir(ray_dir);
 
     float2 box_t = intersect_aabb(ray_origin, inv_dir, AABB(float3(0), float3(8)));
     float t_enter = max(box_t.x, 0.0);
@@ -131,13 +127,17 @@ bool brick_any_hit(
 
     float3 pos = ray_origin + ray_dir * (t_enter + 0.001);
     int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
-    int3 step_dir = int3(sign(ray_dir));
+    int3 step_dir = ray_step_dir(ray_dir);
     float current_t = t_enter;
-    float3 t_delta = abs(inv_dir);
+    float3 t_delta = float3(
+        ray_axis_t_delta(ray_dir.x, inv_dir.x, 1.0),
+        ray_axis_t_delta(ray_dir.y, inv_dir.y, 1.0),
+        ray_axis_t_delta(ray_dir.z, inv_dir.z, 1.0)
+    );
     float3 t_max = float3(
-        ((step_dir.x > 0 ? coord.x + 1 : coord.x) - ray_origin.x) * inv_dir.x,
-        ((step_dir.y > 0 ? coord.y + 1 : coord.y) - ray_origin.y) * inv_dir.y,
-        ((step_dir.z > 0 ? coord.z + 1 : coord.z) - ray_origin.z) * inv_dir.z
+        ray_axis_t_max(ray_origin.x, ray_dir.x, inv_dir.x, coord.x + 1, coord.x),
+        ray_axis_t_max(ray_origin.y, ray_dir.y, inv_dir.y, coord.y + 1, coord.y),
+        ray_axis_t_max(ray_origin.z, ray_dir.z, inv_dir.z, coord.z + 1, coord.z)
     );
 
     for (int i = 0; i < 24 && current_t < max_t; i++) {
@@ -196,12 +196,16 @@ HitResult trace_primary_ray(
     // Brick-grid DDA setup
     float3 inv_dir = ray.inv_dir;
     int3 brick_coord = int3(clamp(floor(pos / 8.0), float3(0), grid_size - 1.0));
-    int3 step_dir = int3(sign(ray.direction));
-    float3 t_delta = abs(inv_dir) * 8.0; // distance in t to cross one brick (8 voxels)
+    int3 step_dir = ray_step_dir(ray.direction);
+    float3 t_delta = float3(
+        ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0),
+        ray_axis_t_delta(ray.direction.y, inv_dir.y, 8.0),
+        ray_axis_t_delta(ray.direction.z, inv_dir.z, 8.0)
+    ); // distance in t to cross one brick (8 voxels)
     float3 t_max = float3(
-        ((step_dir.x > 0 ? (brick_coord.x + 1) * 8.0 : brick_coord.x * 8.0) - pos.x) * inv_dir.x,
-        ((step_dir.y > 0 ? (brick_coord.y + 1) * 8.0 : brick_coord.y * 8.0) - pos.y) * inv_dir.y,
-        ((step_dir.z > 0 ? (brick_coord.z + 1) * 8.0 : brick_coord.z * 8.0) - pos.z) * inv_dir.z
+        ray_axis_t_max(pos.x, ray.direction.x, inv_dir.x, (brick_coord.x + 1) * 8.0, brick_coord.x * 8.0),
+        ray_axis_t_max(pos.y, ray.direction.y, inv_dir.y, (brick_coord.y + 1) * 8.0, brick_coord.y * 8.0),
+        ray_axis_t_max(pos.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
     );
 
     int3 igrid = int3(grid_size);
@@ -296,12 +300,16 @@ bool trace_any_hit_ray(
     float3 pos = ray.origin + ray.direction * (t_enter + 0.001);
     float3 inv_dir = ray.inv_dir;
     int3 brick_coord = int3(clamp(floor(pos / 8.0), float3(0), grid_size - 1.0));
-    int3 step_dir = int3(sign(ray.direction));
-    float3 t_delta = abs(inv_dir) * 8.0;
+    int3 step_dir = ray_step_dir(ray.direction);
+    float3 t_delta = float3(
+        ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0),
+        ray_axis_t_delta(ray.direction.y, inv_dir.y, 8.0),
+        ray_axis_t_delta(ray.direction.z, inv_dir.z, 8.0)
+    );
     float3 t_max = float3(
-        ((step_dir.x > 0 ? (brick_coord.x + 1) * 8.0 : brick_coord.x * 8.0) - ray.origin.x) * inv_dir.x,
-        ((step_dir.y > 0 ? (brick_coord.y + 1) * 8.0 : brick_coord.y * 8.0) - ray.origin.y) * inv_dir.y,
-        ((step_dir.z > 0 ? (brick_coord.z + 1) * 8.0 : brick_coord.z * 8.0) - ray.origin.z) * inv_dir.z
+        ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x, (brick_coord.x + 1) * 8.0, brick_coord.x * 8.0),
+        ray_axis_t_max(ray.origin.y, ray.direction.y, inv_dir.y, (brick_coord.y + 1) * 8.0, brick_coord.y * 8.0),
+        ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
     );
 
     int3 igrid = int3(grid_size);

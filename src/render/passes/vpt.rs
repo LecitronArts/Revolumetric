@@ -1407,7 +1407,7 @@ mod shader_source_tests {
         for token in [
             "restir_di_emissive_geometry_term",
             "reservoir.sample_radiance.rgb * geometry_term",
-            "restir_di_light_visible_from_hit(hit, reservoir)",
+            "restir_di_light_visible_from_hit(hit, reservoir, scene)",
             "float4 hit_position_depth = float4(hit.position, max(hit.t, 0.0));",
             "float4 hit_normal_roughness = float4(normalize(hit.normal), 0.0);",
             "float4 hit_albedo_material = float4(material_cell_albedo(hit.cell), float(voxel_material(hit.cell)));",
@@ -1438,9 +1438,9 @@ mod shader_source_tests {
             "bool brick_any_hit(",
             "float max_t",
             "BrickOccupancy occ",
-            " - ray.origin.x) * inv_dir.x",
-            " - ray.origin.y) * inv_dir.y",
-            " - ray.origin.z) * inv_dir.z",
+            "ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x",
+            "ray_axis_t_max(ray.origin.y, ray.direction.y, inv_dir.y",
+            "ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z",
             "StructuredBuffer<BrickOccupancy> occupancy_buf",
         ] {
             assert!(
@@ -1463,6 +1463,179 @@ mod shader_source_tests {
             !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),
             "VPT ReSTIR-DI visibility must not run full material-returning primary traversal for shadow rays"
         );
+    }
+
+    #[test]
+    fn vpt_restir_di_visibility_respects_shadow_disable_flag() {
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+
+        for token in [
+            "bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir, SceneUniforms scene)",
+            "(scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u",
+            "restir_di_light_visible_from_hit(hit, reservoir, scene)",
+        ] {
+            assert!(
+                vpt.contains(token),
+                "VPT ReSTIR-DI visibility should follow REVOLUMETRIC_LIGHTING_SHADOWS; missing token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn vpt_analytic_sun_direct_respects_voxel_shadow_visibility() {
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+
+        for token in [
+            "bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 sun_dir)",
+            "(scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u",
+            "Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, sun_dir);",
+            "bool sun_occluded = trace_any_hit_ray(",
+            "return !sun_occluded;",
+            "if (sun_term <= 0.0 || !analytic_sun_visible_from_hit(hit, scene, sun_dir))",
+        ] {
+            assert!(
+                vpt.contains(token),
+                "VPT analytic sun must test voxel shadow visibility; missing token {token}"
+            );
+        }
+
+        assert!(
+            !vpt.contains(
+                "return material_cell_albedo(hit.cell) * scene.sun_intensity * sun_term * 0.2;"
+            ),
+            "VPT analytic sun must not unconditionally add direct sunlight through voxel occluders"
+        );
+    }
+
+    #[test]
+    fn vpt_analytic_sun_samples_solar_disk_for_soft_shadow_edges() {
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+
+        for token in [
+            "float3 sample_sun_direction(SceneUniforms scene, inout uint rng_state)",
+            "scene.sun_angular_radius",
+            "float cos_min = cos(sun_radius);",
+            "float cos_theta = lerp(cos_min, 1.0, rand01(rng_state));",
+            "float phi = 6.28318530718 * rand01(rng_state);",
+            "float3 sun_dir = sample_sun_direction(scene, rng_state);",
+            "float sun_term = max(dot(hit.normal, sun_dir), 0.0);",
+            "analytic_sun_direct(hit, scene, rng_state)",
+        ] {
+            assert!(
+                vpt.contains(token),
+                "VPT analytic sun should sample a finite solar disk for soft shadows; missing token {token}"
+            );
+        }
+
+        assert!(
+            !vpt.contains("analytic_sun_direct(hit, scene);"),
+            "analytic sun direct lighting must consume rng_state so penumbrae can converge across VPT samples"
+        );
+    }
+
+    #[test]
+    fn voxel_ray_traversal_treats_parallel_axes_as_non_stepping_slabs() {
+        let ray =
+            std::fs::read_to_string("assets/shaders/shared/ray.slang").expect("ray shader exists");
+        let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+            .expect("voxel traversal shader should be readable");
+
+        for token in [
+            "static const float RAY_DIRECTION_EPSILON",
+            "static const float RAY_PARALLEL_INV_DIR",
+            "static const float RAY_T_MAX",
+            "float ray_safe_rcp(float direction_component)",
+            "float3 ray_safe_inv_dir(float3 direction)",
+            "int ray_step_component(float direction_component)",
+            "int3 ray_step_dir(float3 direction)",
+            "float ray_axis_t_delta(",
+            "float ray_axis_t_max(",
+            "r.inv_dir = ray_safe_inv_dir(direction);",
+        ] {
+            assert!(ray.contains(token), "ray helper missing token {token}");
+        }
+
+        assert!(
+            !ray.contains("sign(direction.x) *")
+                && !ray.contains("sign(direction.y) *")
+                && !ray.contains("sign(direction.z) *"),
+            "parallel ray reciprocals must not use sign(0), which produces a zero reciprocal"
+        );
+
+        for token in [
+            "float3 inv_dir = ray_safe_inv_dir(ray_dir);",
+            "int3 step_dir = ray_step_dir(ray_dir);",
+            "ray_axis_t_delta(ray_dir.x, inv_dir.x, 1.0)",
+            "ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0)",
+            "ray_axis_t_max(ray_origin.x, ray_dir.x, inv_dir.x",
+            "ray_axis_t_max(pos.x, ray.direction.x, inv_dir.x",
+            "ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x",
+        ] {
+            assert!(
+                traverse.contains(token),
+                "voxel traversal missing robust parallel-axis token {token}"
+            );
+        }
+
+        assert!(
+            !traverse.contains("int3(sign(ray_dir))")
+                && !traverse.contains("int3(sign(ray.direction))")
+                && !traverse.contains("sign(ray_dir.x) *")
+                && !traverse.contains("sign(ray.direction.x) *"),
+            "DDA must not step a zero-direction axis or derive reciprocal from sign(0)"
+        );
+    }
+
+    #[test]
+    fn ray_aabb_rejects_parallel_axes_that_start_outside_the_slab() {
+        let math = std::fs::read_to_string("assets/shaders/shared/math.slang")
+            .expect("math shader should be readable");
+
+        for token in [
+            "static const float AABB_PARALLEL_INV_DIR_THRESHOLD",
+            "static const float AABB_T_MAX",
+            "float2 aabb_axis_interval(",
+            "origin_component < min_component || origin_component > max_component",
+            "return float2(1.0, 0.0);",
+            "return float2(-AABB_T_MAX, AABB_T_MAX);",
+            "float2 x = aabb_axis_interval(origin.x, inv_dir.x, box.mn.x, box.mx.x);",
+            "float2 y = aabb_axis_interval(origin.y, inv_dir.y, box.mn.y, box.mx.y);",
+            "float2 z = aabb_axis_interval(origin.z, inv_dir.z, box.mn.z, box.mx.z);",
+        ] {
+            assert!(
+                math.contains(token),
+                "AABB slab intersection missing parallel-axis rejection token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn vpt_ray_biases_do_not_skip_voxel_faces_or_shadow_endpoints() {
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+
+        for token in [
+            "static const float VPT_RAY_SURFACE_BIAS",
+            "static const float VPT_LIGHT_ENDPOINT_BIAS",
+            "hit.position + hit.normal * VPT_RAY_SURFACE_BIAS",
+            "max_light_t = max(light_distance - VPT_LIGHT_ENDPOINT_BIAS, 0.0);",
+        ] {
+            assert!(vpt.contains(token), "VPT shader missing bias token {token}");
+        }
+
+        for forbidden in [
+            "hit.normal * 0.75",
+            "hit.normal * 0.05 + shadow_dir * 0.05",
+            "light_distance - 1.0",
+        ] {
+            assert!(
+                !vpt.contains(forbidden),
+                "VPT shader uses leak-prone large ray bias token {forbidden}"
+            );
+        }
     }
 
     #[test]
