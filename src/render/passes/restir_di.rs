@@ -4,10 +4,14 @@ use gpu_allocator::MemoryLocation;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::GpuImage;
+use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::{
     GpuDirectLight, GpuRestirDiReservoir, GpuRestirDiUniforms, RestirDiSettings,
 };
@@ -37,6 +41,13 @@ pub struct RestirDiPassCreateInfo<'a> {
     pub direct_lights: &'a [GpuDirectLight],
 }
 
+pub struct RestirDiGraphBuffers<'a> {
+    pub uniform_buffer: &'a GpuBuffer,
+    pub uniform_resource: ResourceHandle,
+    pub selected_current_buffer: &'a GpuBuffer,
+    pub selected_current_resource: ResourceHandle,
+}
+
 struct RestirDiBuffers {
     uniform_buffers: Vec<GpuBuffer>,
     direct_lights: GpuBuffer,
@@ -52,7 +63,57 @@ struct RestirDiStage {
     descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
+fn restir_di_effective_settings(
+    settings: RestirDiSettings,
+    history_initialized: bool,
+) -> RestirDiSettings {
+    let mut settings = settings;
+    if !history_initialized {
+        settings.temporal_enabled = false;
+    }
+    settings.spatial_enabled = settings.temporal_enabled && settings.spatial_enabled;
+    settings
+}
+
 impl RestirDiPass {
+    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 6] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
+    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
+    pub(crate) fn spatial_descriptor_binding_specs() -> [DescriptorBindingSpec; 6] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -71,14 +132,7 @@ impl RestirDiPass {
         let initial_stage = match RestirDiStage::new(
             device,
             info.initial_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_BUFFER),
-                (3, vk::DescriptorType::STORAGE_IMAGE),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-            ],
+            &Self::initial_descriptor_binding_specs(),
             info.frame_count,
             &[
                 vk::DescriptorPoolSize {
@@ -104,19 +158,7 @@ impl RestirDiPass {
         let temporal_stage = match RestirDiStage::new(
             device,
             info.temporal_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_BUFFER),
-                (3, vk::DescriptorType::STORAGE_BUFFER),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-                (6, vk::DescriptorType::STORAGE_IMAGE),
-                (7, vk::DescriptorType::STORAGE_IMAGE),
-                (8, vk::DescriptorType::STORAGE_IMAGE),
-                (9, vk::DescriptorType::STORAGE_IMAGE),
-                (10, vk::DescriptorType::STORAGE_IMAGE),
-            ],
+            &Self::temporal_descriptor_binding_specs(),
             info.frame_count,
             &[
                 vk::DescriptorPoolSize {
@@ -143,14 +185,7 @@ impl RestirDiPass {
         let spatial_stage = match RestirDiStage::new(
             device,
             info.spatial_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_BUFFER),
-                (3, vk::DescriptorType::STORAGE_IMAGE),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-            ],
+            &Self::spatial_descriptor_binding_specs(),
             info.frame_count,
             &[
                 vk::DescriptorPoolSize {
@@ -203,6 +238,209 @@ impl RestirDiPass {
             self.height,
         );
         write_mapped(self.uniform_buffers[frame_slot].mapped_ptr(), &uniforms);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        device: &ash::Device,
+        vpt: &'a VptPass,
+        frame_slot: usize,
+        frame_index: u64,
+        settings: RestirDiSettings,
+        history_initialized: bool,
+        final_surface_writes: [ResourceHandle; 4],
+        previous_surface_resources: [ResourceHandle; 3],
+        profiler: Option<&'a GpuProfiler>,
+    ) -> RestirDiGraphBuffers<'a> {
+        let settings = restir_di_effective_settings(settings, history_initialized);
+        self.update_uniforms(frame_slot, settings, frame_index);
+
+        let (uniform_buffer, uniform_size, uniform_usage) = self.uniform_buffer(frame_slot);
+        let (direct_light_buffer, direct_light_size, direct_light_usage) =
+            self.direct_light_buffer();
+        let (initial_buffer, initial_size, initial_usage) = self.initial_buffer();
+        let (temporal_buffer, temporal_size, temporal_usage) = self.temporal_buffer();
+        let (selected_current_buffer, selected_current_size, selected_current_usage) =
+            self.selected_current_buffer(frame_slot);
+        let (selected_history_buffer, selected_history_size, selected_history_usage) =
+            self.selected_history_buffer(frame_slot);
+        let temporal_active = settings.temporal_enabled;
+        let spatial_active = temporal_active && settings.spatial_enabled;
+        self.update_frame_descriptors(
+            device,
+            frame_slot,
+            selected_history_buffer,
+            selected_current_buffer,
+            temporal_active,
+            spatial_active,
+        );
+
+        let initial_resource = graph.import_buffer_with_access(
+            initial_buffer.handle,
+            initial_size,
+            initial_usage,
+            AccessKind::Undefined,
+        );
+        let temporal_resource = graph.import_buffer_with_access(
+            temporal_buffer.handle,
+            temporal_size,
+            temporal_usage,
+            AccessKind::Undefined,
+        );
+        let selected_current_resource = graph.import_buffer_with_access(
+            selected_current_buffer.handle,
+            selected_current_size,
+            selected_current_usage,
+            AccessKind::Undefined,
+        );
+        let selected_history_resource = graph.import_buffer_with_access(
+            selected_history_buffer.handle,
+            selected_history_size,
+            selected_history_usage,
+            if history_initialized {
+                AccessKind::ComputeShaderWrite
+            } else {
+                AccessKind::Undefined
+            },
+        );
+        let uniform_resource = graph.import_buffer_with_access(
+            uniform_buffer.handle,
+            uniform_size,
+            uniform_usage,
+            AccessKind::ComputeShaderRead,
+        );
+        let direct_light_resource = graph.import_buffer_with_access(
+            direct_light_buffer.handle,
+            direct_light_size,
+            direct_light_usage,
+            AccessKind::ComputeShaderRead,
+        );
+
+        let initial_writes = graph.add_pass("restir_di_initial", QueueType::Compute, |builder| {
+            builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+            builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
+            builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
+            builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
+            builder.read_as(direct_light_resource, AccessKind::ComputeShaderRead);
+            let initial_output_resource = if temporal_active {
+                initial_resource
+            } else {
+                selected_current_resource
+            };
+            builder.write_as(initial_output_resource, AccessKind::ComputeShaderWrite);
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RestirDiInitial,
+                    );
+                }
+                self.record_initial(ctx.device, ctx.command_buffer, frame_slot);
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RestirDiInitial,
+                    );
+                }
+            })
+        });
+        let initial_dep = initial_writes[0];
+        let temporal_dep = if temporal_active {
+            let temporal_writes =
+                graph.add_pass("restir_di_temporal", QueueType::Compute, |builder| {
+                    builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[3], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
+                    builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
+                    let temporal_output_resource = if spatial_active {
+                        temporal_resource
+                    } else {
+                        selected_current_resource
+                    };
+                    builder.write_as(temporal_output_resource, AccessKind::ComputeShaderWrite);
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RestirDiTemporal,
+                            );
+                        }
+                        self.record_temporal(ctx.device, ctx.command_buffer, frame_slot);
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RestirDiTemporal,
+                            );
+                        }
+                    })
+                });
+            temporal_writes[0]
+        } else {
+            initial_dep
+        };
+        let selected_current_dep = if spatial_active {
+            let spatial_writes =
+                graph.add_pass("restir_di_spatial", QueueType::Compute, |builder| {
+                    builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(temporal_dep, AccessKind::ComputeShaderRead);
+                    builder.write_as(selected_current_resource, AccessKind::ComputeShaderWrite);
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RestirDiSpatial,
+                            );
+                        }
+                        self.record_spatial(ctx.device, ctx.command_buffer, frame_slot);
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RestirDiSpatial,
+                            );
+                        }
+                    })
+                });
+            spatial_writes[0]
+        } else {
+            temporal_dep
+        };
+
+        vpt.update_restir_di_descriptors(
+            device,
+            frame_slot,
+            uniform_buffer,
+            selected_current_buffer,
+        );
+
+        RestirDiGraphBuffers {
+            uniform_buffer,
+            uniform_resource,
+            selected_current_buffer,
+            selected_current_resource: selected_current_dep,
+        }
     }
 
     pub fn update_surface_descriptors(&self, device: &ash::Device, surface: &VptSurfacePass) {
@@ -494,15 +732,13 @@ impl RestirDiStage {
     fn new(
         device: &ash::Device,
         spirv_bytes: &[u8],
-        bindings: &[(u32, vk::DescriptorType)],
+        bindings: &[DescriptorBindingSpec],
         frame_count: usize,
         pool_sizes: &[vk::DescriptorPoolSize],
     ) -> Result<Self> {
-        let mut builder = DescriptorLayoutBuilder::new();
-        for &(binding, ty) in bindings {
-            builder = builder.add_binding(binding, ty, vk::ShaderStageFlags::COMPUTE, 1);
-        }
-        let descriptor_set_layout = builder.build(device)?;
+        let descriptor_set_layout = DescriptorLayoutBuilder::new()
+            .add_binding_specs(bindings)
+            .build(device)?;
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, pool_sizes) {
             Ok(pool) => pool,
             Err(error) => {
@@ -801,8 +1037,97 @@ fn write_mapped_slice<T: Copy>(mapped_ptr: Option<*mut u8>, values: &[T]) {
 
 #[cfg(test)]
 mod shader_source_tests {
+    use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
+
+    use super::RestirDiPass;
+
     fn source(path: &str) -> String {
-        std::fs::read_to_string(path).expect("shader source should be readable")
+        crate::render::source_checks::read_source(path)
+    }
+
+    fn binding(binding: u32, kind: DescriptorKind, name: &str) -> DescriptorBinding {
+        DescriptorBinding {
+            set: 0,
+            binding,
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    fn shader_reflection(path: &str) -> ShaderReflection {
+        ShaderReflection::from_slang_source("main", &source(path))
+            .expect("shader reflection should parse")
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        shader_reflection(path).bindings
+    }
+
+    #[test]
+    fn restir_di_descriptor_specs_match_shader_manifests() {
+        let initial_specs = RestirDiPass::initial_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "ReSTIR-DI initial",
+            &initial_specs,
+            &shader_reflection("assets/shaders/passes/restir_di_initial.slang"),
+        );
+
+        let temporal_specs = RestirDiPass::temporal_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "ReSTIR-DI temporal",
+            &temporal_specs,
+            &shader_reflection("assets/shaders/passes/restir_di_temporal.slang"),
+        );
+
+        let spatial_specs = RestirDiPass::spatial_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "ReSTIR-DI spatial",
+            &spatial_specs,
+            &shader_reflection("assets/shaders/passes/restir_di_spatial.slang"),
+        );
+    }
+
+    #[test]
+    fn restir_di_initial_shader_binding_manifest_matches_expected_resources() {
+        assert_eq!(
+            shader_bindings("assets/shaders/passes/restir_di_initial.slang"),
+            vec![
+                binding(0, DescriptorKind::UniformBuffer, "restir"),
+                binding(1, DescriptorKind::StorageBuffer, "direct_lights"),
+                binding(2, DescriptorKind::StorageBuffer, "output_reservoirs"),
+                binding(
+                    3,
+                    DescriptorKind::StorageImage,
+                    "current_surface_position_depth",
+                ),
+                binding(
+                    4,
+                    DescriptorKind::StorageImage,
+                    "current_surface_normal_roughness",
+                ),
+                binding(
+                    5,
+                    DescriptorKind::StorageImage,
+                    "current_surface_albedo_material",
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn restir_di_pass_owns_graph_registration_contract() {
+        let pass = source("src/render/passes/restir_di.rs");
+        let implementation = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        assert!(implementation.contains("pub fn register_graph"));
+        assert!(
+            implementation.contains(
+                "builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead)"
+            )
+        );
+        assert!(implementation.contains("vpt.update_restir_di_descriptors"));
     }
 
     #[test]
@@ -958,6 +1283,7 @@ mod shader_source_tests {
         let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
         let pass = source("src/render/passes/restir_di.rs");
         let app = source("src/app.rs");
+        let pipeline = source("src/render/vpt_pipeline.rs");
         let compact_app = app.split_whitespace().collect::<String>();
 
         for shader in [&initial, &temporal, &spatial] {
@@ -989,7 +1315,7 @@ mod shader_source_tests {
         assert!(pass.contains("update_surface_descriptors"));
         assert!(pass.contains("VptSurfacePass"));
         assert!(pass.contains("DescriptorType::STORAGE_IMAGE"));
-        assert!(app.contains("restir_di.update_surface_descriptors"));
+        assert!(pipeline.contains("restir_di.update_surface_descriptors"));
         assert!(
             compact_app
                 .contains("builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead)")
@@ -1040,16 +1366,17 @@ mod shader_source_tests {
             "ReSTIR-DI graph must not add a transfer history update pass"
         );
         assert!(
-            compact_app.contains("selected_current_resource")
-                && compact_app.contains("selected_history_resource")
-                && compact_app.contains("builder.write_as(selected_current_resource,")
-                && compact_app.contains("AccessKind::ComputeShaderWrite,);")
-                && compact_app
-                    .contains("vpt_restir_reads=Some((uniform_resource,selected_current_dep))"),
+            pass_impl.contains("selected_current_resource")
+                && pass_impl.contains("selected_history_resource")
+                && compact_app.contains(
+                    "vpt_restir_reads=Some((restir_graph.uniform_resource,restir_graph.selected_current_resource,));"
+                ),
             "ReSTIR-DI graph must write the current selected slot and feed that exact resource to VPT"
         );
         assert!(
-            !compact_app.contains("builder.read_as(selected_current_dep,AccessKind::TransferRead)"),
+            !compact_app.contains("builder.read_as(selected_current_dep,AccessKind::TransferRead)")
+                && !pass_impl
+                    .contains("builder.read_as(selected_current_dep, AccessKind::TransferRead)"),
             "ReSTIR-DI current selected resource must not be copied through the transfer queue"
         );
     }
@@ -1057,30 +1384,42 @@ mod shader_source_tests {
     #[test]
     fn app_restir_di_dispatches_only_enabled_reuse_stages() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
+        let compact_app = app.split_whitespace().collect::<String>();
         let pass = source("src/render/passes/restir_di.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        let compact_pass = pass_impl.split_whitespace().collect::<String>();
 
         for token in [
-            "letrestir_di_temporal_active=restir_di_settings.temporal_enabled;",
-            "letrestir_di_spatial_active=restir_di_temporal_active&&restir_di_settings.spatial_enabled;",
-            "restir_di.update_frame_descriptors(renderer.device(),frame.frame_slot,selected_history_buffer,selected_current_buffer,restir_di_temporal_active,restir_di_spatial_active,);",
-            "letinitial_output_resource=ifrestir_di_temporal_active{initial_resource}else{selected_current_resource};",
-            "lettemporal_dep=ifrestir_di_temporal_active{",
-            "letselected_current_dep=ifrestir_di_spatial_active",
+            "letsettings=restir_di_effective_settings(settings,history_initialized);",
+            "lettemporal_active=settings.temporal_enabled;",
+            "letspatial_active=temporal_active&&settings.spatial_enabled;",
+            "self.update_frame_descriptors(device,frame_slot,selected_history_buffer,selected_current_buffer,temporal_active,spatial_active,);",
+            "letinitial_output_resource=iftemporal_active{initial_resource}else{selected_current_resource};",
+            "lettemporal_dep=iftemporal_active{",
+            "letselected_current_dep=ifspatial_active",
         ] {
             assert!(
-                compact.contains(token),
-                "ReSTIR-DI app graph must gate disabled reuse stages and keep selected-current descriptors in sync: {token}"
+                compact_pass.contains(token),
+                "ReSTIR-DI pass graph must gate disabled reuse stages and keep selected-current descriptors in sync: {token}"
             );
         }
         assert!(
-            pass.contains("temporal_enabled: bool")
+            pass_impl.contains("temporal_enabled: bool")
                 && pass.contains("let initial_output = if temporal_enabled")
                 && pass.contains("self.initial_stage.write_storage_descriptors_for_frame(\n            device,\n            frame_slot,\n            2,\n            &[initial_output],\n        );"),
             "when temporal reuse is disabled, ReSTIR-DI initial must write the selected current slot that VPT reads"
         );
         assert!(
-            !compact.contains(
+            compact_app.contains("restir_di.register_graph(")
+                && compact_app
+                    .contains("self.restir_di_settings,self.vpt_pipeline.frame_state.restir_di_history_initialized,"),
+            "app must delegate ReSTIR-DI graph registration with the runtime settings"
+        );
+        assert!(
+            !compact_pass.contains(
                 "letinitial_dep=initial_writes[0];lettemporal_writes=graph.add_pass(\"restir_di_temporal\""
             ),
             "ReSTIR-DI must not run temporal or graph-read selected history when temporal reuse is disabled"
@@ -1090,14 +1429,14 @@ mod shader_source_tests {
     #[test]
     fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
-        let needle = "restir_di.update_surface_descriptors(&device,vpt_surface);";
-        assert_eq!(
-            compact.matches(needle).count(),
-            1,
-            "surface descriptor rewrites must stay out of the per-frame render path"
+        let pipeline = source("src/render/vpt_pipeline.rs");
+
+        assert!(!app.contains("restir_di.update_surface_descriptors(&device,vpt_surface);"));
+        assert!(
+            pipeline.contains("restir_di.update_surface_descriptors(&device, vpt_surface);")
+                || pipeline.contains("restir_di.update_surface_descriptors(&device,vpt_surface);")
         );
-        assert!(compact.contains("vpt_surface.resize_images("));
+        assert!(app.contains("self.vpt_pipeline.resize("));
     }
 
     #[test]
@@ -1299,11 +1638,12 @@ mod shader_source_tests {
     #[test]
     fn restir_di_light_table_excludes_analytic_sun_and_preserves_emissive_sampling_power() {
         let app = source("src/app.rs");
+        let pipeline = source("src/render/vpt_pipeline.rs");
         let restir = source("src/render/restir_di.rs");
         let vpt = source("assets/shaders/passes/vpt.slang");
 
         assert!(
-            app.contains("build_direct_lights_from_ucvh(ucvh"),
+            pipeline.contains("build_direct_lights_from_ucvh(ucvh"),
             "ReSTIR-DI direct-light setup should build a finite-emissive light table; the analytic sun is evaluated separately in VPT"
         );
         assert!(
@@ -1410,7 +1750,11 @@ mod shader_source_tests {
 
     #[test]
     fn app_profiles_each_restir_di_compute_stage_separately() {
-        let app = source("src/app.rs");
+        let pass = source("src/render/passes/restir_di.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
 
         for scope in [
             "GpuProfileScope::RestirDiInitial",
@@ -1418,35 +1762,46 @@ mod shader_source_tests {
             "GpuProfileScope::RestirDiSpatial",
         ] {
             assert!(
-                app.contains(scope),
+                pass_impl.contains(scope),
                 "{scope} should be emitted around the matching ReSTIR graph pass"
             );
         }
         assert!(
-            app.find("GpuProfileScope::RestirDiInitial") < app.find("restir_di.record_initial(")
+            pass_impl.find("GpuProfileScope::RestirDiInitial")
+                < pass_impl.find("self.record_initial(")
         );
         assert!(
-            app.find("GpuProfileScope::RestirDiTemporal") < app.find("restir_di.record_temporal(")
+            pass_impl.find("GpuProfileScope::RestirDiTemporal")
+                < pass_impl.find("self.record_temporal(")
         );
         assert!(
-            app.find("GpuProfileScope::RestirDiSpatial") < app.find("restir_di.record_spatial(")
+            pass_impl.find("GpuProfileScope::RestirDiSpatial")
+                < pass_impl.find("self.record_spatial(")
         );
     }
 
     #[test]
     fn app_skips_spatial_passthrough_when_spatial_reuse_is_disabled() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
+        let compact_app = app.split_whitespace().collect::<String>();
+        let pass = source("src/render/passes/restir_di.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        let compact_pass = pass_impl.split_whitespace().collect::<String>();
 
         assert!(
-            compact.contains("ifrestir_di_spatial_active{"),
+            compact_pass.contains("ifspatial_active{"),
             "the spatial graph pass should be created only when spatial reuse is enabled"
         );
         assert!(
-            compact.contains("lettemporal_output_resource=ifrestir_di_spatial_active{temporal_resource}else{selected_current_resource};")
-                && compact.contains("letselected_current_dep=ifrestir_di_spatial_active{")
-                && compact.contains("}else{temporal_dep};")
-                && compact.contains("vpt_restir_reads=Some((uniform_resource,selected_current_dep))"),
+            compact_pass.contains("lettemporal_output_resource=ifspatial_active{temporal_resource}else{selected_current_resource};")
+                && compact_pass.contains("letselected_current_dep=ifspatial_active{")
+                && compact_pass.contains("}else{temporal_dep};")
+                && compact_app.contains(
+                    "vpt_restir_reads=Some((restir_graph.uniform_resource,restir_graph.selected_current_resource,));"
+                ),
             "spatial-disabled ReSTIR should write the temporal output directly into the current selected slot"
         );
     }
@@ -1467,8 +1822,7 @@ mod shader_source_tests {
 
     #[test]
     fn restir_di_pass_does_not_issue_pass_local_barriers() {
-        let implementation = std::fs::read_to_string("src/render/passes/restir_di.rs")
-            .expect("restir pass source should be readable");
+        let implementation = source("src/render/passes/restir_di.rs");
         let implementation = implementation
             .split("#[cfg(test)]")
             .next()
@@ -1480,8 +1834,7 @@ mod shader_source_tests {
 
     #[test]
     fn restir_di_pass_cleans_up_failed_construction_paths() {
-        let implementation = std::fs::read_to_string("src/render/passes/restir_di.rs")
-            .expect("restir pass source should be readable");
+        let implementation = source("src/render/passes/restir_di.rs");
         let implementation = implementation
             .split("#[cfg(test)]")
             .next()

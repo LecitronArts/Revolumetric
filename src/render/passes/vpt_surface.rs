@@ -6,7 +6,7 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::area_restir::{GpuAreaRestirReservoir, GpuAreaRestirUniforms};
 use crate::render::buffer::GpuBuffer;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
@@ -32,6 +32,23 @@ pub struct VptSurfacePass {
 }
 
 impl VptSurfacePass {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 12] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -42,78 +59,7 @@ impl VptSurfacePass {
         scene_ubo: &SceneUniformBuffer,
     ) -> Result<Self> {
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
-            .add_binding(
-                0,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                1,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                2,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                3,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                4,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                5,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                6,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                7,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                8,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                9,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                10,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                11,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
+            .add_binding_specs(&Self::descriptor_binding_specs())
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
@@ -911,6 +857,26 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
             value as *const T as *const u8,
             ptr,
             std::mem::size_of::<T>(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod shader_source_tests {
+    use crate::assets::shader_reflect::ShaderReflection;
+
+    use super::*;
+
+    #[test]
+    fn vpt_surface_descriptor_specs_match_shader_manifest() {
+        let source =
+            crate::render::source_checks::read_source("assets/shaders/passes/vpt_surface.slang");
+        let reflection = ShaderReflection::from_slang_source("main", &source)
+            .expect("shader reflection should parse");
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "VPT surface",
+            &VptSurfacePass::descriptor_binding_specs(),
+            &reflection,
         );
     }
 }

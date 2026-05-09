@@ -1,6 +1,25 @@
 use anyhow::{Context, Result};
 use ash::vk;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DescriptorBindingSpec {
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub stage_flags: vk::ShaderStageFlags,
+    pub count: u32,
+}
+
+impl DescriptorBindingSpec {
+    pub const fn compute(binding: u32, descriptor_type: vk::DescriptorType) -> Self {
+        Self {
+            binding,
+            descriptor_type,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            count: 1,
+        }
+    }
+}
+
 pub struct DescriptorLayoutBuilder {
     bindings: Vec<vk::DescriptorSetLayoutBinding<'static>>,
 }
@@ -26,6 +45,22 @@ impl DescriptorLayoutBuilder {
                 .descriptor_count(count)
                 .stage_flags(stage_flags),
         );
+        self
+    }
+
+    pub fn add_binding_spec(self, spec: DescriptorBindingSpec) -> Self {
+        self.add_binding(
+            spec.binding,
+            spec.descriptor_type,
+            spec.stage_flags,
+            spec.count,
+        )
+    }
+
+    pub fn add_binding_specs(mut self, specs: &[DescriptorBindingSpec]) -> Self {
+        for spec in specs {
+            self = self.add_binding_spec(*spec);
+        }
         self
     }
 
@@ -75,5 +110,49 @@ impl DescriptorPool {
 
     pub fn destroy(&self, device: &ash::Device) {
         unsafe { device.destroy_descriptor_pool(self.handle, None) };
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_specs_match_shader_bindings(
+    pass_name: &str,
+    specs: &[DescriptorBindingSpec],
+    reflection: &crate::assets::shader_reflect::ShaderReflection,
+) {
+    use crate::assets::shader_reflect::DescriptorKind;
+
+    assert_eq!(
+        specs.len(),
+        reflection.bindings.len(),
+        "{pass_name} descriptor spec count must match shader reflection"
+    );
+    for spec in specs {
+        let expected_kind = match spec.descriptor_type {
+            vk::DescriptorType::UNIFORM_BUFFER => DescriptorKind::UniformBuffer,
+            vk::DescriptorType::STORAGE_BUFFER => DescriptorKind::StorageBuffer,
+            vk::DescriptorType::STORAGE_IMAGE => DescriptorKind::StorageImage,
+            other => panic!("{pass_name} uses unsupported descriptor type {other:?}"),
+        };
+        assert!(
+            reflection.bindings.iter().any(|binding| {
+                binding.set == 0 && binding.binding == spec.binding && binding.kind == expected_kind
+            }),
+            "{pass_name} descriptor binding {} missing from shader reflection",
+            spec.binding
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_descriptor_spec_uses_compute_stage_and_count_one() {
+        let spec = DescriptorBindingSpec::compute(6, vk::DescriptorType::UNIFORM_BUFFER);
+        assert_eq!(spec.binding, 6);
+        assert_eq!(spec.descriptor_type, vk::DescriptorType::UNIFORM_BUFFER);
+        assert_eq!(spec.stage_flags, vk::ShaderStageFlags::COMPUTE);
+        assert_eq!(spec.count, 1);
     }
 }
