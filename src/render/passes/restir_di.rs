@@ -1264,8 +1264,9 @@ mod shader_source_tests {
 
         assert!(vpt.contains("restir_di_light_visible_from_hit"));
         assert!(
-            vpt.contains("trace_any_hit_ray(") && vpt.contains("return !shadow_occluded;"),
-            "ReSTIR direct resolve must reject occluded reservoirs with an any-hit visibility query before selected_weight creates bright leaks"
+            vpt.contains("voxel_shadow_occluded_from_hit(hit, shadow_dir, max_light_t)")
+                && vpt.contains("return !shadow_occluded;"),
+            "ReSTIR direct resolve must reject occluded reservoirs with a source-voxel-skipping any-hit visibility query before selected_weight creates bright leaks"
         );
         assert!(
             !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),

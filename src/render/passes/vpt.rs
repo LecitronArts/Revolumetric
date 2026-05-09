@@ -1597,6 +1597,7 @@ mod shader_source_tests {
 
         for token in [
             "bool trace_any_hit_ray(",
+            "bool trace_any_hit_ray_skip_voxel(",
             "bool brick_any_hit(",
             "float max_t",
             "BrickOccupancy occ",
@@ -1617,9 +1618,9 @@ mod shader_source_tests {
             "any-hit shadow traversal must not bind or read material cells"
         );
         assert!(
-            vpt.contains("bool shadow_occluded = trace_any_hit_ray(")
+            vpt.contains("bool shadow_occluded = voxel_shadow_occluded_from_hit(hit, shadow_dir, max_light_t);")
                 && vpt.contains("return !shadow_occluded;"),
-            "VPT ReSTIR-DI visibility should use boolean any-hit shadow traversal"
+            "VPT ReSTIR-DI visibility should use source-voxel-skipping boolean any-hit shadow traversal"
         );
         assert!(
             !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),
@@ -1650,10 +1651,11 @@ mod shader_source_tests {
             .expect("vpt shader should be readable");
 
         for token in [
+            "bool voxel_shadow_occluded_from_hit(HitResult hit, float3 shadow_dir, float max_t)",
             "bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 sun_dir)",
             "(scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u",
-            "Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, sun_dir);",
-            "bool sun_occluded = trace_any_hit_ray(",
+            "Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, shadow_dir);",
+            "bool sun_occluded = voxel_shadow_occluded_from_hit(hit, sun_dir, 1.0e20);",
             "return !sun_occluded;",
             "if (sun_term <= 0.0 || !analytic_sun_visible_from_hit(hit, scene, sun_dir))",
         ] {
@@ -1733,7 +1735,6 @@ mod shader_source_tests {
             "ray_axis_t_delta(ray_dir.x, inv_dir.x, 1.0)",
             "ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0)",
             "ray_axis_t_max(ray_origin.x, ray_dir.x, inv_dir.x",
-            "ray_axis_t_max(pos.x, ray.direction.x, inv_dir.x",
             "ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x",
         ] {
             assert!(
@@ -1806,6 +1807,31 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn voxel_traversal_uses_direction_aware_entry_cells_instead_of_fixed_nudge() {
+        let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+            .expect("voxel traversal shader should be readable");
+
+        for token in [
+            "static const float DDA_GRID_BOUNDARY_EPSILON",
+            "float dda_adjust_boundary_position(",
+            "int dda_start_coord(",
+            "int3 dda_start_coord3(",
+            "dda_start_coord3(entry_pos",
+            "ray.origin.x, ray.direction.x, inv_dir.x",
+        ] {
+            assert!(
+                traverse.contains(token),
+                "voxel traversal shader missing direction-aware DDA entry token {token}"
+            );
+        }
+
+        assert!(
+            !traverse.contains("t_enter + 0.001"),
+            "fixed t-space entry nudges perturb cell selection at voxel and brick boundaries"
+        );
+    }
+
+    #[test]
     fn vpt_ray_biases_do_not_skip_voxel_faces_or_shadow_endpoints() {
         let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
             .expect("vpt shader should be readable");
@@ -1827,6 +1853,42 @@ mod shader_source_tests {
             assert!(
                 !vpt.contains(forbidden),
                 "VPT shader uses leak-prone large ray bias token {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn vpt_shadow_visibility_skips_originating_voxel_to_avoid_surface_acne() {
+        let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+            .expect("voxel traversal shader should be readable");
+        let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+            .expect("vpt shader should be readable");
+
+        for token in [
+            "static const uint VOXEL_TRAVERSAL_NO_SKIP_BRICK",
+            "bool voxel_traversal_should_skip_shadow_hit(",
+            "bool trace_any_hit_ray_skip_voxel(",
+            "uint skip_brick_id",
+            "uint3 skip_local",
+            "node.brick_id",
+        ] {
+            assert!(
+                traverse.contains(token),
+                "voxel traversal shader missing source-voxel shadow skip token {token}"
+            );
+        }
+
+        for token in [
+            "bool voxel_shadow_occluded_from_hit(HitResult hit, float3 shadow_dir, float max_t)",
+            "trace_any_hit_ray_skip_voxel(",
+            "hit.brick_id",
+            "hit.local",
+            "bool sun_occluded = voxel_shadow_occluded_from_hit(hit, sun_dir, 1.0e20);",
+            "bool shadow_occluded = voxel_shadow_occluded_from_hit(hit, shadow_dir, max_light_t);",
+        ] {
+            assert!(
+                vpt.contains(token),
+                "VPT shader missing source-voxel shadow skip token {token}"
             );
         }
     }

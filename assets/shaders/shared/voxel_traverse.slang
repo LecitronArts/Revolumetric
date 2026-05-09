@@ -12,6 +12,8 @@
 #include "voxel_common.slang"
 
 static const float DDA_TIE_EPSILON = 1.0e-6;
+static const float DDA_GRID_BOUNDARY_EPSILON = 1.0e-5;
+static const uint VOXEL_TRAVERSAL_NO_SKIP_BRICK = 0xffffffffu;
 
 float dda_next_t(float3 t_max) {
     return min(t_max.x, min(t_max.y, t_max.z));
@@ -19,6 +21,31 @@ float dda_next_t(float3 t_max) {
 
 bool dda_axis_is_tied(float axis_t, float next_t) {
     return abs(axis_t - next_t) <= DDA_TIE_EPSILON * max(abs(next_t), 1.0);
+}
+
+float dda_adjust_boundary_position(float position, int step_dir) {
+    if (step_dir == 0) {
+        return position;
+    }
+
+    float nearest_boundary = round(position);
+    if (abs(position - nearest_boundary) <= DDA_GRID_BOUNDARY_EPSILON) {
+        return position + float(step_dir) * DDA_GRID_BOUNDARY_EPSILON;
+    }
+    return position;
+}
+
+int dda_start_coord(float position, int step_dir, int max_coord) {
+    float adjusted = dda_adjust_boundary_position(position, step_dir);
+    return int(clamp(floor(adjusted), 0.0, float(max_coord)));
+}
+
+int3 dda_start_coord3(float3 position, int3 step_dir, int3 max_coord) {
+    return int3(
+        dda_start_coord(position.x, step_dir.x, max_coord.x),
+        dda_start_coord(position.y, step_dir.y, max_coord.y),
+        dda_start_coord(position.z, step_dir.z, max_coord.z)
+    );
 }
 
 float3 dda_step_normal(bool step_x, bool step_y, bool step_z, int3 step_dir) {
@@ -108,9 +135,9 @@ bool brick_dda(
     float t_enter = max(box_t.x, 0.0);
     if (t_enter >= box_t.y) return false; // ray misses brick
 
-    float3 pos = ray_origin + ray_dir * (t_enter + 0.001);
-    int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
     int3 step_dir = ray_step_dir(ray_dir);
+    float3 entry_pos = ray_origin + ray_dir * t_enter;
+    int3 coord = dda_start_coord3(entry_pos, step_dir, int3(7));
     float current_t = t_enter;
 
     // Entry face normal: use brick AABB slab intersection to find which face was entered.
@@ -155,8 +182,20 @@ bool brick_dda(
     return false;
 }
 
+bool voxel_traversal_should_skip_shadow_hit(
+    uint brick_id,
+    uint3 local,
+    uint skip_brick_id,
+    uint3 skip_local
+) {
+    return brick_id == skip_brick_id && all(local == skip_local);
+}
+
 bool brick_any_hit(
     BrickOccupancy occ,
+    uint brick_id,
+    uint skip_brick_id,
+    uint3 skip_local,
     float3 ray_origin,
     float3 ray_dir,
     float max_t
@@ -173,9 +212,9 @@ bool brick_any_hit(
         return false;
     }
 
-    float3 pos = ray_origin + ray_dir * (t_enter + 0.001);
-    int3 coord = int3(clamp(floor(pos), float3(0), float3(7)));
     int3 step_dir = ray_step_dir(ray_dir);
+    float3 entry_pos = ray_origin + ray_dir * t_enter;
+    int3 coord = dda_start_coord3(entry_pos, step_dir, int3(7));
     float current_t = t_enter;
     float3 t_delta = float3(
         ray_axis_t_delta(ray_dir.x, inv_dir.x, 1.0),
@@ -192,7 +231,10 @@ bool brick_any_hit(
         if (any(coord < int3(0)) || any(coord >= int3(8))) break;
 
         if (read_occupancy_bit(occ, uint3(coord))) {
-            return true;
+            uint3 local = uint3(coord);
+            if (!voxel_traversal_should_skip_shadow_hit(brick_id, local, skip_brick_id, skip_local)) {
+                return true;
+            }
         }
 
         float3 unused_normal = float3(0.0);
@@ -220,24 +262,24 @@ HitResult trace_primary_ray(
         return NO_HIT;
 
     float t_enter = max(world_t.x, 0.0);
-    float3 pos = ray.origin + ray.direction * (t_enter + 0.001);
+    float3 entry_pos = ray.origin + ray.direction * t_enter;
 
     // Brick-grid DDA setup
     float3 inv_dir = ray.inv_dir;
-    int3 brick_coord = int3(clamp(floor(pos / 8.0), float3(0), grid_size - 1.0));
     int3 step_dir = ray_step_dir(ray.direction);
+    int3 igrid = int3(grid_size);
+    int3 brick_coord = dda_start_coord3(entry_pos / 8.0, step_dir, igrid - int3(1));
     float3 t_delta = float3(
         ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0),
         ray_axis_t_delta(ray.direction.y, inv_dir.y, 8.0),
         ray_axis_t_delta(ray.direction.z, inv_dir.z, 8.0)
     ); // distance in t to cross one brick (8 voxels)
     float3 t_max = float3(
-        ray_axis_t_max(pos.x, ray.direction.x, inv_dir.x, (brick_coord.x + 1) * 8.0, brick_coord.x * 8.0),
-        ray_axis_t_max(pos.y, ray.direction.y, inv_dir.y, (brick_coord.y + 1) * 8.0, brick_coord.y * 8.0),
-        ray_axis_t_max(pos.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
+        ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x, (brick_coord.x + 1) * 8.0, brick_coord.x * 8.0),
+        ray_axis_t_max(ray.origin.y, ray.direction.y, inv_dir.y, (brick_coord.y + 1) * 8.0, brick_coord.y * 8.0),
+        ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
     );
 
-    int3 igrid = int3(grid_size);
     float3 brick_normal = float3(0);
 
     // Max brick steps: grid diagonal
@@ -284,9 +326,11 @@ HitResult trace_primary_ray(
     return NO_HIT;
 }
 
-bool trace_any_hit_ray(
+bool trace_any_hit_ray_skip_voxel(
     Ray ray,
     float max_t,
+    uint skip_brick_id,
+    uint3 skip_local,
     StructuredBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<BrickOccupancy> occupancy_buf
@@ -309,10 +353,11 @@ bool trace_any_hit_ray(
         return false;
     }
 
-    float3 pos = ray.origin + ray.direction * (t_enter + 0.001);
+    float3 entry_pos = ray.origin + ray.direction * t_enter;
     float3 inv_dir = ray.inv_dir;
-    int3 brick_coord = int3(clamp(floor(pos / 8.0), float3(0), grid_size - 1.0));
     int3 step_dir = ray_step_dir(ray.direction);
+    int3 igrid = int3(grid_size);
+    int3 brick_coord = dda_start_coord3(entry_pos / 8.0, step_dir, igrid - int3(1));
     float3 t_delta = float3(
         ray_axis_t_delta(ray.direction.x, inv_dir.x, 8.0),
         ray_axis_t_delta(ray.direction.y, inv_dir.y, 8.0),
@@ -324,7 +369,6 @@ bool trace_any_hit_ray(
         ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
     );
 
-    int3 igrid = int3(grid_size);
     int max_steps = igrid.x + igrid.y + igrid.z;
     float current_t = t_enter;
     for (int i = 0; i < max_steps && i < 256 && current_t < max_t; i++) {
@@ -342,7 +386,15 @@ bool trace_any_hit_ray(
             if (occ.count > 0u) {
                 float3 brick_origin = float3(brick_coord) * 8.0;
                 float3 local_origin = ray.origin - brick_origin;
-                if (brick_any_hit(occ, local_origin, ray.direction, max_t)) {
+                if (brick_any_hit(
+                    occ,
+                    node.brick_id,
+                    skip_brick_id,
+                    skip_local,
+                    local_origin,
+                    ray.direction,
+                    max_t
+                )) {
                     return true;
                 }
             }
@@ -352,4 +404,22 @@ bool trace_any_hit_ray(
     }
 
     return false;
+}
+
+bool trace_any_hit_ray(
+    Ray ray,
+    float max_t,
+    StructuredBuffer<UcvhConfig> config_buf,
+    StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<BrickOccupancy> occupancy_buf
+) {
+    return trace_any_hit_ray_skip_voxel(
+        ray,
+        max_t,
+        VOXEL_TRAVERSAL_NO_SKIP_BRICK,
+        uint3(0),
+        config_buf,
+        hierarchy_l0,
+        occupancy_buf
+    );
 }

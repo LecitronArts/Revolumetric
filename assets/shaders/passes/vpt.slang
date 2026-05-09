@@ -104,19 +104,25 @@ RestirDirectLightSample empty_restir_direct_light_sample() {
     return sample;
 }
 
+bool voxel_shadow_occluded_from_hit(HitResult hit, float3 shadow_dir, float max_t) {
+    Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, shadow_dir);
+    return trace_any_hit_ray_skip_voxel(
+        shadow_ray,
+        max_t,
+        hit.brick_id,
+        hit.local,
+        ucvh_config,
+        hierarchy_l0,
+        brick_occupancy
+    );
+}
+
 bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 sun_dir) {
     if ((scene.lighting_flags & LIGHTING_FLAG_SHADOWS_ENABLED) == 0u) {
         return true;
     }
 
-    Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, sun_dir);
-    bool sun_occluded = trace_any_hit_ray(
-        shadow_ray,
-        1.0e20,
-        ucvh_config,
-        hierarchy_l0,
-        brick_occupancy
-    );
+    bool sun_occluded = voxel_shadow_occluded_from_hit(hit, sun_dir, 1.0e20);
     return !sun_occluded;
 }
 
@@ -260,14 +266,7 @@ bool restir_di_light_visible_from_hit(HitResult hit, RestirDiReservoir reservoir
         max_light_t = max(light_distance - VPT_LIGHT_ENDPOINT_BIAS, 0.0);
     }
 
-    Ray shadow_ray = make_ray(hit.position + hit.normal * VPT_RAY_SURFACE_BIAS, shadow_dir);
-    bool shadow_occluded = trace_any_hit_ray(
-        shadow_ray,
-        max_light_t,
-        ucvh_config,
-        hierarchy_l0,
-        brick_occupancy
-    );
+    bool shadow_occluded = voxel_shadow_occluded_from_hit(hit, shadow_dir, max_light_t);
     return !shadow_occluded;
 }
 
