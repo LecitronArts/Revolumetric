@@ -28,6 +28,9 @@ static const uint VPT_DEBUG_VIEW_AREA_WEIGHT = 13u;
 static const uint VPT_DEBUG_VIEW_AREA_HISTORY_VALID = 14u;
 static const uint VPT_DEBUG_VIEW_AREA_REJECTION = 15u;
 static const uint VPT_DEBUG_VIEW_AREA_JACOBIAN = 16u;
+static const uint VPT_DEBUG_VIEW_VOXEL_BRICK = 17u;
+static const uint VPT_DEBUG_VIEW_VOXEL_LOCAL = 18u;
+static const uint VPT_DEBUG_VIEW_VOXEL_HIT = 19u;
 
 uint lighting_debug_view(uint flags) {
     return (flags & LIGHTING_DEBUG_VIEW_MASK) >> LIGHTING_DEBUG_VIEW_SHIFT;

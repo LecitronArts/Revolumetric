@@ -112,7 +112,10 @@ bool debug_view_bypasses_temporal(uint debug_view) {
         || debug_view == VPT_DEBUG_VIEW_AREA_WEIGHT
         || debug_view == VPT_DEBUG_VIEW_AREA_HISTORY_VALID
         || debug_view == VPT_DEBUG_VIEW_AREA_REJECTION
-        || debug_view == VPT_DEBUG_VIEW_AREA_JACOBIAN;
+        || debug_view == VPT_DEBUG_VIEW_AREA_JACOBIAN
+        || debug_view == VPT_DEBUG_VIEW_VOXEL_BRICK
+        || debug_view == VPT_DEBUG_VIEW_VOXEL_LOCAL
+        || debug_view == VPT_DEBUG_VIEW_VOXEL_HIT;
 }
 
 float3 visualize_luminance_variance(float2 moments) {

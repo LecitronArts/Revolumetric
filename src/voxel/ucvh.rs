@@ -308,6 +308,42 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_bricks_preserve_continuous_wall_across_boundary() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(16, 8, 8)));
+
+        for y in 0..8 {
+            for z in 0..8 {
+                assert!(u.set_voxel(UVec3::new(7, y, z), VoxelCell::new(3, 1, [0; 3])));
+                assert!(u.set_voxel(UVec3::new(8, y, z), VoxelCell::new(3, 1, [0; 3])));
+            }
+        }
+        u.rebuild_hierarchy();
+
+        assert_eq!(u.config.brick_grid_size, UVec3::new(2, 1, 1));
+        assert_eq!(u.allocated_brick_count(), 2);
+
+        for y in 0..8 {
+            for z in 0..8 {
+                assert_eq!(
+                    u.get_voxel(UVec3::new(7, y, z)).material,
+                    3,
+                    "left brick boundary voxel should remain solid at y={y} z={z}"
+                );
+                assert_eq!(
+                    u.get_voxel(UVec3::new(8, y, z)).material,
+                    3,
+                    "right brick boundary voxel should remain solid at y={y} z={z}"
+                );
+            }
+        }
+
+        assert_ne!(u.hierarchy.get_l0(UVec3::new(0, 0, 0)).brick_id, u32::MAX);
+        assert_ne!(u.hierarchy.get_l0(UVec3::new(1, 0, 0)).brick_id, u32::MAX);
+        assert_eq!(u.hierarchy.get_l0(UVec3::new(0, 0, 0)).flags & 1, 1);
+        assert_eq!(u.hierarchy.get_l0(UVec3::new(1, 0, 0)).flags & 1, 1);
+    }
+
+    #[test]
     fn out_of_bounds_set_voxel_returns_false_without_allocating() {
         let mut u = test_ucvh();
         let cell = VoxelCell {

@@ -32,6 +32,9 @@ pub const VPT_DEBUG_VIEW_AREA_WEIGHT: u32 = 13;
 pub const VPT_DEBUG_VIEW_AREA_HISTORY_VALID: u32 = 14;
 pub const VPT_DEBUG_VIEW_AREA_REJECTION: u32 = 15;
 pub const VPT_DEBUG_VIEW_AREA_JACOBIAN: u32 = 16;
+pub const VPT_DEBUG_VIEW_VOXEL_BRICK: u32 = 17;
+pub const VPT_DEBUG_VIEW_VOXEL_LOCAL: u32 = 18;
+pub const VPT_DEBUG_VIEW_VOXEL_HIT: u32 = 19;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightingDebugView {
@@ -64,6 +67,9 @@ pub enum VptDebugView {
     AreaHistoryValid,
     AreaRejection,
     AreaJacobian,
+    VoxelBrick,
+    VoxelLocal,
+    VoxelHit,
 }
 
 impl RenderMode {
@@ -104,6 +110,9 @@ impl VptDebugView {
             Self::AreaHistoryValid => VPT_DEBUG_VIEW_AREA_HISTORY_VALID,
             Self::AreaRejection => VPT_DEBUG_VIEW_AREA_REJECTION,
             Self::AreaJacobian => VPT_DEBUG_VIEW_AREA_JACOBIAN,
+            Self::VoxelBrick => VPT_DEBUG_VIEW_VOXEL_BRICK,
+            Self::VoxelLocal => VPT_DEBUG_VIEW_VOXEL_LOCAL,
+            Self::VoxelHit => VPT_DEBUG_VIEW_VOXEL_HIT,
         }
     }
 }
@@ -308,7 +317,7 @@ impl LightingSettings {
             &mut settings.vpt_debug_view,
             vpt_debug_view,
             "REVOLUMETRIC_VPT_DEBUG_VIEW",
-            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian",
+            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit",
             parse_vpt_debug_view,
             &mut warnings,
         );
@@ -409,6 +418,12 @@ fn parse_vpt_debug_view(value: &str) -> Option<VptDebugView> {
         Some(VptDebugView::AreaRejection)
     } else if value.eq_ignore_ascii_case("area_jacobian") {
         Some(VptDebugView::AreaJacobian)
+    } else if value.eq_ignore_ascii_case("voxel_brick") {
+        Some(VptDebugView::VoxelBrick)
+    } else if value.eq_ignore_ascii_case("voxel_local") {
+        Some(VptDebugView::VoxelLocal)
+    } else if value.eq_ignore_ascii_case("voxel_hit") {
+        Some(VptDebugView::VoxelHit)
     } else {
         None
     }
@@ -1002,6 +1017,34 @@ mod tests {
             assert!(
                 result.warnings.is_empty(),
                 "area debug view alias {raw} should parse without warnings"
+            );
+            assert_eq!(uniforms.vpt_debug_view, expected_gpu_value);
+        }
+    }
+
+    #[test]
+    fn lighting_settings_parse_voxel_traversal_debug_view_aliases() {
+        let cases = [("voxel_brick", 17), ("voxel_local", 18), ("voxel_hit", 19)];
+
+        for (raw, expected_gpu_value) in cases {
+            let result = LightingSettings::from_values_report_with_denoiser(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(raw),
+                None,
+            );
+            let mut uniforms = GpuSceneUniforms::zeroed();
+            uniforms.apply_lighting_settings(result.settings);
+
+            assert!(
+                result.warnings.is_empty(),
+                "voxel debug view alias {raw} should parse without warnings"
             );
             assert_eq!(uniforms.vpt_debug_view, expected_gpu_value);
         }

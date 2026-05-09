@@ -94,6 +94,7 @@ struct VptTraceSample {
     float3 direct_radiance;
     float3 indirect_radiance;
     float reservoir_weight;
+    HitResult first_hit;
 };
 
 RestirDirectLightSample empty_restir_direct_light_sample() {
@@ -135,6 +136,7 @@ VptTraceSample empty_vpt_trace_sample() {
     sample.direct_radiance = float3(0.0);
     sample.indirect_radiance = float3(0.0);
     sample.reservoir_weight = 0.0;
+    sample.first_hit = NO_HIT;
     return sample;
 }
 
@@ -158,6 +160,32 @@ float3 visualize_area_restir_id(uint value) {
         float((h >> 8) & 0xffu),
         float((h >> 16) & 0xffu)
     ) / 255.0;
+}
+
+float3 visualize_voxel_brick_id(HitResult first_hit) {
+    if (!first_hit.hit) {
+        return float3(0.0);
+    }
+    uint h = hash_u32(first_hit.brick_id * 747796405u + 2891336453u);
+    return float3(
+        float((h >> 0) & 0xffu),
+        float((h >> 8) & 0xffu),
+        float((h >> 16) & 0xffu)
+    ) / 255.0;
+}
+
+float3 visualize_voxel_local_coord(HitResult first_hit) {
+    if (!first_hit.hit) {
+        return float3(0.0);
+    }
+    return (float3(first_hit.local) + 0.5) / 8.0;
+}
+
+float3 visualize_voxel_hit(HitResult first_hit) {
+    if (!first_hit.hit) {
+        return float3(0.0);
+    }
+    return normalize(first_hit.normal) * 0.5 + 0.5;
 }
 
 float3 visualize_area_restir_debug(uint2 pixel, SceneUniforms scene) {
@@ -300,6 +328,9 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
 
     for (uint bounce = 0u; bounce < max_bounces; bounce++) {
         HitResult hit = trace_primary_ray(ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials);
+        if (bounce == 0u) {
+            sample.first_hit = hit;
+        }
         if (!hit.hit) {
             float3 contribution = throughput * sky_color_for_dir(ray.direction, scene);
             sample.radiance += contribution;
@@ -369,6 +400,12 @@ void main(uint3 tid : SV_DispatchThreadID) {
         sample_radiance = sample.direct_radiance;
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_INDIRECT) {
         sample_radiance = sample.indirect_radiance;
+    } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_VOXEL_BRICK) {
+        sample_radiance = visualize_voxel_brick_id(sample.first_hit);
+    } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_VOXEL_LOCAL) {
+        sample_radiance = visualize_voxel_local_coord(sample.first_hit);
+    } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_VOXEL_HIT) {
+        sample_radiance = visualize_voxel_hit(sample.first_hit);
     } else if (is_area_restir_debug_view(scene.vpt_debug_view)) {
         sample_radiance = visualize_area_restir_debug(tid.xy, scene);
     }

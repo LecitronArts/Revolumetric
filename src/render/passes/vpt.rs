@@ -1445,6 +1445,51 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn vpt_trace_shader_exposes_voxel_traversal_debug_views() {
+        let scene_common = normalized_source(include_str!(
+            "../../../assets/shaders/shared/scene_common.slang"
+        ));
+        let source = normalized_source(include_str!("../../../assets/shaders/passes/vpt.slang"));
+        let temporal = normalized_source(include_str!(
+            "../../../assets/shaders/passes/vpt_temporal.slang"
+        ));
+
+        for token in [
+            "VPT_DEBUG_VIEW_VOXEL_BRICK",
+            "VPT_DEBUG_VIEW_VOXEL_LOCAL",
+            "VPT_DEBUG_VIEW_VOXEL_HIT",
+        ] {
+            assert!(
+                scene_common.contains(token),
+                "scene_common missing voxel debug constant {token}"
+            );
+            assert!(
+                source.contains(token),
+                "VPT shader missing voxel debug routing token {token}"
+            );
+            assert!(
+                temporal.contains(token),
+                "temporal shader must bypass voxel traversal debug token {token}"
+            );
+        }
+
+        for token in [
+            "visualize_voxel_brick_id",
+            "visualize_voxel_local_coord",
+            "visualize_voxel_hit",
+            "sample.first_hit",
+            "first_hit.brick_id",
+            "first_hit.local",
+            "first_hit.normal",
+        ] {
+            assert!(
+                source.contains(token),
+                "VPT shader missing voxel traversal debug token {token}"
+            );
+        }
+    }
+
+    #[test]
     fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT surface graph test");
@@ -2246,6 +2291,9 @@ mod shader_source_tests {
             "AreaRestirDebugView::Rejection => Some(VptDebugView::AreaRejection)",
             "AreaRestirDebugView::Jacobian => Some(VptDebugView::AreaJacobian)",
             "self.lighting_settings.vpt_debug_view = vpt_debug_view",
+            "VptDebugView::VoxelBrick => \"voxel_brick\"",
+            "VptDebugView::VoxelLocal => \"voxel_local\"",
+            "VptDebugView::VoxelHit => \"voxel_hit\"",
         ] {
             assert!(
                 source.contains(token),

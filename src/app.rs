@@ -89,6 +89,9 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
         VptDebugView::AreaHistoryValid => "area_history_valid",
         VptDebugView::AreaRejection => "area_rejection",
         VptDebugView::AreaJacobian => "area_jacobian",
+        VptDebugView::VoxelBrick => "voxel_brick",
+        VptDebugView::VoxelLocal => "voxel_local",
+        VptDebugView::VoxelHit => "voxel_hit",
     }
 }
 
