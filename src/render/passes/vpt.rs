@@ -823,6 +823,111 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn vpt_atrous_pass_declares_svgf_edge_aware_filter_contract() {
+        let rust = std::fs::read_to_string("src/render/passes/vpt_atrous.rs")
+            .expect("VPT atrous pass source should exist");
+        let shader = std::fs::read_to_string("assets/shaders/passes/vpt_atrous.slang")
+            .expect("VPT atrous shader should exist");
+
+        for token in [
+            "pub struct VptAtrousPass",
+            "pub filtered_radiance",
+            "ping_radiance",
+            "pong_radiance",
+            "pub fn record",
+            "pub fn output_image",
+            "vpt_atrous_filtered",
+            "vpt_atrous_ping",
+            "vpt_atrous_pong",
+        ] {
+            assert!(rust.contains(token), "VPT atrous Rust missing {token}");
+        }
+
+        for token in [
+            "RWTexture2D<float4> input_radiance_image",
+            "RWTexture2D<float4> moments_history_image",
+            "RWTexture2D<float4> surface_position_depth",
+            "RWTexture2D<float4> surface_normal_roughness",
+            "RWTexture2D<float4> surface_albedo_material",
+            "RWTexture2D<float4> filtered_radiance_image",
+            "atrous_step_width",
+            "normal_weight",
+            "depth_weight",
+            "safe_normalize",
+            "albedo_weight",
+            "center_albedo_material.rgb",
+            "material_weight",
+            "variance_weight",
+            "scene.denoiser_atrous_iterations",
+            "DENOISER_FLAG_ENABLED",
+            "scene.vpt_debug_view != VPT_DEBUG_VIEW_FINAL",
+        ] {
+            assert!(shader.contains(token), "VPT atrous shader missing {token}");
+        }
+    }
+
+    #[test]
+    fn app_routes_temporal_radiance_through_vpt_atrous_before_postprocess() {
+        let source = std::fs::read_to_string("src/app.rs")
+            .expect("app source should be readable for VPT atrous graph test");
+        let compact = source.split_whitespace().collect::<String>();
+
+        for token in [
+            "use crate::render::passes::vpt_atrous",
+            "VptAtrousPass",
+            "VptAtrousPassCreateInfo",
+            "VptAtrousPassResizeInfo",
+            "vpt_atrous_pass: Option<VptAtrousPass>",
+            "VptAtrousPass::new",
+            "VptAtrousPassResizeInfo",
+            "graph.add_pass(\"vpt_atrous\"",
+            "GpuProfileScope::VptAtrous",
+            "postprocess.update_input_image",
+            "vpt_atrous.output_image()",
+        ] {
+            assert!(
+                source.contains(token),
+                "app missing VPT atrous token {token}"
+            );
+        }
+
+        let temporal_idx = source
+            .find("graph.add_pass(\"vpt_temporal\"")
+            .expect("VPT temporal graph pass should exist");
+        let atrous_idx = source
+            .find("graph.add_pass(\"vpt_atrous\"")
+            .expect("VPT atrous graph pass should exist");
+        let postprocess_idx = source
+            .find("graph.add_pass(\"postprocess\"")
+            .expect("postprocess graph pass should exist");
+
+        assert!(temporal_idx < atrous_idx);
+        assert!(atrous_idx < postprocess_idx);
+        assert!(compact.contains("letmutatrous_input_dep=temporal_radiance_dep;"));
+        assert!(compact.contains("letmutatrous_ping_dep=atrous_ping_resource;"));
+        assert!(compact.contains("letmutatrous_pong_dep=atrous_pong_resource;"));
+        assert!(compact.contains("letoutput_is_final=iteration_index+1==atrous_pass_count;"));
+        assert!(
+            compact
+                .contains("letoutput_is_ping=!output_is_final&&iteration_index.is_multiple_of(2);")
+        );
+        assert!(compact.contains("builder.read_as(atrous_input_dep,AccessKind::ComputeShaderRead"));
+        assert!(
+            compact.contains("builder.read_as(temporal_moments_dep,AccessKind::ComputeShaderRead")
+        );
+        assert!(compact.contains("letatrous_filtered_resource=graph.import_image_with_access("));
+        assert!(
+            compact
+                .contains("builder.write_as(atrous_output_resource,AccessKind::ComputeShaderWrite")
+        );
+        assert!(
+            compact.contains("builder.read_as(atrous_filtered_dep,AccessKind::ComputeShaderRead")
+        );
+        assert!(compact.contains("atrous_ping_dep=atrous_writes[0];"));
+        assert!(compact.contains("atrous_pong_dep=atrous_writes[0];"));
+    }
+
+    #[test]
     fn vpt_temporal_seeds_valid_history_when_no_previous_history_is_accepted() {
         let shader = std::fs::read_to_string("assets/shaders/passes/vpt_temporal.slang")
             .expect("VPT temporal shader should exist");
@@ -875,9 +980,9 @@ mod shader_source_tests {
 
         assert!(
             compact.contains(
-                "lettemporal_radiance_initial_access=ifself.vpt_temporal_history_initialized{AccessKind::ComputeShaderRead"
+                "lettemporal_radiance_initial_access=ifself.vpt_temporal_history_initialized{AccessKind::TransferRead"
             ),
-            "temporal radiance must be imported from the previous frame's postprocess read layout"
+            "temporal radiance must be imported from the previous frame's history-copy read layout"
         );
         assert!(
             compact.contains(

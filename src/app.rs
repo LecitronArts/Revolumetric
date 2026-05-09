@@ -26,6 +26,9 @@ use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::postprocess::PostprocessPass;
 use crate::render::passes::restir_di::{RestirDiPass, RestirDiPassCreateInfo};
 use crate::render::passes::vpt::VptPass;
+use crate::render::passes::vpt_atrous::{
+    VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
+};
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
     VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
@@ -204,6 +207,7 @@ struct RevolumetricApp {
     vpt_surface_pass: Option<VptSurfacePass>,
     vpt_pass: Option<VptPass>,
     vpt_temporal_pass: Option<VptTemporalPass>,
+    vpt_atrous_pass: Option<VptAtrousPass>,
     area_restir_pass: Option<AreaRestirPass>,
     restir_di_pass: Option<RestirDiPass>,
     ucvh: Option<Ucvh>,
@@ -258,6 +262,7 @@ impl RevolumetricApp {
             vpt_surface_pass: None,
             vpt_pass: None,
             vpt_temporal_pass: None,
+            vpt_atrous_pass: None,
             area_restir_pass: None,
             restir_di_pass: None,
             ucvh: None,
@@ -386,9 +391,29 @@ impl RevolumetricApp {
                 .context("failed to resize VPT temporal images")?;
             self.vpt_temporal_history_initialized = false;
         }
-        if let (Some(postprocess), Some(vpt_temporal), Some(scene_ubo)) = (
-            &mut self.postprocess_pass,
+        if let (Some(vpt_atrous), Some(vpt_temporal), Some(vpt_surface), Some(scene_ubo)) = (
+            &mut self.vpt_atrous_pass,
             &self.vpt_temporal_pass,
+            &self.vpt_surface_pass,
+            &self.scene_ubo,
+        ) {
+            vpt_atrous
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptAtrousPassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        temporal: vpt_temporal,
+                        vpt_surface,
+                    },
+                )
+                .context("failed to resize VPT atrous images")?;
+        }
+        if let (Some(postprocess), Some(vpt_atrous), Some(scene_ubo)) = (
+            &mut self.postprocess_pass,
+            &self.vpt_atrous_pass,
             &self.scene_ubo,
         ) {
             postprocess
@@ -397,7 +422,7 @@ impl RevolumetricApp {
                     allocator,
                     width,
                     height,
-                    &vpt_temporal.accumulated_radiance,
+                    vpt_atrous.output_image(),
                     scene_ubo,
                 )
                 .context("failed to resize VPT postprocess images")?;
@@ -619,10 +644,17 @@ impl RevolumetricApp {
                         vpt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
                     }
 
-                    if let (Some(vpt_surface), Some(vpt), Some(vpt_temporal), Some(postprocess)) = (
+                    if let (
+                        Some(vpt_surface),
+                        Some(vpt),
+                        Some(vpt_temporal),
+                        Some(vpt_atrous),
+                        Some(postprocess),
+                    ) = (
                         &self.vpt_surface_pass,
                         &self.vpt_pass,
                         &self.vpt_temporal_pass,
+                        &self.vpt_atrous_pass,
                         &self.postprocess_pass,
                     ) {
                         let surface_position_resource = graph.import_image_with_access(
@@ -1418,7 +1450,7 @@ impl RevolumetricApp {
 
                         postprocess.update_input_image(
                             renderer.device(),
-                            &vpt_temporal.accumulated_radiance,
+                            vpt_atrous.output_image(),
                             frame.frame_slot,
                         );
                         let noisy_initial_access = if self.vpt_accumulation_needs_init {
@@ -1496,7 +1528,7 @@ impl RevolumetricApp {
                         let noisy_moments_dep = vpt_writes[1];
                         let temporal_radiance_initial_access =
                             if self.vpt_temporal_history_initialized {
-                                AccessKind::ComputeShaderRead
+                                AccessKind::TransferRead
                             } else {
                                 AccessKind::Undefined
                             };
@@ -1628,6 +1660,116 @@ impl RevolumetricApp {
                             });
                         let temporal_radiance_dep = temporal_writes[0];
                         let temporal_moments_dep = temporal_writes[1];
+                        let atrous_iterations =
+                            VptAtrousPass::active_iteration_count(self.lighting_settings);
+                        let atrous_pass_count =
+                            VptAtrousPass::pass_count_for_iterations(atrous_iterations);
+                        let atrous_filtered_resource = graph.import_image_with_access(
+                            vpt_atrous.filtered_radiance.handle,
+                            vpt_atrous.filtered_radiance.extent.width,
+                            vpt_atrous.filtered_radiance.extent.height,
+                            vk::Format::R16G16B16A16_SFLOAT,
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::TRANSFER_SRC
+                                | vk::ImageUsageFlags::TRANSFER_DST,
+                            AccessKind::Undefined,
+                        );
+                        let atrous_ping_resource = graph.import_image_with_access(
+                            vpt_atrous.ping_radiance.handle,
+                            vpt_atrous.ping_radiance.extent.width,
+                            vpt_atrous.ping_radiance.extent.height,
+                            vk::Format::R16G16B16A16_SFLOAT,
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::TRANSFER_SRC
+                                | vk::ImageUsageFlags::TRANSFER_DST,
+                            AccessKind::Undefined,
+                        );
+                        let atrous_pong_resource = graph.import_image_with_access(
+                            vpt_atrous.pong_radiance.handle,
+                            vpt_atrous.pong_radiance.extent.width,
+                            vpt_atrous.pong_radiance.extent.height,
+                            vk::Format::R16G16B16A16_SFLOAT,
+                            vk::ImageUsageFlags::STORAGE
+                                | vk::ImageUsageFlags::TRANSFER_SRC
+                                | vk::ImageUsageFlags::TRANSFER_DST,
+                            AccessKind::Undefined,
+                        );
+                        let mut atrous_input_dep = temporal_radiance_dep;
+                        let mut atrous_filtered_dep = temporal_radiance_dep;
+                        let mut atrous_ping_dep = atrous_ping_resource;
+                        let mut atrous_pong_dep = atrous_pong_resource;
+                        for iteration_index in 0..atrous_pass_count {
+                            let output_is_final = iteration_index + 1 == atrous_pass_count;
+                            let output_is_ping =
+                                !output_is_final && iteration_index.is_multiple_of(2);
+                            let atrous_output_resource = if output_is_final {
+                                atrous_filtered_resource
+                            } else if output_is_ping {
+                                atrous_ping_dep
+                            } else {
+                                atrous_pong_dep
+                            };
+                            let begin_atrous_scope = iteration_index == 0;
+                            let end_atrous_scope = iteration_index + 1 == atrous_pass_count;
+                            let slot = frame.frame_slot;
+                            let atrous_writes =
+                                graph.add_pass("vpt_atrous", QueueType::Compute, |builder| {
+                                    builder
+                                        .read_as(atrous_input_dep, AccessKind::ComputeShaderRead);
+                                    builder.read_as(
+                                        temporal_moments_dep,
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        final_surface_writes[0],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        final_surface_writes[1],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.read_as(
+                                        final_surface_writes[2],
+                                        AccessKind::ComputeShaderRead,
+                                    );
+                                    builder.write_as(
+                                        atrous_output_resource,
+                                        AccessKind::ComputeShaderWrite,
+                                    );
+                                    Box::new(move |ctx| {
+                                        if begin_atrous_scope && let Some(profiler) = profiler {
+                                            profiler.begin_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::VptAtrous,
+                                            );
+                                        }
+                                        vpt_atrous.record(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            slot,
+                                            atrous_iterations,
+                                            iteration_index,
+                                        );
+                                        if end_atrous_scope && let Some(profiler) = profiler {
+                                            profiler.end_scope(
+                                                ctx.device,
+                                                ctx.command_buffer,
+                                                slot,
+                                                GpuProfileScope::VptAtrous,
+                                            );
+                                        }
+                                    })
+                                });
+                            atrous_input_dep = atrous_writes[0];
+                            atrous_filtered_dep = atrous_writes[0];
+                            if output_is_ping {
+                                atrous_ping_dep = atrous_writes[0];
+                            } else if !output_is_final {
+                                atrous_pong_dep = atrous_writes[0];
+                            }
+                        }
                         graph.add_pass(
                             "vpt_surface_history_update",
                             QueueType::Transfer,
@@ -1683,8 +1825,7 @@ impl RevolumetricApp {
                         );
                         let postprocess_writes =
                             graph.add_pass("postprocess", QueueType::Compute, |builder| {
-                                builder
-                                    .read_as(temporal_radiance_dep, AccessKind::ComputeShaderRead);
+                                builder.read_as(atrous_filtered_dep, AccessKind::ComputeShaderRead);
                                 builder.write_as(
                                     postprocess_output_resource,
                                     AccessKind::ComputeShaderWrite,
@@ -1839,6 +1980,7 @@ impl RevolumetricApp {
                         tracing::warn!(
                             vpt_ready = self.vpt_pass.is_some(),
                             vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
+                            vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
                             postprocess_ready = self.postprocess_pass.is_some(),
                             "skipping VPT frame until required passes are initialized"
                         );
@@ -1916,6 +2058,9 @@ impl Drop for RevolumetricApp {
                 capture.destroy(renderer.device(), renderer.allocator());
             }
             if let Some(pass) = self.postprocess_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
+            if let Some(pass) = self.vpt_atrous_pass.take() {
                 pass.destroy(renderer.device(), renderer.allocator());
             }
             if let Some(pass) = self.vpt_temporal_pass.take() {
@@ -2317,9 +2462,49 @@ impl ApplicationHandler for RevolumetricApp {
             }
         }
 
+        if self.vpt_atrous_pass.is_none()
+            && let (Some(vpt_temporal), Some(vpt_surface), Some(scene_ubo_ref)) = (
+                &self.vpt_temporal_pass,
+                &self.vpt_surface_pass,
+                &self.scene_ubo,
+            )
+        {
+            let renderer = self.renderer.as_ref().unwrap();
+            let extent = renderer.swapchain_extent();
+            let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vpt_atrous.spv"));
+            if spirv.is_empty() {
+                tracing::warn!("vpt_atrous.spv is empty; slangc may not be installed");
+            } else {
+                match VptAtrousPass::new(
+                    renderer.device(),
+                    renderer.allocator(),
+                    VptAtrousPassCreateInfo {
+                        width: extent.width,
+                        height: extent.height,
+                        spirv_bytes: spirv,
+                        scene_ubo: scene_ubo_ref,
+                        temporal: vpt_temporal,
+                        vpt_surface,
+                    },
+                ) {
+                    Ok(pass) => {
+                        tracing::info!(
+                            width = extent.width,
+                            height = extent.height,
+                            "initialized VPT atrous pass"
+                        );
+                        self.vpt_atrous_pass = Some(pass);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to create VPT atrous pass");
+                    }
+                }
+            }
+        }
+
         if self.postprocess_pass.is_none()
-            && let (Some(vpt_temporal), Some(scene_ubo_ref)) =
-                (&self.vpt_temporal_pass, &self.scene_ubo)
+            && let (Some(vpt_atrous), Some(scene_ubo_ref)) =
+                (&self.vpt_atrous_pass, &self.scene_ubo)
         {
             let renderer = self.renderer.as_ref().unwrap();
             let extent = renderer.swapchain_extent();
@@ -2333,7 +2518,7 @@ impl ApplicationHandler for RevolumetricApp {
                     extent.width,
                     extent.height,
                     spirv,
-                    &vpt_temporal.accumulated_radiance,
+                    vpt_atrous.output_image(),
                     scene_ubo_ref,
                 ) {
                     Ok(pass) => {
