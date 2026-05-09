@@ -6,7 +6,7 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::area_restir::{GpuAreaRestirReservoir, GpuAreaRestirUniforms};
 use crate::render::buffer::GpuBuffer;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::restir_di::{GpuRestirDiReservoir, GpuRestirDiUniforms};
@@ -27,6 +27,22 @@ pub struct VptPass {
 }
 
 impl VptPass {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -37,72 +53,7 @@ impl VptPass {
         scene_ubo: &SceneUniformBuffer,
     ) -> Result<Self> {
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
-            .add_binding(
-                0,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                1,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                2,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                3,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                4,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                5,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                6,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                7,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                8,
-                vk::DescriptorType::STORAGE_IMAGE,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                9,
-                vk::DescriptorType::UNIFORM_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
-            .add_binding(
-                10,
-                vk::DescriptorType::STORAGE_BUFFER,
-                vk::ShaderStageFlags::COMPUTE,
-                1,
-            )
+            .add_binding_specs(&Self::descriptor_binding_specs())
             .build(device)?;
 
         let frame_count = scene_ubo.frame_count();
@@ -713,6 +664,8 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 mod shader_source_tests {
     use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
 
+    use super::VptPass;
+
     fn normalized_source(path_source: &str) -> String {
         crate::render::source_checks::normalize(path_source)
     }
@@ -730,10 +683,22 @@ mod shader_source_tests {
         }
     }
 
-    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+    fn shader_reflection(path: &str) -> ShaderReflection {
         ShaderReflection::from_slang_source("main", &source(path))
             .expect("shader reflection should parse")
-            .bindings
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        shader_reflection(path).bindings
+    }
+
+    #[test]
+    fn vpt_descriptor_specs_match_shader_manifest() {
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "VPT trace",
+            &VptPass::descriptor_binding_specs(),
+            &shader_reflection("assets/shaders/passes/vpt.slang"),
+        );
     }
 
     #[test]
@@ -1963,14 +1928,10 @@ mod shader_source_tests {
             .next()
             .expect("implementation section should exist");
 
-        crate::render::source_checks::assert_compact_contains_all(
-            implementation,
-            &[".add_binding(6,", ".add_binding(7,"],
-            "VPT pass ReSTIR-DI descriptors",
-        );
         crate::render::source_checks::assert_contains_all(
             implementation,
             &[
+                "descriptor_binding_specs",
                 "update_restir_di_descriptors",
                 "GpuRestirDiUniforms",
                 "GpuRestirDiReservoir",
@@ -1987,14 +1948,10 @@ mod shader_source_tests {
             .next()
             .expect("implementation section should exist");
 
-        crate::render::source_checks::assert_compact_contains_all(
-            implementation,
-            &[".add_binding(9,", ".add_binding(10,"],
-            "VPT pass Area ReSTIR descriptors",
-        );
         crate::render::source_checks::assert_contains_all(
             implementation,
             &[
+                "descriptor_binding_specs",
                 "disabled_area_restir_uniform_buffers",
                 "disabled_area_restir_reservoir_buffer",
                 "update_area_restir_descriptors",
@@ -2161,14 +2118,10 @@ mod shader_source_tests {
             );
         }
 
-        crate::render::source_checks::assert_compact_contains_all(
-            implementation,
-            &[".add_binding(10,", ".add_binding(11,"],
-            "VPT surface pass selected-primary descriptors",
-        );
         crate::render::source_checks::assert_contains_all(
             implementation,
             &[
+                "descriptor_binding_specs",
                 "bootstrap_descriptor_sets",
                 "selected_descriptor_sets",
                 "disabled_area_restir_uniform_buffers",

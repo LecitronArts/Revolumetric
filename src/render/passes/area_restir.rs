@@ -7,7 +7,7 @@ use crate::render::area_restir::{
     AreaRestirSettings, GpuAreaRestirReservoir, GpuAreaRestirUniforms,
 };
 use crate::render::buffer::GpuBuffer;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
@@ -62,6 +62,50 @@ struct AreaRestirStage {
 }
 
 impl AreaRestirPass {
+    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
+        ]
+    }
+
+    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
+    pub(crate) fn spatial_descriptor_binding_specs() -> [DescriptorBindingSpec; 7] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -80,19 +124,7 @@ impl AreaRestirPass {
         let initial_stage = match AreaRestirStage::new(
             device,
             info.initial_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_IMAGE),
-                (3, vk::DescriptorType::STORAGE_IMAGE),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-                (6, vk::DescriptorType::UNIFORM_BUFFER),
-                (7, vk::DescriptorType::STORAGE_BUFFER),
-                (8, vk::DescriptorType::STORAGE_BUFFER),
-                (9, vk::DescriptorType::STORAGE_BUFFER),
-                (10, vk::DescriptorType::STORAGE_BUFFER),
-            ],
+            &Self::initial_descriptor_binding_specs(),
             info.frame_count,
         ) {
             Ok(stage) => stage,
@@ -104,19 +136,7 @@ impl AreaRestirPass {
         let temporal_stage = match AreaRestirStage::new(
             device,
             info.temporal_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_BUFFER),
-                (3, vk::DescriptorType::STORAGE_BUFFER),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-                (6, vk::DescriptorType::STORAGE_IMAGE),
-                (7, vk::DescriptorType::STORAGE_IMAGE),
-                (8, vk::DescriptorType::STORAGE_IMAGE),
-                (9, vk::DescriptorType::STORAGE_IMAGE),
-                (10, vk::DescriptorType::STORAGE_IMAGE),
-            ],
+            &Self::temporal_descriptor_binding_specs(),
             info.frame_count,
         ) {
             Ok(stage) => stage,
@@ -129,15 +149,7 @@ impl AreaRestirPass {
         let spatial_stage = match AreaRestirStage::new(
             device,
             info.spatial_spirv,
-            &[
-                (0, vk::DescriptorType::UNIFORM_BUFFER),
-                (1, vk::DescriptorType::STORAGE_BUFFER),
-                (2, vk::DescriptorType::STORAGE_BUFFER),
-                (3, vk::DescriptorType::STORAGE_IMAGE),
-                (4, vk::DescriptorType::STORAGE_IMAGE),
-                (5, vk::DescriptorType::STORAGE_IMAGE),
-                (6, vk::DescriptorType::STORAGE_IMAGE),
-            ],
+            &Self::spatial_descriptor_binding_specs(),
             info.frame_count,
         ) {
             Ok(stage) => stage,
@@ -536,19 +548,17 @@ impl AreaRestirStage {
     fn new(
         device: &ash::Device,
         spirv_bytes: &[u8],
-        bindings: &[(u32, vk::DescriptorType)],
+        bindings: &[DescriptorBindingSpec],
         frame_count: usize,
     ) -> Result<Self> {
-        let mut builder = DescriptorLayoutBuilder::new();
-        for &(binding, ty) in bindings {
-            builder = builder.add_binding(binding, ty, vk::ShaderStageFlags::COMPUTE, 1);
-        }
-        let descriptor_set_layout = builder.build(device)?;
+        let descriptor_set_layout = DescriptorLayoutBuilder::new()
+            .add_binding_specs(bindings)
+            .build(device)?;
         let mut uniform_count = 0u32;
         let mut storage_buffer_count = 0u32;
         let mut storage_image_count = 0u32;
-        for &(_, ty) in bindings {
-            match ty {
+        for spec in bindings {
+            match spec.descriptor_type {
                 vk::DescriptorType::UNIFORM_BUFFER => uniform_count += frame_count as u32,
                 vk::DescriptorType::STORAGE_BUFFER => storage_buffer_count += frame_count as u32,
                 vk::DescriptorType::STORAGE_IMAGE => storage_image_count += frame_count as u32,
@@ -916,6 +926,8 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 mod shader_source_tests {
     use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
 
+    use super::AreaRestirPass;
+
     fn source(path: &str) -> String {
         crate::render::source_checks::read_source(path)
     }
@@ -929,10 +941,37 @@ mod shader_source_tests {
         }
     }
 
-    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+    fn shader_reflection(path: &str) -> ShaderReflection {
         ShaderReflection::from_slang_source("main", &source(path))
             .expect("shader reflection should parse")
-            .bindings
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        shader_reflection(path).bindings
+    }
+
+    #[test]
+    fn area_restir_descriptor_specs_match_shader_manifests() {
+        let initial_specs = AreaRestirPass::initial_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "Area ReSTIR initial",
+            &initial_specs,
+            &shader_reflection("assets/shaders/passes/area_restir_initial.slang"),
+        );
+
+        let temporal_specs = AreaRestirPass::temporal_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "Area ReSTIR temporal",
+            &temporal_specs,
+            &shader_reflection("assets/shaders/passes/area_restir_temporal.slang"),
+        );
+
+        let spatial_specs = AreaRestirPass::spatial_descriptor_binding_specs();
+        crate::render::descriptor::assert_specs_match_shader_bindings(
+            "Area ReSTIR spatial",
+            &spatial_specs,
+            &shader_reflection("assets/shaders/passes/area_restir_spatial.slang"),
+        );
     }
 
     #[test]

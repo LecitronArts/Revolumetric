@@ -36,6 +36,7 @@ mod tests {
     fn compact_ignores_line_endings_and_spacing() {
         let source = "builder\r\n    .add_binding(\r\n        6,\r\n    )";
         assert_eq!(compact(source), "builder.add_binding(6,)");
+        assert_compact_contains_all(source, &["builder.add_binding(6,)"], "compact source");
     }
 
     #[test]
