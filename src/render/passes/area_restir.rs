@@ -1392,7 +1392,7 @@ mod shader_source_tests {
         assert!(
             compact_app.contains("area_restir.register_graph(")
                 && compact_app
-                    .contains("self.area_restir_settings,self.area_restir_history_initialized,")
+                    .contains("self.area_restir_settings,self.vpt_pipeline.frame_state.area_restir_history_initialized,")
                 && compact_app.contains("final_surface_writes=area_graph.final_surface_writes;"),
             "app must delegate Area ReSTIR graph registration while preserving settings and outputs"
         );
@@ -1403,6 +1403,7 @@ mod shader_source_tests {
         let app = source("src/app.rs");
         let compact_app = app.split_whitespace().collect::<String>();
         let pass = source("src/render/passes/area_restir.rs");
+        let pipeline = source("src/render/vpt_pipeline.rs");
         let pass_impl = pass
             .split("#[cfg(test)]")
             .next()
@@ -1425,6 +1426,8 @@ mod shader_source_tests {
                 "Area ReSTIR pass selected frame-ring policy missing token {token}"
             );
         }
+        assert!(pipeline.contains("pub area_restir_pass: Option<AreaRestirPass>"));
+        assert!(pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();"));
         assert!(
             compact_app.contains(
                 "vpt_area_restir_reads=Some((area_graph.uniform_resource,area_graph.selected_current_resource,));"

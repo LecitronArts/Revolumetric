@@ -329,10 +329,15 @@ mod shader_source_tests {
             &std::fs::read_to_string("src/app.rs")
                 .expect("app source should be readable for render-pipeline source test"),
         );
+        let pipeline = normalized_source(
+            &std::fs::read_to_string("src/render/vpt_pipeline.rs")
+                .expect("VPT pipeline source should be readable for render-pipeline source test"),
+        );
 
-        assert!(source.contains("postprocess_pass: Option<PostprocessPass>"));
         assert!(source.contains("capture: Option<RenderCapture>"));
-        assert!(source.contains("PostprocessPass::new"));
+        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
+        assert!(pipeline.contains("pub postprocess_pass: Option<PostprocessPass>"));
+        assert!(pipeline.contains("PostprocessPass::new"));
         assert!(
             source.contains("graph.add_pass(\"postprocess\"")
                 || source.contains(

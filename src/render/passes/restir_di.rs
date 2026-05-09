@@ -1283,6 +1283,7 @@ mod shader_source_tests {
         let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
         let pass = source("src/render/passes/restir_di.rs");
         let app = source("src/app.rs");
+        let pipeline = source("src/render/vpt_pipeline.rs");
         let compact_app = app.split_whitespace().collect::<String>();
 
         for shader in [&initial, &temporal, &spatial] {
@@ -1314,7 +1315,7 @@ mod shader_source_tests {
         assert!(pass.contains("update_surface_descriptors"));
         assert!(pass.contains("VptSurfacePass"));
         assert!(pass.contains("DescriptorType::STORAGE_IMAGE"));
-        assert!(app.contains("restir_di.update_surface_descriptors"));
+        assert!(pipeline.contains("restir_di.update_surface_descriptors"));
         assert!(
             compact_app
                 .contains("builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead)")
@@ -1414,7 +1415,7 @@ mod shader_source_tests {
         assert!(
             compact_app.contains("restir_di.register_graph(")
                 && compact_app
-                    .contains("self.restir_di_settings,self.restir_di_history_initialized,"),
+                    .contains("self.restir_di_settings,self.vpt_pipeline.frame_state.restir_di_history_initialized,"),
             "app must delegate ReSTIR-DI graph registration with the runtime settings"
         );
         assert!(
@@ -1428,14 +1429,14 @@ mod shader_source_tests {
     #[test]
     fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
-        let needle = "restir_di.update_surface_descriptors(&device,vpt_surface);";
-        assert_eq!(
-            compact.matches(needle).count(),
-            1,
-            "surface descriptor rewrites must stay out of the per-frame render path"
+        let pipeline = source("src/render/vpt_pipeline.rs");
+
+        assert!(!app.contains("restir_di.update_surface_descriptors(&device,vpt_surface);"));
+        assert!(
+            pipeline.contains("restir_di.update_surface_descriptors(&device, vpt_surface);")
+                || pipeline.contains("restir_di.update_surface_descriptors(&device,vpt_surface);")
         );
-        assert!(compact.contains("vpt_surface.resize_images("));
+        assert!(app.contains("self.vpt_pipeline.resize("));
     }
 
     #[test]
@@ -1637,11 +1638,12 @@ mod shader_source_tests {
     #[test]
     fn restir_di_light_table_excludes_analytic_sun_and_preserves_emissive_sampling_power() {
         let app = source("src/app.rs");
+        let pipeline = source("src/render/vpt_pipeline.rs");
         let restir = source("src/render/restir_di.rs");
         let vpt = source("assets/shaders/passes/vpt.slang");
 
         assert!(
-            app.contains("build_direct_lights_from_ucvh(ucvh"),
+            pipeline.contains("build_direct_lights_from_ucvh(ucvh"),
             "ReSTIR-DI direct-light setup should build a finite-emissive light table; the analytic sun is evaluated separately in VPT"
         );
         assert!(

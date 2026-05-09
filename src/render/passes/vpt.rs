@@ -909,16 +909,17 @@ mod shader_source_tests {
     fn app_routes_temporal_radiance_through_vpt_atrous_before_postprocess() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT atrous graph test");
+        let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable for VPT atrous graph test");
         let compact = source.split_whitespace().collect::<String>();
 
+        assert!(pipeline.contains("pub vpt_atrous_pass: Option<VptAtrousPass>"));
+        assert!(pipeline.contains("pub postprocess_pass: Option<PostprocessPass>"));
+        assert!(pipeline.contains("VptAtrousPass::new"));
+        assert!(pipeline.contains("VptAtrousPassCreateInfo"));
+        assert!(pipeline.contains("PostprocessPass::new"));
+        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
         for token in [
-            "use crate::render::passes::vpt_atrous",
-            "VptAtrousPass",
-            "VptAtrousPassCreateInfo",
-            "VptAtrousPassResizeInfo",
-            "vpt_atrous_pass: Option<VptAtrousPass>",
-            "VptAtrousPass::new",
-            "VptAtrousPassResizeInfo",
             "graph.add_pass(\"vpt_atrous\"",
             "GpuProfileScope::VptAtrous",
             "postprocess.update_input_image",
@@ -1015,24 +1016,26 @@ mod shader_source_tests {
     fn app_declares_persistent_vpt_image_layouts_from_previous_frame_final_access() {
         let app = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for persistent VPT image layout test");
+        let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable for persistent VPT image layout test");
         let compact = app.split_whitespace().collect::<String>();
 
         assert!(
             compact.contains(
-                "lettemporal_radiance_initial_access=ifself.vpt_temporal_history_initialized{AccessKind::TransferRead"
+                "lettemporal_radiance_initial_access=ifself.vpt_pipeline.frame_state.vpt_temporal_history_initialized{AccessKind::TransferRead"
             ),
             "temporal radiance must be imported from the previous frame's history-copy read layout"
         );
         assert!(
             compact.contains(
-                "lettemporal_moments_initial_access=ifself.vpt_temporal_history_initialized{AccessKind::TransferRead"
+                "lettemporal_moments_initial_access=ifself.vpt_pipeline.frame_state.vpt_temporal_history_initialized{AccessKind::TransferRead"
             ),
             "temporal moments must be imported from the previous frame's history-copy read layout"
         );
         assert!(
-            compact.contains("postprocess_output_initialized:bool")
-                && compact.contains("self.postprocess_output_initialized=false;")
-                && compact.contains("letpostprocess_initial_access=ifself.postprocess_output_initialized{AccessKind::TransferRead")
+            pipeline.contains("pub postprocess_output_initialized: bool")
+                && pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();")
+                && compact.contains("letpostprocess_initial_access=ifself.vpt_pipeline.frame_state.postprocess_output_initialized{AccessKind::TransferRead")
                 && compact.contains("letpostprocess_output_resource=graph.import_image_with_access("),
             "postprocess output is a persistent image and must be imported with its tracked previous-frame layout"
         );
@@ -1042,15 +1045,22 @@ mod shader_source_tests {
     fn app_resets_vpt_temporal_state_on_resize_and_key_changes() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT reset test");
+        let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable for VPT reset test");
+        let compact = source.split_whitespace().collect::<String>();
 
-        assert!(source.contains("self.vpt_sample_index = 0;"));
-        assert!(source.contains("self.last_vpt_camera_key = None;"));
-        assert!(source.contains("if self.vpt_accumulation_needs_init {"));
-        assert!(source.contains("self.vpt_temporal_history_initialized = false;"));
+        assert!(source.contains("self.vpt_pipeline.resize("));
+        assert!(
+            source.contains(
+                "fn resize_render_passes(&mut self, width: u32, height: u32) -> Result<()>"
+            )
+        );
+        assert!(pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();"));
+        assert!(compact.contains("self.vpt_pipeline.frame_state.vpt_temporal_history_initialized"));
         assert!(source.contains("fov_y.to_bits()"));
         assert!(source.contains("frame.swapchain_extent.width"));
         assert!(source.contains("self.lighting_settings.vpt_max_bounces"));
-        assert!(source.contains("initialized postprocess pass from VPT output"));
+        assert!(pipeline.contains("initialized postprocess pass from VPT output"));
         assert!(source.contains("skipping VPT frame until required passes are initialized"));
         assert!(source.contains("graph.has_final_access(AccessKind::Present)"));
         assert!(source.contains("add_swapchain_clear_present_pass"));
@@ -1070,18 +1080,22 @@ mod shader_source_tests {
     fn app_keeps_vpt_first_use_sample_zero_until_noisy_radiance_is_written() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT first-use test");
+        let compact = source.split_whitespace().collect::<String>();
 
         assert!(
-            source.contains("let scene_vpt_sample_index = if self.vpt_accumulation_needs_init {")
-                && source.contains("vpt_sample_index: scene_vpt_sample_index"),
+            compact.contains(
+                "letscene_vpt_sample_index=ifself.vpt_pipeline.frame_state.vpt_accumulation_needs_init{0}else{self.vpt_pipeline.frame_state.vpt_sample_index};"
+            ) && compact.contains("vpt_sample_index:scene_vpt_sample_index"),
             "scene UBO must see sample 0 while the accumulation image is still first-use"
         );
         assert!(
-            source.contains("let noisy_initial_access = if self.vpt_accumulation_needs_init {"),
+            compact.contains(
+                "letnoisy_initial_access=ifself.vpt_pipeline.frame_state.vpt_accumulation_needs_init{AccessKind::Undefined}else{AccessKind::ComputeShaderRead};"
+            ),
             "first-use VPT noisy images must start from Undefined even if internal sample state was advanced"
         );
         assert!(
-            source.contains("self.last_vpt_camera_key = None;"),
+            source.contains("self.vpt_pipeline.frame_state.last_vpt_camera_key = None;"),
             "skipped VPT frames must not advance reusable accumulation state"
         );
     }
@@ -1520,6 +1534,8 @@ mod shader_source_tests {
     fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT surface graph test");
+        let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable for VPT surface graph test");
         let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
             .expect("Area ReSTIR pass source should be readable");
         let bootstrap_surface_idx = source
@@ -1535,8 +1551,10 @@ mod shader_source_tests {
             .find("graph.add_pass(\"vpt\"")
             .expect("VPT trace graph pass should exist after surface registration");
 
-        assert!(source.contains("vpt_surface_pass: Option<VptSurfacePass>"));
-        assert!(source.contains("VptSurfacePass::new"));
+        assert!(source.contains("vpt_pipeline: VptRuntimePipeline"));
+        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
+        assert!(pipeline.contains("pub vpt_surface_pass: Option<VptSurfacePass>"));
+        assert!(pipeline.contains("VptSurfacePass::new"));
         assert!(bootstrap_surface_idx < area_register_idx);
         assert!(area_pass.find("\"area_restir_initial\"") < Some(selected_surface_idx));
         assert!(area_register_idx < vpt_idx);
@@ -1569,21 +1587,24 @@ mod shader_source_tests {
     fn app_keeps_restir_di_behind_vpt_setting() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for ReSTIR-DI app wiring test");
+        let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable for ReSTIR-DI app wiring test");
         let compact_source = source.split_whitespace().collect::<String>();
 
         assert!(source.contains("RestirDiSettings::from_env"));
         assert!(source.contains("restir_di_settings: RestirDiSettings"));
-        assert!(source.contains("restir_di_pass: Option<RestirDiPass>"));
+        assert!(pipeline.contains("pub restir_di_pass: Option<RestirDiPass>"));
         assert!(source.contains("fn restir_di_vpt_enabled(&self) -> bool"));
+        assert!(source.contains("let restir_di_enabled = self.restir_di_vpt_enabled();"));
+        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
         assert!(
             compact_source.contains("self.restir_di_settings.enabled"),
             "ReSTIR-DI must stay disabled unless the explicit setting is enabled"
         );
         assert!(
-            compact_source.find("restir_di.register_graph(")
-                > compact_source
-                    .find("ifrestir_di_enabled&&letSome(restir_di)=&self.restir_di_pass{"),
-            "ReSTIR-DI graph registration must be nested behind the explicit setting guard"
+            pipeline.contains("fn ensure_restir_di_pass")
+                && pipeline.contains("if self.restir_di_pass.is_some() || !restir_di_enabled {"),
+            "ReSTIR-DI pass creation must be nested behind the explicit setting guard"
         );
     }
 
@@ -2264,28 +2285,35 @@ mod shader_source_tests {
         let source = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
         let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
             .expect("Area ReSTIR pass source should be readable");
+        let vpt_pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
+            .expect("VPT pipeline source should be readable");
+        let compact = source.split_whitespace().collect::<String>();
         let compact_area_pass = area_pass.split_whitespace().collect::<String>();
 
         for app_token in [
             "AreaRestirSettings::from_env",
             "area_restir_settings: AreaRestirSettings",
-            "area_restir_pass: Option<AreaRestirPass>",
-            "area_restir_history_initialized",
-            "AreaRestirPass::new",
-            "AreaRestirPassCreateInfo",
             "ucvh_gpu",
-            "area_restir.update_surface_descriptors",
-            "area_restir.update_ucvh_descriptors",
+            "self.vpt_pipeline.ensure_passes(",
             "area_restir.register_graph(",
             "area_graph.final_surface_writes",
             "area_graph.selected_current_resource",
             "vpt_area_restir_reads",
+            "self.vpt_pipeline.frame_state.area_restir_history_initialized",
         ] {
             assert!(
-                source.contains(app_token),
+                if app_token == "self.vpt_pipeline.frame_state.area_restir_history_initialized" {
+                    compact.contains(app_token)
+                } else {
+                    source.contains(app_token)
+                },
                 "app missing Area ReSTIR token {app_token}"
             );
         }
+
+        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
+        assert!(vpt_pipeline.contains("AreaRestirPass::new"));
+        assert!(vpt_pipeline.contains("AreaRestirPassCreateInfo"));
 
         for pass_token in [
             "self.update_uniforms",
@@ -2294,10 +2322,12 @@ mod shader_source_tests {
             "\"area_restir_spatial\"",
             "self.selected_current_buffer",
             "self.selected_history_buffer",
+            "update_surface_descriptors",
+            "update_ucvh_descriptors",
             "vpt.update_area_restir_descriptors",
         ] {
             assert!(
-                area_pass.contains(pass_token),
+                area_pass.contains(pass_token) || vpt_pipeline.contains(pass_token),
                 "Area ReSTIR pass missing graph token {pass_token}"
             );
         }
