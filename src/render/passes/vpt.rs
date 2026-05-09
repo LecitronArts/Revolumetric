@@ -711,12 +711,70 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 
 #[cfg(test)]
 mod shader_source_tests {
+    use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
+
     fn normalized_source(path_source: &str) -> String {
         crate::render::source_checks::normalize(path_source)
     }
 
     fn source(path: &str) -> String {
         crate::render::source_checks::read_source(path)
+    }
+
+    fn binding(binding: u32, kind: DescriptorKind, name: &str) -> DescriptorBinding {
+        DescriptorBinding {
+            set: 0,
+            binding,
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        ShaderReflection::from_slang_source("main", &source(path))
+            .expect("shader reflection should parse")
+            .bindings
+    }
+
+    #[test]
+    fn vpt_shader_binding_manifest_matches_expected_resources() {
+        assert_eq!(
+            shader_bindings("assets/shaders/passes/vpt.slang"),
+            vec![
+                binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+                binding(1, DescriptorKind::StorageImage, "noisy_radiance_image"),
+                binding(2, DescriptorKind::StorageBuffer, "ucvh_config"),
+                binding(3, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+                binding(4, DescriptorKind::StorageBuffer, "brick_occupancy"),
+                binding(5, DescriptorKind::StorageBuffer, "brick_materials"),
+                binding(6, DescriptorKind::UniformBuffer, "restir"),
+                binding(7, DescriptorKind::StorageBuffer, "restir_reservoirs"),
+                binding(8, DescriptorKind::StorageImage, "noisy_moments_image"),
+                binding(9, DescriptorKind::UniformBuffer, "area_restir"),
+                binding(10, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            ]
+        );
+    }
+
+    #[test]
+    fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
+        assert_eq!(
+            shader_bindings("assets/shaders/passes/vpt_surface.slang"),
+            vec![
+                binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+                binding(1, DescriptorKind::StorageImage, "surface_position_depth"),
+                binding(2, DescriptorKind::StorageImage, "surface_normal_roughness"),
+                binding(3, DescriptorKind::StorageImage, "surface_albedo_material"),
+                binding(4, DescriptorKind::StorageImage, "motion_history"),
+                binding(5, DescriptorKind::StorageBuffer, "ucvh_config"),
+                binding(6, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+                binding(7, DescriptorKind::StorageBuffer, "brick_occupancy"),
+                binding(8, DescriptorKind::StorageBuffer, "brick_materials"),
+                binding(9, DescriptorKind::UniformBuffer, "vpt_history"),
+                binding(10, DescriptorKind::UniformBuffer, "area_restir"),
+                binding(11, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            ]
+        );
     }
 
     #[test]

@@ -801,8 +801,52 @@ fn write_mapped_slice<T: Copy>(mapped_ptr: Option<*mut u8>, values: &[T]) {
 
 #[cfg(test)]
 mod shader_source_tests {
+    use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
+
     fn source(path: &str) -> String {
         crate::render::source_checks::read_source(path)
+    }
+
+    fn binding(binding: u32, kind: DescriptorKind, name: &str) -> DescriptorBinding {
+        DescriptorBinding {
+            set: 0,
+            binding,
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        ShaderReflection::from_slang_source("main", &source(path))
+            .expect("shader reflection should parse")
+            .bindings
+    }
+
+    #[test]
+    fn restir_di_initial_shader_binding_manifest_matches_expected_resources() {
+        assert_eq!(
+            shader_bindings("assets/shaders/passes/restir_di_initial.slang"),
+            vec![
+                binding(0, DescriptorKind::UniformBuffer, "restir"),
+                binding(1, DescriptorKind::StorageBuffer, "direct_lights"),
+                binding(2, DescriptorKind::StorageBuffer, "output_reservoirs"),
+                binding(
+                    3,
+                    DescriptorKind::StorageImage,
+                    "current_surface_position_depth",
+                ),
+                binding(
+                    4,
+                    DescriptorKind::StorageImage,
+                    "current_surface_normal_roughness",
+                ),
+                binding(
+                    5,
+                    DescriptorKind::StorageImage,
+                    "current_surface_albedo_material",
+                ),
+            ]
+        );
     }
 
     #[test]

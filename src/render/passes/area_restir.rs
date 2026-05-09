@@ -914,8 +914,45 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 
 #[cfg(test)]
 mod shader_source_tests {
+    use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
+
     fn source(path: &str) -> String {
         crate::render::source_checks::read_source(path)
+    }
+
+    fn binding(binding: u32, kind: DescriptorKind, name: &str) -> DescriptorBinding {
+        DescriptorBinding {
+            set: 0,
+            binding,
+            kind,
+            name: name.to_string(),
+        }
+    }
+
+    fn shader_bindings(path: &str) -> Vec<DescriptorBinding> {
+        ShaderReflection::from_slang_source("main", &source(path))
+            .expect("shader reflection should parse")
+            .bindings
+    }
+
+    #[test]
+    fn area_restir_initial_shader_binding_manifest_matches_expected_resources() {
+        assert_eq!(
+            shader_bindings("assets/shaders/passes/area_restir_initial.slang"),
+            vec![
+                binding(0, DescriptorKind::UniformBuffer, "area_restir"),
+                binding(1, DescriptorKind::StorageBuffer, "output_reservoirs"),
+                binding(2, DescriptorKind::StorageImage, "surface_position_depth"),
+                binding(3, DescriptorKind::StorageImage, "surface_normal_roughness"),
+                binding(4, DescriptorKind::StorageImage, "surface_albedo_material"),
+                binding(5, DescriptorKind::StorageImage, "area_restir_debug"),
+                binding(6, DescriptorKind::UniformBuffer, "scene_ubo"),
+                binding(7, DescriptorKind::StorageBuffer, "ucvh_config"),
+                binding(8, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+                binding(9, DescriptorKind::StorageBuffer, "brick_occupancy"),
+                binding(10, DescriptorKind::StorageBuffer, "brick_materials"),
+            ]
+        );
     }
 
     #[test]
