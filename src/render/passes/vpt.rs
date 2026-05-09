@@ -1730,6 +1730,37 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn voxel_traversal_steps_all_tied_dda_axes_to_avoid_edge_seams() {
+        let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+            .expect("voxel traversal shader should be readable");
+
+        for token in [
+            "static const float DDA_TIE_EPSILON",
+            "float dda_next_t(float3 t_max)",
+            "bool dda_axis_is_tied(float axis_t, float next_t)",
+            "float3 dda_step_normal(",
+            "void dda_step_voxel(",
+            "void dda_step_brick(",
+            "dda_step_voxel(coord, t_max, t_delta, step_dir, current_t, hit_normal);",
+            "dda_step_brick(brick_coord, t_max, t_delta, step_dir);",
+        ] {
+            assert!(
+                traverse.contains(token),
+                "voxel traversal shader missing tie-aware DDA token {token}"
+            );
+        }
+
+        assert!(
+            !traverse.contains("if (t_max.x < t_max.y)"),
+            "single-axis DDA tie breaking visits edge-touching cells and creates voxel/brick seams"
+        );
+        assert!(
+            !traverse.contains("normal * rsqrt(len2)"),
+            "tie-aware traversal must keep exported hit normals axis-aligned for lighting and reprojection"
+        );
+    }
+
+    #[test]
     fn vpt_ray_biases_do_not_skip_voxel_faces_or_shadow_endpoints() {
         let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
             .expect("vpt shader should be readable");

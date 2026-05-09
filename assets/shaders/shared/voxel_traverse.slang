@@ -4,12 +4,85 @@
 //
 // Key algorithms from references:
 // - Amanatides-Woo DDA stepping (standard)
-// - Branching DDA over branchless (from DeadlockCode/voxel_ray_traversal, ~5% faster)
+// - Tie-aware DDA: step every axis whose t_max reaches the next grid boundary
 // - occupancy_count skip (from GDVoxelPlayground — if count==0, skip entire brick)
 // - pixelToRay single-matrix ray gen (from DeadlockCode/voxel_ray_traversal)
 
 #include "ray.slang"
 #include "voxel_common.slang"
+
+static const float DDA_TIE_EPSILON = 1.0e-6;
+
+float dda_next_t(float3 t_max) {
+    return min(t_max.x, min(t_max.y, t_max.z));
+}
+
+bool dda_axis_is_tied(float axis_t, float next_t) {
+    return abs(axis_t - next_t) <= DDA_TIE_EPSILON * max(abs(next_t), 1.0);
+}
+
+float3 dda_step_normal(bool step_x, bool step_y, bool step_z, int3 step_dir) {
+    if (step_x) {
+        return float3(-float(step_dir.x), 0.0, 0.0);
+    }
+    if (step_y) {
+        return float3(0.0, -float(step_dir.y), 0.0);
+    }
+    if (step_z) {
+        return float3(0.0, 0.0, -float(step_dir.z));
+    }
+    return float3(0.0, 0.0, -1.0);
+}
+
+void dda_step_voxel(
+    inout int3 coord,
+    inout float3 t_max,
+    float3 t_delta,
+    int3 step_dir,
+    inout float current_t,
+    inout float3 hit_normal
+) {
+    float next_t = dda_next_t(t_max);
+    bool step_x = dda_axis_is_tied(t_max.x, next_t);
+    bool step_y = dda_axis_is_tied(t_max.y, next_t);
+    bool step_z = dda_axis_is_tied(t_max.z, next_t);
+    hit_normal = dda_step_normal(step_x, step_y, step_z, step_dir);
+    current_t = next_t;
+    if (step_x) {
+        coord.x += step_dir.x;
+        t_max.x += t_delta.x;
+    }
+    if (step_y) {
+        coord.y += step_dir.y;
+        t_max.y += t_delta.y;
+    }
+    if (step_z) {
+        coord.z += step_dir.z;
+        t_max.z += t_delta.z;
+    }
+}
+
+void dda_step_brick(
+    inout int3 brick_coord,
+    inout float3 t_max,
+    float3 t_delta,
+    int3 step_dir
+) {
+    float current_t = 0.0;
+    float3 hit_normal = float3(0.0);
+    dda_step_voxel(brick_coord, t_max, t_delta, step_dir, current_t, hit_normal);
+}
+
+void dda_step_brick_with_t(
+    inout int3 brick_coord,
+    inout float3 t_max,
+    float3 t_delta,
+    int3 step_dir,
+    inout float current_t
+) {
+    float3 hit_normal = float3(0.0);
+    dda_step_voxel(brick_coord, t_max, t_delta, step_dir, current_t, hit_normal);
+}
 
 // --- Brick-internal DDA (Level 2) ---
 // Amanatides-Woo DDA through 8^3 brick occupancy.
@@ -77,32 +150,7 @@ bool brick_dda(
             return true;
         }
 
-        // Branching DDA (faster than branchless per DeadlockCode benchmarks)
-        if (t_max.x < t_max.y) {
-            if (t_max.x < t_max.z) {
-                hit_normal = float3(-float(step_dir.x), 0, 0);
-                current_t = t_max.x;
-                coord.x += step_dir.x;
-                t_max.x += t_delta.x;
-            } else {
-                hit_normal = float3(0, 0, -float(step_dir.z));
-                current_t = t_max.z;
-                coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        } else {
-            if (t_max.y < t_max.z) {
-                hit_normal = float3(0, -float(step_dir.y), 0);
-                current_t = t_max.y;
-                coord.y += step_dir.y;
-                t_max.y += t_delta.y;
-            } else {
-                hit_normal = float3(0, 0, -float(step_dir.z));
-                current_t = t_max.z;
-                coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        }
+        dda_step_voxel(coord, t_max, t_delta, step_dir, current_t, hit_normal);
     }
     return false;
 }
@@ -147,27 +195,8 @@ bool brick_any_hit(
             return true;
         }
 
-        if (t_max.x < t_max.y) {
-            if (t_max.x < t_max.z) {
-                current_t = t_max.x;
-                coord.x += step_dir.x;
-                t_max.x += t_delta.x;
-            } else {
-                current_t = t_max.z;
-                coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        } else {
-            if (t_max.y < t_max.z) {
-                current_t = t_max.y;
-                coord.y += step_dir.y;
-                t_max.y += t_delta.y;
-            } else {
-                current_t = t_max.z;
-                coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        }
+        float3 unused_normal = float3(0.0);
+        dda_step_voxel(coord, t_max, t_delta, step_dir, current_t, unused_normal);
     }
     return false;
 }
@@ -249,24 +278,7 @@ HitResult trace_primary_ray(
             }
         }
 
-        // Step to next brick (branching DDA)
-        if (t_max.x < t_max.y) {
-            if (t_max.x < t_max.z) {
-                brick_coord.x += step_dir.x;
-                t_max.x += t_delta.x;
-            } else {
-                brick_coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        } else {
-            if (t_max.y < t_max.z) {
-                brick_coord.y += step_dir.y;
-                t_max.y += t_delta.y;
-            } else {
-                brick_coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        }
+        dda_step_brick(brick_coord, t_max, t_delta, step_dir);
     }
 
     return NO_HIT;
@@ -336,27 +348,7 @@ bool trace_any_hit_ray(
             }
         }
 
-        if (t_max.x < t_max.y) {
-            if (t_max.x < t_max.z) {
-                current_t = t_max.x;
-                brick_coord.x += step_dir.x;
-                t_max.x += t_delta.x;
-            } else {
-                current_t = t_max.z;
-                brick_coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        } else {
-            if (t_max.y < t_max.z) {
-                current_t = t_max.y;
-                brick_coord.y += step_dir.y;
-                t_max.y += t_delta.y;
-            } else {
-                current_t = t_max.z;
-                brick_coord.z += step_dir.z;
-                t_max.z += t_delta.z;
-            }
-        }
+        dda_step_brick_with_t(brick_coord, t_max, t_delta, step_dir, current_t);
     }
 
     return false;
