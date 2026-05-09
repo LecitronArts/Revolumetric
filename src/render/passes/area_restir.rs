@@ -8,9 +8,13 @@ use crate::render::area_restir::{
 };
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
+use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
@@ -39,6 +43,14 @@ pub struct AreaRestirPassCreateInfo<'a> {
     pub ucvh_gpu: &'a UcvhGpuResources,
 }
 
+pub struct AreaRestirGraphBuffers<'a> {
+    pub uniform_buffer: &'a GpuBuffer,
+    pub uniform_resource: ResourceHandle,
+    pub selected_current_buffer: &'a GpuBuffer,
+    pub selected_current_resource: ResourceHandle,
+    pub final_surface_writes: [ResourceHandle; 4],
+}
+
 struct AreaRestirBuffers {
     uniform_buffers: Vec<GpuBuffer>,
     initial_reservoirs: GpuBuffer,
@@ -59,6 +71,18 @@ struct AreaRestirStage {
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
+fn area_restir_effective_settings(
+    settings: AreaRestirSettings,
+    history_initialized: bool,
+) -> AreaRestirSettings {
+    let mut settings = settings;
+    if !history_initialized {
+        settings.temporal_enabled = false;
+    }
+    settings.spatial_enabled = settings.temporal_enabled && settings.spatial_enabled;
+    settings
 }
 
 impl AreaRestirPass {
@@ -193,6 +217,257 @@ impl AreaRestirPass {
             self.height,
         );
         write_mapped(self.uniform_buffers[frame_slot].mapped_ptr(), &uniforms);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        device: &ash::Device,
+        vpt: &'a VptPass,
+        vpt_surface: &'a VptSurfacePass,
+        frame_slot: usize,
+        frame_index: u64,
+        settings: AreaRestirSettings,
+        history_initialized: bool,
+        bootstrap_surface_writes: [ResourceHandle; 4],
+        previous_surface_resources: [ResourceHandle; 3],
+        profiler: Option<&'a GpuProfiler>,
+    ) -> AreaRestirGraphBuffers<'a> {
+        let settings = area_restir_effective_settings(settings, history_initialized);
+        let temporal_active = settings.temporal_enabled;
+        let spatial_active = temporal_active && settings.spatial_enabled;
+        self.update_uniforms(frame_slot, settings, frame_index);
+
+        let (uniform_buffer, uniform_size, uniform_usage) = self.uniform_buffer(frame_slot);
+        let (initial_buffer, initial_size, initial_usage) = self.initial_buffer();
+        let (temporal_buffer, temporal_size, temporal_usage) = self.temporal_buffer();
+        let (selected_current_buffer, selected_current_size, selected_current_usage) =
+            self.selected_current_buffer(frame_slot);
+        let (selected_history_buffer, selected_history_size, selected_history_usage) =
+            self.selected_history_buffer(frame_slot);
+        self.update_frame_descriptors(
+            device,
+            frame_slot,
+            selected_history_buffer,
+            selected_current_buffer,
+            temporal_active,
+            spatial_active,
+        );
+
+        let uniform_resource = graph.import_buffer_with_access(
+            uniform_buffer.handle,
+            uniform_size,
+            uniform_usage,
+            AccessKind::ComputeShaderRead,
+        );
+        let initial_resource = graph.import_buffer_with_access(
+            initial_buffer.handle,
+            initial_size,
+            initial_usage,
+            AccessKind::Undefined,
+        );
+        let temporal_resource = graph.import_buffer_with_access(
+            temporal_buffer.handle,
+            temporal_size,
+            temporal_usage,
+            AccessKind::Undefined,
+        );
+        let selected_current_resource = graph.import_buffer_with_access(
+            selected_current_buffer.handle,
+            selected_current_size,
+            selected_current_usage,
+            AccessKind::Undefined,
+        );
+        let selected_history_resource = graph.import_buffer_with_access(
+            selected_history_buffer.handle,
+            selected_history_size,
+            selected_history_usage,
+            if history_initialized {
+                AccessKind::ComputeShaderWrite
+            } else {
+                AccessKind::Undefined
+            },
+        );
+        let debug_resource = graph.import_image_with_access(
+            self.debug_image.handle,
+            self.debug_image.extent.width,
+            self.debug_image.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::Undefined,
+        );
+
+        let initial_writes = graph.add_pass("area_restir_initial", QueueType::Compute, |builder| {
+            builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+            builder.read_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderRead);
+            builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
+            builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
+            let initial_output_resource = if temporal_active {
+                initial_resource
+            } else {
+                selected_current_resource
+            };
+            builder.write_as(initial_output_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(debug_resource, AccessKind::ComputeShaderWrite);
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::AreaRestirInitial,
+                    );
+                }
+                self.record_initial(ctx.device, ctx.command_buffer, frame_slot);
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::AreaRestirInitial,
+                    );
+                }
+            })
+        });
+        let initial_dep = initial_writes[0];
+        let debug_dep = initial_writes[1];
+        let temporal_dep = if temporal_active {
+            let temporal_writes =
+                graph.add_pass("area_restir_temporal", QueueType::Compute, |builder| {
+                    builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                    builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
+                    builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[3], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[2], AccessKind::ComputeShaderRead);
+                    let temporal_output_resource = if spatial_active {
+                        temporal_resource
+                    } else {
+                        selected_current_resource
+                    };
+                    builder.write_as(temporal_output_resource, AccessKind::ComputeShaderWrite);
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::AreaRestirTemporal,
+                            );
+                        }
+                        self.record_temporal(ctx.device, ctx.command_buffer, frame_slot);
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::AreaRestirTemporal,
+                            );
+                        }
+                    })
+                });
+            temporal_writes[0]
+        } else {
+            initial_dep
+        };
+        let (selected_resource, final_debug_dep) = if spatial_active {
+            let spatial_writes =
+                graph.add_pass("area_restir_spatial", QueueType::Compute, |builder| {
+                    builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                    builder.read_as(temporal_dep, AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.write_as(selected_current_resource, AccessKind::ComputeShaderWrite);
+                    builder.write_as(debug_dep, AccessKind::ComputeShaderWrite);
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::AreaRestirSpatial,
+                            );
+                        }
+                        self.record_spatial(ctx.device, ctx.command_buffer, frame_slot);
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::AreaRestirSpatial,
+                            );
+                        }
+                    })
+                });
+            (spatial_writes[0], spatial_writes[1])
+        } else if temporal_active {
+            (temporal_dep, debug_dep)
+        } else {
+            (initial_dep, debug_dep)
+        };
+        let _ = final_debug_dep;
+
+        vpt.update_area_restir_descriptors(
+            device,
+            frame_slot,
+            uniform_buffer,
+            selected_current_buffer,
+        );
+        vpt_surface.update_area_restir_descriptors(
+            device,
+            frame_slot,
+            uniform_buffer,
+            selected_current_buffer,
+        );
+        let selected_surface_writes =
+            graph.add_pass("vpt_surface_selected", QueueType::Compute, |builder| {
+                builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
+                builder.read_as(selected_resource, AccessKind::ComputeShaderRead);
+                builder.write_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderWrite);
+                builder.write_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderWrite);
+                builder.write_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderWrite);
+                builder.write_as(bootstrap_surface_writes[3], AccessKind::ComputeShaderWrite);
+                Box::new(move |ctx| {
+                    if let Some(profiler) = profiler {
+                        profiler.begin_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptSurfaceSelected,
+                        );
+                    }
+                    vpt_surface.record_selected(ctx.device, ctx.command_buffer, frame_slot);
+                    if let Some(profiler) = profiler {
+                        profiler.end_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptSurfaceSelected,
+                        );
+                    }
+                })
+            });
+
+        AreaRestirGraphBuffers {
+            uniform_buffer,
+            uniform_resource,
+            selected_current_buffer,
+            selected_current_resource: selected_resource,
+            final_surface_writes: [
+                selected_surface_writes[0],
+                selected_surface_writes[1],
+                selected_surface_writes[2],
+                selected_surface_writes[3],
+            ],
+        }
     }
 
     pub fn update_surface_descriptors(&self, device: &ash::Device, surface: &VptSurfacePass) {
@@ -995,6 +1270,18 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn area_restir_pass_owns_graph_registration_contract() {
+        let pass = source("src/render/passes/area_restir.rs");
+        let implementation = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        assert!(implementation.contains("pub fn register_graph"));
+        assert!(implementation.contains("vpt_surface.update_area_restir_descriptors"));
+        assert!(implementation.contains("vpt.update_area_restir_descriptors"));
+    }
+
+    #[test]
     fn area_restir_pass_declares_independent_resources_without_local_barriers() {
         let implementation = source("src/render/passes/area_restir.rs");
         let implementation = implementation
@@ -1064,67 +1351,93 @@ mod shader_source_tests {
     #[test]
     fn app_area_restir_dispatches_only_enabled_reuse_stages() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
+        let compact_app = app.split_whitespace().collect::<String>();
+        let pass = source("src/render/passes/area_restir.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        let compact_pass = pass_impl.split_whitespace().collect::<String>();
 
         for token in [
-            "letarea_temporal_active=area_restir_settings.temporal_enabled;",
-            "letarea_spatial_active=area_temporal_active&&area_restir_settings.spatial_enabled;",
-            "letarea_initial_output_resource=ifarea_temporal_active{area_initial_resource}else{area_selected_current_resource};",
-            "letarea_temporal_dep=ifarea_temporal_active{",
+            "letsettings=area_restir_effective_settings(settings,history_initialized);",
+            "lettemporal_active=settings.temporal_enabled;",
+            "letspatial_active=temporal_active&&settings.spatial_enabled;",
+            "letinitial_output_resource=iftemporal_active{initial_resource}else{selected_current_resource};",
+            "lettemporal_dep=iftemporal_active{",
             "graph.add_pass(\"area_restir_temporal\"",
-            "}else{area_initial_dep};",
-            "letarea_temporal_output_resource=ifarea_spatial_active{area_temporal_resource}else{area_selected_current_resource};",
-            ")=ifarea_spatial_active{",
+            "}else{initial_dep};",
+            "lettemporal_output_resource=ifspatial_active{temporal_resource}else{selected_current_resource};",
+            ")=ifspatial_active{",
             "graph.add_pass(\"area_restir_spatial\"",
             "vpt.update_area_restir_descriptors(",
+            "vpt_surface.update_area_restir_descriptors(",
         ] {
             assert!(
-                compact.contains(token),
-                "app Area ReSTIR graph missing conditional-dispatch token {token}"
+                compact_pass.contains(token),
+                "Area ReSTIR pass graph missing conditional-dispatch token {token}"
             );
         }
         assert!(
-            compact.contains("if!history_initialized{settings.temporal_enabled=false;}")
-                && compact.contains(
+            compact_pass.contains("if!history_initialized{settings.temporal_enabled=false;}")
+                && compact_pass.contains(
                     "settings.spatial_enabled=settings.temporal_enabled&&settings.spatial_enabled;"
                 )
-                && compact.contains(
-                    "area_restir_effective_settings(self.area_restir_settings,self.area_restir_history_initialized"
-                )
-                && compact.contains(
-                    "letarea_spatial_active=area_temporal_active&&area_restir_settings.spatial_enabled;"
-                ),
+                && compact_pass
+                    .contains("area_restir_effective_settings(settings,history_initialized)")
+                && compact_pass
+                    .contains("letspatial_active=temporal_active&&settings.spatial_enabled;"),
             "effective settings must disable spatial reuse until temporal history is usable"
+        );
+        assert!(
+            compact_app.contains("area_restir.register_graph(")
+                && compact_app
+                    .contains("self.area_restir_settings,self.area_restir_history_initialized,")
+                && compact_app.contains("final_surface_writes=area_graph.final_surface_writes;"),
+            "app must delegate Area ReSTIR graph registration while preserving settings and outputs"
         );
     }
 
     #[test]
     fn app_uses_area_restir_selected_frame_ring_for_history_and_vpt_reads() {
         let app = source("src/app.rs");
-        let compact = app.split_whitespace().collect::<String>();
+        let compact_app = app.split_whitespace().collect::<String>();
+        let pass = source("src/render/passes/area_restir.rs");
+        let pass_impl = pass
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+        let compact_pass = pass_impl.split_whitespace().collect::<String>();
 
         for token in [
             "fnarea_restir_effective_settings(settings:AreaRestirSettings,history_initialized:bool,)->AreaRestirSettings{",
-            "area_restir.selected_current_buffer(",
-            "area_restir.selected_history_buffer(",
-            "area_selected_current_resource",
-            "area_selected_history_resource",
-            "area_restir_effective_settings(self.area_restir_settings,self.area_restir_history_initialized",
-            "builder.read_as(area_selected_history_resource,",
-            "builder.write_as(area_selected_current_resource,",
-            "vpt_area_restir_reads=Some((area_uniform_resource,area_selected_reservoir_resource));",
+            "self.selected_current_buffer(frame_slot)",
+            "self.selected_history_buffer(frame_slot)",
+            "selected_current_resource",
+            "selected_history_resource",
+            "area_restir_effective_settings(settings,history_initialized)",
+            "builder.read_as(selected_history_resource,",
+            "builder.write_as(selected_current_resource,",
+            "selected_current_resource:selected_resource,",
         ] {
             assert!(
-                compact.contains(token),
-                "app Area ReSTIR selected frame-ring policy missing token {token}"
+                compact_pass.contains(token),
+                "Area ReSTIR pass selected frame-ring policy missing token {token}"
             );
         }
         assert!(
-            !compact.contains("area_restir_selected_reservoir("),
+            compact_app.contains(
+                "vpt_area_restir_reads=Some((area_graph.uniform_resource,area_graph.selected_current_resource,));"
+            ),
+            "app must feed VPT the selected Area ReSTIR graph resource returned by the pass"
+        );
+        assert!(
+            !compact_pass.contains("area_restir_selected_reservoir("),
             "Area ReSTIR final reservoir selection must not point VPT/history at intermediate buffers"
         );
         assert!(
-            !app.contains("area_restir_history_update"),
+            !app.contains("area_restir_history_update")
+                && !pass_impl.contains("area_restir_history_update"),
             "Area ReSTIR graph must not add a transfer history update pass"
         );
     }

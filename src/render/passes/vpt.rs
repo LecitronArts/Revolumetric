@@ -1520,23 +1520,28 @@ mod shader_source_tests {
     fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT surface graph test");
+        let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
+            .expect("Area ReSTIR pass source should be readable");
         let bootstrap_surface_idx = source
             .find("\"vpt_surface_bootstrap\"")
             .expect("VPT bootstrap surface graph pass should exist");
-        let selected_surface_idx = source
+        let area_register_idx = source
+            .find("area_restir.register_graph(")
+            .expect("Area ReSTIR graph registration should exist");
+        let selected_surface_idx = area_pass
             .find("\"vpt_surface_selected\"")
             .expect("VPT selected surface graph pass should exist");
-        let vpt_idx = selected_surface_idx
-            + source[selected_surface_idx..]
-                .find("graph.add_pass(\"vpt\"")
-                .expect("VPT trace graph pass should exist after selected VPT surface");
+        let vpt_idx = source
+            .find("graph.add_pass(\"vpt\"")
+            .expect("VPT trace graph pass should exist after surface registration");
 
         assert!(source.contains("vpt_surface_pass: Option<VptSurfacePass>"));
         assert!(source.contains("VptSurfacePass::new"));
-        assert!(bootstrap_surface_idx < selected_surface_idx);
-        assert!(selected_surface_idx < vpt_idx);
-        if let Some(restir_idx) = source.find("graph.add_pass(\"restir_di_initial\"") {
-            assert!(selected_surface_idx < restir_idx);
+        assert!(bootstrap_surface_idx < area_register_idx);
+        assert!(area_pass.find("\"area_restir_initial\"") < Some(selected_surface_idx));
+        assert!(area_register_idx < vpt_idx);
+        if let Some(restir_idx) = source.find("restir_di.register_graph(") {
+            assert!(area_register_idx < restir_idx);
         }
     }
 
@@ -1544,15 +1549,18 @@ mod shader_source_tests {
     fn app_profiles_bootstrap_and_selected_vpt_surface_with_distinct_query_scopes() {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT surface profiler test");
+        let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
+            .expect("Area ReSTIR pass source should be readable");
         let profiler = std::fs::read_to_string("src/render/gpu_profiler.rs")
             .expect("GPU profiler source should be readable");
 
         assert!(profiler.contains("VptSurfaceBootstrap"));
         assert!(profiler.contains("VptSurfaceSelected"));
         assert!(source.contains("GpuProfileScope::VptSurfaceBootstrap"));
-        assert!(source.contains("GpuProfileScope::VptSurfaceSelected"));
+        assert!(area_pass.contains("GpuProfileScope::VptSurfaceSelected"));
         assert!(
-            !source.contains("GpuProfileScope::VptSurface,"),
+            !source.contains("GpuProfileScope::VptSurface,")
+                && !area_pass.contains("GpuProfileScope::VptSurface,"),
             "bootstrap and selected surface passes must not reuse one timestamp query scope"
         );
     }
@@ -1572,9 +1580,10 @@ mod shader_source_tests {
             "ReSTIR-DI must stay disabled unless the explicit setting is enabled"
         );
         assert!(
-            compact_source.find("graph.add_pass(\"restir_di_initial\"")
-                > compact_source.find("restir_di_enabled&&letSome(restir_di)=&self.restir_di_pass"),
-            "ReSTIR-DI graph passes must be nested behind the explicit setting guard"
+            compact_source.find("restir_di.register_graph(")
+                > compact_source
+                    .find("ifrestir_di_enabled&&letSome(restir_di)=&self.restir_di_pass{"),
+            "ReSTIR-DI graph registration must be nested behind the explicit setting guard"
         );
     }
 
@@ -2139,72 +2148,94 @@ mod shader_source_tests {
 
     #[test]
     fn app_uses_selected_vpt_surface_after_area_restir_for_di_trace_and_temporal() {
-        let source = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
-        let compact = source.split_whitespace().collect::<String>();
-        let assert_compute_read = |resource: &str| {
+        let app = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
+        let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
+            .expect("Area ReSTIR pass source should be readable");
+        let compact_app = app.split_whitespace().collect::<String>();
+        let compact_area_pass = area_pass.split_whitespace().collect::<String>();
+        let assert_app_compute_read = |resource: &str| {
             let single_line = format!("builder.read_as({resource},AccessKind::ComputeShaderRead);");
             let trailing_comma =
                 format!("builder.read_as({resource},AccessKind::ComputeShaderRead,);");
             assert!(
-                compact.contains(&single_line) || compact.contains(&trailing_comma),
+                compact_app.contains(&single_line) || compact_app.contains(&trailing_comma),
                 "app graph must route {resource} as a compute read dependency"
             );
         };
 
         for token in [
             "\"vpt_surface_bootstrap\"",
-            "\"vpt_surface_selected\"",
-            "vpt_surface.record_bootstrap",
-            "vpt_surface.record_selected",
-            "vpt_surface.update_area_restir_descriptors",
+            "area_restir.register_graph(",
+            "area_graph.final_surface_writes",
+            "area_graph.selected_current_resource",
+            "vpt_area_restir_reads",
             "final_surface_writes",
             "let bootstrap_surface_writes",
+            "vpt_surface.record_bootstrap",
         ] {
             assert!(
-                source.contains(token),
+                app.contains(token),
                 "app graph missing selected-surface token {token}"
             );
         }
+        for token in [
+            "\"vpt_surface_selected\"",
+            "vpt_surface.record_selected",
+            "vpt_surface.update_area_restir_descriptors",
+        ] {
+            assert!(
+                area_pass.contains(token),
+                "Area ReSTIR pass graph missing selected-surface token {token}"
+            );
+        }
 
-        let bootstrap_idx = source
+        let bootstrap_idx = app
             .find("\"vpt_surface_bootstrap\"")
             .expect("bootstrap surface pass should exist");
-        let area_idx = source
+        let area_register_idx = app
+            .find("area_restir.register_graph(")
+            .expect("Area ReSTIR graph registration should exist");
+        let area_initial_idx = area_pass
             .find("\"area_restir_initial\"")
             .expect("Area ReSTIR initial pass should exist");
-        let selected_idx = source
+        let selected_idx = area_pass
             .find("\"vpt_surface_selected\"")
             .expect("selected surface pass should exist");
-        let restir_idx = source.find("\"restir_di_initial\"").unwrap_or(usize::MAX);
-        let vpt_idx = source
+        let restir_idx = app.find("restir_di.register_graph(").unwrap_or(usize::MAX);
+        let vpt_idx = app
             .find("graph.add_pass(\"vpt\"")
             .expect("VPT pass should exist");
-        let temporal_idx = source
+        let temporal_idx = app
             .find("graph.add_pass(\"vpt_temporal\"")
             .expect("VPT temporal pass should exist");
-        let history_update_idx = source
+        let history_update_idx = app
             .find("\"vpt_surface_history_update\"")
             .expect("VPT surface history update pass should exist");
 
-        assert!(bootstrap_idx < area_idx);
-        assert!(area_idx < selected_idx);
+        assert!(bootstrap_idx < area_register_idx);
+        assert!(area_initial_idx < selected_idx);
         if restir_idx != usize::MAX {
-            assert!(selected_idx < restir_idx);
+            assert!(area_register_idx < restir_idx);
         }
-        assert!(selected_idx < vpt_idx);
-        assert!(selected_idx < temporal_idx);
-        assert!(selected_idx < history_update_idx);
+        assert!(area_register_idx < vpt_idx);
+        assert!(area_register_idx < temporal_idx);
+        assert!(area_register_idx < history_update_idx);
 
         for resource in [
-            "area_uniform_resource",
-            "area_selected_reservoir_resource",
             "final_surface_writes[0]",
             "final_surface_writes[1]",
             "final_surface_writes[2]",
             "final_surface_writes[3]",
         ] {
-            assert_compute_read(resource);
+            assert_app_compute_read(resource);
         }
+        assert!(
+            compact_area_pass
+                .contains("builder.read_as(uniform_resource,AccessKind::ComputeShaderRead)")
+                && compact_area_pass
+                    .contains("builder.read_as(selected_resource,AccessKind::ComputeShaderRead)"),
+            "Area ReSTIR selected-surface pass must read the selected reservoir and uniform resources"
+        );
     }
 
     #[test]
@@ -2212,9 +2243,11 @@ mod shader_source_tests {
         let source = std::fs::read_to_string("src/app.rs")
             .expect("app source should be readable for VPT ReSTIR-DI graph test");
         let compact_source = source.split_whitespace().collect::<String>();
+        let restir_pass = std::fs::read_to_string("src/render/passes/restir_di.rs")
+            .expect("ReSTIR-DI source should be readable");
 
         assert!(source.contains("vpt_restir_reads"));
-        assert!(source.contains("vpt.update_restir_di_descriptors"));
+        assert!(restir_pass.contains("vpt.update_restir_di_descriptors"));
         assert!(
             compact_source
                 .contains("builder.read_as(restir_uniform_resource,AccessKind::ComputeShaderRead")
@@ -2229,9 +2262,11 @@ mod shader_source_tests {
     #[test]
     fn app_wires_area_restir_between_surface_and_vpt_with_history_and_vpt_reads() {
         let source = std::fs::read_to_string("src/app.rs").expect("app source should be readable");
-        let compact_source = source.split_whitespace().collect::<String>();
+        let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
+            .expect("Area ReSTIR pass source should be readable");
+        let compact_area_pass = area_pass.split_whitespace().collect::<String>();
 
-        for token in [
+        for app_token in [
             "AreaRestirSettings::from_env",
             "area_restir_settings: AreaRestirSettings",
             "area_restir_pass: Option<AreaRestirPass>",
@@ -2241,44 +2276,59 @@ mod shader_source_tests {
             "ucvh_gpu",
             "area_restir.update_surface_descriptors",
             "area_restir.update_ucvh_descriptors",
-            "area_restir.update_uniforms",
-            "\"area_restir_initial\"",
-            "\"area_restir_temporal\"",
-            "\"area_restir_spatial\"",
-            "area_restir.selected_current_buffer",
-            "area_restir.selected_history_buffer",
-            "vpt.update_area_restir_descriptors",
+            "area_restir.register_graph(",
+            "area_graph.final_surface_writes",
+            "area_graph.selected_current_resource",
             "vpt_area_restir_reads",
         ] {
             assert!(
-                source.contains(token),
-                "app missing Area ReSTIR token {token}"
+                source.contains(app_token),
+                "app missing Area ReSTIR token {app_token}"
+            );
+        }
+
+        for pass_token in [
+            "self.update_uniforms",
+            "\"area_restir_initial\"",
+            "\"area_restir_temporal\"",
+            "\"area_restir_spatial\"",
+            "self.selected_current_buffer",
+            "self.selected_history_buffer",
+            "vpt.update_area_restir_descriptors",
+        ] {
+            assert!(
+                area_pass.contains(pass_token),
+                "Area ReSTIR pass missing graph token {pass_token}"
             );
         }
 
         let bootstrap_surface_idx = source
             .find("\"vpt_surface_bootstrap\"")
             .expect("bootstrap surface pass should exist");
-        let area_initial_idx = source
+        let area_register_idx = source
+            .find("area_restir.register_graph(")
+            .expect("Area ReSTIR graph registration should exist");
+        let area_initial_idx = area_pass
             .find("\"area_restir_initial\"")
             .expect("Area ReSTIR initial pass should exist");
-        let selected_surface_idx = source
+        let selected_surface_idx = area_pass
             .find("\"vpt_surface_selected\"")
             .expect("selected surface pass should exist");
         let vpt_idx = source
             .find("graph.add_pass(\"vpt\"")
             .expect("VPT pass should exist");
-        assert!(bootstrap_surface_idx < area_initial_idx);
+        assert!(bootstrap_surface_idx < area_register_idx);
         assert!(area_initial_idx < selected_surface_idx);
-        assert!(selected_surface_idx < vpt_idx);
+        assert!(area_register_idx < vpt_idx);
 
         assert!(
-            compact_source
-                .contains("builder.read_as(area_uniform_resource,AccessKind::ComputeShaderRead")
+            compact_area_pass
+                .contains("builder.read_as(uniform_resource,AccessKind::ComputeShaderRead")
         );
-        assert!(compact_source.contains(
-            "builder.read_as(area_selected_reservoir_resource,AccessKind::ComputeShaderRead"
-        ));
+        assert!(
+            compact_area_pass
+                .contains("builder.read_as(selected_resource,AccessKind::ComputeShaderRead")
+        );
         assert!(
             !source.contains("\"area_restir_history_update\""),
             "Area ReSTIR selected reservoirs must not be copied through a transfer history pass"
