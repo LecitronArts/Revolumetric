@@ -915,7 +915,7 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 #[cfg(test)]
 mod shader_source_tests {
     fn source(path: &str) -> String {
-        std::fs::read_to_string(path).expect("source should be readable")
+        crate::render::source_checks::read_source(path)
     }
 
     #[test]
@@ -1161,24 +1161,23 @@ mod shader_source_tests {
         let initial = source("assets/shaders/passes/area_restir_initial.slang");
         let temporal = source("assets/shaders/passes/area_restir_temporal.slang");
 
-        for token in [
-            "float4 center_position_depth = surface_position_depth[pixel];",
-            "AreaRestirCandidateSurface center_surface = read_center_surface(pixel);",
-            "AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(",
-            "uint2 pixel,\n    AreaRestirSampleState sample_state",
-            "evaluate_area_restir_candidate_surface(scene_ubo, pixel, sample_state)",
-            "ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(",
-            "HitResult hit = trace_primary_ray(",
-            "make_ray(primary_ray.origin, primary_ray.direction)",
-            "float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);",
-            "float2 pixel_sample = area_restir_pixel_sample(pixel, sample_state);",
-            "surface.position_depth = float4(hit.position, hit.t);",
-        ] {
-            assert!(
-                initial.contains(token),
-                "initial shader missing ray-evaluated candidate token {token}"
-            );
-        }
+        crate::render::source_checks::assert_contains_all(
+            &initial,
+            &[
+                "float4 center_position_depth = surface_position_depth[pixel];",
+                "AreaRestirCandidateSurface center_surface = read_center_surface(pixel);",
+                "AreaRestirCandidateSurface candidate_surface = evaluate_area_restir_candidate_surface(",
+                "uint2 pixel,\n    AreaRestirSampleState sample_state",
+                "evaluate_area_restir_candidate_surface(scene_ubo, pixel, sample_state)",
+                "ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(",
+                "HitResult hit = trace_primary_ray(",
+                "make_ray(primary_ray.origin, primary_ray.direction)",
+                "float target_pdf = area_restir_candidate_target_pdf(center_surface, candidate_surface);",
+                "float2 pixel_sample = area_restir_pixel_sample(pixel, sample_state);",
+                "surface.position_depth = float4(hit.position, hit.t);",
+            ],
+            "initial shader ray-evaluated candidate",
+        );
         assert!(
             initial.contains("#include \"voxel_traverse.slang\"")
                 && initial.contains("#include \"material_common.slang\"")

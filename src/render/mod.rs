@@ -19,3 +19,6 @@ pub mod scene_ubo;
 pub mod shader;
 pub mod swapchain;
 pub mod vpt_history;
+
+#[cfg(test)]
+pub(crate) mod source_checks;

@@ -802,7 +802,7 @@ fn write_mapped_slice<T: Copy>(mapped_ptr: Option<*mut u8>, values: &[T]) {
 #[cfg(test)]
 mod shader_source_tests {
     fn source(path: &str) -> String {
-        std::fs::read_to_string(path).expect("shader source should be readable")
+        crate::render::source_checks::read_source(path)
     }
 
     #[test]
@@ -1467,8 +1467,7 @@ mod shader_source_tests {
 
     #[test]
     fn restir_di_pass_does_not_issue_pass_local_barriers() {
-        let implementation = std::fs::read_to_string("src/render/passes/restir_di.rs")
-            .expect("restir pass source should be readable");
+        let implementation = source("src/render/passes/restir_di.rs");
         let implementation = implementation
             .split("#[cfg(test)]")
             .next()
@@ -1480,8 +1479,7 @@ mod shader_source_tests {
 
     #[test]
     fn restir_di_pass_cleans_up_failed_construction_paths() {
-        let implementation = std::fs::read_to_string("src/render/passes/restir_di.rs")
-            .expect("restir pass source should be readable");
+        let implementation = source("src/render/passes/restir_di.rs");
         let implementation = implementation
             .split("#[cfg(test)]")
             .next()

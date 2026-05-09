@@ -712,7 +712,11 @@ fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
 #[cfg(test)]
 mod shader_source_tests {
     fn normalized_source(path_source: &str) -> String {
-        path_source.replace("\r\n", "\n")
+        crate::render::source_checks::normalize(path_source)
+    }
+
+    fn source(path: &str) -> String {
+        crate::render::source_checks::read_source(path)
     }
 
     #[test]
@@ -1895,45 +1899,54 @@ mod shader_source_tests {
 
     #[test]
     fn vpt_pass_binds_restir_di_uniform_and_reservoir_resources() {
-        let source =
-            std::fs::read_to_string("src/render/passes/vpt.rs").expect("vpt source is readable");
-        let implementation = source
+        let pass_source = source("src/render/passes/vpt.rs");
+        let implementation = pass_source
             .split("#[cfg(test)]")
             .next()
             .expect("implementation section should exist");
 
-        assert!(implementation.contains(".add_binding(\n                6,"));
-        assert!(implementation.contains(".add_binding(\n                7,"));
-        assert!(implementation.contains("update_restir_di_descriptors"));
-        assert!(implementation.contains("GpuRestirDiUniforms"));
-        assert!(implementation.contains("GpuRestirDiReservoir"));
+        crate::render::source_checks::assert_compact_contains_all(
+            implementation,
+            &[".add_binding(6,", ".add_binding(7,"],
+            "VPT pass ReSTIR-DI descriptors",
+        );
+        crate::render::source_checks::assert_contains_all(
+            implementation,
+            &[
+                "update_restir_di_descriptors",
+                "GpuRestirDiUniforms",
+                "GpuRestirDiReservoir",
+            ],
+            "VPT pass ReSTIR-DI descriptors",
+        );
     }
 
     #[test]
     fn vpt_pass_binds_area_restir_as_independent_sample_area_resources() {
-        let source =
-            std::fs::read_to_string("src/render/passes/vpt.rs").expect("vpt source is readable");
-        let implementation = source
+        let pass_source = source("src/render/passes/vpt.rs");
+        let implementation = pass_source
             .split("#[cfg(test)]")
             .next()
             .expect("implementation section should exist");
 
-        for token in [
-            ".add_binding(\n                9,",
-            ".add_binding(\n                10,",
-            "disabled_area_restir_uniform_buffers",
-            "disabled_area_restir_reservoir_buffer",
-            "update_area_restir_descriptors",
-            "GpuAreaRestirUniforms",
-            "GpuAreaRestirReservoir",
-            "create_disabled_area_restir_uniform_buffers",
-            "create_disabled_area_restir_reservoir_buffer",
-        ] {
-            assert!(
-                implementation.contains(token),
-                "VPT pass missing Area ReSTIR token {token}"
-            );
-        }
+        crate::render::source_checks::assert_compact_contains_all(
+            implementation,
+            &[".add_binding(9,", ".add_binding(10,"],
+            "VPT pass Area ReSTIR descriptors",
+        );
+        crate::render::source_checks::assert_contains_all(
+            implementation,
+            &[
+                "disabled_area_restir_uniform_buffers",
+                "disabled_area_restir_reservoir_buffer",
+                "update_area_restir_descriptors",
+                "GpuAreaRestirUniforms",
+                "GpuAreaRestirReservoir",
+                "create_disabled_area_restir_uniform_buffers",
+                "create_disabled_area_restir_reservoir_buffer",
+            ],
+            "VPT pass Area ReSTIR descriptors",
+        );
 
         assert!(
             implementation.find("update_restir_di_descriptors")
@@ -2069,10 +2082,8 @@ mod shader_source_tests {
 
     #[test]
     fn vpt_surface_pass_binds_area_restir_selected_primary_sample() {
-        let surface_shader = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
-            .expect("VPT surface shader should exist");
-        let pass_source = std::fs::read_to_string("src/render/passes/vpt_surface.rs")
-            .expect("VPT surface pass should exist");
+        let surface_shader = source("assets/shaders/passes/vpt_surface.slang");
+        let pass_source = source("src/render/passes/vpt_surface.rs");
         let implementation = pass_source
             .split("#[cfg(test)]")
             .next()
@@ -2092,25 +2103,27 @@ mod shader_source_tests {
             );
         }
 
-        for token in [
-            ".add_binding(\n                10,",
-            ".add_binding(\n                11,",
-            "bootstrap_descriptor_sets",
-            "selected_descriptor_sets",
-            "disabled_area_restir_uniform_buffers",
-            "disabled_area_restir_reservoir_buffer",
-            "update_area_restir_descriptors",
-            "record_bootstrap",
-            "record_selected",
-            "write_area_restir_descriptor_sets",
-            "GpuAreaRestirUniforms",
-            "GpuAreaRestirReservoir",
-        ] {
-            assert!(
-                implementation.contains(token),
-                "VPT surface pass missing selected-primary descriptor token {token}"
-            );
-        }
+        crate::render::source_checks::assert_compact_contains_all(
+            implementation,
+            &[".add_binding(10,", ".add_binding(11,"],
+            "VPT surface pass selected-primary descriptors",
+        );
+        crate::render::source_checks::assert_contains_all(
+            implementation,
+            &[
+                "bootstrap_descriptor_sets",
+                "selected_descriptor_sets",
+                "disabled_area_restir_uniform_buffers",
+                "disabled_area_restir_reservoir_buffer",
+                "update_area_restir_descriptors",
+                "record_bootstrap",
+                "record_selected",
+                "write_area_restir_descriptor_sets",
+                "GpuAreaRestirUniforms",
+                "GpuAreaRestirReservoir",
+            ],
+            "VPT surface pass selected-primary descriptors",
+        );
     }
 
     #[test]
