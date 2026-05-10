@@ -119,6 +119,7 @@ mod tests {
         assert!(source.contains("float2 current_jitter"));
         assert!(source.contains("float2 previous_jitter"));
         assert!(source.contains("uint history_reset_generation"));
+        assert!(source.contains("VPT_HISTORY_FLAG_LIGHTS_INVALIDATED"));
         assert!(source.contains("struct VptSurfacePixel"));
         assert!(source.contains("float linear_depth"));
         assert!(source.contains("uint material_id"));

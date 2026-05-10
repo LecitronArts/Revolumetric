@@ -56,7 +56,8 @@ void write_miss(uint2 pixel) {
 float4 project_previous_pixel(float3 world_position) {
     if ((vpt_history.flags & VPT_HISTORY_FLAG_CAMERA_CUT) != 0u
         || (vpt_history.flags & VPT_HISTORY_FLAG_RESIZE) != 0u
-        || (vpt_history.flags & VPT_HISTORY_FLAG_SCENE_INVALIDATED) != 0u) {
+        || (vpt_history.flags & VPT_HISTORY_FLAG_SCENE_INVALIDATED) != 0u
+        || (vpt_history.flags & VPT_HISTORY_FLAG_LIGHTS_INVALIDATED) != 0u) {
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 

@@ -630,6 +630,7 @@ fn vpt_history_abi_declares_surface_and_reprojection_contract() {
         "VPT_HISTORY_FLAG_CAMERA_CUT",
         "VPT_HISTORY_FLAG_RESIZE",
         "VPT_HISTORY_FLAG_SCENE_INVALIDATED",
+        "VPT_HISTORY_FLAG_LIGHTS_INVALIDATED",
         "GpuVptSurfacePixel",
         "linear_depth",
         "material_id",
@@ -647,6 +648,7 @@ fn vpt_history_abi_declares_surface_and_reprojection_contract() {
         "float2 previous_jitter",
         "uint history_reset_generation",
         "static const uint VPT_HISTORY_FLAG_CAMERA_CUT",
+        "static const uint VPT_HISTORY_FLAG_LIGHTS_INVALIDATED",
         "struct VptSurfacePixel",
     ] {
         assert!(

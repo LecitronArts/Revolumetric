@@ -163,6 +163,43 @@ impl RevolumetricApp {
         }
     }
 
+    fn current_vpt_camera_frame(&self) -> VptCameraFrame {
+        match self.world.resource::<CameraRig>() {
+            Some(rig) => VptCameraFrame {
+                position: rig.camera.position,
+                forward: rig.camera.forward,
+                up: rig.camera.up,
+                fov_y_radians: rig.camera.fov_y_radians,
+                aperture_radius: rig.camera.aperture_radius,
+                focal_distance: rig.camera.focal_distance,
+            },
+            None => VptCameraFrame {
+                position: glam::Vec3::new(64.0, 80.0, -40.0),
+                forward: glam::Vec3::Z,
+                up: glam::Vec3::Y,
+                fov_y_radians: std::f32::consts::FRAC_PI_4,
+                aperture_radius: 0.0,
+                focal_distance: 128.0,
+            },
+        }
+    }
+
+    fn current_sun_light(&self) -> (glam::Vec3, glam::Vec3) {
+        match self.world.resource::<DirectionalLight>() {
+            Some(light) => (light.direction, light.intensity),
+            None => (
+                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                glam::Vec3::new(2.0, 1.5, 1.25),
+            ),
+        }
+    }
+
+    fn current_elapsed_seconds(&self) -> f32 {
+        self.world
+            .resource::<Time>()
+            .map_or(0.0, |time| time.elapsed_seconds)
+    }
+
     fn tick_frame(&mut self) -> Result<()> {
         // Real delta time
         let now = std::time::Instant::now();
@@ -188,6 +225,9 @@ impl RevolumetricApp {
 
         let restir_di_enabled = self.restir_di_vpt_enabled();
         let area_restir_enabled = self.area_restir_vpt_enabled();
+        let camera = self.current_vpt_camera_frame();
+        let (sun_direction, sun_intensity) = self.current_sun_light();
+        let elapsed_seconds = self.current_elapsed_seconds();
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = renderer.begin_frame()?;
             if frame.should_render {
@@ -215,41 +255,6 @@ impl RevolumetricApp {
                     }
                 }
 
-                let camera = {
-                    let rig = self.world.resource::<CameraRig>();
-                    match rig {
-                        Some(rig) => VptCameraFrame {
-                            position: rig.camera.position,
-                            forward: rig.camera.forward,
-                            up: rig.camera.up,
-                            fov_y_radians: rig.camera.fov_y_radians,
-                            aperture_radius: rig.camera.aperture_radius,
-                            focal_distance: rig.camera.focal_distance,
-                        },
-                        None => VptCameraFrame {
-                            position: glam::Vec3::new(64.0, 80.0, -40.0),
-                            forward: glam::Vec3::Z,
-                            up: glam::Vec3::Y,
-                            fov_y_radians: std::f32::consts::FRAC_PI_4,
-                            aperture_radius: 0.0,
-                            focal_distance: 128.0,
-                        },
-                    }
-                };
-                let (sun_direction, sun_intensity) = {
-                    let light = self.world.resource::<DirectionalLight>();
-                    match light {
-                        Some(light) => (light.direction, light.intensity),
-                        None => (
-                            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
-                            glam::Vec3::new(2.0, 1.5, 1.25),
-                        ),
-                    }
-                };
-                let elapsed_seconds = self
-                    .world
-                    .resource::<Time>()
-                    .map_or(0.0, |time| time.elapsed_seconds);
                 if let Some(scene_ubo) = &self.scene_ubo {
                     let record_result = self.vpt_pipeline.record_and_execute_frame(
                         renderer,
@@ -657,7 +662,11 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
+    use crate::scene::camera::Camera;
+    use crate::scene::components::CameraRig;
+    use crate::scene::light::DirectionalLight;
 
     #[test]
     fn view_projection_round_trips_pixel_to_ray_center_coordinates() {
@@ -703,6 +712,71 @@ mod tests {
             (reprojected - expected).length() < 1.0e-3,
             "expected {expected}, got {reprojected}"
         );
+    }
+
+    #[test]
+    fn current_vpt_camera_frame_uses_rig_when_present() {
+        let mut app = RevolumetricApp::new();
+        app.world.insert_resource(CameraRig {
+            camera: Camera {
+                position: glam::Vec3::new(1.0, 2.0, 3.0),
+                forward: glam::Vec3::new(0.25, 0.5, 0.75).normalize(),
+                up: glam::Vec3::Y,
+                fov_y_radians: 1.1,
+                aperture_radius: 0.25,
+                focal_distance: 42.0,
+            },
+            ..CameraRig::default()
+        });
+
+        let camera = app.current_vpt_camera_frame();
+        assert_eq!(camera.position, glam::Vec3::new(1.0, 2.0, 3.0));
+        assert!((camera.forward - glam::Vec3::new(0.25, 0.5, 0.75).normalize()).length() < 1e-6);
+        assert_eq!(camera.up, glam::Vec3::Y);
+        assert!((camera.fov_y_radians - 1.1).abs() < 1e-6);
+        assert!((camera.aperture_radius - 0.25).abs() < 1e-6);
+        assert!((camera.focal_distance - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn current_vpt_camera_frame_falls_back_to_expected_defaults() {
+        let app = RevolumetricApp::new();
+        let camera = app.current_vpt_camera_frame();
+
+        assert_eq!(camera.position, glam::Vec3::new(64.0, 80.0, -40.0));
+        assert_eq!(camera.forward, glam::Vec3::Z);
+        assert_eq!(camera.up, glam::Vec3::Y);
+        assert!((camera.fov_y_radians - std::f32::consts::FRAC_PI_4).abs() < 1e-6);
+        assert_eq!(camera.aperture_radius, 0.0);
+        assert_eq!(camera.focal_distance, 128.0);
+    }
+
+    #[test]
+    fn current_sun_light_uses_world_light_when_present() {
+        let mut app = RevolumetricApp::new();
+        app.world.insert_resource(DirectionalLight {
+            direction: glam::Vec3::new(-1.0, 0.5, 0.25).normalize(),
+            intensity: glam::Vec3::new(4.0, 3.0, 2.0),
+        });
+
+        let (direction, intensity) = app.current_sun_light();
+        assert!((direction - glam::Vec3::new(-1.0, 0.5, 0.25).normalize()).length() < 1e-6);
+        assert_eq!(intensity, glam::Vec3::new(4.0, 3.0, 2.0));
+    }
+
+    #[test]
+    fn current_sun_light_falls_back_to_expected_defaults() {
+        let app = RevolumetricApp::new();
+        let (direction, intensity) = app.current_sun_light();
+
+        assert!((direction - glam::Vec3::new(0.5, 1.0, 0.25).normalize()).length() < 1e-6);
+        assert_eq!(intensity, glam::Vec3::new(2.0, 1.5, 1.25));
+    }
+
+    #[test]
+    fn current_elapsed_seconds_defaults_to_zero_without_time_resource() {
+        let app = RevolumetricApp::new();
+        assert_eq!(app.current_elapsed_seconds(), 0.0);
     }
 
     #[test]

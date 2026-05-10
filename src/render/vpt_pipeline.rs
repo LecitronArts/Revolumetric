@@ -28,7 +28,8 @@ use crate::render::scene_ubo::{
     LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, build_scene_uniforms,
 };
 use crate::render::vpt_history::{
-    GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_RESIZE,
+    GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_LIGHTS_INVALIDATED,
+    VPT_HISTORY_FLAG_RESIZE, VPT_HISTORY_FLAG_SCENE_INVALIDATED,
 };
 use crate::voxel::gpu_upload::UcvhGpuResources;
 use crate::voxel::ucvh::Ucvh;
@@ -68,6 +69,8 @@ pub struct VptFrameRecordResult {
 pub struct VptPipelineFrameState {
     pub vpt_sample_index: u32,
     pub last_vpt_camera_key: Option<[u32; 15]>,
+    pub last_vpt_scene_key: Option<[u32; 14]>,
+    pub history_reset_generation: u32,
     pub vpt_accumulation_needs_init: bool,
     pub vpt_temporal_history_initialized: bool,
     pub postprocess_output_initialized: bool,
@@ -82,6 +85,8 @@ impl Default for VptPipelineFrameState {
         Self {
             vpt_sample_index: 0,
             last_vpt_camera_key: None,
+            last_vpt_scene_key: None,
+            history_reset_generation: 0,
             vpt_accumulation_needs_init: true,
             vpt_temporal_history_initialized: false,
             postprocess_output_initialized: false,
@@ -97,6 +102,7 @@ impl VptPipelineFrameState {
     pub fn reset_for_resize_or_camera_cut(&mut self) {
         self.vpt_sample_index = 0;
         self.last_vpt_camera_key = None;
+        self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
         self.vpt_accumulation_needs_init = true;
         self.vpt_temporal_history_initialized = false;
         self.postprocess_output_initialized = false;
@@ -104,6 +110,18 @@ impl VptPipelineFrameState {
         self.restir_di_history_initialized = false;
         self.previous_vpt_view_proj = None;
         self.previous_vpt_resolution = None;
+    }
+
+    pub fn reset_for_scene_change(&mut self) {
+        self.vpt_sample_index = 0;
+        self.last_vpt_camera_key = None;
+        self.last_vpt_scene_key = None;
+        self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
+        self.vpt_accumulation_needs_init = true;
+        self.vpt_temporal_history_initialized = false;
+        self.postprocess_output_initialized = false;
+        self.area_restir_history_initialized = false;
+        self.restir_di_history_initialized = false;
     }
 }
 
@@ -125,6 +143,31 @@ impl Default for VptRuntimePipeline {
 }
 
 impl VptRuntimePipeline {
+    fn make_scene_key(
+        sun_direction: glam::Vec3,
+        sun_intensity: glam::Vec3,
+        lighting_settings: LightingSettings,
+        restir_di_enabled: bool,
+        area_restir_enabled: bool,
+    ) -> [u32; 14] {
+        [
+            sun_direction.x.to_bits(),
+            sun_direction.y.to_bits(),
+            sun_direction.z.to_bits(),
+            sun_intensity.x.to_bits(),
+            sun_intensity.y.to_bits(),
+            sun_intensity.z.to_bits(),
+            lighting_settings.shadows_enabled as u32,
+            lighting_settings.skip_backface_shadows as u32,
+            lighting_settings.vpt_max_bounces,
+            lighting_settings.sun_angular_radius.to_bits(),
+            lighting_settings.denoiser_enabled as u32,
+            lighting_settings.denoiser_atrous_iterations,
+            restir_di_enabled as u32,
+            area_restir_enabled as u32,
+        ]
+    }
+
     pub fn new() -> Self {
         Self {
             postprocess_pass: None,
@@ -523,6 +566,18 @@ impl VptRuntimePipeline {
         let mut restir_di_selected_written = false;
         let mut area_restir_selected_written = false;
         let mut current_vpt_view_proj = None;
+        let scene_key = Self::make_scene_key(
+            inputs.sun_direction,
+            inputs.sun_intensity,
+            inputs.lighting_settings,
+            inputs.restir_di_enabled,
+            inputs.area_restir_enabled,
+        );
+        let scene_changed = self.frame_state.last_vpt_scene_key != Some(scene_key);
+        if scene_changed {
+            self.frame_state.reset_for_scene_change();
+            self.frame_state.last_vpt_scene_key = Some(scene_key);
+        }
 
         if inputs.ucvh_ready {
             let camera = inputs.camera;
@@ -609,6 +664,11 @@ impl VptRuntimePipeline {
             } else {
                 0
             };
+            let scene_history_flags = if scene_changed {
+                VPT_HISTORY_FLAG_SCENE_INVALIDATED | VPT_HISTORY_FLAG_LIGHTS_INVALIDATED
+            } else {
+                0
+            };
             let history_uniforms = GpuVptHistoryUniforms {
                 current_view_proj: current_view_proj.transpose().to_cols_array_2d(),
                 previous_view_proj: previous_view_proj.transpose().to_cols_array_2d(),
@@ -617,8 +677,8 @@ impl VptRuntimePipeline {
                 current_jitter: [0.0, 0.0],
                 previous_jitter: [0.0, 0.0],
                 frame_index: frame.frame_index as u32,
-                history_reset_generation: 0,
-                flags: history_flags,
+                history_reset_generation: self.frame_state.history_reset_generation,
+                flags: history_flags | scene_history_flags,
                 _pad0: 0,
             };
             if let Some(vpt_surface) = &self.vpt_surface_pass {
@@ -1144,12 +1204,15 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::scene_ubo::{LightingDebugView, LightingSettings, RenderMode, VptDebugView};
 
     #[test]
     fn frame_state_reset_clears_history_and_accumulation() {
         let mut state = VptPipelineFrameState {
             vpt_sample_index: 7,
             last_vpt_camera_key: Some([1; 15]),
+            last_vpt_scene_key: Some([2; 14]),
+            history_reset_generation: 9,
             vpt_accumulation_needs_init: false,
             vpt_temporal_history_initialized: true,
             postprocess_output_initialized: true,
@@ -1163,6 +1226,8 @@ mod tests {
 
         assert_eq!(state.vpt_sample_index, 0);
         assert_eq!(state.last_vpt_camera_key, None);
+        assert_eq!(state.last_vpt_scene_key, Some([2; 14]));
+        assert_eq!(state.history_reset_generation, 10);
         assert!(state.vpt_accumulation_needs_init);
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
@@ -1170,5 +1235,78 @@ mod tests {
         assert!(!state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, None);
         assert_eq!(state.previous_vpt_resolution, None);
+    }
+
+    #[test]
+    fn frame_state_scene_reset_clears_history_without_touching_camera_history() {
+        let mut state = VptPipelineFrameState {
+            vpt_sample_index: 11,
+            last_vpt_camera_key: Some([1; 15]),
+            last_vpt_scene_key: Some([2; 14]),
+            history_reset_generation: 3,
+            vpt_accumulation_needs_init: false,
+            vpt_temporal_history_initialized: true,
+            postprocess_output_initialized: true,
+            area_restir_history_initialized: true,
+            restir_di_history_initialized: true,
+            previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
+            previous_vpt_resolution: Some([1280, 720]),
+        };
+
+        state.reset_for_scene_change();
+
+        assert_eq!(state.vpt_sample_index, 0);
+        assert_eq!(state.last_vpt_camera_key, None);
+        assert_eq!(state.last_vpt_scene_key, None);
+        assert_eq!(state.history_reset_generation, 4);
+        assert!(state.vpt_accumulation_needs_init);
+        assert!(!state.vpt_temporal_history_initialized);
+        assert!(!state.postprocess_output_initialized);
+        assert!(!state.area_restir_history_initialized);
+        assert!(!state.restir_di_history_initialized);
+        assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
+        assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
+    }
+
+    #[test]
+    fn scene_key_changes_when_light_and_reuse_settings_change() {
+        let base = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            LightingSettings {
+                shadows_enabled: true,
+                skip_backface_shadows: false,
+                render_mode: RenderMode::Vpt,
+                vpt_max_bounces: 2,
+                sun_angular_radius: 0.02,
+                debug_view: LightingDebugView::Final,
+                exposure: 1.0,
+                denoiser_enabled: true,
+                denoiser_atrous_iterations: 4,
+                vpt_debug_view: VptDebugView::Final,
+            },
+            false,
+            false,
+        );
+        let changed = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(3.0, 2.0, 1.5),
+            LightingSettings {
+                shadows_enabled: false,
+                skip_backface_shadows: true,
+                render_mode: RenderMode::Vpt,
+                vpt_max_bounces: 4,
+                sun_angular_radius: 0.05,
+                debug_view: LightingDebugView::Final,
+                exposure: 1.0,
+                denoiser_enabled: false,
+                denoiser_atrous_iterations: 2,
+                vpt_debug_view: VptDebugView::Final,
+            },
+            true,
+            true,
+        );
+
+        assert_ne!(base, changed);
     }
 }
