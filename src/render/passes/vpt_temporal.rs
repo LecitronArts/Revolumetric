@@ -3,10 +3,13 @@ use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 
 pub struct VptTemporalPass {
@@ -19,6 +22,24 @@ pub struct VptTemporalPass {
     pub accumulated_moments_history: GpuImage,
     pub previous_accumulated_radiance: GpuImage,
     pub previous_accumulated_moments_history: GpuImage,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptTemporalGraphOutputs {
+    pub accumulated_radiance: ResourceHandle,
+    pub accumulated_moments: ResourceHandle,
+    pub previous_accumulated_radiance: ResourceHandle,
+    pub previous_accumulated_moments: ResourceHandle,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptTemporalGraphInputs<'a> {
+    pub frame_slot: usize,
+    pub history_initialized: bool,
+    pub noisy_inputs: [ResourceHandle; 2],
+    pub surface_inputs: [ResourceHandle; 4],
+    pub previous_surface_inputs: [ResourceHandle; 3],
+    pub profiler: Option<&'a GpuProfiler>,
 }
 
 pub struct VptTemporalPassCreateInfo<'a> {
@@ -215,6 +236,160 @@ impl VptTemporalPass {
             cmd,
             &self.accumulated_moments_history,
             &self.previous_accumulated_moments_history,
+        );
+    }
+
+    pub fn register_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        inputs: VptTemporalGraphInputs<'a>,
+    ) -> VptTemporalGraphOutputs {
+        let VptTemporalGraphInputs {
+            frame_slot,
+            history_initialized,
+            noisy_inputs,
+            surface_inputs,
+            previous_surface_inputs,
+            profiler,
+        } = inputs;
+        let temporal_initial_access = if history_initialized {
+            AccessKind::TransferRead
+        } else {
+            AccessKind::Undefined
+        };
+        let previous_temporal_access = if history_initialized {
+            AccessKind::TransferWrite
+        } else {
+            AccessKind::Undefined
+        };
+        let temporal_radiance_resource = graph.import_image_with_access(
+            self.accumulated_radiance.handle,
+            self.accumulated_radiance.extent.width,
+            self.accumulated_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            temporal_initial_access,
+        );
+        let temporal_moments_resource = graph.import_image_with_access(
+            self.accumulated_moments_history.handle,
+            self.accumulated_moments_history.extent.width,
+            self.accumulated_moments_history.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            temporal_initial_access,
+        );
+        let previous_temporal_radiance_resource = graph.import_image_with_access(
+            self.previous_accumulated_radiance.handle,
+            self.previous_accumulated_radiance.extent.width,
+            self.previous_accumulated_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_temporal_access,
+        );
+        let previous_temporal_moments_resource = graph.import_image_with_access(
+            self.previous_accumulated_moments_history.handle,
+            self.previous_accumulated_moments_history.extent.width,
+            self.previous_accumulated_moments_history.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_temporal_access,
+        );
+
+        let temporal_writes = graph.add_pass("vpt_temporal", QueueType::Compute, |builder| {
+            builder.read_as(noisy_inputs[0], AccessKind::ComputeShaderRead);
+            builder.read_as(noisy_inputs[1], AccessKind::ComputeShaderRead);
+            for surface_input in surface_inputs {
+                builder.read_as(surface_input, AccessKind::ComputeShaderRead);
+            }
+            for previous_surface_input in previous_surface_inputs {
+                builder.read_as(previous_surface_input, AccessKind::ComputeShaderRead);
+            }
+            builder.read_as(
+                previous_temporal_radiance_resource,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                previous_temporal_moments_resource,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.write_as(temporal_radiance_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(temporal_moments_resource, AccessKind::ComputeShaderWrite);
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::VptTemporal,
+                    );
+                }
+                self.record(ctx.device, ctx.command_buffer, frame_slot);
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::VptTemporal,
+                    );
+                }
+            })
+        });
+
+        VptTemporalGraphOutputs {
+            accumulated_radiance: temporal_writes[0],
+            accumulated_moments: temporal_writes[1],
+            previous_accumulated_radiance: previous_temporal_radiance_resource,
+            previous_accumulated_moments: previous_temporal_moments_resource,
+        }
+    }
+
+    pub fn register_history_update_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        vpt_surface: &'a VptSurfacePass,
+        temporal_outputs: VptTemporalGraphOutputs,
+        surface_inputs: [ResourceHandle; 4],
+        previous_surface_inputs: [ResourceHandle; 3],
+    ) {
+        graph.add_pass(
+            "vpt_surface_history_update",
+            QueueType::Transfer,
+            |builder| {
+                builder.read_as(
+                    temporal_outputs.accumulated_radiance,
+                    AccessKind::TransferRead,
+                );
+                builder.read_as(
+                    temporal_outputs.accumulated_moments,
+                    AccessKind::TransferRead,
+                );
+                builder.write_as(
+                    temporal_outputs.previous_accumulated_radiance,
+                    AccessKind::TransferWrite,
+                );
+                builder.write_as(
+                    temporal_outputs.previous_accumulated_moments,
+                    AccessKind::TransferWrite,
+                );
+                builder.read_as(surface_inputs[0], AccessKind::TransferRead);
+                builder.read_as(surface_inputs[1], AccessKind::TransferRead);
+                builder.read_as(surface_inputs[2], AccessKind::TransferRead);
+                builder.write_as(previous_surface_inputs[0], AccessKind::TransferWrite);
+                builder.write_as(previous_surface_inputs[1], AccessKind::TransferWrite);
+                builder.write_as(previous_surface_inputs[2], AccessKind::TransferWrite);
+                Box::new(move |ctx| {
+                    self.record_history_update(ctx.device, ctx.command_buffer);
+                    vpt_surface.record_history_update(ctx.device, ctx.command_buffer);
+                })
+            },
         );
     }
 

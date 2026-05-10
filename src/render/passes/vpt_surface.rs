@@ -7,8 +7,11 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::area_restir::{GpuAreaRestirReservoir, GpuAreaRestirUniforms};
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 use crate::render::vpt_history::GpuVptHistoryUniforms;
 use crate::voxel::gpu_upload::UcvhGpuResources;
@@ -29,6 +32,12 @@ pub struct VptSurfacePass {
     pub previous_surface_normal_roughness: GpuImage,
     pub previous_surface_albedo_material: GpuImage,
     pub motion_history: GpuImage,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptSurfaceBootstrapGraph {
+    pub surface_writes: [ResourceHandle; 4],
+    pub previous_surface_resources: [ResourceHandle; 3],
 }
 
 impl VptSurfacePass {
@@ -327,6 +336,132 @@ impl VptSurfacePass {
 
     pub fn record_selected(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         self.record_with_descriptor_set(device, cmd, self.selected_descriptor_sets[frame_slot]);
+    }
+
+    pub fn register_bootstrap_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        history_initialized: bool,
+        frame_slot: usize,
+        profiler: Option<&'a GpuProfiler>,
+    ) -> VptSurfaceBootstrapGraph {
+        let surface_position_resource = graph.import_image_with_access(
+            self.surface_position_depth.handle,
+            self.surface_position_depth.extent.width,
+            self.surface_position_depth.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let surface_normal_resource = graph.import_image_with_access(
+            self.surface_normal_roughness.handle,
+            self.surface_normal_roughness.extent.width,
+            self.surface_normal_roughness.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let surface_albedo_resource = graph.import_image_with_access(
+            self.surface_albedo_material.handle,
+            self.surface_albedo_material.extent.width,
+            self.surface_albedo_material.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let motion_history_resource = graph.import_image_with_access(
+            self.motion_history.handle,
+            self.motion_history.extent.width,
+            self.motion_history.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let previous_surface_access = if history_initialized {
+            AccessKind::TransferWrite
+        } else {
+            AccessKind::Undefined
+        };
+        let previous_surface_position_resource = graph.import_image_with_access(
+            self.previous_surface_position_depth.handle,
+            self.previous_surface_position_depth.extent.width,
+            self.previous_surface_position_depth.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_surface_access,
+        );
+        let previous_surface_normal_resource = graph.import_image_with_access(
+            self.previous_surface_normal_roughness.handle,
+            self.previous_surface_normal_roughness.extent.width,
+            self.previous_surface_normal_roughness.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_surface_access,
+        );
+        let previous_surface_albedo_resource = graph.import_image_with_access(
+            self.previous_surface_albedo_material.handle,
+            self.previous_surface_albedo_material.extent.width,
+            self.previous_surface_albedo_material.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_surface_access,
+        );
+
+        let bootstrap_writes =
+            graph.add_pass("vpt_surface_bootstrap", QueueType::Compute, |builder| {
+                builder.write_as(surface_position_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(surface_normal_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(surface_albedo_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(motion_history_resource, AccessKind::ComputeShaderWrite);
+                Box::new(move |ctx| {
+                    if let Some(profiler) = profiler {
+                        profiler.begin_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptSurfaceBootstrap,
+                        );
+                    }
+                    self.record_bootstrap(ctx.device, ctx.command_buffer, frame_slot);
+                    if let Some(profiler) = profiler {
+                        profiler.end_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptSurfaceBootstrap,
+                        );
+                    }
+                })
+            });
+        let surface_images = [
+            self.surface_position_depth.handle,
+            self.surface_normal_roughness.handle,
+            self.surface_albedo_material.handle,
+            self.motion_history.handle,
+        ];
+        for (&resource, &image) in bootstrap_writes.iter().zip(surface_images.iter()) {
+            graph.bind_image(resource, image);
+        }
+
+        VptSurfaceBootstrapGraph {
+            surface_writes: [
+                bootstrap_writes[0],
+                bootstrap_writes[1],
+                bootstrap_writes[2],
+                bootstrap_writes[3],
+            ],
+            previous_surface_resources: [
+                previous_surface_position_resource,
+                previous_surface_normal_resource,
+                previous_surface_albedo_resource,
+            ],
+        }
     }
 
     fn record_with_descriptor_set(
@@ -869,10 +1004,11 @@ mod shader_source_tests {
 
     #[test]
     fn vpt_surface_descriptor_specs_match_shader_manifest() {
-        let source =
-            crate::render::source_checks::read_source("assets/shaders/passes/vpt_surface.slang");
-        let reflection = ShaderReflection::from_slang_source("main", &source)
-            .expect("shader reflection should parse");
+        let source_path = "assets/shaders/passes/vpt_surface.slang";
+        let source = crate::render::source_checks::read_source(source_path);
+        let reflection =
+            ShaderReflection::from_slang_compiled_or_source("main", source_path, &source)
+                .expect("shader reflection should parse");
         crate::render::descriptor::assert_specs_match_shader_bindings(
             "VPT surface",
             &VptSurfacePass::descriptor_binding_specs(),

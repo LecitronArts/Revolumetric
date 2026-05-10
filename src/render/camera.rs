@@ -49,6 +49,32 @@ pub fn compute_pixel_to_ray(
     )
 }
 
+pub fn compute_view_proj(
+    camera_pos: Vec3,
+    camera_forward: Vec3,
+    camera_up: Vec3,
+    fov_y: f32,
+    width: u32,
+    height: u32,
+) -> Mat4 {
+    let forward = camera_forward.normalize();
+    let right = camera_up.cross(forward).normalize();
+    let up = forward.cross(right);
+    let view = Mat4::from_cols(
+        Vec4::new(right.x, up.x, -forward.x, 0.0),
+        Vec4::new(right.y, up.y, -forward.y, 0.0),
+        Vec4::new(right.z, up.z, -forward.z, 0.0),
+        Vec4::new(
+            -right.dot(camera_pos),
+            -up.dot(camera_pos),
+            forward.dot(camera_pos),
+            1.0,
+        ),
+    );
+    let projection = Mat4::perspective_rh(fov_y, width as f32 / height as f32, 0.01, 10_000.0);
+    projection * view
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

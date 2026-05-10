@@ -53,6 +53,7 @@ fn main() {
     for path in &pass_paths {
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let spv_path = out_dir.join(format!("{stem}.spv"));
+        let reflection_json_path = out_dir.join(format!("{stem}.reflection.json"));
 
         let status = Command::new("slangc")
             .arg(path)
@@ -64,6 +65,8 @@ fn main() {
             .arg("compute")
             .arg("-o")
             .arg(&spv_path)
+            .arg("-reflection-json")
+            .arg(&reflection_json_path)
             .arg("-I")
             .arg(shader_dir.join("shared"))
             .status();
@@ -127,6 +130,8 @@ fn write_placeholder_spirv_files(pass_paths: &[PathBuf], out_dir: &Path) {
     for path in pass_paths {
         let stem = path.file_stem().unwrap().to_str().unwrap();
         let spv_path = out_dir.join(format!("{stem}.spv"));
+        let reflection_json_path = out_dir.join(format!("{stem}.reflection.json"));
         std::fs::write(spv_path, []).unwrap();
+        let _ = std::fs::remove_file(reflection_json_path);
     }
 }

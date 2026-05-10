@@ -1,22 +1,69 @@
 use anyhow::{Context, Result};
+use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
+use crate::render::area_restir::AreaRestirSettings;
+use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
+use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
 use crate::render::device::RenderDevice;
+use crate::render::frame::FrameContext;
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::passes::area_restir::{AreaRestirPass, AreaRestirPassCreateInfo};
-use crate::render::passes::postprocess::PostprocessPass;
+use crate::render::passes::blit_to_swapchain;
+use crate::render::passes::postprocess::{PostprocessGraphInputs, PostprocessPass};
 use crate::render::passes::restir_di::{RestirDiPass, RestirDiPassCreateInfo};
 use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_atrous::{
-    VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
+    VptAtrousGraphInputs, VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
 };
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
-    VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
+    VptTemporalGraphInputs, VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
 };
+use crate::render::resource::{AccessKind, QueueType};
+use crate::render::restir_di::RestirDiSettings;
 use crate::render::restir_di::build_direct_lights_from_ucvh;
-use crate::render::scene_ubo::SceneUniformBuffer;
+use crate::render::scene_ubo::{
+    LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, build_scene_uniforms,
+};
+use crate::render::vpt_history::{
+    GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_RESIZE,
+};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 use crate::voxel::ucvh::Ucvh;
+
+#[derive(Debug, Clone, Copy)]
+pub struct VptCameraFrame {
+    pub position: glam::Vec3,
+    pub forward: glam::Vec3,
+    pub up: glam::Vec3,
+    pub fov_y_radians: f32,
+    pub aperture_radius: f32,
+    pub focal_distance: f32,
+}
+
+pub struct VptFrameInputs<'a> {
+    pub scene_ubo: &'a SceneUniformBuffer,
+    pub camera: VptCameraFrame,
+    pub sun_direction: glam::Vec3,
+    pub sun_intensity: glam::Vec3,
+    pub elapsed_seconds: f32,
+    pub lighting_settings: LightingSettings,
+    pub restir_di_settings: RestirDiSettings,
+    pub area_restir_settings: AreaRestirSettings,
+    pub restir_di_enabled: bool,
+    pub area_restir_enabled: bool,
+    pub ucvh_ready: bool,
+    pub capture: Option<&'a mut RenderCapture>,
+    pub profiler: Option<&'a GpuProfiler>,
+}
+
+pub struct VptFrameRecordResult {
+    pub pending_capture: Option<CaptureMetadata>,
+    pub submitted_fence: vk::Fence,
+    pub rendered_vpt: bool,
+}
 
 pub struct VptPipelineFrameState {
     pub vpt_sample_index: u32,
@@ -463,6 +510,429 @@ impl VptRuntimePipeline {
         }
     }
 
+    pub fn record_and_execute_frame(
+        &mut self,
+        renderer: &RenderDevice,
+        frame: &FrameContext,
+        mut inputs: VptFrameInputs<'_>,
+    ) -> Result<VptFrameRecordResult> {
+        let mut graph = RenderGraph::new();
+        let mut pending_capture = None;
+        let mut rendered_vpt = false;
+        let mut vpt_accumulation_written = false;
+        let mut restir_di_selected_written = false;
+        let mut area_restir_selected_written = false;
+        let mut current_vpt_view_proj = None;
+
+        if inputs.ucvh_ready {
+            let camera = inputs.camera;
+            let pixel_to_ray = compute_pixel_to_ray(
+                camera.position,
+                camera.forward,
+                camera.up,
+                camera.fov_y_radians,
+                frame.swapchain_extent.width,
+                frame.swapchain_extent.height,
+            );
+            let camera_key = [
+                camera.position.x.to_bits(),
+                camera.position.y.to_bits(),
+                camera.position.z.to_bits(),
+                camera.forward.x.to_bits(),
+                camera.forward.y.to_bits(),
+                camera.forward.z.to_bits(),
+                camera.up.x.to_bits(),
+                camera.up.y.to_bits(),
+                camera.up.z.to_bits(),
+                camera.fov_y_radians.to_bits(),
+                camera.aperture_radius.to_bits(),
+                camera.focal_distance.to_bits(),
+                frame.swapchain_extent.width,
+                frame.swapchain_extent.height,
+                inputs.lighting_settings.vpt_max_bounces,
+            ];
+            if self.frame_state.last_vpt_camera_key == Some(camera_key) {
+                self.frame_state.vpt_sample_index =
+                    self.frame_state.vpt_sample_index.saturating_add(1);
+            } else {
+                self.frame_state.vpt_sample_index = 0;
+                self.frame_state.last_vpt_camera_key = Some(camera_key);
+            }
+            let scene_vpt_sample_index = if self.frame_state.vpt_accumulation_needs_init {
+                0
+            } else {
+                self.frame_state.vpt_sample_index
+            };
+
+            let scene_data = build_scene_uniforms(SceneUniformInputs {
+                pixel_to_ray,
+                resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
+                camera_right: camera.up.cross(camera.forward).normalize(),
+                camera_up: camera.up.normalize(),
+                camera_forward: camera.forward.normalize(),
+                aperture_radius: camera.aperture_radius,
+                focal_distance: camera.focal_distance,
+                sun_direction: inputs.sun_direction,
+                sun_intensity: inputs.sun_intensity,
+                sky_color: [0.4, 0.5, 0.7],
+                ground_color: [0.15, 0.1, 0.08],
+                time: inputs.elapsed_seconds,
+                lighting_settings: inputs.lighting_settings,
+                vpt_sample_index: scene_vpt_sample_index,
+            });
+            inputs.scene_ubo.update(frame.frame_slot, &scene_data);
+
+            let current_view_proj = compute_view_proj(
+                camera.position,
+                camera.forward,
+                camera.up,
+                camera.fov_y_radians,
+                frame.swapchain_extent.width,
+                frame.swapchain_extent.height,
+            );
+            current_vpt_view_proj = Some(current_view_proj);
+            let previous_view_proj = self
+                .frame_state
+                .previous_vpt_view_proj
+                .unwrap_or(current_view_proj);
+            let previous_resolution = self
+                .frame_state
+                .previous_vpt_resolution
+                .unwrap_or([frame.swapchain_extent.width, frame.swapchain_extent.height]);
+            let history_flags = if self.frame_state.previous_vpt_view_proj.is_none() {
+                VPT_HISTORY_FLAG_CAMERA_CUT
+            } else if self.frame_state.previous_vpt_resolution.is_none()
+                || previous_resolution
+                    != [frame.swapchain_extent.width, frame.swapchain_extent.height]
+            {
+                VPT_HISTORY_FLAG_RESIZE
+            } else {
+                0
+            };
+            let history_uniforms = GpuVptHistoryUniforms {
+                current_view_proj: current_view_proj.transpose().to_cols_array_2d(),
+                previous_view_proj: previous_view_proj.transpose().to_cols_array_2d(),
+                current_resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
+                previous_resolution,
+                current_jitter: [0.0, 0.0],
+                previous_jitter: [0.0, 0.0],
+                frame_index: frame.frame_index as u32,
+                history_reset_generation: 0,
+                flags: history_flags,
+                _pad0: 0,
+            };
+            if let Some(vpt_surface) = &self.vpt_surface_pass {
+                vpt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
+            }
+
+            if let (
+                Some(vpt_surface),
+                Some(vpt),
+                Some(vpt_temporal),
+                Some(vpt_atrous),
+                Some(postprocess),
+            ) = (
+                &self.vpt_surface_pass,
+                &self.vpt_pass,
+                &self.vpt_temporal_pass,
+                &self.vpt_atrous_pass,
+                &self.postprocess_pass,
+            ) {
+                let slot = frame.frame_slot;
+                let profiler = inputs.profiler;
+                let surface_graph = vpt_surface.register_bootstrap_graph(
+                    &mut graph,
+                    self.frame_state.vpt_temporal_history_initialized,
+                    slot,
+                    profiler,
+                );
+                let bootstrap_surface_resources = surface_graph.surface_writes;
+                let mut final_surface_writes = bootstrap_surface_resources;
+                let previous_surface_resources = surface_graph.previous_surface_resources;
+                let mut vpt_area_restir_reads = None;
+                if inputs.area_restir_enabled
+                    && let Some(area_restir) = &self.area_restir_pass
+                {
+                    let area_graph = area_restir.register_graph(
+                        &mut graph,
+                        renderer.device(),
+                        vpt,
+                        vpt_surface,
+                        frame.frame_slot,
+                        frame.frame_index,
+                        inputs.area_restir_settings,
+                        self.frame_state.area_restir_history_initialized,
+                        bootstrap_surface_resources,
+                        previous_surface_resources,
+                        inputs.profiler,
+                    );
+                    final_surface_writes = area_graph.final_surface_writes;
+                    vpt_area_restir_reads = Some((
+                        area_graph.uniform_resource,
+                        area_graph.selected_current_resource,
+                    ));
+                    area_restir_selected_written = true;
+                }
+
+                let mut vpt_restir_reads = None;
+                if inputs.restir_di_enabled
+                    && let Some(restir_di) = &self.restir_di_pass
+                {
+                    let restir_graph = restir_di.register_graph(
+                        &mut graph,
+                        renderer.device(),
+                        vpt,
+                        frame.frame_slot,
+                        frame.frame_index,
+                        inputs.restir_di_settings,
+                        self.frame_state.restir_di_history_initialized,
+                        final_surface_writes,
+                        previous_surface_resources,
+                        inputs.profiler,
+                    );
+                    vpt_restir_reads = Some((
+                        restir_graph.uniform_resource,
+                        restir_graph.selected_current_resource,
+                    ));
+                    restir_di_selected_written = true;
+                }
+
+                vpt_accumulation_written = true;
+                rendered_vpt = true;
+
+                let vpt_outputs = vpt.register_graph(
+                    &mut graph,
+                    slot,
+                    self.frame_state.vpt_accumulation_needs_init,
+                    vpt_restir_reads,
+                    vpt_area_restir_reads,
+                    profiler,
+                );
+                let noisy_radiance_dep = vpt_outputs.noisy_radiance;
+                let noisy_moments_dep = vpt_outputs.noisy_moments;
+
+                let temporal_outputs = vpt_temporal.register_graph(
+                    &mut graph,
+                    VptTemporalGraphInputs {
+                        frame_slot: slot,
+                        history_initialized: self.frame_state.vpt_temporal_history_initialized,
+                        noisy_inputs: [noisy_radiance_dep, noisy_moments_dep],
+                        surface_inputs: final_surface_writes,
+                        previous_surface_inputs: previous_surface_resources,
+                        profiler,
+                    },
+                );
+                let temporal_radiance_dep = temporal_outputs.accumulated_radiance;
+                let temporal_moments_dep = temporal_outputs.accumulated_moments;
+
+                let atrous_outputs = vpt_atrous.register_graph(
+                    &mut graph,
+                    VptAtrousGraphInputs {
+                        frame_slot: slot,
+                        lighting_settings: inputs.lighting_settings,
+                        temporal_radiance: temporal_radiance_dep,
+                        temporal_moments: temporal_moments_dep,
+                        surface_inputs: final_surface_writes,
+                        profiler,
+                    },
+                );
+                let atrous_filtered_dep = atrous_outputs.filtered_radiance;
+
+                vpt_temporal.register_history_update_graph(
+                    &mut graph,
+                    vpt_surface,
+                    temporal_outputs,
+                    final_surface_writes,
+                    previous_surface_resources,
+                );
+
+                let postprocess_output = postprocess.output_image.handle;
+                let postprocess_extent = postprocess.output_image.extent;
+                let postprocess_outputs = postprocess.register_graph(
+                    &mut graph,
+                    PostprocessGraphInputs {
+                        device: renderer.device(),
+                        frame_slot: frame.frame_slot,
+                        input_radiance: atrous_filtered_dep,
+                        hdr_image: vpt_atrous.output_image(),
+                        output_initialized: self.frame_state.postprocess_output_initialized,
+                        profiler,
+                    },
+                );
+                let src_image = postprocess_output;
+                let src_extent = postprocess_extent;
+                let dst_image = frame.swapchain_image;
+                let dst_extent = frame.swapchain_extent;
+                let dep_handle = postprocess_outputs.output;
+                let mut capture_dependency = None;
+                let capture_frame = inputs
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.should_capture(frame.frame_index));
+                if capture_frame && let Some(capture) = inputs.capture.as_deref_mut() {
+                    let restir_di_temporal_enabled =
+                        inputs.restir_di_enabled && inputs.restir_di_settings.temporal_enabled;
+                    let restir_di_spatial_enabled =
+                        restir_di_temporal_enabled && inputs.restir_di_settings.spatial_enabled;
+                    let area_restir_temporal_enabled =
+                        inputs.area_restir_enabled && inputs.area_restir_settings.temporal_enabled;
+                    let area_restir_spatial_enabled =
+                        area_restir_temporal_enabled && inputs.area_restir_settings.spatial_enabled;
+                    let readback = capture.ensure_readback(
+                        renderer.device(),
+                        renderer.allocator(),
+                        postprocess_extent.width,
+                        postprocess_extent.height,
+                    )?;
+                    let readback_buffer = readback.handle;
+                    let readback_size = readback.size;
+                    let readback_usage = readback.usage;
+                    let readback_resource = graph.import_buffer_with_access(
+                        readback_buffer,
+                        readback_size,
+                        readback_usage,
+                        AccessKind::Undefined,
+                    );
+                    let capture_writes =
+                        graph.add_pass("capture_postprocess", QueueType::Transfer, |builder| {
+                            builder.read_as(dep_handle, AccessKind::TransferRead);
+                            builder.write_as(readback_resource, AccessKind::TransferWrite);
+                            Box::new(move |ctx| {
+                                cmd_copy_image_to_buffer(
+                                    ctx.device,
+                                    ctx.command_buffer,
+                                    src_image,
+                                    src_extent,
+                                    readback_buffer,
+                                );
+                            })
+                        });
+                    let capture_dep = capture_writes[0];
+                    let paths = capture.config().paths_for_frame(frame.frame_index);
+                    pending_capture = Some(CaptureMetadata {
+                        frame_index: frame.frame_index,
+                        vpt_sample_index: scene_vpt_sample_index,
+                        width: postprocess_extent.width,
+                        height: postprocess_extent.height,
+                        source: "postprocess_output",
+                        ppm_path: paths.ppm_path,
+                        json_path: paths.json_path,
+                        restir_di_enabled: inputs.restir_di_enabled,
+                        restir_di_temporal_enabled,
+                        restir_di_spatial_enabled,
+                        area_restir_enabled: inputs.area_restir_enabled,
+                        area_restir_temporal_enabled,
+                        area_restir_spatial_enabled,
+                        vpt_debug_view: vpt_debug_view_name(
+                            inputs.lighting_settings.vpt_debug_view,
+                        ),
+                        denoiser_enabled: inputs.lighting_settings.denoiser_enabled,
+                    });
+                    tracing::info!(
+                        frame_index = frame.frame_index,
+                        width = postprocess_extent.width,
+                        height = postprocess_extent.height,
+                        "queued postprocess capture"
+                    );
+                    capture_dependency = Some(capture_dep);
+                }
+
+                let swapchain_dep = graph.import_image_with_access(
+                    dst_image,
+                    dst_extent.width,
+                    dst_extent.height,
+                    frame.swapchain_format,
+                    vk::ImageUsageFlags::TRANSFER_DST,
+                    swapchain_access_from_layout(frame.swapchain_image_layout)?,
+                );
+                graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
+                    builder.read_as(dep_handle, AccessKind::TransferRead);
+                    if let Some(capture_dep) = capture_dependency {
+                        builder.depend_on(capture_dep);
+                    }
+                    builder.write_as(swapchain_dep, AccessKind::TransferWrite);
+                    builder.finish_as(swapchain_dep, AccessKind::Present);
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                slot,
+                                GpuProfileScope::BlitToSwapchain,
+                            );
+                        }
+                        blit_to_swapchain::record_blit_core(
+                            ctx.device,
+                            ctx.command_buffer,
+                            src_image,
+                            src_extent,
+                            dst_image,
+                            dst_extent,
+                        );
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                slot,
+                                GpuProfileScope::BlitToSwapchain,
+                            );
+                        }
+                    })
+                });
+            } else {
+                self.frame_state.vpt_sample_index = 0;
+                self.frame_state.last_vpt_camera_key = None;
+                tracing::warn!(
+                    vpt_ready = self.vpt_pass.is_some(),
+                    vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
+                    vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
+                    postprocess_ready = self.postprocess_pass.is_some(),
+                    "skipping VPT frame until required passes are initialized"
+                );
+            }
+        } else {
+            tracing::warn!("skipping UCVH render passes until GPU upload succeeds");
+        }
+
+        if !graph.has_final_access(AccessKind::Present) {
+            tracing::warn!(
+                "render graph produced no presentable output; clearing swapchain fallback"
+            );
+            add_swapchain_clear_present_pass(
+                &mut graph,
+                frame.swapchain_image,
+                frame.swapchain_extent,
+                frame.swapchain_format,
+                frame.swapchain_image_layout,
+            )?;
+        }
+        graph.compile()?;
+        graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
+
+        if let Some(current_view_proj) = current_vpt_view_proj {
+            self.frame_state.previous_vpt_view_proj = Some(current_view_proj);
+            self.frame_state.previous_vpt_resolution =
+                Some([frame.swapchain_extent.width, frame.swapchain_extent.height]);
+        }
+        if vpt_accumulation_written {
+            self.frame_state.vpt_accumulation_needs_init = false;
+            self.frame_state.vpt_temporal_history_initialized = true;
+            self.frame_state.postprocess_output_initialized = true;
+        }
+        if restir_di_selected_written {
+            self.frame_state.restir_di_history_initialized = true;
+        }
+        if area_restir_selected_written {
+            self.frame_state.area_restir_history_initialized = true;
+        }
+
+        Ok(VptFrameRecordResult {
+            pending_capture,
+            submitted_fence: frame.in_flight_fence,
+            rendered_vpt,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn resize(
         &mut self,
@@ -596,6 +1066,78 @@ impl VptRuntimePipeline {
         if let Some(pass) = self.restir_di_pass {
             pass.destroy(device, allocator);
         }
+    }
+}
+
+fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
+    AccessKind::from_swapchain_layout(layout)
+        .with_context(|| format!("unsupported tracked swapchain image layout: {layout:?}"))
+}
+
+fn add_swapchain_clear_present_pass(
+    graph: &mut RenderGraph<'_>,
+    dst_image: vk::Image,
+    dst_extent: vk::Extent2D,
+    dst_format: vk::Format,
+    current_layout: vk::ImageLayout,
+) -> Result<()> {
+    let current_access = swapchain_access_from_layout(current_layout)?;
+    let swapchain = graph.import_image_with_access(
+        dst_image,
+        dst_extent.width,
+        dst_extent.height,
+        dst_format,
+        vk::ImageUsageFlags::TRANSFER_DST,
+        current_access,
+    );
+
+    graph.add_pass("clear_swapchain", QueueType::Graphics, |builder| {
+        builder.write_as(swapchain, AccessKind::TransferWrite);
+        builder.finish_as(swapchain, AccessKind::Present);
+        Box::new(move |ctx| {
+            let color = vk::ClearColorValue {
+                float32: [0.015, 0.018, 0.022, 1.0],
+            };
+            let range = vk::ImageSubresourceRange::default()
+                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                .level_count(1)
+                .layer_count(1);
+            unsafe {
+                ctx.device.cmd_clear_color_image(
+                    ctx.command_buffer,
+                    dst_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &color,
+                    std::slice::from_ref(&range),
+                );
+            }
+        })
+    });
+    Ok(())
+}
+
+fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
+    match debug_view {
+        VptDebugView::Final => "final",
+        VptDebugView::Raw => "raw",
+        VptDebugView::Temporal => "temporal",
+        VptDebugView::Variance => "variance",
+        VptDebugView::HistoryValid => "history_valid",
+        VptDebugView::Motion => "motion",
+        VptDebugView::Normal => "normal",
+        VptDebugView::Depth => "depth",
+        VptDebugView::ReservoirWeight => "reservoir_weight",
+        VptDebugView::Direct => "direct",
+        VptDebugView::Indirect => "indirect",
+        VptDebugView::AreaSubpixel => "area_subpixel",
+        VptDebugView::AreaLens => "area_lens",
+        VptDebugView::AreaWeight => "area_weight",
+        VptDebugView::AreaHistoryValid => "area_history_valid",
+        VptDebugView::AreaRejection => "area_rejection",
+        VptDebugView::AreaJacobian => "area_jacobian",
+        VptDebugView::VoxelBrick => "voxel_brick",
+        VptDebugView::VoxelLocal => "voxel_local",
+        VptDebugView::VoxelHit => "voxel_hit",
     }
 }
 

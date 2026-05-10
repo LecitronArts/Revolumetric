@@ -1,5 +1,4 @@
-use anyhow::{Context, Result};
-use ash::vk;
+use anyhow::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, WindowEvent};
@@ -16,22 +15,12 @@ use crate::ecs::world::World;
 use crate::platform::time::Time;
 use crate::platform::window::WindowDescriptor;
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
-use crate::render::camera::compute_pixel_to_ray;
-use crate::render::capture::{CaptureMetadata, RenderCapture};
+use crate::render::capture::RenderCapture;
 use crate::render::device::RenderDevice;
-use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler, GpuProfilerConfig};
-use crate::render::graph::RenderGraph;
-use crate::render::passes::blit_to_swapchain;
-use crate::render::passes::vpt_atrous::VptAtrousPass;
-use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
+use crate::render::gpu_profiler::{GpuProfiler, GpuProfilerConfig};
 use crate::render::restir_di::RestirDiSettings;
-use crate::render::scene_ubo::{
-    LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, build_scene_uniforms,
-};
-use crate::render::vpt_history::{
-    GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_RESIZE,
-};
-use crate::render::vpt_pipeline::VptRuntimePipeline;
+use crate::render::scene_ubo::{LightingSettings, SceneUniformBuffer, VptDebugView};
+use crate::render::vpt_pipeline::{VptCameraFrame, VptFrameInputs, VptRuntimePipeline};
 use crate::scene::light::DirectionalLight;
 use crate::scene::systems;
 use crate::voxel::generator;
@@ -61,110 +50,11 @@ fn area_restir_debug_to_vpt_debug_view(debug_view: AreaRestirDebugView) -> Optio
     }
 }
 
-fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
-    match debug_view {
-        VptDebugView::Final => "final",
-        VptDebugView::Raw => "raw",
-        VptDebugView::Temporal => "temporal",
-        VptDebugView::Variance => "variance",
-        VptDebugView::HistoryValid => "history_valid",
-        VptDebugView::Motion => "motion",
-        VptDebugView::Normal => "normal",
-        VptDebugView::Depth => "depth",
-        VptDebugView::ReservoirWeight => "reservoir_weight",
-        VptDebugView::Direct => "direct",
-        VptDebugView::Indirect => "indirect",
-        VptDebugView::AreaSubpixel => "area_subpixel",
-        VptDebugView::AreaLens => "area_lens",
-        VptDebugView::AreaWeight => "area_weight",
-        VptDebugView::AreaHistoryValid => "area_history_valid",
-        VptDebugView::AreaRejection => "area_rejection",
-        VptDebugView::AreaJacobian => "area_jacobian",
-        VptDebugView::VoxelBrick => "voxel_brick",
-        VptDebugView::VoxelLocal => "voxel_local",
-        VptDebugView::VoxelHit => "voxel_hit",
-    }
-}
-
-fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
-    AccessKind::from_swapchain_layout(layout)
-        .with_context(|| format!("unsupported tracked swapchain image layout: {layout:?}"))
-}
-
-fn add_swapchain_clear_present_pass(
-    graph: &mut RenderGraph<'_>,
-    dst_image: vk::Image,
-    dst_extent: vk::Extent2D,
-    dst_format: vk::Format,
-    current_layout: vk::ImageLayout,
-) -> Result<()> {
-    let current_access = swapchain_access_from_layout(current_layout)?;
-    let swapchain = graph.import_image_with_access(
-        dst_image,
-        dst_extent.width,
-        dst_extent.height,
-        dst_format,
-        vk::ImageUsageFlags::TRANSFER_DST,
-        current_access,
-    );
-
-    graph.add_pass("clear_swapchain", QueueType::Graphics, |builder| {
-        builder.write_as(swapchain, AccessKind::TransferWrite);
-        builder.finish_as(swapchain, AccessKind::Present);
-        Box::new(move |ctx| {
-            let color = vk::ClearColorValue {
-                float32: [0.015, 0.018, 0.022, 1.0],
-            };
-            let range = vk::ImageSubresourceRange::default()
-                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                .level_count(1)
-                .layer_count(1);
-            unsafe {
-                ctx.device.cmd_clear_color_image(
-                    ctx.command_buffer,
-                    dst_image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &color,
-                    std::slice::from_ref(&range),
-                );
-            }
-        })
-    });
-    Ok(())
-}
-
 fn parse_exit_after_frames() -> Option<u64> {
     std::env::var("REVOLUMETRIC_EXIT_AFTER_FRAMES")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|&frames| frames > 0)
-}
-
-fn compute_view_proj(
-    camera_pos: glam::Vec3,
-    camera_forward: glam::Vec3,
-    camera_up: glam::Vec3,
-    fov_y: f32,
-    width: u32,
-    height: u32,
-) -> glam::Mat4 {
-    let forward = camera_forward.normalize();
-    let right = camera_up.cross(forward).normalize();
-    let up = forward.cross(right);
-    let view = glam::Mat4::from_cols(
-        glam::Vec4::new(right.x, up.x, -forward.x, 0.0),
-        glam::Vec4::new(right.y, up.y, -forward.y, 0.0),
-        glam::Vec4::new(right.z, up.z, -forward.z, 0.0),
-        glam::Vec4::new(
-            -right.dot(camera_pos),
-            -up.dot(camera_pos),
-            forward.dot(camera_pos),
-            1.0,
-        ),
-    );
-    let projection =
-        glam::Mat4::perspective_rh(fov_y, width as f32 / height as f32, 0.01, 10_000.0);
-    projection * view
 }
 
 struct RevolumetricApp {
@@ -298,7 +188,6 @@ impl RevolumetricApp {
 
         let restir_di_enabled = self.restir_di_vpt_enabled();
         let area_restir_enabled = self.area_restir_vpt_enabled();
-        let mut pending_capture = None;
         if let Some(renderer) = self.renderer.as_mut() {
             let frame = renderer.begin_frame()?;
             if frame.should_render {
@@ -325,979 +214,83 @@ impl RevolumetricApp {
                         }
                     }
                 }
-                let ucvh_ready = self.ucvh_uploaded;
 
-                let mut graph = RenderGraph::new();
-                let profiler = self.gpu_profiler.as_ref();
-                let mut vpt_accumulation_written = false;
-                let mut restir_di_selected_written = false;
-                let mut area_restir_selected_written = false;
-                let mut current_vpt_view_proj: Option<glam::Mat4> = None;
-
-                if ucvh_ready {
-                    let (cam_pos, cam_forward, cam_up, fov_y, aperture_radius, focal_distance) = {
-                        let rig = self.world.resource::<CameraRig>();
-                        match rig {
-                            Some(rig) => (
-                                rig.camera.position,
-                                rig.camera.forward,
-                                rig.camera.up,
-                                rig.camera.fov_y_radians,
-                                rig.camera.aperture_radius,
-                                rig.camera.focal_distance,
-                            ),
-                            None => (
-                                glam::Vec3::new(64.0, 80.0, -40.0),
-                                glam::Vec3::Z,
-                                glam::Vec3::Y,
-                                std::f32::consts::FRAC_PI_4,
-                                0.0,
-                                128.0,
-                            ),
-                        }
-                    };
-
-                    let pixel_to_ray = compute_pixel_to_ray(
-                        cam_pos,
-                        cam_forward,
-                        cam_up,
-                        fov_y,
-                        frame.swapchain_extent.width,
-                        frame.swapchain_extent.height,
-                    );
-                    let camera_key = [
-                        cam_pos.x.to_bits(),
-                        cam_pos.y.to_bits(),
-                        cam_pos.z.to_bits(),
-                        cam_forward.x.to_bits(),
-                        cam_forward.y.to_bits(),
-                        cam_forward.z.to_bits(),
-                        cam_up.x.to_bits(),
-                        cam_up.y.to_bits(),
-                        cam_up.z.to_bits(),
-                        fov_y.to_bits(),
-                        aperture_radius.to_bits(),
-                        focal_distance.to_bits(),
-                        frame.swapchain_extent.width,
-                        frame.swapchain_extent.height,
-                        self.lighting_settings.vpt_max_bounces,
-                    ];
-                    if self.vpt_pipeline.frame_state.last_vpt_camera_key == Some(camera_key) {
-                        self.vpt_pipeline.frame_state.vpt_sample_index = self
-                            .vpt_pipeline
-                            .frame_state
-                            .vpt_sample_index
-                            .saturating_add(1);
-                    } else {
-                        self.vpt_pipeline.frame_state.vpt_sample_index = 0;
-                        self.vpt_pipeline.frame_state.last_vpt_camera_key = Some(camera_key);
+                let camera = {
+                    let rig = self.world.resource::<CameraRig>();
+                    match rig {
+                        Some(rig) => VptCameraFrame {
+                            position: rig.camera.position,
+                            forward: rig.camera.forward,
+                            up: rig.camera.up,
+                            fov_y_radians: rig.camera.fov_y_radians,
+                            aperture_radius: rig.camera.aperture_radius,
+                            focal_distance: rig.camera.focal_distance,
+                        },
+                        None => VptCameraFrame {
+                            position: glam::Vec3::new(64.0, 80.0, -40.0),
+                            forward: glam::Vec3::Z,
+                            up: glam::Vec3::Y,
+                            fov_y_radians: std::f32::consts::FRAC_PI_4,
+                            aperture_radius: 0.0,
+                            focal_distance: 128.0,
+                        },
                     }
-                    let scene_vpt_sample_index =
-                        if self.vpt_pipeline.frame_state.vpt_accumulation_needs_init {
-                            0
-                        } else {
-                            self.vpt_pipeline.frame_state.vpt_sample_index
-                        };
-
-                    // Read DirectionalLight from World
-                    let (sun_dir, sun_intensity) = {
-                        let light = self.world.resource::<DirectionalLight>();
-                        match light {
-                            Some(l) => (l.direction, l.intensity),
-                            None => (
-                                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
-                                glam::Vec3::new(2.0, 1.5, 1.25),
-                            ),
-                        }
-                    };
-
-                    let scene_data = build_scene_uniforms(SceneUniformInputs {
-                        pixel_to_ray,
-                        resolution: [frame.swapchain_extent.width, frame.swapchain_extent.height],
-                        camera_right: cam_up.cross(cam_forward).normalize(),
-                        camera_up: cam_up.normalize(),
-                        camera_forward: cam_forward.normalize(),
-                        aperture_radius,
-                        focal_distance,
-                        sun_direction: sun_dir,
-                        sun_intensity,
-                        sky_color: [0.4, 0.5, 0.7],
-                        ground_color: [0.15, 0.1, 0.08],
-                        time: self
-                            .world
-                            .resource::<Time>()
-                            .map_or(0.0, |t| t.elapsed_seconds),
-                        lighting_settings: self.lighting_settings,
-                        vpt_sample_index: scene_vpt_sample_index,
-                    });
-
-                    if let Some(ubo) = &self.scene_ubo {
-                        ubo.update(frame.frame_slot, &scene_data);
+                };
+                let (sun_direction, sun_intensity) = {
+                    let light = self.world.resource::<DirectionalLight>();
+                    match light {
+                        Some(light) => (light.direction, light.intensity),
+                        None => (
+                            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                            glam::Vec3::new(2.0, 1.5, 1.25),
+                        ),
                     }
-
-                    let current_view_proj = compute_view_proj(
-                        cam_pos,
-                        cam_forward,
-                        cam_up,
-                        fov_y,
-                        frame.swapchain_extent.width,
-                        frame.swapchain_extent.height,
-                    );
-                    current_vpt_view_proj = Some(current_view_proj);
-                    let previous_view_proj = self
-                        .vpt_pipeline
-                        .frame_state
-                        .previous_vpt_view_proj
-                        .unwrap_or(current_view_proj);
-                    let previous_resolution = self
-                        .vpt_pipeline
-                        .frame_state
-                        .previous_vpt_resolution
-                        .unwrap_or([frame.swapchain_extent.width, frame.swapchain_extent.height]);
-                    let history_flags = if self
-                        .vpt_pipeline
-                        .frame_state
-                        .previous_vpt_view_proj
-                        .is_none()
-                    {
-                        VPT_HISTORY_FLAG_CAMERA_CUT
-                    } else if self
-                        .vpt_pipeline
-                        .frame_state
-                        .previous_vpt_resolution
-                        .is_none()
-                        || previous_resolution
-                            != [frame.swapchain_extent.width, frame.swapchain_extent.height]
-                    {
-                        VPT_HISTORY_FLAG_RESIZE
-                    } else {
-                        0
-                    };
-                    let history_uniforms = GpuVptHistoryUniforms {
-                        current_view_proj: current_view_proj.transpose().to_cols_array_2d(),
-                        previous_view_proj: previous_view_proj.transpose().to_cols_array_2d(),
-                        current_resolution: [
-                            frame.swapchain_extent.width,
-                            frame.swapchain_extent.height,
-                        ],
-                        previous_resolution,
-                        current_jitter: [0.0, 0.0],
-                        previous_jitter: [0.0, 0.0],
-                        frame_index: frame.frame_index as u32,
-                        history_reset_generation: 0,
-                        flags: history_flags,
-                        _pad0: 0,
-                    };
-                    if let Some(vpt_surface) = &self.vpt_pipeline.vpt_surface_pass {
-                        vpt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
-                    }
-
-                    if let (
-                        Some(vpt_surface),
-                        Some(vpt),
-                        Some(vpt_temporal),
-                        Some(vpt_atrous),
-                        Some(postprocess),
-                    ) = (
-                        &self.vpt_pipeline.vpt_surface_pass,
-                        &self.vpt_pipeline.vpt_pass,
-                        &self.vpt_pipeline.vpt_temporal_pass,
-                        &self.vpt_pipeline.vpt_atrous_pass,
-                        &self.vpt_pipeline.postprocess_pass,
-                    ) {
-                        let surface_position_resource = graph.import_image_with_access(
-                            vpt_surface.surface_position_depth.handle,
-                            vpt_surface.surface_position_depth.extent.width,
-                            vpt_surface.surface_position_depth.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            AccessKind::Undefined,
-                        );
-                        let surface_normal_resource = graph.import_image_with_access(
-                            vpt_surface.surface_normal_roughness.handle,
-                            vpt_surface.surface_normal_roughness.extent.width,
-                            vpt_surface.surface_normal_roughness.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            AccessKind::Undefined,
-                        );
-                        let surface_albedo_resource = graph.import_image_with_access(
-                            vpt_surface.surface_albedo_material.handle,
-                            vpt_surface.surface_albedo_material.extent.width,
-                            vpt_surface.surface_albedo_material.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            AccessKind::Undefined,
-                        );
-                        let motion_history_resource = graph.import_image_with_access(
-                            vpt_surface.motion_history.handle,
-                            vpt_surface.motion_history.extent.width,
-                            vpt_surface.motion_history.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            AccessKind::Undefined,
-                        );
-                        let previous_surface_access = if self
-                            .vpt_pipeline
-                            .frame_state
-                            .vpt_temporal_history_initialized
-                        {
-                            AccessKind::TransferWrite
-                        } else {
-                            AccessKind::Undefined
-                        };
-                        let previous_surface_position_resource = graph.import_image_with_access(
-                            vpt_surface.previous_surface_position_depth.handle,
-                            vpt_surface.previous_surface_position_depth.extent.width,
-                            vpt_surface.previous_surface_position_depth.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            previous_surface_access,
-                        );
-                        let previous_surface_normal_resource = graph.import_image_with_access(
-                            vpt_surface.previous_surface_normal_roughness.handle,
-                            vpt_surface.previous_surface_normal_roughness.extent.width,
-                            vpt_surface.previous_surface_normal_roughness.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            previous_surface_access,
-                        );
-                        let previous_surface_albedo_resource = graph.import_image_with_access(
-                            vpt_surface.previous_surface_albedo_material.handle,
-                            vpt_surface.previous_surface_albedo_material.extent.width,
-                            vpt_surface.previous_surface_albedo_material.extent.height,
-                            vk::Format::R32G32B32A32_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            previous_surface_access,
-                        );
-                        let slot = frame.frame_slot;
-                        let bootstrap_surface_writes = graph.add_pass(
-                            "vpt_surface_bootstrap",
-                            QueueType::Compute,
-                            |builder| {
-                                builder.write_as(
-                                    surface_position_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                builder.write_as(
-                                    surface_normal_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                builder.write_as(
-                                    surface_albedo_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                builder.write_as(
-                                    motion_history_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                Box::new(move |ctx| {
-                                    if let Some(profiler) = profiler {
-                                        profiler.begin_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::VptSurfaceBootstrap,
-                                        );
-                                    }
-                                    vpt_surface.record_bootstrap(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                    );
-                                    if let Some(profiler) = profiler {
-                                        profiler.end_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::VptSurfaceBootstrap,
-                                        );
-                                    }
-                                })
-                            },
-                        );
-                        let surface_images = [
-                            vpt_surface.surface_position_depth.handle,
-                            vpt_surface.surface_normal_roughness.handle,
-                            vpt_surface.surface_albedo_material.handle,
-                            vpt_surface.motion_history.handle,
-                        ];
-                        for (&resource, &image) in
-                            bootstrap_surface_writes.iter().zip(surface_images.iter())
-                        {
-                            graph.bind_image(resource, image);
-                        }
-
-                        let bootstrap_surface_resources: [ResourceHandle; 4] = [
-                            bootstrap_surface_writes[0],
-                            bootstrap_surface_writes[1],
-                            bootstrap_surface_writes[2],
-                            bootstrap_surface_writes[3],
-                        ];
-                        let mut final_surface_writes = bootstrap_surface_resources;
-                        let previous_surface_resources = [
-                            previous_surface_position_resource,
-                            previous_surface_normal_resource,
-                            previous_surface_albedo_resource,
-                        ];
-                        let mut vpt_area_restir_reads = None;
-                        if area_restir_enabled
-                            && let Some(area_restir) = &self.vpt_pipeline.area_restir_pass
-                        {
-                            let area_graph = area_restir.register_graph(
-                                &mut graph,
-                                renderer.device(),
-                                vpt,
-                                vpt_surface,
-                                frame.frame_slot,
-                                frame.frame_index,
-                                self.area_restir_settings,
-                                self.vpt_pipeline
-                                    .frame_state
-                                    .area_restir_history_initialized,
-                                bootstrap_surface_resources,
-                                previous_surface_resources,
-                                profiler,
-                            );
-                            final_surface_writes = area_graph.final_surface_writes;
-                            vpt_area_restir_reads = Some((
-                                area_graph.uniform_resource,
-                                area_graph.selected_current_resource,
-                            ));
-                            area_restir_selected_written = true;
-                        }
-                        let mut vpt_restir_reads = None;
-                        if restir_di_enabled
-                            && let Some(restir_di) = &self.vpt_pipeline.restir_di_pass
-                        {
-                            let restir_graph = restir_di.register_graph(
-                                &mut graph,
-                                renderer.device(),
-                                vpt,
-                                frame.frame_slot,
-                                frame.frame_index,
-                                self.restir_di_settings,
-                                self.vpt_pipeline.frame_state.restir_di_history_initialized,
-                                final_surface_writes,
-                                previous_surface_resources,
-                                profiler,
-                            );
-                            vpt_restir_reads = Some((
-                                restir_graph.uniform_resource,
-                                restir_graph.selected_current_resource,
-                            ));
-                            restir_di_selected_written = true;
-                        }
-                        postprocess.update_input_image(
-                            renderer.device(),
-                            vpt_atrous.output_image(),
-                            frame.frame_slot,
-                        );
-                        let noisy_initial_access =
-                            if self.vpt_pipeline.frame_state.vpt_accumulation_needs_init {
-                                AccessKind::Undefined
-                            } else {
-                                AccessKind::ComputeShaderRead
-                            };
-                        let noisy_radiance_resource = graph.import_image_with_access(
-                            vpt.noisy_radiance_image.handle,
-                            vpt.noisy_radiance_image.extent.width,
-                            vpt.noisy_radiance_image.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            noisy_initial_access,
-                        );
-                        let noisy_moments_resource = graph.import_image_with_access(
-                            vpt.noisy_moments_image.handle,
-                            vpt.noisy_moments_image.extent.width,
-                            vpt.noisy_moments_image.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            noisy_initial_access,
-                        );
-                        vpt_accumulation_written = true;
-                        let vpt_writes = graph.add_pass("vpt", QueueType::Compute, |builder| {
-                            builder
-                                .write_as(noisy_radiance_resource, AccessKind::ComputeShaderWrite);
-                            builder
-                                .write_as(noisy_moments_resource, AccessKind::ComputeShaderWrite);
-                            if let Some((restir_uniform_resource, restir_reservoir_resource)) =
-                                vpt_restir_reads
-                            {
-                                builder.read_as(
-                                    restir_uniform_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    restir_reservoir_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                            }
-                            if let Some((area_uniform_resource, area_selected_reservoir_resource)) =
-                                vpt_area_restir_reads
-                            {
-                                builder
-                                    .read_as(area_uniform_resource, AccessKind::ComputeShaderRead);
-                                builder.read_as(
-                                    area_selected_reservoir_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                            }
-                            let slot = frame.frame_slot;
-                            Box::new(move |ctx| {
-                                if let Some(profiler) = profiler {
-                                    profiler.begin_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::Vpt,
-                                    );
-                                }
-                                vpt.record(ctx.device, ctx.command_buffer, slot);
-                                if let Some(profiler) = profiler {
-                                    profiler.end_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::Vpt,
-                                    );
-                                }
-                            })
-                        });
-
-                        let noisy_radiance_dep = vpt_writes[0];
-                        let noisy_moments_dep = vpt_writes[1];
-                        let temporal_radiance_initial_access = if self
-                            .vpt_pipeline
-                            .frame_state
-                            .vpt_temporal_history_initialized
-                        {
-                            AccessKind::TransferRead
-                        } else {
-                            AccessKind::Undefined
-                        };
-                        let temporal_moments_initial_access = if self
-                            .vpt_pipeline
-                            .frame_state
-                            .vpt_temporal_history_initialized
-                        {
-                            AccessKind::TransferRead
-                        } else {
-                            AccessKind::Undefined
-                        };
-                        let previous_temporal_access = if self
-                            .vpt_pipeline
-                            .frame_state
-                            .vpt_temporal_history_initialized
-                        {
-                            AccessKind::TransferWrite
-                        } else {
-                            AccessKind::Undefined
-                        };
-                        let temporal_radiance_resource = graph.import_image_with_access(
-                            vpt_temporal.accumulated_radiance.handle,
-                            vpt_temporal.accumulated_radiance.extent.width,
-                            vpt_temporal.accumulated_radiance.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            temporal_radiance_initial_access,
-                        );
-                        let temporal_moments_resource = graph.import_image_with_access(
-                            vpt_temporal.accumulated_moments_history.handle,
-                            vpt_temporal.accumulated_moments_history.extent.width,
-                            vpt_temporal.accumulated_moments_history.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            temporal_moments_initial_access,
-                        );
-                        let previous_temporal_radiance_resource = graph.import_image_with_access(
-                            vpt_temporal.previous_accumulated_radiance.handle,
-                            vpt_temporal.previous_accumulated_radiance.extent.width,
-                            vpt_temporal.previous_accumulated_radiance.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            previous_temporal_access,
-                        );
-                        let previous_temporal_moments_resource = graph.import_image_with_access(
-                            vpt_temporal.previous_accumulated_moments_history.handle,
-                            vpt_temporal
-                                .previous_accumulated_moments_history
-                                .extent
-                                .width,
-                            vpt_temporal
-                                .previous_accumulated_moments_history
-                                .extent
-                                .height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            previous_temporal_access,
-                        );
-                        let slot = frame.frame_slot;
-                        let temporal_writes =
-                            graph.add_pass("vpt_temporal", QueueType::Compute, |builder| {
-                                builder.read_as(noisy_radiance_dep, AccessKind::ComputeShaderRead);
-                                builder.read_as(noisy_moments_dep, AccessKind::ComputeShaderRead);
-                                builder.read_as(
-                                    final_surface_writes[0],
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    final_surface_writes[1],
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    final_surface_writes[2],
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    final_surface_writes[3],
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    previous_surface_position_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    previous_surface_normal_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    previous_surface_albedo_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    previous_temporal_radiance_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.read_as(
-                                    previous_temporal_moments_resource,
-                                    AccessKind::ComputeShaderRead,
-                                );
-                                builder.write_as(
-                                    temporal_radiance_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                builder.write_as(
-                                    temporal_moments_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                Box::new(move |ctx| {
-                                    if let Some(profiler) = profiler {
-                                        profiler.begin_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::VptTemporal,
-                                        );
-                                    }
-                                    vpt_temporal.record(ctx.device, ctx.command_buffer, slot);
-                                    if let Some(profiler) = profiler {
-                                        profiler.end_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::VptTemporal,
-                                        );
-                                    }
-                                })
-                            });
-                        let temporal_radiance_dep = temporal_writes[0];
-                        let temporal_moments_dep = temporal_writes[1];
-                        let atrous_iterations: u32 =
-                            VptAtrousPass::active_iteration_count(self.lighting_settings);
-                        let atrous_pass_count: u32 =
-                            VptAtrousPass::pass_count_for_iterations(atrous_iterations);
-                        let atrous_filtered_resource = graph.import_image_with_access(
-                            vpt_atrous.filtered_radiance.handle,
-                            vpt_atrous.filtered_radiance.extent.width,
-                            vpt_atrous.filtered_radiance.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            AccessKind::Undefined,
-                        );
-                        let atrous_ping_resource = graph.import_image_with_access(
-                            vpt_atrous.ping_radiance.handle,
-                            vpt_atrous.ping_radiance.extent.width,
-                            vpt_atrous.ping_radiance.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            AccessKind::Undefined,
-                        );
-                        let atrous_pong_resource = graph.import_image_with_access(
-                            vpt_atrous.pong_radiance.handle,
-                            vpt_atrous.pong_radiance.extent.width,
-                            vpt_atrous.pong_radiance.extent.height,
-                            vk::Format::R16G16B16A16_SFLOAT,
-                            vk::ImageUsageFlags::STORAGE
-                                | vk::ImageUsageFlags::TRANSFER_SRC
-                                | vk::ImageUsageFlags::TRANSFER_DST,
-                            AccessKind::Undefined,
-                        );
-                        let mut atrous_input_dep = temporal_radiance_dep;
-                        let mut atrous_filtered_dep = temporal_radiance_dep;
-                        let mut atrous_ping_dep = atrous_ping_resource;
-                        let mut atrous_pong_dep = atrous_pong_resource;
-                        for iteration_index in 0..atrous_pass_count {
-                            let output_is_final = iteration_index + 1 == atrous_pass_count;
-                            let output_is_ping =
-                                !output_is_final && iteration_index.is_multiple_of(2);
-                            let atrous_output_resource = if output_is_final {
-                                atrous_filtered_resource
-                            } else if output_is_ping {
-                                atrous_ping_dep
-                            } else {
-                                atrous_pong_dep
-                            };
-                            let begin_atrous_scope = iteration_index == 0;
-                            let end_atrous_scope = iteration_index + 1 == atrous_pass_count;
-                            let slot = frame.frame_slot;
-                            let atrous_writes =
-                                graph.add_pass("vpt_atrous", QueueType::Compute, |builder| {
-                                    builder
-                                        .read_as(atrous_input_dep, AccessKind::ComputeShaderRead);
-                                    builder.read_as(
-                                        temporal_moments_dep,
-                                        AccessKind::ComputeShaderRead,
-                                    );
-                                    builder.read_as(
-                                        final_surface_writes[0],
-                                        AccessKind::ComputeShaderRead,
-                                    );
-                                    builder.read_as(
-                                        final_surface_writes[1],
-                                        AccessKind::ComputeShaderRead,
-                                    );
-                                    builder.read_as(
-                                        final_surface_writes[2],
-                                        AccessKind::ComputeShaderRead,
-                                    );
-                                    builder.write_as(
-                                        atrous_output_resource,
-                                        AccessKind::ComputeShaderWrite,
-                                    );
-                                    Box::new(move |ctx| {
-                                        if begin_atrous_scope && let Some(profiler) = profiler {
-                                            profiler.begin_scope(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                                GpuProfileScope::VptAtrous,
-                                            );
-                                        }
-                                        vpt_atrous.record(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            atrous_iterations,
-                                            iteration_index,
-                                        );
-                                        if end_atrous_scope && let Some(profiler) = profiler {
-                                            profiler.end_scope(
-                                                ctx.device,
-                                                ctx.command_buffer,
-                                                slot,
-                                                GpuProfileScope::VptAtrous,
-                                            );
-                                        }
-                                    })
-                                });
-                            atrous_input_dep = atrous_writes[0];
-                            atrous_filtered_dep = atrous_writes[0];
-                            if output_is_ping {
-                                atrous_ping_dep = atrous_writes[0];
-                            } else if !output_is_final {
-                                atrous_pong_dep = atrous_writes[0];
-                            }
-                        }
-                        graph.add_pass(
-                            "vpt_surface_history_update",
-                            QueueType::Transfer,
-                            |builder| {
-                                builder.read_as(temporal_radiance_dep, AccessKind::TransferRead);
-                                builder.read_as(temporal_moments_dep, AccessKind::TransferRead);
-                                builder.write_as(
-                                    previous_temporal_radiance_resource,
-                                    AccessKind::TransferWrite,
-                                );
-                                builder.write_as(
-                                    previous_temporal_moments_resource,
-                                    AccessKind::TransferWrite,
-                                );
-                                builder.read_as(final_surface_writes[0], AccessKind::TransferRead);
-                                builder.read_as(final_surface_writes[1], AccessKind::TransferRead);
-                                builder.read_as(final_surface_writes[2], AccessKind::TransferRead);
-                                builder.write_as(
-                                    previous_surface_position_resource,
-                                    AccessKind::TransferWrite,
-                                );
-                                builder.write_as(
-                                    previous_surface_normal_resource,
-                                    AccessKind::TransferWrite,
-                                );
-                                builder.write_as(
-                                    previous_surface_albedo_resource,
-                                    AccessKind::TransferWrite,
-                                );
-                                Box::new(move |ctx| {
-                                    vpt_temporal
-                                        .record_history_update(ctx.device, ctx.command_buffer);
-                                    vpt_surface
-                                        .record_history_update(ctx.device, ctx.command_buffer);
-                                })
-                            },
-                        );
-
-                        let postprocess_initial_access =
-                            if self.vpt_pipeline.frame_state.postprocess_output_initialized {
-                                AccessKind::TransferRead
-                            } else {
-                                AccessKind::Undefined
-                            };
-                        let postprocess_output = postprocess.output_image.handle;
-                        let postprocess_extent = postprocess.output_image.extent;
-                        let postprocess_output_resource = graph.import_image_with_access(
-                            postprocess_output,
-                            postprocess_extent.width,
-                            postprocess_extent.height,
-                            vk::Format::R8G8B8A8_UNORM,
-                            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-                            postprocess_initial_access,
-                        );
-                        let postprocess_writes =
-                            graph.add_pass("postprocess", QueueType::Compute, |builder| {
-                                builder.read_as(atrous_filtered_dep, AccessKind::ComputeShaderRead);
-                                builder.write_as(
-                                    postprocess_output_resource,
-                                    AccessKind::ComputeShaderWrite,
-                                );
-                                Box::new(move |ctx| {
-                                    if let Some(profiler) = profiler {
-                                        profiler.begin_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::Postprocess,
-                                        );
-                                    }
-                                    postprocess.record(ctx.device, ctx.command_buffer, slot);
-                                    if let Some(profiler) = profiler {
-                                        profiler.end_scope(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            slot,
-                                            GpuProfileScope::Postprocess,
-                                        );
-                                    }
-                                })
-                            });
-
-                        let src_image = postprocess_output;
-                        let src_extent = postprocess_extent;
-                        let dst_image = frame.swapchain_image;
-                        let dst_extent = frame.swapchain_extent;
-                        let dep_handle = postprocess_writes[0];
-                        let mut capture_dependency = None;
-                        let capture_frame = self
-                            .capture
-                            .as_ref()
-                            .is_some_and(|capture| capture.should_capture(frame.frame_index));
-                        if capture_frame && let Some(capture) = &mut self.capture {
-                            let restir_di_temporal_enabled =
-                                restir_di_enabled && self.restir_di_settings.temporal_enabled;
-                            let restir_di_spatial_enabled = restir_di_temporal_enabled
-                                && self.restir_di_settings.spatial_enabled;
-                            let area_restir_temporal_enabled =
-                                area_restir_enabled && self.area_restir_settings.temporal_enabled;
-                            let area_restir_spatial_enabled = area_restir_temporal_enabled
-                                && self.area_restir_settings.spatial_enabled;
-                            let readback = capture.ensure_readback(
-                                renderer.device(),
-                                renderer.allocator(),
-                                postprocess_extent.width,
-                                postprocess_extent.height,
-                            )?;
-                            let readback_buffer = readback.handle;
-                            let readback_size = readback.size;
-                            let readback_usage = readback.usage;
-                            let readback_resource = graph.import_buffer_with_access(
-                                readback_buffer,
-                                readback_size,
-                                readback_usage,
-                                AccessKind::Undefined,
-                            );
-                            let capture_writes = graph.add_pass(
-                                "capture_postprocess",
-                                QueueType::Transfer,
-                                |builder| {
-                                    builder.read_as(dep_handle, AccessKind::TransferRead);
-                                    builder.write_as(readback_resource, AccessKind::TransferWrite);
-                                    Box::new(move |ctx| {
-                                        crate::render::capture::cmd_copy_image_to_buffer(
-                                            ctx.device,
-                                            ctx.command_buffer,
-                                            src_image,
-                                            src_extent,
-                                            readback_buffer,
-                                        );
-                                    })
-                                },
-                            );
-                            let capture_dep = capture_writes[0];
-                            let paths = capture.config().paths_for_frame(frame.frame_index);
-                            pending_capture = Some(CaptureMetadata {
-                                frame_index: frame.frame_index,
-                                vpt_sample_index: scene_vpt_sample_index,
-                                width: postprocess_extent.width,
-                                height: postprocess_extent.height,
-                                source: "postprocess_output",
-                                ppm_path: paths.ppm_path,
-                                json_path: paths.json_path,
-                                restir_di_enabled,
-                                restir_di_temporal_enabled,
-                                restir_di_spatial_enabled,
-                                area_restir_enabled,
-                                area_restir_temporal_enabled,
-                                area_restir_spatial_enabled,
-                                vpt_debug_view: vpt_debug_view_name(
-                                    self.lighting_settings.vpt_debug_view,
-                                ),
-                                denoiser_enabled: self.lighting_settings.denoiser_enabled,
-                            });
+                };
+                let elapsed_seconds = self
+                    .world
+                    .resource::<Time>()
+                    .map_or(0.0, |time| time.elapsed_seconds);
+                if let Some(scene_ubo) = &self.scene_ubo {
+                    let record_result = self.vpt_pipeline.record_and_execute_frame(
+                        renderer,
+                        &frame,
+                        VptFrameInputs {
+                            scene_ubo,
+                            camera,
+                            sun_direction,
+                            sun_intensity,
+                            elapsed_seconds,
+                            lighting_settings: self.lighting_settings,
+                            restir_di_settings: self.restir_di_settings,
+                            area_restir_settings: self.area_restir_settings,
+                            restir_di_enabled,
+                            area_restir_enabled,
+                            ucvh_ready: self.ucvh_uploaded,
+                            capture: self.capture.as_mut(),
+                            profiler: self.gpu_profiler.as_ref(),
+                        },
+                    )?;
+                    let submitted_fence = record_result.submitted_fence;
+                    let mut pending_capture = record_result.pending_capture;
+                    renderer.end_frame(frame)?;
+                    if let Some(metadata) = pending_capture.take() {
+                        renderer.wait_for_fence(submitted_fence)?;
+                        if let Some(capture) = &self.capture {
+                            capture.write_rgba8_capture(&metadata)?;
                             tracing::info!(
-                                frame_index = frame.frame_index,
-                                width = postprocess_extent.width,
-                                height = postprocess_extent.height,
-                                "queued postprocess capture"
+                                frame_index = metadata.frame_index,
+                                ppm = %metadata.ppm_path.display(),
+                                json = %metadata.json_path.display(),
+                                "wrote postprocess capture"
                             );
-                            capture_dependency = Some(capture_dep);
                         }
-
-                        let swapchain_dep = graph.import_image_with_access(
-                            dst_image,
-                            dst_extent.width,
-                            dst_extent.height,
-                            frame.swapchain_format,
-                            vk::ImageUsageFlags::TRANSFER_DST,
-                            swapchain_access_from_layout(frame.swapchain_image_layout)?,
-                        );
-                        graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
-                            builder.read_as(dep_handle, AccessKind::TransferRead);
-                            if let Some(capture_dep) = capture_dependency {
-                                builder.depend_on(capture_dep);
-                            }
-                            builder.write_as(swapchain_dep, AccessKind::TransferWrite);
-                            builder.finish_as(swapchain_dep, AccessKind::Present);
-                            Box::new(move |ctx| {
-                                if let Some(profiler) = profiler {
-                                    profiler.begin_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
-                                    );
-                                }
-                                blit_to_swapchain::record_blit_core(
-                                    ctx.device,
-                                    ctx.command_buffer,
-                                    src_image,
-                                    src_extent,
-                                    dst_image,
-                                    dst_extent,
-                                );
-                                if let Some(profiler) = profiler {
-                                    profiler.end_scope(
-                                        ctx.device,
-                                        ctx.command_buffer,
-                                        slot,
-                                        GpuProfileScope::BlitToSwapchain,
-                                    );
-                                }
-                            })
-                        });
-                    } else {
-                        self.vpt_pipeline.frame_state.vpt_sample_index = 0;
-                        self.vpt_pipeline.frame_state.last_vpt_camera_key = None;
-                        tracing::warn!(
-                            vpt_ready = self.vpt_pipeline.vpt_pass.is_some(),
-                            vpt_temporal_ready = self.vpt_pipeline.vpt_temporal_pass.is_some(),
-                            vpt_atrous_ready = self.vpt_pipeline.vpt_atrous_pass.is_some(),
-                            postprocess_ready = self.vpt_pipeline.postprocess_pass.is_some(),
-                            "skipping VPT frame until required passes are initialized"
-                        );
                     }
                 } else {
-                    tracing::warn!("skipping UCVH render passes until GPU upload succeeds");
-                }
-
-                if !graph.has_final_access(AccessKind::Present) {
-                    tracing::warn!(
-                        "render graph produced no presentable output; clearing swapchain fallback"
-                    );
-                    add_swapchain_clear_present_pass(
-                        &mut graph,
-                        frame.swapchain_image,
-                        frame.swapchain_extent,
-                        frame.swapchain_format,
-                        frame.swapchain_image_layout,
-                    )?;
-                }
-                graph.compile()?;
-                graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
-                if let Some(current_view_proj) = current_vpt_view_proj {
-                    self.vpt_pipeline.frame_state.previous_vpt_view_proj = Some(current_view_proj);
-                    self.vpt_pipeline.frame_state.previous_vpt_resolution =
-                        Some([frame.swapchain_extent.width, frame.swapchain_extent.height]);
-                }
-                if vpt_accumulation_written {
-                    self.vpt_pipeline.frame_state.vpt_accumulation_needs_init = false;
-                    self.vpt_pipeline
-                        .frame_state
-                        .vpt_temporal_history_initialized = true;
-                    self.vpt_pipeline.frame_state.postprocess_output_initialized = true;
-                }
-                if restir_di_selected_written {
-                    self.vpt_pipeline.frame_state.restir_di_history_initialized = true;
-                }
-                if area_restir_selected_written {
-                    self.vpt_pipeline
-                        .frame_state
-                        .area_restir_history_initialized = true;
-                }
-                let submitted_fence = frame.in_flight_fence;
-                renderer.end_frame(frame)?;
-                if let Some(metadata) = pending_capture.take() {
-                    renderer.wait_for_fence(submitted_fence)?;
-                    if let Some(capture) = &self.capture {
-                        capture.write_rgba8_capture(&metadata)?;
-                        tracing::info!(
-                            frame_index = metadata.frame_index,
-                            ppm = %metadata.ppm_path.display(),
-                            json = %metadata.json_path.display(),
-                            "wrote postprocess capture"
-                        );
-                    }
+                    tracing::warn!("skipping render frame until scene UBO is initialized");
+                    renderer.end_frame(frame)?;
                 }
             }
         }
-
         if let Some(input) = self.world.resource_mut::<InputState>() {
             input.clear_per_frame();
         }
@@ -1664,7 +657,7 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
 
     #[test]
     fn view_projection_round_trips_pixel_to_ray_center_coordinates() {
@@ -1727,5 +720,21 @@ mod tests {
         assert!(!app_struct.contains("vpt_pass: Option<VptPass>"));
         assert!(!app_struct.contains("vpt_surface_pass: Option<VptSurfacePass>"));
         assert!(!app_struct.contains("postprocess_pass: Option<PostprocessPass>"));
+        assert!(source.contains("self.vpt_pipeline.record_and_execute_frame("));
+        let add_pass_call = ["graph", ".", "add_pass"].concat();
+        for pass_name in [
+            "vpt".to_string(),
+            ["vpt", "_temporal"].concat(),
+            ["vpt", "_atrous"].concat(),
+            ["post", "process"].concat(),
+            ["capture", "_post", "process"].concat(),
+            ["blit", "_to_", "swapchain"].concat(),
+        ] {
+            let forbidden = format!("{add_pass_call}(\"{pass_name}\"");
+            assert!(
+                !source.contains(&forbidden),
+                "app.rs must not own VPT frame graph pass {forbidden}"
+            );
+        }
     }
 }

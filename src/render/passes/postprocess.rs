@@ -3,8 +3,11 @@ use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
 
 pub struct PostprocessPass {
@@ -13,6 +16,20 @@ pub struct PostprocessPass {
     descriptor_pool: DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
     pub output_image: GpuImage,
+}
+
+#[derive(Clone, Copy)]
+pub struct PostprocessGraphOutputs {
+    pub output: ResourceHandle,
+}
+
+pub struct PostprocessGraphInputs<'a> {
+    pub device: &'a ash::Device,
+    pub frame_slot: usize,
+    pub input_radiance: ResourceHandle,
+    pub hdr_image: &'a GpuImage,
+    pub output_initialized: bool,
+    pub profiler: Option<&'a GpuProfiler>,
 }
 
 impl PostprocessPass {
@@ -192,6 +209,62 @@ impl PostprocessPass {
         }
     }
 
+    pub fn register_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        inputs: PostprocessGraphInputs<'a>,
+    ) -> PostprocessGraphOutputs {
+        let PostprocessGraphInputs {
+            device,
+            frame_slot,
+            input_radiance,
+            hdr_image,
+            output_initialized,
+            profiler,
+        } = inputs;
+        self.update_input_image(device, hdr_image, frame_slot);
+        let output_initial_access = if output_initialized {
+            AccessKind::TransferRead
+        } else {
+            AccessKind::Undefined
+        };
+        let postprocess_output_resource = graph.import_image_with_access(
+            self.output_image.handle,
+            self.output_image.extent.width,
+            self.output_image.extent.height,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            output_initial_access,
+        );
+        let postprocess_writes = graph.add_pass("postprocess", QueueType::Compute, |builder| {
+            builder.read_as(input_radiance, AccessKind::ComputeShaderRead);
+            builder.write_as(postprocess_output_resource, AccessKind::ComputeShaderWrite);
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::Postprocess,
+                    );
+                }
+                self.record(ctx.device, ctx.command_buffer, frame_slot);
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::Postprocess,
+                    );
+                }
+            })
+        });
+
+        PostprocessGraphOutputs {
+            output: postprocess_writes[0],
+        }
+    }
+
     pub fn update_input_image(
         &self,
         device: &ash::Device,
@@ -261,121 +334,4 @@ fn write_descriptor_sets(
 }
 
 #[cfg(test)]
-mod shader_source_tests {
-    fn normalized_source(path_source: &str) -> String {
-        path_source.replace("\r\n", "\n")
-    }
-
-    #[test]
-    fn postprocess_shader_declares_hdr_input_and_ldr_output_abi() {
-        let source = normalized_source(include_str!(
-            "../../../assets/shaders/passes/postprocess.slang"
-        ));
-
-        assert!(
-            source.contains("[[vk::image_format(\"rgba16f\")]]\nRWTexture2D<float4> hdr_image;"),
-            "postprocess input must be rgba16f HDR storage image"
-        );
-        assert!(
-            source.contains("[[vk::image_format(\"rgba8\")]]\nRWTexture2D<float4> output_image;"),
-            "postprocess output must be rgba8 LDR storage image"
-        );
-    }
-
-    #[test]
-    fn postprocess_shader_applies_exposure_aces_and_gamma() {
-        let source = normalized_source(include_str!(
-            "../../../assets/shaders/passes/postprocess.slang"
-        ));
-
-        assert!(
-            source.contains("scene.exposure"),
-            "postprocess shader must read exposure from SceneUniforms"
-        );
-        assert!(
-            source.contains("aces_tonemap("),
-            "postprocess shader must apply ACES tonemapping"
-        );
-        assert!(
-            source.contains("pow(mapped, float3(1.0 / 2.2))"),
-            "postprocess shader must apply gamma correction after tonemapping"
-        );
-    }
-
-    #[test]
-    fn postprocess_input_update_is_frame_slot_scoped() {
-        let source = std::fs::read_to_string("src/render/passes/postprocess.rs")
-            .expect("postprocess source should be readable");
-
-        assert!(source.contains("update_input_image(&self, device: &ash::Device, hdr_image: &GpuImage, frame_slot: usize)"));
-        assert!(source.contains("self.descriptor_sets.get(frame_slot)"));
-        let start = source
-            .find("pub fn update_input_image")
-            .expect("update_input_image should exist");
-        let end = source[start..]
-            .find("pub fn destroy")
-            .map(|offset| start + offset)
-            .expect("destroy should follow update_input_image");
-        let body = &source[start..end];
-        assert!(
-            !body.contains("for &ds in &self.descriptor_sets"),
-            "postprocess input rebinding must not rewrite descriptor sets still in flight"
-        );
-    }
-
-    #[test]
-    fn app_wires_vpt_through_postprocess_before_blit() {
-        let source = normalized_source(
-            &std::fs::read_to_string("src/app.rs")
-                .expect("app source should be readable for render-pipeline source test"),
-        );
-        let pipeline = normalized_source(
-            &std::fs::read_to_string("src/render/vpt_pipeline.rs")
-                .expect("VPT pipeline source should be readable for render-pipeline source test"),
-        );
-
-        assert!(source.contains("capture: Option<RenderCapture>"));
-        assert!(source.contains("self.vpt_pipeline.ensure_passes("));
-        assert!(pipeline.contains("pub postprocess_pass: Option<PostprocessPass>"));
-        assert!(pipeline.contains("PostprocessPass::new"));
-        assert!(
-            source.contains("graph.add_pass(\"postprocess\"")
-                || source.contains(
-                    "graph.add_pass(\n                                        \"postprocess\""
-                )
-        );
-        assert!(source.contains("GpuProfileScope::Postprocess"));
-
-        let vpt_idx = source
-            .find("graph.add_pass(\"vpt\"")
-            .expect("VPT graph pass should exist");
-        let postprocess_idx = vpt_idx
-            + source[vpt_idx..]
-                .find("graph.add_pass(\"postprocess\"")
-                .or_else(|| {
-                    source[vpt_idx..].find(
-                        "graph.add_pass(\n                                        \"postprocess\"",
-                    )
-                })
-                .expect("postprocess graph pass should exist after VPT");
-        let capture_idx = postprocess_idx
-            + source[postprocess_idx..]
-                .find("\"capture_postprocess\"")
-                .expect("capture graph pass should exist after postprocess");
-        let blit_idx = postprocess_idx
-            + source[postprocess_idx..]
-                .find("graph.add_pass(\"blit_to_swapchain\"")
-                .or_else(|| {
-                    source[postprocess_idx..]
-                        .find("graph.add_pass(\n                                        \"blit_to_swapchain\"")
-                })
-                .expect("blit graph pass should exist");
-
-        assert!(vpt_idx < postprocess_idx);
-        assert!(postprocess_idx < blit_idx);
-        assert!(postprocess_idx < capture_idx);
-        assert!(capture_idx < blit_idx);
-        assert!(source.contains("cmd_copy_image_to_buffer"));
-        assert!(source.contains("renderer.wait_for_fence"));
-    }
-}
+mod shader_source_tests;

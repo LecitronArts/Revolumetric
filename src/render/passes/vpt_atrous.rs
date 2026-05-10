@@ -6,10 +6,13 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
+use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::VptTemporalPass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{
     GpuSceneUniforms, LightingSettings, SceneUniformBuffer, VptDebugView,
 };
@@ -35,6 +38,21 @@ pub struct VptAtrousPass {
     pub filtered_radiance: GpuImage,
     pub ping_radiance: GpuImage,
     pub pong_radiance: GpuImage,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptAtrousGraphOutputs {
+    pub filtered_radiance: ResourceHandle,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptAtrousGraphInputs<'a> {
+    pub frame_slot: usize,
+    pub lighting_settings: LightingSettings,
+    pub temporal_radiance: ResourceHandle,
+    pub temporal_moments: ResourceHandle,
+    pub surface_inputs: [ResourceHandle; 4],
+    pub profiler: Option<&'a GpuProfiler>,
 }
 
 pub struct VptAtrousPassCreateInfo<'a> {
@@ -235,6 +253,114 @@ impl VptAtrousPass {
                 &[],
             );
             device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
+        }
+    }
+
+    pub fn register_graph<'a>(
+        &'a self,
+        graph: &mut RenderGraph<'a>,
+        inputs: VptAtrousGraphInputs<'a>,
+    ) -> VptAtrousGraphOutputs {
+        let VptAtrousGraphInputs {
+            frame_slot,
+            lighting_settings,
+            temporal_radiance,
+            temporal_moments,
+            surface_inputs,
+            profiler,
+        } = inputs;
+        let atrous_iterations = Self::active_iteration_count(lighting_settings);
+        let atrous_pass_count = Self::pass_count_for_iterations(atrous_iterations);
+        let atrous_filtered_resource = graph.import_image_with_access(
+            self.filtered_radiance.handle,
+            self.filtered_radiance.extent.width,
+            self.filtered_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::Undefined,
+        );
+        let atrous_ping_resource = graph.import_image_with_access(
+            self.ping_radiance.handle,
+            self.ping_radiance.extent.width,
+            self.ping_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::Undefined,
+        );
+        let atrous_pong_resource = graph.import_image_with_access(
+            self.pong_radiance.handle,
+            self.pong_radiance.extent.width,
+            self.pong_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::Undefined,
+        );
+        let mut atrous_input_dep = temporal_radiance;
+        let mut atrous_filtered_dep = temporal_radiance;
+        let mut atrous_ping_dep = atrous_ping_resource;
+        let mut atrous_pong_dep = atrous_pong_resource;
+        for iteration_index in 0..atrous_pass_count {
+            let output_is_final = iteration_index + 1 == atrous_pass_count;
+            let output_is_ping = !output_is_final && iteration_index.is_multiple_of(2);
+            let atrous_output_resource = if output_is_final {
+                atrous_filtered_resource
+            } else if output_is_ping {
+                atrous_ping_dep
+            } else {
+                atrous_pong_dep
+            };
+            let begin_atrous_scope = iteration_index == 0;
+            let end_atrous_scope = iteration_index + 1 == atrous_pass_count;
+            let atrous_writes = graph.add_pass("vpt_atrous", QueueType::Compute, |builder| {
+                builder.read_as(atrous_input_dep, AccessKind::ComputeShaderRead);
+                builder.read_as(temporal_moments, AccessKind::ComputeShaderRead);
+                builder.read_as(surface_inputs[0], AccessKind::ComputeShaderRead);
+                builder.read_as(surface_inputs[1], AccessKind::ComputeShaderRead);
+                builder.read_as(surface_inputs[2], AccessKind::ComputeShaderRead);
+                builder.write_as(atrous_output_resource, AccessKind::ComputeShaderWrite);
+                Box::new(move |ctx| {
+                    if begin_atrous_scope && let Some(profiler) = profiler {
+                        profiler.begin_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptAtrous,
+                        );
+                    }
+                    self.record(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        atrous_iterations,
+                        iteration_index,
+                    );
+                    if end_atrous_scope && let Some(profiler) = profiler {
+                        profiler.end_scope(
+                            ctx.device,
+                            ctx.command_buffer,
+                            frame_slot,
+                            GpuProfileScope::VptAtrous,
+                        );
+                    }
+                })
+            });
+            atrous_input_dep = atrous_writes[0];
+            atrous_filtered_dep = atrous_writes[0];
+            if output_is_ping {
+                atrous_ping_dep = atrous_writes[0];
+            } else if !output_is_final {
+                atrous_pong_dep = atrous_writes[0];
+            }
+        }
+
+        VptAtrousGraphOutputs {
+            filtered_radiance: atrous_filtered_dep,
         }
     }
 
