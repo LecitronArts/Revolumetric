@@ -19,7 +19,35 @@ thiserror = "2.0"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-winit = "0.30"
+winit = { version = "0.30", features = ["android-native-activity"] }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Feature used to gate the desktop/native binary so Android builds only the library
+desktop = []
+default = []
+
+[[bin]]
+name = "revolumetric"
+path = "src/main.rs"
+# only build the binary when the `desktop` feature is enabled
+required-features = ["desktop"]
+
+[package.metadata.android]
+apk_name = "Revolumetric"
+assets = "assets"
+build_targets = ["aarch64-linux-android"]
+min_sdk_version = 26
+target_sdk_version = 33
+
+[package.metadata.android.signing.release]
+path = "android-release.pfx"
+keystore_password = "Revolumetric_Release_2026"
 
 [build-dependencies]
 walkdir = "2"
+
+[profile.release]
+panic = "unwind"
