@@ -19,6 +19,7 @@ pub mod scene_ubo;
 pub mod shader;
 pub mod swapchain;
 pub mod vpt_history;
+pub mod vpt_motion;
 pub mod vpt_pipeline;
 
 #[cfg(test)]

@@ -3,7 +3,7 @@ use crate::voxel::brick::{BRICK_EDGE, BrickData, VoxelCell};
 use crate::voxel::brick_pool::{BrickId, BrickPool};
 use crate::voxel::morton;
 use crate::voxel::occupancy::CascadedOccupancy;
-use glam::UVec3;
+use glam::{IVec3, UVec3};
 
 fn div_ceil_uvec3(value: UVec3, divisor: u32) -> UVec3 {
     UVec3::new(
@@ -33,6 +33,39 @@ impl UcvhConfig {
     }
 }
 
+/// Brick-space region invalidated by ordinary UCVH content edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UcvhInvalidationRegion {
+    pub brick_min: UVec3,
+    pub brick_max_exclusive: UVec3,
+    pub generation: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UcvhMotionEvent {
+    pub region_min: UVec3,
+    pub region_max_exclusive: UVec3,
+    pub world_delta_current_from_previous: IVec3,
+    pub generation: u32,
+}
+
+impl UcvhMotionEvent {
+    fn has_valid_bounds(&self) -> bool {
+        self.region_min.x < self.region_max_exclusive.x
+            && self.region_min.y < self.region_max_exclusive.y
+            && self.region_min.z < self.region_max_exclusive.z
+    }
+
+    fn overlaps(self, other: Self) -> bool {
+        self.region_min.x < other.region_max_exclusive.x
+            && self.region_max_exclusive.x > other.region_min.x
+            && self.region_min.y < other.region_max_exclusive.y
+            && self.region_max_exclusive.y > other.region_min.y
+            && self.region_min.z < other.region_max_exclusive.z
+            && self.region_max_exclusive.z > other.region_min.z
+    }
+}
+
 /// Unified Cascaded Volume Hierarchy — the single entry point for voxel data.
 pub struct Ucvh {
     pub config: UcvhConfig,
@@ -42,6 +75,11 @@ pub struct Ucvh {
     brick_map: Vec<Option<BrickId>>,
     /// Brick IDs that need GPU re-upload
     dirty_bricks: Vec<BrickId>,
+    /// Brick-space regions whose content edits should invalidate temporal history.
+    invalidation_regions: Vec<UcvhInvalidationRegion>,
+    /// Explicit semantic content motion. Ordinary edits never synthesize these.
+    motion_events: Vec<UcvhMotionEvent>,
+    content_generation: u32,
     /// Whether the hierarchy needs rebuild
     hierarchy_dirty: bool,
 }
@@ -56,6 +94,9 @@ impl Ucvh {
             hierarchy: CascadedOccupancy::new(config.brick_grid_size),
             brick_map: vec![None; l0_count],
             dirty_bricks: Vec::new(),
+            invalidation_regions: Vec::new(),
+            motion_events: Vec::new(),
+            content_generation: 0,
             hierarchy_dirty: false,
             config,
         }
@@ -80,6 +121,35 @@ impl Ucvh {
 
     fn l0_index(&self, brick_pos: UVec3) -> usize {
         CascadedOccupancy::flat_index(brick_pos, self.config.brick_grid_size)
+    }
+
+    fn next_content_generation(&mut self) -> u32 {
+        let generation = self.content_generation;
+        self.content_generation = self.content_generation.wrapping_add(1);
+        generation
+    }
+
+    fn record_invalidation_region(&mut self, brick_pos: UVec3, generation: u32) {
+        let region = UcvhInvalidationRegion {
+            brick_min: brick_pos,
+            brick_max_exclusive: brick_pos + UVec3::ONE,
+            generation,
+        };
+        if let Some(existing) = self.invalidation_regions.iter_mut().find(|existing| {
+            existing.brick_min == region.brick_min
+                && existing.brick_max_exclusive == region.brick_max_exclusive
+        }) {
+            *existing = region;
+        } else {
+            self.invalidation_regions.push(region);
+        }
+    }
+
+    fn motion_event_inside_world(&self, event: UcvhMotionEvent) -> bool {
+        event.has_valid_bounds()
+            && event.region_max_exclusive.x <= self.config.world_size.x
+            && event.region_max_exclusive.y <= self.config.world_size.y
+            && event.region_max_exclusive.z <= self.config.world_size.z
     }
 
     /// Ensure a brick exists at `brick_pos`, allocating if needed.
@@ -110,6 +180,10 @@ impl Ucvh {
             }
         };
         let m = morton::encode(lp.x, lp.y, lp.z);
+        let previous = self.pool.get_material(id, m);
+        if voxel_cell_eq(previous, cell) {
+            return true;
+        }
         self.pool.set_material(id, m, cell);
         if cell.is_air() {
             self.pool.occupancy_mut(id).clear(lp.x, lp.y, lp.z);
@@ -119,6 +193,8 @@ impl Ucvh {
         if !self.dirty_bricks.contains(&id) {
             self.dirty_bricks.push(id);
         }
+        let generation = self.next_content_generation();
+        self.record_invalidation_region(bp, generation);
         self.hierarchy_dirty = true;
         true
     }
@@ -147,6 +223,8 @@ impl Ucvh {
         if !self.dirty_bricks.contains(&id) {
             self.dirty_bricks.push(id);
         }
+        let generation = self.next_content_generation();
+        self.record_invalidation_region(brick_pos, generation);
         self.hierarchy_dirty = true;
         true
     }
@@ -180,6 +258,37 @@ impl Ucvh {
         std::mem::take(&mut self.dirty_bricks)
     }
 
+    pub fn take_invalidation_regions(&mut self) -> Vec<UcvhInvalidationRegion> {
+        std::mem::take(&mut self.invalidation_regions)
+    }
+
+    pub fn invalidation_regions(&self) -> &[UcvhInvalidationRegion] {
+        &self.invalidation_regions
+    }
+
+    pub fn push_motion_event(&mut self, event: UcvhMotionEvent) -> bool {
+        if !self.motion_event_inside_world(event) {
+            return false;
+        }
+        if self
+            .motion_events
+            .iter()
+            .any(|existing| existing.overlaps(event))
+        {
+            return false;
+        }
+        self.motion_events.push(event);
+        true
+    }
+
+    pub fn motion_events(&self) -> &[UcvhMotionEvent] {
+        &self.motion_events
+    }
+
+    pub fn take_motion_events(&mut self) -> Vec<UcvhMotionEvent> {
+        std::mem::take(&mut self.motion_events)
+    }
+
     pub fn is_hierarchy_dirty(&self) -> bool {
         self.hierarchy_dirty
     }
@@ -187,6 +296,10 @@ impl Ucvh {
     pub fn allocated_brick_count(&self) -> u32 {
         self.pool.allocated_count()
     }
+}
+
+fn voxel_cell_eq(a: VoxelCell, b: VoxelCell) -> bool {
+    a.material == b.material && a.flags == b.flags && a.emissive == b.emissive && a._pad == b._pad
 }
 
 #[cfg(test)]
@@ -374,5 +487,51 @@ mod tests {
 
         assert!(!u.write_brick(UVec3::new(16, 0, 0), &data));
         assert_eq!(u.allocated_brick_count(), 0);
+    }
+
+    #[test]
+    fn set_voxel_records_a_single_invalidated_brick_region() {
+        let mut u = test_ucvh();
+        let cell = VoxelCell::new(1, 0, [0; 3]);
+
+        assert!(u.set_voxel(UVec3::new(2, 3, 4), cell));
+
+        let invalidations = u.take_invalidation_regions();
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].brick_min, UVec3::ZERO);
+        assert_eq!(invalidations[0].brick_max_exclusive, UVec3::new(1, 1, 1));
+    }
+
+    #[test]
+    fn write_brick_records_the_full_brick_region_and_generation() {
+        let mut u = test_ucvh();
+        let data = BrickData::new();
+
+        assert!(u.write_brick(UVec3::new(1, 2, 3), &data));
+
+        let invalidations = u.take_invalidation_regions();
+        assert_eq!(invalidations.len(), 1);
+        assert_eq!(invalidations[0].brick_min, UVec3::new(1, 2, 3));
+        assert_eq!(invalidations[0].brick_max_exclusive, UVec3::new(2, 3, 4));
+        assert_eq!(invalidations[0].generation, 0);
+    }
+
+    #[test]
+    fn semantic_move_rejects_overlapping_regions() {
+        let mut u = test_ucvh();
+        let event = UcvhMotionEvent {
+            region_min: UVec3::new(4, 4, 4),
+            region_max_exclusive: UVec3::new(8, 8, 8),
+            world_delta_current_from_previous: glam::IVec3::new(1, 0, 0),
+            generation: 42,
+        };
+
+        assert!(u.push_motion_event(event));
+        assert!(!u.push_motion_event(UcvhMotionEvent {
+            region_min: UVec3::new(6, 6, 6),
+            region_max_exclusive: UVec3::new(9, 9, 9),
+            world_delta_current_from_previous: glam::IVec3::new(0, 1, 0),
+            generation: 43,
+        }));
     }
 }
