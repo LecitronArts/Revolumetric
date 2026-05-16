@@ -739,6 +739,44 @@ fn vpt_surface_motion_uses_history_uniform_reprojection() {
 }
 
 #[test]
+fn vpt_hit_payload_carries_motion_id_without_changing_reprojection_consumers() {
+    let ray = source("assets/shaders/shared/ray.slang");
+    let traversal = source("assets/shaders/shared/voxel_traverse.slang");
+    let surface = source("assets/shaders/passes/vpt_surface.slang");
+    let temporal = source("assets/shaders/passes/vpt_temporal.slang");
+    let restir_di = source("assets/shaders/passes/restir_di_temporal.slang");
+    let area_restir = source("assets/shaders/passes/area_restir_temporal.slang");
+
+    for token in [
+        "static const uint VPT_MOTION_ID_INVALID = 0u;",
+        "static const uint VPT_MOTION_ID_STATIC_UCVH = 1u;",
+        "uint  motion_id",
+        "VPT_MOTION_ID_INVALID",
+    ] {
+        assert!(ray.contains(token), "ray hit payload missing {token}");
+    }
+    assert!(
+        traversal.contains("result.motion_id = VPT_MOTION_ID_STATIC_UCVH;"),
+        "primary UCVH hits should carry an explicit static motion source id"
+    );
+    assert!(
+        surface.contains("motion.z = float(hit.motion_id);")
+            && surface.contains("motion_history[pixel] = motion;"),
+        "surface motion guide should preserve the hit motion id in the unused z lane"
+    );
+    for consumer in [temporal, restir_di, area_restir] {
+        assert!(
+            consumer.contains("vpt_history_sample_from_motion(pixel, motion);"),
+            "temporal consumers should continue using the shared xy/w reprojection contract"
+        );
+        assert!(
+            !consumer.contains("motion.z"),
+            "motion id plumbing must not change temporal reprojection acceptance yet"
+        );
+    }
+}
+
+#[test]
 fn vpt_pipeline_keeps_camera_projection_unjittered_until_taa_resolve_exists() {
     let pipeline = source("src/render/vpt_pipeline.rs");
 

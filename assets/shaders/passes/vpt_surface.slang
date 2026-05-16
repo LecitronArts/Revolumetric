@@ -130,5 +130,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     surface_position_depth[pixel] = float4(hit.position, hit.t);
     surface_normal_roughness[pixel] = float4(normalize(hit.normal), emissive_luma);
     surface_albedo_material[pixel] = float4(albedo, material_id);
-    motion_history[pixel] = project_previous_pixel(pixel, hit.position);
+    float4 motion = project_previous_pixel(pixel, hit.position);
+    motion.z = float(hit.motion_id);
+    motion_history[pixel] = motion;
 }
