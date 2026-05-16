@@ -1,0 +1,13 @@
+[target.aarch64-linux-android]
+# Use the NDK's clang as the linker and llvm-ar for archiving on Windows.
+# Adjust the paths below if your NDK is installed elsewhere or a different NDK version is used.
+
+# Use the triple-prefixed clang wrapper so the correct target flags are applied by the
+# NDK driver (on Windows these are .cmd wrappers in the `bin` directory).
+linker = "D:/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android23-clang.cmd"
+ar = "D:/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+
+[env]
+# Make build scripts that call `cc` pick the NDK clang for cross compilation.
+CC_aarch64_linux_android = "D:/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/aarch64-linux-android23-clang.cmd"
+AR = "D:/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

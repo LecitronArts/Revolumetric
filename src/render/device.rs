@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use ash::{Device, Entry, Instance, vk};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::collections::BTreeSet;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, c_char};
 use winit::window::Window;
 
 use crate::render::allocator::GpuAllocator;
@@ -119,6 +119,44 @@ impl RenderDevice {
         let surface_loader = ash::khr::surface::Instance::new(&entry, &instance);
         let size = window.inner_size();
 
+        // Determine desired swapchain size. On Android, default to a 720p
+        // render target to save performance unless explicitly disabled via
+        // REVOLUMETRIC_ANDROID_FORCE_720P=0 in the environment.
+        let (desired_width, desired_height) = {
+            let w = size.width.max(1);
+            let h = size.height.max(1);
+            #[cfg(target_os = "android")]
+            {
+                let force_720p = std::env::var("REVOLUMETRIC_ANDROID_FORCE_720P")
+                    .ok()
+                    .as_deref()
+                    != Some("0");
+                if !force_720p {
+                    (w, h)
+                } else {
+                    const MAX_W: u32 = 1280;
+                    const MAX_H: u32 = 720;
+                    if w <= MAX_W && h <= MAX_H {
+                        (w, h)
+                    } else {
+                        let aspect = w as f32 / h as f32;
+                        let target_aspect = MAX_W as f32 / MAX_H as f32;
+                        if aspect >= target_aspect {
+                            let hh = ((MAX_W as f32) / aspect).round() as u32;
+                            (MAX_W, hh.max(1))
+                        } else {
+                            let ww = ((MAX_H as f32) * aspect).round() as u32;
+                            (ww.max(1), MAX_H)
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "android"))]
+            {
+                (w, h)
+            }
+        };
+
         let device_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
         let selection =
             pick_physical_device(&instance, &surface_loader, surface, &device_extension_names)?;
@@ -175,8 +213,8 @@ impl RenderDevice {
             &swapchain_support,
             selection.graphics_queue_family_index,
             selection.present_queue_family_index,
-            size.width.max(1),
-            size.height.max(1),
+            desired_width,
+            desired_height,
         )?;
 
         let frames = create_frame_resources(
@@ -554,7 +592,7 @@ fn pick_physical_device(
     instance: &Instance,
     surface_loader: &ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
-    required_extensions: &[*const i8],
+    required_extensions: &[*const c_char],
 ) -> Result<PhysicalDeviceSelection> {
     let physical_devices = unsafe { instance.enumerate_physical_devices() }
         .context("failed to enumerate Vulkan physical devices")?;
@@ -673,7 +711,7 @@ fn query_swapchain_support(
 fn ensure_required_device_extensions(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
-    required_extensions: &[*const i8],
+    required_extensions: &[*const c_char],
 ) -> Result<()> {
     let available_extensions =
         unsafe { instance.enumerate_device_extension_properties(physical_device) }
@@ -736,7 +774,7 @@ fn has_layer(available_layers: &[vk::LayerProperties], target: &CStr) -> bool {
     })
 }
 
-fn vk_cstr_to_string(raw_name: &[i8]) -> String {
+fn vk_cstr_to_string(raw_name: &[c_char]) -> String {
     let name = unsafe { CStr::from_ptr(raw_name.as_ptr()) };
     name.to_string_lossy().into_owned()
 }

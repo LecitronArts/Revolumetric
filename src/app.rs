@@ -1,10 +1,15 @@
 use anyhow::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, WindowEvent};
+use winit::event::{AxisId, ButtonId, DeviceEvent, DeviceId, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
+
+#[cfg(target_os = "android")]
+use winit::platform::android::EventLoopBuilderExtAndroid;
+#[cfg(target_os = "android")]
+use winit::platform::android::activity::AndroidApp;
 
 use crate::platform::input::InputState;
 use crate::scene::camera::update_fly_camera;
@@ -31,6 +36,20 @@ pub fn run() -> Result<()> {
     init_tracing();
 
     let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut app = RevolumetricApp::new();
+    event_loop.run_app(&mut app)?;
+    Ok(())
+}
+
+#[cfg(target_os = "android")]
+pub fn run_android(app: AndroidApp) -> Result<()> {
+    init_tracing();
+
+    let mut builder = EventLoop::builder();
+    builder.with_android_app(app);
+    let event_loop = builder.build()?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = RevolumetricApp::new();
@@ -167,7 +186,7 @@ impl RevolumetricApp {
         match self.world.resource::<CameraRig>() {
             Some(rig) => VptCameraFrame {
                 position: rig.camera.position,
-                forward: rig.camera.forward,
+                                                                                                                                                           forward: rig.camera.forward,
                 up: rig.camera.up,
                 fov_y_radians: rig.camera.fov_y_radians,
                 aperture_radius: rig.camera.aperture_radius,
@@ -603,8 +622,21 @@ impl ApplicationHandler for RevolumetricApp {
                     }
                 }
             }
-            WindowEvent::CursorMoved { .. } => {
-                // Mouse deltas handled via DeviceEvent::MouseMotion for reliable FPS camera
+            WindowEvent::CursorMoved { position, .. } => {
+                if let Some(input) = self.world.resource_mut::<InputState>()
+                    && input.right_mouse_held
+                {
+                    if let Some((last_x, last_y)) = self.last_cursor_pos {
+                        input.mouse_dx += (position.x - last_x) as f32;
+                        input.mouse_dy += (position.y - last_y) as f32;
+                    }
+                }
+                self.last_cursor_pos = Some((position.x, position.y));
+            }
+            WindowEvent::AxisMotion { axis, value, .. } => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    apply_gamepad_axis(input, axis, value as f32);
+                }
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let scroll = match delta {
@@ -636,13 +668,26 @@ impl ApplicationHandler for RevolumetricApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        if let DeviceEvent::MouseMotion { delta } = event {
-            if let Some(input) = self.world.resource_mut::<InputState>() {
-                if input.right_mouse_held {
-                    input.mouse_dx += delta.0 as f32;
-                    input.mouse_dy += delta.1 as f32;
+        match event {
+            DeviceEvent::MouseMotion { delta } => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    if input.right_mouse_held {
+                        input.mouse_dx += delta.0 as f32;
+                        input.mouse_dy += delta.1 as f32;
+                    }
                 }
             }
+            DeviceEvent::Motion { axis, value } => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    apply_gamepad_axis(input, axis, value as f32);
+                }
+            }
+            DeviceEvent::Button { button, state } => {
+                if let Some(input) = self.world.resource_mut::<InputState>() {
+                    apply_gamepad_button(input, button, state);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -651,6 +696,33 @@ impl ApplicationHandler for RevolumetricApp {
             window.request_redraw();
         }
     }
+}
+
+const GAMEPAD_AXIS_LEFT_X: AxisId = 0;
+const GAMEPAD_AXIS_LEFT_Y: AxisId = 1;
+const GAMEPAD_AXIS_RIGHT_X: AxisId = 2;
+const GAMEPAD_AXIS_RIGHT_Y: AxisId = 3;
+const GAMEPAD_AXIS_LEFT_TRIGGER: AxisId = 4;
+const GAMEPAD_AXIS_RIGHT_TRIGGER: AxisId = 5;
+
+fn apply_gamepad_axis(input: &mut InputState, axis: AxisId, value: f32) {
+    match axis {
+        GAMEPAD_AXIS_LEFT_X => input.gamepad_left_x = value,
+        GAMEPAD_AXIS_LEFT_Y => input.gamepad_left_y = value,
+        GAMEPAD_AXIS_RIGHT_X => input.gamepad_right_x = value,
+        GAMEPAD_AXIS_RIGHT_Y => input.gamepad_right_y = value,
+        GAMEPAD_AXIS_LEFT_TRIGGER => input.gamepad_left_trigger = normalize_trigger(value),
+        GAMEPAD_AXIS_RIGHT_TRIGGER => input.gamepad_right_trigger = normalize_trigger(value),
+        _ => {}
+    }
+}
+
+fn apply_gamepad_button(_input: &mut InputState, _button: ButtonId, _state: winit::event::ElementState) {
+    // Reserved for future button bindings (e.g. camera reset, speed boost).
+}
+
+fn normalize_trigger(value: f32) -> f32 {
+    ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
 fn init_tracing() {
