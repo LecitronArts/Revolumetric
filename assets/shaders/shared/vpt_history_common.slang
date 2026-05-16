@@ -28,3 +28,11 @@ struct VptSurfacePixel {
     float history_confidence;
     uint _pad0;
 };
+
+float2 vpt_previous_pixel_center_from_motion(uint2 pixel, float4 motion) {
+    return float2(pixel) + 0.5 + motion.xy;
+}
+
+float2 vpt_history_sample_from_motion(uint2 pixel, float4 motion) {
+    return vpt_previous_pixel_center_from_motion(pixel, motion) - 0.5;
+}

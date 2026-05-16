@@ -149,7 +149,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (motion.w == 0.0) {
         history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID;
     } else {
-        float2 history_sample = motion.xy - 0.5;
+        float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
         int2 previous_base_pixel = int2(floor(history_sample));
         float2 history_fraction = saturate(history_sample - float2(previous_base_pixel));
 

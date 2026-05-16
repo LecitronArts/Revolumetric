@@ -111,6 +111,124 @@ void dda_step_brick_with_t(
     dda_step_voxel(brick_coord, t_max, t_delta, step_dir, current_t, hit_normal);
 }
 
+bool dda_t_exceeds_target(float next_t, float target_t) {
+    return next_t > target_t + DDA_TIE_EPSILON * max(abs(target_t), 1.0);
+}
+
+uint ucvh_flat_index(uint3 pos, uint3 dim) {
+    return pos.x + pos.y * dim.x + pos.z * dim.x * dim.y;
+}
+
+bool hierarchy_level_empty_at_brick(
+    int3 brick_coord,
+    uint level,
+    uint block_size,
+    uint3 grid_dim,
+    StructuredBuffer<NodeLN> hierarchy_l1,
+    StructuredBuffer<NodeLN> hierarchy_l2,
+    StructuredBuffer<NodeLN> hierarchy_l3,
+    StructuredBuffer<NodeLN> hierarchy_l4
+) {
+    uint3 parent_dim = (grid_dim + uint3(block_size - 1u)) / block_size;
+    uint3 parent_coord = uint3(brick_coord) / block_size;
+    if (any(parent_coord >= parent_dim)) {
+        return false;
+    }
+
+    uint parent_index = ucvh_flat_index(parent_coord, parent_dim);
+    NodeLN parent;
+    if (level == 1u) {
+        parent = hierarchy_l1[parent_index];
+    } else if (level == 2u) {
+        parent = hierarchy_l2[parent_index];
+    } else if (level == 3u) {
+        parent = hierarchy_l3[parent_index];
+    } else {
+        parent = hierarchy_l4[parent_index];
+    }
+    return node_ln_child_mask(parent) == 0u;
+}
+
+void advance_brick_dda_to_t(
+    inout int3 brick_coord,
+    inout float3 t_max,
+    float3 t_delta,
+    int3 step_dir,
+    inout float current_t,
+    float target_t
+) {
+    while (current_t < target_t) {
+        float next_t = dda_next_t(t_max);
+        if (dda_t_exceeds_target(next_t, target_t)) {
+            break;
+        }
+        float previous_t = current_t;
+        dda_step_brick_with_t(brick_coord, t_max, t_delta, step_dir, current_t);
+        if (current_t <= previous_t) {
+            break;
+        }
+    }
+}
+
+bool try_skip_empty_hierarchy_block(
+    Ray ray,
+    int3 brick_coord,
+    uint3 grid_dim,
+    StructuredBuffer<NodeLN> hierarchy_l1,
+    StructuredBuffer<NodeLN> hierarchy_l2,
+    StructuredBuffer<NodeLN> hierarchy_l3,
+    StructuredBuffer<NodeLN> hierarchy_l4,
+    inout float3 t_max,
+    float3 t_delta,
+    int3 step_dir,
+    inout float current_t,
+    out int3 skipped_brick_coord
+) {
+    skipped_brick_coord = brick_coord;
+    uint selected_block_size = 0u;
+    for (uint level = 4u; level >= 1u; level--) {
+        uint block_size = 1u << level;
+        if (hierarchy_level_empty_at_brick(
+            brick_coord,
+            level,
+            block_size,
+            grid_dim,
+            hierarchy_l1,
+            hierarchy_l2,
+            hierarchy_l3,
+            hierarchy_l4
+        )) {
+            selected_block_size = block_size;
+            break;
+        }
+        if (level == 1u) {
+            break;
+        }
+    }
+
+    if (selected_block_size == 0u) {
+        return false;
+    }
+
+    float3 block_min = float3((uint3(brick_coord) / selected_block_size) * selected_block_size) * 8.0;
+    float3 block_max = min(block_min + float3(selected_block_size * 8u), float3(grid_dim) * 8.0);
+    float2 block_t = intersect_aabb(ray.origin, ray.inv_dir, AABB(block_min, block_max));
+    if (block_t.x > block_t.y || block_t.y <= current_t) {
+        return false;
+    }
+
+    int3 original_brick_coord = skipped_brick_coord;
+    advance_brick_dda_to_t(
+        skipped_brick_coord,
+        t_max,
+        t_delta,
+        step_dir,
+        current_t,
+        block_t.y
+    );
+    return any(skipped_brick_coord != original_brick_coord);
+}
+
 // --- Brick-internal DDA (Level 2) ---
 // Amanatides-Woo DDA through 8^3 brick occupancy.
 // Uses read_occupancy_bit() from voxel_common.slang (Morton-order bit indexing).
@@ -249,6 +367,10 @@ HitResult trace_primary_ray(
     Ray ray,
     StructuredBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<NodeLN> hierarchy_l1,
+    StructuredBuffer<NodeLN> hierarchy_l2,
+    StructuredBuffer<NodeLN> hierarchy_l3,
+    StructuredBuffer<NodeLN> hierarchy_l4,
     StructuredBuffer<BrickOccupancy> occupancy_buf,
     StructuredBuffer<VoxelCell> material_buf
 ) {
@@ -280,13 +402,31 @@ HitResult trace_primary_ray(
         ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
     );
 
-    float3 brick_normal = float3(0);
-
     // Max brick steps: grid diagonal
     int max_steps = igrid.x + igrid.y + igrid.z;
+    float current_t = t_enter;
     for (int i = 0; i < max_steps && i < 256; i++) {
         if (any(brick_coord < int3(0)) || any(brick_coord >= igrid))
             break;
+
+        int3 skipped_brick_coord;
+        if (try_skip_empty_hierarchy_block(
+            ray,
+            brick_coord,
+            uint3(igrid),
+            hierarchy_l1,
+            hierarchy_l2,
+            hierarchy_l3,
+            hierarchy_l4,
+            t_max,
+            t_delta,
+            step_dir,
+            current_t,
+            skipped_brick_coord
+        )) {
+            brick_coord = skipped_brick_coord;
+            continue;
+        }
 
         // Lookup L0 node
         uint l0_idx = uint(brick_coord.x)
@@ -320,7 +460,7 @@ HitResult trace_primary_ray(
             }
         }
 
-        dda_step_brick(brick_coord, t_max, t_delta, step_dir);
+        dda_step_brick_with_t(brick_coord, t_max, t_delta, step_dir, current_t);
     }
 
     return NO_HIT;
@@ -333,6 +473,10 @@ bool trace_any_hit_ray_skip_voxel(
     uint3 skip_local,
     StructuredBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<NodeLN> hierarchy_l1,
+    StructuredBuffer<NodeLN> hierarchy_l2,
+    StructuredBuffer<NodeLN> hierarchy_l3,
+    StructuredBuffer<NodeLN> hierarchy_l4,
     StructuredBuffer<BrickOccupancy> occupancy_buf
 ) {
     if (max_t <= 0.0) {
@@ -376,6 +520,25 @@ bool trace_any_hit_ray_skip_voxel(
             break;
         }
 
+        int3 skipped_brick_coord;
+        if (try_skip_empty_hierarchy_block(
+            ray,
+            brick_coord,
+            uint3(igrid),
+            hierarchy_l1,
+            hierarchy_l2,
+            hierarchy_l3,
+            hierarchy_l4,
+            t_max,
+            t_delta,
+            step_dir,
+            current_t,
+            skipped_brick_coord
+        )) {
+            brick_coord = skipped_brick_coord;
+            continue;
+        }
+
         uint l0_idx = uint(brick_coord.x)
                     + uint(brick_coord.y) * uint(igrid.x)
                     + uint(brick_coord.z) * uint(igrid.x) * uint(igrid.y);
@@ -411,6 +574,10 @@ bool trace_any_hit_ray(
     float max_t,
     StructuredBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
+    StructuredBuffer<NodeLN> hierarchy_l1,
+    StructuredBuffer<NodeLN> hierarchy_l2,
+    StructuredBuffer<NodeLN> hierarchy_l3,
+    StructuredBuffer<NodeLN> hierarchy_l4,
     StructuredBuffer<BrickOccupancy> occupancy_buf
 ) {
     return trace_any_hit_ray_skip_voxel(
@@ -420,6 +587,10 @@ bool trace_any_hit_ray(
         uint3(0),
         config_buf,
         hierarchy_l0,
+        hierarchy_l1,
+        hierarchy_l2,
+        hierarchy_l3,
+        hierarchy_l4,
         occupancy_buf
     );
 }

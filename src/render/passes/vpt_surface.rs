@@ -41,7 +41,7 @@ pub struct VptSurfaceBootstrapGraph {
 }
 
 impl VptSurfacePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 12] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 16] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -52,9 +52,13 @@ impl VptSurfacePass {
             DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
-            DescriptorBindingSpec::compute(9, vk::DescriptorType::UNIFORM_BUFFER),
-            DescriptorBindingSpec::compute(10, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(14, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -83,7 +87,7 @@ impl VptSurfacePass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 10 * frame_count as u32,
+                descriptor_count: 18 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, 2 * frame_count as u32, &pool_sizes)
@@ -796,6 +800,10 @@ fn write_descriptor_sets_from_refs(
     let ucvh_buffers = [
         &ucvh_gpu.config_buffer,
         &ucvh_gpu.hierarchy_l0_buffer,
+        &ucvh_gpu.hierarchy_ln_buffers[0],
+        &ucvh_gpu.hierarchy_ln_buffers[1],
+        &ucvh_gpu.hierarchy_ln_buffers[2],
+        &ucvh_gpu.hierarchy_ln_buffers[3],
         &ucvh_gpu.occupancy_buffer,
         &ucvh_gpu.material_buffer,
     ];
@@ -851,7 +859,7 @@ fn write_descriptor_sets_from_refs(
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(9)
+                .dst_binding(13)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&history_ubo_info)),
         );
@@ -882,12 +890,12 @@ fn write_area_restir_descriptor_set(
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(10)
+            .dst_binding(14)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&area_uniform_info)),
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(11)
+            .dst_binding(15)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&area_reservoir_info)),
     ];

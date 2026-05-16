@@ -1,4 +1,5 @@
 #include "scene_common.slang"
+#include "vpt_history_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<SceneUniforms> scene_ubo;
@@ -440,7 +441,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     if (motion.w > 0.0) {
         if (current_surface_valid) {
-            float2 history_sample = motion.xy - 0.5;
+            float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
             int2 previous_base_pixel = int2(floor(history_sample));
             float2 history_fraction = saturate(history_sample - float2(previous_base_pixel));
             ReprojectedHistorySample history = sample_reprojected_history(
@@ -481,7 +482,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (scene.vpt_debug_view == VPT_DEBUG_VIEW_HISTORY_VALID) {
         accumulated = float3(history_reused);
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_MOTION) {
-        float2 delta = motion.w > 0.0 ? (motion.xy - float2(pixel) - 0.5) : float2(0.0);
+        float2 delta = motion.w > 0.0 ? motion.xy : float2(0.0);
         accumulated = float3(delta * 0.05 + 0.5, motion.w > 0.0 ? 1.0 : 0.0);
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_VARIANCE) {
         accumulated = visualize_luminance_variance(accumulated_moments);

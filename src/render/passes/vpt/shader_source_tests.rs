@@ -46,13 +46,17 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
             binding(1, DescriptorKind::StorageImage, "noisy_radiance_image"),
             binding(2, DescriptorKind::StorageBuffer, "ucvh_config"),
             binding(3, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(4, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(5, DescriptorKind::StorageBuffer, "brick_materials"),
-            binding(6, DescriptorKind::UniformBuffer, "restir"),
-            binding(7, DescriptorKind::StorageBuffer, "restir_reservoirs"),
-            binding(8, DescriptorKind::StorageImage, "noisy_moments_image"),
-            binding(9, DescriptorKind::UniformBuffer, "area_restir"),
-            binding(10, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(4, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(5, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(6, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(7, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(8, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(9, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(10, DescriptorKind::UniformBuffer, "restir"),
+            binding(11, DescriptorKind::StorageBuffer, "restir_reservoirs"),
+            binding(12, DescriptorKind::StorageImage, "noisy_moments_image"),
+            binding(13, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(14, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
         ]
     );
 }
@@ -69,11 +73,15 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
             binding(4, DescriptorKind::StorageImage, "motion_history"),
             binding(5, DescriptorKind::StorageBuffer, "ucvh_config"),
             binding(6, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(7, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(8, DescriptorKind::StorageBuffer, "brick_materials"),
-            binding(9, DescriptorKind::UniformBuffer, "vpt_history"),
-            binding(10, DescriptorKind::UniformBuffer, "area_restir"),
-            binding(11, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(7, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(11, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(12, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(13, DescriptorKind::UniformBuffer, "vpt_history"),
+            binding(14, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(15, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
         ]
     );
 }
@@ -649,6 +657,8 @@ fn vpt_history_abi_declares_surface_and_reprojection_contract() {
         "uint history_reset_generation",
         "static const uint VPT_HISTORY_FLAG_CAMERA_CUT",
         "static const uint VPT_HISTORY_FLAG_LIGHTS_INVALIDATED",
+        "float2 vpt_previous_pixel_center_from_motion",
+        "float2 vpt_history_sample_from_motion",
         "struct VptSurfacePixel",
     ] {
         assert!(
@@ -708,8 +718,14 @@ fn vpt_surface_motion_uses_history_uniform_reprojection() {
 
     assert!(shader.contains("ConstantBuffer<VptHistoryUniforms> vpt_history"));
     assert!(shader.contains("project_previous_pixel"));
+    assert!(shader.contains("vpt_history.current_view_proj"));
     assert!(shader.contains("vpt_history.previous_view_proj"));
+    assert!(shader.contains("vpt_history.previous_resolution"));
     assert!(shader.contains("VPT_HISTORY_FLAG_CAMERA_CUT"));
+    assert!(shader.contains("current_clip.w <= 1.0e-5"));
+    assert!(shader.contains("previous_clip.w <= 1.0e-5"));
+    assert!(shader.contains("float2 current_pixel = float2(pixel) + 0.5"));
+    assert!(shader.contains("float2 motion = previous_pixel - current_pixel"));
     assert!(!shader.contains("motion_history[pixel] = float4(float2(pixel), 0.0, 1.0);"));
 
     assert!(rust.contains("GpuVptHistoryUniforms"));
@@ -723,19 +739,44 @@ fn vpt_surface_motion_uses_history_uniform_reprojection() {
 }
 
 #[test]
+fn vpt_pipeline_keeps_camera_projection_unjittered_until_taa_resolve_exists() {
+    let pipeline = source("src/render/vpt_pipeline.rs");
+
+    assert!(
+        !pipeline.contains("taa_frame_jitter(frame.frame_index)"),
+        "VPT must not apply frame-varying camera jitter until temporal resolve is explicitly jitter-stable"
+    );
+    assert!(
+        pipeline.contains("current_jitter: [0.0, 0.0]"),
+        "history uniforms should declare zero jitter while the VPT camera path is unjittered"
+    );
+    assert!(
+        pipeline.contains("previous_jitter: [0.0, 0.0]"),
+        "history uniforms should declare zero previous jitter while the VPT camera path is unjittered"
+    );
+}
+
+#[test]
 fn vpt_temporal_bilinear_reprojection_converts_pixel_centers_to_texel_corners() {
     let surface = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
         .expect("VPT surface shader should exist");
     let temporal = std::fs::read_to_string("assets/shaders/passes/vpt_temporal.slang")
         .expect("VPT temporal shader should exist");
+    let common = std::fs::read_to_string("assets/shaders/shared/vpt_history_common.slang")
+        .expect("VPT history common shader should exist");
 
     assert!(
-        surface.contains("(previous_ndc.x * 0.5 + 0.5)"),
-        "surface pass should output continuous previous-frame pixel-center coordinates"
+        surface.contains("float2 current_pixel = float2(")
+            && surface.contains("float2 previous_pixel = float2("),
+        "surface pass should compute current and previous pixel centers before differencing them"
     );
     assert!(
-        temporal.contains("float2 history_sample = motion.xy - 0.5;"),
-        "4-tap temporal reprojection must convert previous pixel-center coordinates to texel-corner sample space"
+        common.contains("return float2(pixel) + 0.5 + motion.xy;"),
+        "shared helper must define previous pixel centers from motion delta"
+    );
+    assert!(
+        temporal.contains("float2 history_sample = vpt_history_sample_from_motion(pixel, motion);"),
+        "4-tap temporal reprojection must reconstruct the previous pixel-center coordinate from the motion delta"
     );
     assert!(
         temporal.contains("int2 previous_base_pixel = int2(floor(history_sample));"),
@@ -748,12 +789,12 @@ fn vpt_temporal_bilinear_reprojection_converts_pixel_centers_to_texel_corners() 
         "bilinear weights must be computed from the center-corrected base pixel"
     );
     assert!(
-        !temporal.contains("uint2 previous_pixel = uint2(floor(motion.xy));"),
-        "flooring motion.xy directly treats pixel centers as texel corners and biases temporal history"
+        !temporal.contains("uint2 previous_pixel = uint2(motion.xy);"),
+        "motion.xy is now a delta, not an absolute previous pixel coordinate"
     );
     assert!(
-        !temporal.contains("uint2 previous_pixel = uint2(round(motion.xy));"),
-        "round biases exact pixel-center reprojection toward the next pixel and makes stable history drift"
+        !temporal.contains("float2 history_sample = motion.xy - 0.5;"),
+        "subtracting 0.5 from a delta motion vector would bias the history sample"
     );
 }
 
@@ -865,8 +906,8 @@ fn vpt_temporal_motion_debug_view_encodes_reprojection_delta() {
         "temporal shader should expose motion history for reprojection debugging"
     );
     assert!(
-        temporal.contains("motion.xy - float2(pixel) - 0.5"),
-        "motion debug view should show previous-pixel delta after removing pixel-center offset"
+        temporal.contains("motion.xy"),
+        "motion debug view should show the raw motion delta"
     );
 }
 
@@ -1286,7 +1327,7 @@ fn voxel_traversal_steps_all_tied_dda_axes_to_avoid_edge_seams() {
         "void dda_step_voxel(",
         "void dda_step_brick(",
         "dda_step_voxel(coord, t_max, t_delta, step_dir, current_t, hit_normal);",
-        "dda_step_brick(brick_coord, t_max, t_delta, step_dir);",
+        "dda_step_brick_with_t(brick_coord, t_max, t_delta, step_dir, current_t);",
     ] {
         assert!(
             traverse.contains(token),
@@ -1327,6 +1368,62 @@ fn voxel_traversal_uses_direction_aware_entry_cells_instead_of_fixed_nudge() {
         !traverse.contains("t_enter + 0.001"),
         "fixed t-space entry nudges perturb cell selection at voxel and brick boundaries"
     );
+}
+
+#[test]
+fn voxel_traversal_uses_uploaded_l1_l4_hierarchy_for_empty_space_skipping() {
+    let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+        .expect("voxel traversal shader should be readable");
+    let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+        .expect("vpt shader should be readable");
+    let surface = std::fs::read_to_string("assets/shaders/passes/vpt_surface.slang")
+        .expect("surface shader should be readable");
+
+    for token in [
+        "StructuredBuffer<NodeLN> hierarchy_l1",
+        "StructuredBuffer<NodeLN> hierarchy_l2",
+        "StructuredBuffer<NodeLN> hierarchy_l3",
+        "StructuredBuffer<NodeLN> hierarchy_l4",
+        "bool hierarchy_level_empty_at_brick(",
+        "bool try_skip_empty_hierarchy_block(",
+        "void advance_brick_dda_to_t(",
+        "node_ln_child_mask(parent)",
+        "try_skip_empty_hierarchy_block(",
+    ] {
+        assert!(
+            traverse.contains(token),
+            "voxel traversal shader missing hierarchy skip token {token}"
+        );
+    }
+
+    assert!(
+        traverse.matches("try_skip_empty_hierarchy_block(").count() >= 3,
+        "primary and any-hit traversal loops must both use hierarchy empty-space skipping"
+    );
+    assert!(
+        vpt.contains("hierarchy_l4") && surface.contains("hierarchy_l4"),
+        "VPT trace and surface passes must pass all L1-L4 buffers into shared traversal"
+    );
+}
+
+#[test]
+fn voxel_hierarchy_skip_does_not_advance_past_block_exit_boundary() {
+    let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+        .expect("voxel traversal shader should be readable");
+
+    for token in [
+        "bool dda_t_exceeds_target(",
+        "float next_t = dda_next_t(t_max);",
+        "if (dda_t_exceeds_target(next_t, target_t))",
+        "break;",
+        "int3 original_brick_coord = skipped_brick_coord;",
+        "return any(skipped_brick_coord != original_brick_coord);",
+    ] {
+        assert!(
+            traverse.contains(token),
+            "hierarchy skip DDA advance missing boundary guard token {token}"
+        );
+    }
 }
 
 #[test]

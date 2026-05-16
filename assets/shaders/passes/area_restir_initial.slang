@@ -36,9 +36,21 @@ StructuredBuffer<UcvhConfig> ucvh_config;
 StructuredBuffer<NodeL0> hierarchy_l0;
 
 [[vk::binding(9, 0)]]
-StructuredBuffer<BrickOccupancy> brick_occupancy;
+StructuredBuffer<NodeLN> hierarchy_l1;
 
 [[vk::binding(10, 0)]]
+StructuredBuffer<NodeLN> hierarchy_l2;
+
+[[vk::binding(11, 0)]]
+StructuredBuffer<NodeLN> hierarchy_l3;
+
+[[vk::binding(12, 0)]]
+StructuredBuffer<NodeLN> hierarchy_l4;
+
+[[vk::binding(13, 0)]]
+StructuredBuffer<BrickOccupancy> brick_occupancy;
+
+[[vk::binding(14, 0)]]
 StructuredBuffer<VoxelCell> brick_materials;
 
 struct AreaRestirCandidateSurface {
@@ -108,6 +120,10 @@ AreaRestirCandidateSurface evaluate_area_restir_candidate_surface(
         make_ray(primary_ray.origin, primary_ray.direction),
         ucvh_config,
         hierarchy_l0,
+        hierarchy_l1,
+        hierarchy_l2,
+        hierarchy_l3,
+        hierarchy_l4,
         brick_occupancy,
         brick_materials
     );

@@ -297,7 +297,9 @@ fn restir_di_temporal_uses_explicit_history_surface_and_selected_frame_ring() {
     assert!(temporal.contains("previous_surface_normal_roughness"));
     assert!(temporal.contains("previous_surface_albedo_material"));
     assert!(temporal.contains("motion_history"));
-    assert!(temporal.contains("previous_pixel"));
+    assert!(
+        temporal.contains("float2 history_sample = vpt_history_sample_from_motion(pixel, motion);")
+    );
     assert!(temporal.contains("position_delta"));
     assert!(
         !temporal.contains("dot(normalize(normal_roughness.xyz), normalize(normal_roughness.xyz))")

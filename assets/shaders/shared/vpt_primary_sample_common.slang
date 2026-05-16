@@ -70,6 +70,6 @@ ScenePrimaryRay vpt_resolve_surface_primary_ray(
         return vpt_primary_ray_from_area_reservoir(pixel, scene, reservoir);
     }
 
-    // Surface guide fallback must stay stable so motion/history buffers do not jitter every frame.
+    // Surface guide fallback stays on the pixel center so history guides do not shift every frame.
     return vpt_center_primary_ray(pixel, scene);
 }

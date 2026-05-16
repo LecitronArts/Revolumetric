@@ -36,7 +36,7 @@ pub struct VptGraphOutputs {
 }
 
 impl VptPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 15] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -44,11 +44,15 @@ impl VptPass {
             DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_BUFFER),
-            DescriptorBindingSpec::compute(6, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
-            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
-            DescriptorBindingSpec::compute(9, vk::DescriptorType::UNIFORM_BUFFER),
-            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(14, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -77,7 +81,7 @@ impl VptPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 6 * frame_count as u32,
+                descriptor_count: 10 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -289,12 +293,12 @@ impl VptPass {
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_sets[frame_slot])
-                .dst_binding(6)
+                .dst_binding(10)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&restir_uniform_info)),
             vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_sets[frame_slot])
-                .dst_binding(7)
+                .dst_binding(11)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&restir_reservoir_info)),
         ];
@@ -319,12 +323,12 @@ impl VptPass {
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_sets[frame_slot])
-                .dst_binding(9)
+                .dst_binding(13)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&area_uniform_info)),
             vk::WriteDescriptorSet::default()
                 .dst_set(self.descriptor_sets[frame_slot])
-                .dst_binding(10)
+                .dst_binding(14)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&area_reservoir_info)),
         ];
@@ -510,6 +514,10 @@ fn write_descriptor_sets(
     let ucvh_buffers = [
         &ucvh_gpu.config_buffer,
         &ucvh_gpu.hierarchy_l0_buffer,
+        &ucvh_gpu.hierarchy_ln_buffers[0],
+        &ucvh_gpu.hierarchy_ln_buffers[1],
+        &ucvh_gpu.hierarchy_ln_buffers[2],
+        &ucvh_gpu.hierarchy_ln_buffers[3],
         &ucvh_gpu.occupancy_buffer,
         &ucvh_gpu.material_buffer,
     ];
@@ -557,7 +565,7 @@ fn write_descriptor_sets(
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(8)
+                .dst_binding(12)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(std::slice::from_ref(&moments_info)),
         );
@@ -583,12 +591,12 @@ fn write_restir_descriptor_sets(
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(6)
+                .dst_binding(10)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&restir_uniform_info)),
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(7)
+                .dst_binding(11)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&restir_reservoir_info)),
         ];
@@ -614,12 +622,12 @@ fn write_area_restir_descriptor_sets(
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(9)
+                .dst_binding(13)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&area_uniform_info)),
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(10)
+                .dst_binding(14)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(&area_reservoir_info)),
         ];

@@ -86,7 +86,7 @@ fn area_restir_effective_settings(
 }
 
 impl AreaRestirPass {
-    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 15] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -99,6 +99,10 @@ impl AreaRestirPass {
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(14, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -694,6 +698,10 @@ impl AreaRestirPass {
             &[
                 &ucvh_gpu.config_buffer,
                 &ucvh_gpu.hierarchy_l0_buffer,
+                &ucvh_gpu.hierarchy_ln_buffers[0],
+                &ucvh_gpu.hierarchy_ln_buffers[1],
+                &ucvh_gpu.hierarchy_ln_buffers[2],
+                &ucvh_gpu.hierarchy_ln_buffers[3],
                 &ucvh_gpu.occupancy_buffer,
                 &ucvh_gpu.material_buffer,
             ],

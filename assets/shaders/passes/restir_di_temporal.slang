@@ -99,14 +99,15 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 surface_normal_roughness = current_surface_normal_roughness[pixel];
     float4 surface_albedo_material = current_surface_albedo_material[pixel];
     float4 motion = motion_history[tid.xy];
+    float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
     bool previous_pixel_valid = motion.w >= 0.5
-        && motion.x >= 0.0
-        && motion.y >= 0.0
-        && motion.x < float(restir.width)
-        && motion.y < float(restir.height);
+        && history_sample.x >= 0.0
+        && history_sample.y >= 0.0
+        && history_sample.x < float(restir.width)
+        && history_sample.y < float(restir.height);
 
     if (restir.temporal_enabled != 0u && previous_pixel_valid) {
-        uint2 previous_pixel = uint2(motion.xy);
+        uint2 previous_pixel = uint2(history_sample);
         uint previous_index = previous_pixel.y * restir.width + previous_pixel.x;
         RestirDiReservoir history_reservoir = history_reservoirs[previous_index];
         if (restir_di_is_valid_reservoir(history_reservoir)

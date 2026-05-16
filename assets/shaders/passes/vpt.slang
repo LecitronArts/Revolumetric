@@ -25,25 +25,37 @@ StructuredBuffer<UcvhConfig> ucvh_config;
 StructuredBuffer<NodeL0> hierarchy_l0;
 
 [[vk::binding(4, 0)]]
-StructuredBuffer<BrickOccupancy> brick_occupancy;
+StructuredBuffer<NodeLN> hierarchy_l1;
 
 [[vk::binding(5, 0)]]
-StructuredBuffer<VoxelCell> brick_materials;
+StructuredBuffer<NodeLN> hierarchy_l2;
 
 [[vk::binding(6, 0)]]
-ConstantBuffer<RestirDiUniforms> restir;
+StructuredBuffer<NodeLN> hierarchy_l3;
 
 [[vk::binding(7, 0)]]
-StructuredBuffer<RestirDiReservoir> restir_reservoirs;
+StructuredBuffer<NodeLN> hierarchy_l4;
 
 [[vk::binding(8, 0)]]
+StructuredBuffer<BrickOccupancy> brick_occupancy;
+
+[[vk::binding(9, 0)]]
+StructuredBuffer<VoxelCell> brick_materials;
+
+[[vk::binding(10, 0)]]
+ConstantBuffer<RestirDiUniforms> restir;
+
+[[vk::binding(11, 0)]]
+StructuredBuffer<RestirDiReservoir> restir_reservoirs;
+
+[[vk::binding(12, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> noisy_moments_image;
 
-[[vk::binding(9, 0)]]
+[[vk::binding(13, 0)]]
 ConstantBuffer<AreaRestirUniforms> area_restir;
 
-[[vk::binding(10, 0)]]
+[[vk::binding(14, 0)]]
 StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;
 
 uint hash_u32(uint x) {
@@ -113,6 +125,10 @@ bool voxel_shadow_occluded_from_hit(HitResult hit, float3 shadow_dir, float max_
         hit.local,
         ucvh_config,
         hierarchy_l0,
+        hierarchy_l1,
+        hierarchy_l2,
+        hierarchy_l3,
+        hierarchy_l4,
         brick_occupancy
     );
 }
@@ -326,7 +342,17 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
     uint max_bounces = clamp(scene.vpt_max_bounces, 1u, 8u);
 
     for (uint bounce = 0u; bounce < max_bounces; bounce++) {
-        HitResult hit = trace_primary_ray(ray, ucvh_config, hierarchy_l0, brick_occupancy, brick_materials);
+        HitResult hit = trace_primary_ray(
+            ray,
+            ucvh_config,
+            hierarchy_l0,
+            hierarchy_l1,
+            hierarchy_l2,
+            hierarchy_l3,
+            hierarchy_l4,
+            brick_occupancy,
+            brick_materials
+        );
         if (bounce == 0u) {
             sample.first_hit = hit;
         }

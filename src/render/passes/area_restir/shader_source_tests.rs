@@ -62,8 +62,12 @@ fn area_restir_initial_shader_binding_manifest_matches_expected_resources() {
             binding(6, DescriptorKind::UniformBuffer, "scene_ubo"),
             binding(7, DescriptorKind::StorageBuffer, "ucvh_config"),
             binding(8, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(9, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(10, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(12, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(13, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(14, DescriptorKind::StorageBuffer, "brick_materials"),
         ]
     );
 }
@@ -268,6 +272,10 @@ fn area_restir_shaders_declare_expected_entry_points_and_resources() {
         "ConstantBuffer<SceneUniforms> scene_ubo",
         "StructuredBuffer<UcvhConfig> ucvh_config",
         "StructuredBuffer<NodeL0> hierarchy_l0",
+        "StructuredBuffer<NodeLN> hierarchy_l1",
+        "StructuredBuffer<NodeLN> hierarchy_l2",
+        "StructuredBuffer<NodeLN> hierarchy_l3",
+        "StructuredBuffer<NodeLN> hierarchy_l4",
         "StructuredBuffer<BrickOccupancy> brick_occupancy",
         "StructuredBuffer<VoxelCell> brick_materials",
         "area_restir_invalid_reservoir",
@@ -378,6 +386,10 @@ fn area_restir_shaders_cache_per_pixel_surface_reads() {
             && initial.contains("#include \"material_common.slang\"")
             && initial.contains("StructuredBuffer<UcvhConfig> ucvh_config")
             && initial.contains("StructuredBuffer<NodeL0> hierarchy_l0")
+            && initial.contains("StructuredBuffer<NodeLN> hierarchy_l1")
+            && initial.contains("StructuredBuffer<NodeLN> hierarchy_l2")
+            && initial.contains("StructuredBuffer<NodeLN> hierarchy_l3")
+            && initial.contains("StructuredBuffer<NodeLN> hierarchy_l4")
             && initial.contains("StructuredBuffer<BrickOccupancy> brick_occupancy")
             && initial.contains("StructuredBuffer<VoxelCell> brick_materials"),
         "initial shader must bind UCVH resources to evaluate each area candidate ray"
@@ -401,6 +413,10 @@ fn area_restir_shaders_cache_per_pixel_surface_reads() {
         temporal.contains("float4 motion = center_context.motion_history;")
             && !temporal.contains("float4 motion = motion_history.Load(int3(pixel, 0));"),
         "temporal shader must reuse motion already loaded into center_context"
+    );
+    assert!(
+        temporal.contains("float2 history_sample = vpt_history_sample_from_motion(pixel, motion);"),
+        "Area ReSTIR temporal must reconstruct the previous pixel center from motion delta"
     );
 }
 
@@ -447,7 +463,7 @@ fn area_restir_temporal_reuses_history_in_current_pixel_measure() {
     let common = source("assets/shaders/shared/area_restir_common.slang");
 
     for token in [
-        "float2 history_sample = motion.xy - 0.5;",
+        "float2 history_sample = vpt_history_sample_from_motion(pixel, motion);",
         "float2 history_fraction",
         "static const int2 area_restir_history_tap_offsets[4]",
         "static const float AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT",
