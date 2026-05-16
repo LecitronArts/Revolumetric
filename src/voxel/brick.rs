@@ -7,7 +7,7 @@ pub const BRICK_VOLUME: usize = 512; // 8^3
 /// Occupancy bitmask for an 8^3 brick (hot-path, fits GPU L2).
 /// Bits are indexed in Morton order matching material storage.
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
 pub struct BrickOccupancy {
     pub bits: [u32; 16], // 512 bits
     pub count: u32,      // number of solid voxels (0 = empty, skip instantly)
@@ -46,7 +46,7 @@ impl BrickOccupancy {
 
 /// Single voxel material data (cold-path, read only on ray hit).
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
 pub struct VoxelCell {
     pub material: u16,
     pub flags: u16,

@@ -1,5 +1,5 @@
 // src/voxel/ucvh.rs
-use crate::voxel::brick::{BRICK_EDGE, BrickData, VoxelCell};
+use crate::voxel::brick::{BRICK_EDGE, BRICK_VOLUME, BrickData, VoxelCell};
 use crate::voxel::brick_pool::{BrickId, BrickPool};
 use crate::voxel::morton;
 use crate::voxel::occupancy::CascadedOccupancy;
@@ -216,9 +216,23 @@ impl Ucvh {
         if !self.contains_brick_pos(brick_pos) {
             return false;
         }
-        let Some(id) = self.ensure_brick(brick_pos) else {
-            return false;
+        let idx = self.l0_index(brick_pos);
+        let id = match self.brick_map[idx] {
+            Some(id) => id,
+            None if brick_data_is_air(data) => return true,
+            None => {
+                let Some(id) = self.ensure_brick(brick_pos) else {
+                    return false;
+                };
+                id
+            }
         };
+        let base = id as usize * BRICK_VOLUME;
+        if self.pool.occupancy(id) == &data.occupancy
+            && self.pool.material_pool()[base..base + BRICK_VOLUME] == data.materials[..]
+        {
+            return true;
+        }
         self.pool.write_brick(id, data);
         if !self.dirty_bricks.contains(&id) {
             self.dirty_bricks.push(id);
@@ -300,6 +314,10 @@ impl Ucvh {
 
 fn voxel_cell_eq(a: VoxelCell, b: VoxelCell) -> bool {
     a.material == b.material && a.flags == b.flags && a.emissive == b.emissive && a._pad == b._pad
+}
+
+fn brick_data_is_air(data: &BrickData) -> bool {
+    data.occupancy.is_empty() && data.materials.iter().all(|cell| *cell == VoxelCell::AIR)
 }
 
 #[cfg(test)]
@@ -421,6 +439,19 @@ mod tests {
     }
 
     #[test]
+    fn write_brick_repeated_identical_data_does_not_duplicate_invalidation_region() {
+        let mut u = test_ucvh();
+        let mut data = BrickData::new();
+        data.set_voxel(0, 0, 0, VoxelCell::new(2, 0, [1, 2, 3]));
+
+        assert!(u.write_brick(UVec3::new(2, 3, 4), &data));
+        assert_eq!(u.take_invalidation_regions().len(), 1);
+
+        assert!(u.write_brick(UVec3::new(2, 3, 4), &data));
+        assert!(u.take_invalidation_regions().is_empty());
+    }
+
+    #[test]
     fn adjacent_bricks_preserve_continuous_wall_across_boundary() {
         let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(16, 8, 8)));
 
@@ -505,7 +536,8 @@ mod tests {
     #[test]
     fn write_brick_records_the_full_brick_region_and_generation() {
         let mut u = test_ucvh();
-        let data = BrickData::new();
+        let mut data = BrickData::new();
+        data.set_voxel(0, 0, 0, VoxelCell::new(1, 0, [0; 3]));
 
         assert!(u.write_brick(UVec3::new(1, 2, 3), &data));
 
@@ -514,6 +546,16 @@ mod tests {
         assert_eq!(invalidations[0].brick_min, UVec3::new(1, 2, 3));
         assert_eq!(invalidations[0].brick_max_exclusive, UVec3::new(2, 3, 4));
         assert_eq!(invalidations[0].generation, 0);
+    }
+
+    #[test]
+    fn write_brick_with_empty_data_on_missing_brick_is_a_no_op() {
+        let mut u = test_ucvh();
+        let data = BrickData::new();
+
+        assert!(u.write_brick(UVec3::new(1, 2, 3), &data));
+        assert_eq!(u.allocated_brick_count(), 0);
+        assert!(u.take_invalidation_regions().is_empty());
     }
 
     #[test]
