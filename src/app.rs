@@ -25,7 +25,9 @@ use crate::render::device::RenderDevice;
 use crate::render::gpu_profiler::{GpuProfiler, GpuProfilerConfig};
 use crate::render::restir_di::RestirDiSettings;
 use crate::render::scene_ubo::{LightingSettings, SceneUniformBuffer, VptDebugView};
-use crate::render::vpt_pipeline::{VptCameraFrame, VptFrameInputs, VptRuntimePipeline};
+use crate::render::vpt_pipeline::{
+    UcvhFrameChanges, VptCameraFrame, VptFrameInputs, VptRuntimePipeline,
+};
 use crate::scene::light::DirectionalLight;
 use crate::scene::systems;
 use crate::voxel::generator;
@@ -219,6 +221,18 @@ impl RevolumetricApp {
             .map_or(0.0, |time| time.elapsed_seconds)
     }
 
+    fn snapshot_ucvh_frame_changes(ucvh: &Ucvh) -> UcvhFrameChanges {
+        UcvhFrameChanges::new(
+            ucvh.invalidation_regions().to_vec(),
+            ucvh.motion_events().to_vec(),
+        )
+    }
+
+    fn clear_ucvh_frame_changes(ucvh: &mut Ucvh) {
+        let _ = ucvh.take_invalidation_regions();
+        let _ = ucvh.take_motion_events();
+    }
+
     fn tick_frame(&mut self) -> Result<()> {
         // Real delta time
         let now = std::time::Instant::now();
@@ -261,7 +275,7 @@ impl RevolumetricApp {
 
                 // Upload UCVH data to GPU (first frame only)
                 if !self.ucvh_uploaded {
-                    if let (Some(ucvh), Some(gpu)) = (&self.ucvh, &self.ucvh_gpu) {
+                    if let (Some(ucvh), Some(gpu)) = (self.ucvh.as_mut(), &self.ucvh_gpu) {
                         match gpu.upload_all(renderer.device(), frame.command_buffer, ucvh) {
                             Ok(()) => {
                                 self.ucvh_uploaded = true;
@@ -273,6 +287,15 @@ impl RevolumetricApp {
                         }
                     }
                 }
+
+                let ucvh_frame_changes = if self.ucvh_uploaded {
+                    self.ucvh
+                        .as_ref()
+                        .map(Self::snapshot_ucvh_frame_changes)
+                        .unwrap_or_default()
+                } else {
+                    UcvhFrameChanges::default()
+                };
 
                 if let Some(scene_ubo) = &self.scene_ubo {
                     let record_result = self.vpt_pipeline.record_and_execute_frame(
@@ -290,6 +313,7 @@ impl RevolumetricApp {
                             restir_di_enabled,
                             area_restir_enabled,
                             ucvh_ready: self.ucvh_uploaded,
+                            ucvh_frame_changes,
                             capture: self.capture.as_mut(),
                             profiler: self.gpu_profiler.as_ref(),
                         },
@@ -297,6 +321,11 @@ impl RevolumetricApp {
                     let submitted_fence = record_result.submitted_fence;
                     let mut pending_capture = record_result.pending_capture;
                     renderer.end_frame(frame)?;
+                    if self.ucvh_uploaded
+                        && let Some(ucvh) = self.ucvh.as_mut()
+                    {
+                        Self::clear_ucvh_frame_changes(ucvh);
+                    }
                     if let Some(metadata) = pending_capture.take() {
                         renderer.wait_for_fence(submitted_fence)?;
                         if let Some(capture) = &self.capture {
@@ -739,6 +768,8 @@ mod tests {
     use crate::scene::camera::Camera;
     use crate::scene::components::CameraRig;
     use crate::scene::light::DirectionalLight;
+    use crate::voxel::brick::VoxelCell;
+    use crate::voxel::ucvh::UcvhMotionEvent;
 
     #[test]
     fn view_projection_round_trips_pixel_to_ray_center_coordinates() {
@@ -849,6 +880,37 @@ mod tests {
     fn current_elapsed_seconds_defaults_to_zero_without_time_resource() {
         let app = RevolumetricApp::new();
         assert_eq!(app.current_elapsed_seconds(), 0.0);
+    }
+
+    #[test]
+    fn snapshotting_ucvh_frame_changes_returns_render_visible_change_summary_without_consuming() {
+        let mut ucvh = Ucvh::new(UcvhConfig::new(glam::UVec3::splat(32)));
+        assert!(ucvh.set_voxel(glam::UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
+        assert!(ucvh.push_motion_event(UcvhMotionEvent {
+            region_min: glam::UVec3::new(8, 8, 8),
+            region_max_exclusive: glam::UVec3::new(16, 16, 16),
+            world_delta_current_from_previous: glam::IVec3::new(1, 0, 0),
+            generation: 2,
+        }));
+
+        let changes = RevolumetricApp::snapshot_ucvh_frame_changes(&ucvh);
+
+        assert_eq!(changes.invalidation_regions.len(), 1);
+        assert_eq!(changes.motion_events.len(), 1);
+        assert!(changes.invalidates_history());
+        assert_eq!(ucvh.invalidation_regions().len(), 1);
+        assert_eq!(ucvh.motion_events().len(), 1);
+    }
+
+    #[test]
+    fn clearing_ucvh_frame_changes_discards_initial_generation_metadata() {
+        let mut ucvh = Ucvh::new(UcvhConfig::new(glam::UVec3::splat(32)));
+        assert!(ucvh.set_voxel(glam::UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
+
+        RevolumetricApp::clear_ucvh_frame_changes(&mut ucvh);
+
+        assert!(ucvh.invalidation_regions().is_empty());
+        assert!(ucvh.motion_events().is_empty());
     }
 
     #[test]

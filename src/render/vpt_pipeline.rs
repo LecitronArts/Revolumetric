@@ -32,7 +32,7 @@ use crate::render::vpt_history::{
     VPT_HISTORY_FLAG_RESIZE, VPT_HISTORY_FLAG_SCENE_INVALIDATED,
 };
 use crate::voxel::gpu_upload::UcvhGpuResources;
-use crate::voxel::ucvh::Ucvh;
+use crate::voxel::ucvh::{Ucvh, UcvhInvalidationRegion, UcvhMotionEvent};
 
 #[derive(Debug, Clone, Copy)]
 pub struct VptCameraFrame {
@@ -56,8 +56,31 @@ pub struct VptFrameInputs<'a> {
     pub restir_di_enabled: bool,
     pub area_restir_enabled: bool,
     pub ucvh_ready: bool,
+    pub ucvh_frame_changes: UcvhFrameChanges,
     pub capture: Option<&'a mut RenderCapture>,
     pub profiler: Option<&'a GpuProfiler>,
+}
+
+#[derive(Debug, Default)]
+pub struct UcvhFrameChanges {
+    pub invalidation_regions: Vec<UcvhInvalidationRegion>,
+    pub motion_events: Vec<UcvhMotionEvent>,
+}
+
+impl UcvhFrameChanges {
+    pub fn new(
+        invalidation_regions: Vec<UcvhInvalidationRegion>,
+        motion_events: Vec<UcvhMotionEvent>,
+    ) -> Self {
+        Self {
+            invalidation_regions,
+            motion_events,
+        }
+    }
+
+    pub fn invalidates_history(&self) -> bool {
+        !self.invalidation_regions.is_empty() || !self.motion_events.is_empty()
+    }
 }
 
 pub struct VptFrameRecordResult {
@@ -116,6 +139,17 @@ impl VptPipelineFrameState {
         self.vpt_sample_index = 0;
         self.last_vpt_camera_key = None;
         self.last_vpt_scene_key = None;
+        self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
+        self.vpt_accumulation_needs_init = true;
+        self.vpt_temporal_history_initialized = false;
+        self.postprocess_output_initialized = false;
+        self.area_restir_history_initialized = false;
+        self.restir_di_history_initialized = false;
+    }
+
+    pub fn reset_for_ucvh_content_change(&mut self) {
+        self.vpt_sample_index = 0;
+        self.last_vpt_camera_key = None;
         self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
         self.vpt_accumulation_needs_init = true;
         self.vpt_temporal_history_initialized = false;
@@ -574,9 +608,12 @@ impl VptRuntimePipeline {
             inputs.area_restir_enabled,
         );
         let scene_changed = self.frame_state.last_vpt_scene_key != Some(scene_key);
+        let ucvh_history_invalidated = inputs.ucvh_frame_changes.invalidates_history();
         if scene_changed {
             self.frame_state.reset_for_scene_change();
             self.frame_state.last_vpt_scene_key = Some(scene_key);
+        } else if ucvh_history_invalidated {
+            self.frame_state.reset_for_ucvh_content_change();
         }
 
         if inputs.ucvh_ready {
@@ -666,6 +703,8 @@ impl VptRuntimePipeline {
             };
             let scene_history_flags = if scene_changed {
                 VPT_HISTORY_FLAG_SCENE_INVALIDATED | VPT_HISTORY_FLAG_LIGHTS_INVALIDATED
+            } else if ucvh_history_invalidated {
+                VPT_HISTORY_FLAG_SCENE_INVALIDATED
             } else {
                 0
             };
@@ -1205,6 +1244,7 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
 mod tests {
     use super::*;
     use crate::render::scene_ubo::{LightingDebugView, LightingSettings, RenderMode, VptDebugView};
+    use crate::voxel::ucvh::{UcvhInvalidationRegion, UcvhMotionEvent};
 
     #[test]
     fn frame_state_reset_clears_history_and_accumulation() {
@@ -1266,6 +1306,64 @@ mod tests {
         assert!(!state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
         assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
+    }
+
+    #[test]
+    fn frame_state_ucvh_content_reset_clears_history_without_forgetting_scene_or_camera_history() {
+        let mut state = VptPipelineFrameState {
+            vpt_sample_index: 11,
+            last_vpt_camera_key: Some([1; 15]),
+            last_vpt_scene_key: Some([2; 14]),
+            history_reset_generation: 3,
+            vpt_accumulation_needs_init: false,
+            vpt_temporal_history_initialized: true,
+            postprocess_output_initialized: true,
+            area_restir_history_initialized: true,
+            restir_di_history_initialized: true,
+            previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
+            previous_vpt_resolution: Some([1280, 720]),
+        };
+
+        state.reset_for_ucvh_content_change();
+
+        assert_eq!(state.vpt_sample_index, 0);
+        assert_eq!(state.last_vpt_camera_key, None);
+        assert_eq!(state.last_vpt_scene_key, Some([2; 14]));
+        assert_eq!(state.history_reset_generation, 4);
+        assert!(state.vpt_accumulation_needs_init);
+        assert!(!state.vpt_temporal_history_initialized);
+        assert!(!state.postprocess_output_initialized);
+        assert!(!state.area_restir_history_initialized);
+        assert!(!state.restir_di_history_initialized);
+        assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
+        assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
+    }
+
+    #[test]
+    fn ucvh_frame_changes_invalidate_history_when_regions_or_motion_events_are_present() {
+        let no_changes = UcvhFrameChanges::default();
+        assert!(!no_changes.invalidates_history());
+
+        let invalidated = UcvhFrameChanges::new(
+            vec![UcvhInvalidationRegion {
+                brick_min: glam::UVec3::new(1, 2, 3),
+                brick_max_exclusive: glam::UVec3::new(2, 3, 4),
+                generation: 7,
+            }],
+            Vec::new(),
+        );
+        assert!(invalidated.invalidates_history());
+
+        let moved = UcvhFrameChanges::new(
+            Vec::new(),
+            vec![UcvhMotionEvent {
+                region_min: glam::UVec3::new(8, 8, 8),
+                region_max_exclusive: glam::UVec3::new(16, 16, 16),
+                world_delta_current_from_previous: glam::IVec3::new(1, 0, 0),
+                generation: 8,
+            }],
+        );
+        assert!(moved.invalidates_history());
     }
 
     #[test]
