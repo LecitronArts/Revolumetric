@@ -35,6 +35,10 @@ pub const VPT_DEBUG_VIEW_AREA_JACOBIAN: u32 = 16;
 pub const VPT_DEBUG_VIEW_VOXEL_BRICK: u32 = 17;
 pub const VPT_DEBUG_VIEW_VOXEL_LOCAL: u32 = 18;
 pub const VPT_DEBUG_VIEW_VOXEL_HIT: u32 = 19;
+pub const VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS: u32 = 20;
+pub const VPT_DEBUG_VIEW_NRD_VIEWZ: u32 = 21;
+pub const VPT_DEBUG_VIEW_NRD_MOTION: u32 = 22;
+pub const VPT_DEBUG_VIEW_NRD_MOTION_Z: u32 = 23;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightingDebugView {
@@ -70,6 +74,10 @@ pub enum VptDebugView {
     VoxelBrick,
     VoxelLocal,
     VoxelHit,
+    NrdNormalRoughness,
+    NrdViewZ,
+    NrdMotion,
+    NrdMotionZ,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +129,10 @@ impl VptDebugView {
             Self::VoxelBrick => VPT_DEBUG_VIEW_VOXEL_BRICK,
             Self::VoxelLocal => VPT_DEBUG_VIEW_VOXEL_LOCAL,
             Self::VoxelHit => VPT_DEBUG_VIEW_VOXEL_HIT,
+            Self::NrdNormalRoughness => VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS,
+            Self::NrdViewZ => VPT_DEBUG_VIEW_NRD_VIEWZ,
+            Self::NrdMotion => VPT_DEBUG_VIEW_NRD_MOTION,
+            Self::NrdMotionZ => VPT_DEBUG_VIEW_NRD_MOTION_Z,
         }
     }
 }
@@ -345,7 +357,7 @@ impl LightingSettings {
             &mut settings.vpt_debug_view,
             vpt_debug_view,
             "REVOLUMETRIC_VPT_DEBUG_VIEW",
-            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit",
+            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z",
             parse_vpt_debug_view,
             &mut warnings,
         );
@@ -492,6 +504,14 @@ fn parse_vpt_debug_view(value: &str) -> Option<VptDebugView> {
         Some(VptDebugView::VoxelLocal)
     } else if value.eq_ignore_ascii_case("voxel_hit") {
         Some(VptDebugView::VoxelHit)
+    } else if value.eq_ignore_ascii_case("nrd_normal_roughness") {
+        Some(VptDebugView::NrdNormalRoughness)
+    } else if value.eq_ignore_ascii_case("nrd_viewz") {
+        Some(VptDebugView::NrdViewZ)
+    } else if value.eq_ignore_ascii_case("nrd_motion") {
+        Some(VptDebugView::NrdMotion)
+    } else if value.eq_ignore_ascii_case("nrd_motion_z") {
+        Some(VptDebugView::NrdMotionZ)
     } else {
         None
     }
@@ -1188,6 +1208,39 @@ mod tests {
             assert!(
                 result.warnings.is_empty(),
                 "voxel debug view alias {raw} should parse without warnings"
+            );
+            assert_eq!(uniforms.vpt_debug_view, expected_gpu_value);
+        }
+    }
+
+    #[test]
+    fn lighting_settings_parse_nrd_guide_debug_view_aliases() {
+        let cases = [
+            ("nrd_normal_roughness", 20),
+            ("nrd_viewz", 21),
+            ("nrd_motion", 22),
+            ("nrd_motion_z", 23),
+        ];
+
+        for (raw, expected_gpu_value) in cases {
+            let result = LightingSettings::from_values_report_with_denoiser(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(raw),
+                None,
+            );
+            let mut uniforms = GpuSceneUniforms::zeroed();
+            uniforms.apply_lighting_settings(result.settings);
+
+            assert!(
+                result.warnings.is_empty(),
+                "NRD guide debug view alias {raw} should parse without warnings"
             );
             assert_eq!(uniforms.vpt_debug_view, expected_gpu_value);
         }

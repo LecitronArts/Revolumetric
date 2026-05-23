@@ -1230,6 +1230,10 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
         VptDebugView::VoxelBrick => "voxel_brick",
         VptDebugView::VoxelLocal => "voxel_local",
         VptDebugView::VoxelHit => "voxel_hit",
+        VptDebugView::NrdNormalRoughness => "nrd_normal_roughness",
+        VptDebugView::NrdViewZ => "nrd_viewz",
+        VptDebugView::NrdMotion => "nrd_motion",
+        VptDebugView::NrdMotionZ => "nrd_motion_z",
     }
 }
 

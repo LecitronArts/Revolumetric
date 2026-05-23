@@ -31,6 +31,10 @@ static const uint VPT_DEBUG_VIEW_AREA_JACOBIAN = 16u;
 static const uint VPT_DEBUG_VIEW_VOXEL_BRICK = 17u;
 static const uint VPT_DEBUG_VIEW_VOXEL_LOCAL = 18u;
 static const uint VPT_DEBUG_VIEW_VOXEL_HIT = 19u;
+static const uint VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS = 20u;
+static const uint VPT_DEBUG_VIEW_NRD_VIEWZ = 21u;
+static const uint VPT_DEBUG_VIEW_NRD_MOTION = 22u;
+static const uint VPT_DEBUG_VIEW_NRD_MOTION_Z = 23u;
 static const float VPT_VIEW_Z_MISS_SENTINEL = 1.0e20;
 
 uint lighting_debug_view(uint flags) {

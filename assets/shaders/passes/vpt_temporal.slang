@@ -30,50 +30,54 @@ RWTexture2D<float4> surface_albedo_material;
 RWTexture2D<float> surface_material_roughness;
 
 [[vk::binding(7, 0)]]
-[[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_position_depth;
+[[vk::image_format("r32f")]]
+RWTexture2D<float> surface_view_z;
 
 [[vk::binding(8, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_normal_roughness;
+RWTexture2D<float4> previous_surface_position_depth;
 
 [[vk::binding(9, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_albedo_material;
+RWTexture2D<float4> previous_surface_normal_roughness;
 
 [[vk::binding(10, 0)]]
+[[vk::image_format("rgba32f")]]
+RWTexture2D<float4> previous_surface_albedo_material;
+
+[[vk::binding(11, 0)]]
 [[vk::image_format("r16f")]]
 RWTexture2D<float> previous_surface_material_roughness;
 
-[[vk::binding(11, 0)]]
+[[vk::binding(12, 0)]]
 [[vk::image_format("rgba32f")]]
 RWTexture2D<float4> motion_history;
 
-[[vk::binding(12, 0)]]
+[[vk::binding(13, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> accumulated_radiance_image;
 
-[[vk::binding(13, 0)]]
+[[vk::binding(14, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> accumulated_moments_history_image;
 
-[[vk::binding(14, 0)]]
+[[vk::binding(15, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> previous_accumulated_radiance_image;
 
-[[vk::binding(15, 0)]]
+[[vk::binding(16, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> previous_accumulated_moments_history_image;
 
-[[vk::binding(16, 0)]]
+[[vk::binding(17, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> motion_flags;
 
-[[vk::binding(17, 0)]]
+[[vk::binding(18, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> surface_brick_generation;
 
-[[vk::binding(18, 0)]]
+[[vk::binding(19, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> previous_surface_brick_generation;
 
@@ -153,6 +157,23 @@ float3 visualize_linear_depth(float linear_depth) {
     }
     float depth = saturate(log2(linear_depth + 1.0) / 12.0);
     return float3(depth);
+}
+
+float3 visualize_nrd_normal_roughness(uint2 pixel, bool valid_surface) {
+    if (!valid_surface) {
+        return float3(0.0);
+    }
+    float3 normal = normalize(surface_normal_roughness[pixel].xyz) * 0.5 + 0.5;
+    float roughness = saturate(surface_material_roughness[pixel]);
+    return float3(normal.xy, roughness);
+}
+
+float3 visualize_nrd_motion_z(float motion_z, bool valid_motion) {
+    if (!valid_motion) {
+        return float3(0.0);
+    }
+    float encoded = clamp(motion_z * 0.05, -0.5, 0.5) + 0.5;
+    return float3(encoded, motion_z >= 0.0 ? 1.0 : 0.0, motion_z < 0.0 ? 1.0 : 0.0);
 }
 
 bool compatible_current_surface(uint2 pixel, uint2 neighbor_pixel) {
@@ -438,6 +459,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 motion = motion_history[pixel];
     uint flags = motion_flags[pixel];
     bool current_surface_valid = surface_position_depth[pixel].w >= 0.0;
+    bool motion_valid = current_surface_valid && !vpt_motion_flags_reject_history(flags);
     FireflyClampStats firefly_stats = (FireflyClampStats)0;
 
     if (debug_view_bypasses_temporal(scene.vpt_debug_view)) {
@@ -455,6 +477,26 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
     if (scene.vpt_debug_view == VPT_DEBUG_VIEW_DEPTH) {
         accumulated_radiance_image[pixel] = float4(visualize_linear_depth(surface_position_depth[pixel].w), 1.0);
+        accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
+        return;
+    }
+
+    if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS
+        || scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_VIEWZ
+        || scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_MOTION
+        || scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_MOTION_Z) {
+        float3 guide_debug = float3(0.0);
+        if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS) {
+            guide_debug = visualize_nrd_normal_roughness(pixel, current_surface_valid);
+        } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_VIEWZ) {
+            guide_debug = current_surface_valid ? visualize_linear_depth(surface_view_z[pixel]) : float3(0.0);
+        } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_MOTION) {
+            float2 delta = motion_valid ? motion.xy : float2(0.0);
+            guide_debug = float3(delta * 0.05 + 0.5, motion_valid ? 1.0 : 0.0);
+        } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_MOTION_Z) {
+            guide_debug = visualize_nrd_motion_z(motion.z, motion_valid);
+        }
+        accumulated_radiance_image[pixel] = float4(guide_debug, 1.0);
         accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
         return;
     }

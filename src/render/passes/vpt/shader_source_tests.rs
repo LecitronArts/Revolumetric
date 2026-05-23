@@ -460,51 +460,52 @@ fn vpt_temporal_shader_binding_manifest_matches_motion_guide_resources() {
                 DescriptorKind::StorageImage,
                 "surface_material_roughness"
             ),
+            binding(7, DescriptorKind::StorageImage, "surface_view_z"),
             binding(
-                7,
+                8,
                 DescriptorKind::StorageImage,
                 "previous_surface_position_depth"
             ),
             binding(
-                8,
+                9,
                 DescriptorKind::StorageImage,
                 "previous_surface_normal_roughness"
             ),
             binding(
-                9,
+                10,
                 DescriptorKind::StorageImage,
                 "previous_surface_albedo_material"
             ),
             binding(
-                10,
+                11,
                 DescriptorKind::StorageImage,
                 "previous_surface_material_roughness"
             ),
-            binding(11, DescriptorKind::StorageImage, "motion_history"),
+            binding(12, DescriptorKind::StorageImage, "motion_history"),
             binding(
-                12,
+                13,
                 DescriptorKind::StorageImage,
                 "accumulated_radiance_image"
             ),
             binding(
-                13,
+                14,
                 DescriptorKind::StorageImage,
                 "accumulated_moments_history_image",
             ),
             binding(
-                14,
+                15,
                 DescriptorKind::StorageImage,
                 "previous_accumulated_radiance_image"
             ),
             binding(
-                15,
+                16,
                 DescriptorKind::StorageImage,
                 "previous_accumulated_moments_history_image",
             ),
-            binding(16, DescriptorKind::StorageImage, "motion_flags"),
-            binding(17, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(17, DescriptorKind::StorageImage, "motion_flags"),
+            binding(18, DescriptorKind::StorageImage, "surface_brick_generation"),
             binding(
-                18,
+                19,
                 DescriptorKind::StorageImage,
                 "previous_surface_brick_generation",
             ),
@@ -545,8 +546,8 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
     assert!(atrous_rs.contains("surface_inputs: VptCurrentSurfaceResources"));
 
     for token in [
-        "DescriptorBindingSpec::compute(18,vk::DescriptorType::STORAGE_IMAGE),",
-        "letimage_refs=[&vpt.noisy_radiance_image,&vpt.noisy_moments_image,&vpt_surface.surface_position_depth,&vpt_surface.surface_normal_roughness,&vpt_surface.surface_albedo_material,&vpt_surface.surface_material_roughness,&vpt_surface.previous_surface_position_depth,&vpt_surface.previous_surface_normal_roughness,&vpt_surface.previous_surface_albedo_material,&vpt_surface.previous_surface_material_roughness,&vpt_surface.motion_history,temporal.accumulated_radiance,temporal.accumulated_moments_history,temporal.previous_accumulated_radiance,temporal.previous_accumulated_moments_history,&vpt_surface.motion_flags,&vpt_surface.surface_brick_generation,&vpt_surface.previous_surface_brick_generation,];",
+        "DescriptorBindingSpec::compute(19,vk::DescriptorType::STORAGE_IMAGE),",
+        "letimage_refs=[&vpt.noisy_radiance_image,&vpt.noisy_moments_image,&vpt_surface.surface_position_depth,&vpt_surface.surface_normal_roughness,&vpt_surface.surface_albedo_material,&vpt_surface.surface_material_roughness,&vpt_surface.surface_view_z,&vpt_surface.previous_surface_position_depth,&vpt_surface.previous_surface_normal_roughness,&vpt_surface.previous_surface_albedo_material,&vpt_surface.previous_surface_material_roughness,&vpt_surface.motion_history,temporal.accumulated_radiance,temporal.accumulated_moments_history,temporal.previous_accumulated_radiance,temporal.previous_accumulated_moments_history,&vpt_surface.motion_flags,&vpt_surface.surface_brick_generation,&vpt_surface.previous_surface_brick_generation,];",
     ] {
         assert!(
             compact_temporal_rs.contains(token),
@@ -1332,7 +1333,7 @@ fn vpt_motion_id_uses_independent_guide_without_changing_reprojection_consumers(
             && !surface.contains("motion.z = float(hit.motion_id);"),
         "motion.z must carry the NRD 2.5D depth delta, not the semantic motion id"
     );
-    for consumer in [temporal, restir_di, area_restir] {
+    for consumer in [restir_di, area_restir] {
         assert!(
             consumer.contains("vpt_history_sample_from_motion(pixel, motion);"),
             "temporal consumers should continue using the shared xy/w reprojection contract"
@@ -1342,6 +1343,14 @@ fn vpt_motion_id_uses_independent_guide_without_changing_reprojection_consumers(
             "motion id plumbing must not change temporal reprojection acceptance yet"
         );
     }
+
+    assert!(
+        surface.contains("motion.z = previous_view_z - view_z;")
+            && surface.contains("motion_history[pixel] = motion;")
+            && temporal.contains("visualize_nrd_motion_z(motion.z, motion_valid)")
+            && temporal.contains("vpt_history_sample_from_motion(pixel, motion);"),
+        "NRD z-guide must be written in surface and only consumed as a debug view in temporal"
+    );
 }
 
 #[test]
@@ -1548,6 +1557,54 @@ fn vpt_debug_views_are_actually_routed_to_temporal_output() {
         temporal.contains("visualize_luminance_variance("),
         "variance debug view should expose temporal moment variance instead of silently showing final color"
     );
+}
+
+#[test]
+fn vpt_nrd_guide_debug_views_are_routed_to_temporal_output() {
+    let scene_common = source("assets/shaders/shared/scene_common.slang");
+    let temporal = source("assets/shaders/passes/vpt_temporal.slang");
+    let temporal_rs = source("src/render/passes/vpt_temporal.rs");
+    let compact_temporal_rs = temporal_rs.split_whitespace().collect::<String>();
+
+    for token in [
+        "VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS",
+        "VPT_DEBUG_VIEW_NRD_VIEWZ",
+        "VPT_DEBUG_VIEW_NRD_MOTION",
+        "VPT_DEBUG_VIEW_NRD_MOTION_Z",
+    ] {
+        assert!(
+            scene_common.contains(token),
+            "scene common missing NRD guide debug constant {token}"
+        );
+        assert!(
+            temporal.contains(token),
+            "VPT temporal shader missing NRD guide debug token {token}"
+        );
+    }
+
+    for token in [
+        "RWTexture2D<float> surface_view_z",
+        "visualize_nrd_normal_roughness",
+        "visualize_nrd_motion_z",
+        "surface_view_z[pixel]",
+        "motion.z",
+        "accumulated_radiance_image[pixel] = float4(guide_debug, 1.0);",
+    ] {
+        assert!(
+            temporal.contains(token),
+            "VPT temporal shader missing NRD guide debug routing token {token}"
+        );
+    }
+
+    for token in [
+        "descriptor_count: 19 * frame_count as u32",
+        "&vpt_surface.surface_view_z",
+    ] {
+        assert!(
+            temporal_rs.contains(token) || compact_temporal_rs.contains(token),
+            "VPT temporal Rust/tests missing NRD guide descriptor token {token}"
+        );
+    }
 }
 
 #[test]

@@ -62,7 +62,7 @@ pub struct VptTemporalPassResizeInfo<'a> {
 }
 
 impl VptTemporalPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 19] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 20] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -83,6 +83,7 @@ impl VptTemporalPass {
             DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(19, vk::DescriptorType::STORAGE_IMAGE),
         ]
     }
 
@@ -100,7 +101,7 @@ impl VptTemporalPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 18 * frame_count as u32,
+                descriptor_count: 19 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -623,6 +624,7 @@ fn write_descriptor_sets(
             &vpt_surface.surface_normal_roughness,
             &vpt_surface.surface_albedo_material,
             &vpt_surface.surface_material_roughness,
+            &vpt_surface.surface_view_z,
             &vpt_surface.previous_surface_position_depth,
             &vpt_surface.previous_surface_normal_roughness,
             &vpt_surface.previous_surface_albedo_material,
