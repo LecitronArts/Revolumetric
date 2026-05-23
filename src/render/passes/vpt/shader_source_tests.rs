@@ -79,6 +79,10 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
             binding(12, DescriptorKind::StorageImage, "noisy_moments_image"),
             binding(13, DescriptorKind::UniformBuffer, "area_restir"),
             binding(14, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(15, DescriptorKind::StorageImage, "nrd_diff_radiance_hitdist"),
+            binding(16, DescriptorKind::StorageImage, "nrd_spec_radiance_hitdist"),
+            binding(17, DescriptorKind::StorageImage, "nrd_residual_radiance"),
+            binding(18, DescriptorKind::StorageImage, "nrd_material_factors"),
         ]
     );
 }
@@ -664,6 +668,73 @@ fn vpt_shader_declares_stochastic_accumulating_reference_path() {
     assert!(source.contains("float3 sample_radiance = sample.radiance;"));
     assert!(source.contains("float luminance = dot(sample_radiance"));
     assert!(source.contains("noisy_radiance_image[tid.xy] = float4(sample_radiance, 1.0);"));
+}
+
+#[test]
+fn vpt_nrd_noisy_frontend_contract() {
+    let shader = source("assets/shaders/passes/vpt.slang");
+    let rust = source("src/render/passes/vpt.rs");
+    let compact_shader = shader.split_whitespace().collect::<String>();
+
+    for token in [
+        "struct VptTraceSample",
+        "float first_indirect_hit_distance",
+        "float3 nrd_diffuse_radiance",
+        "float3 nrd_residual_signal",
+        "RWTexture2D<float4> nrd_diff_radiance_hitdist",
+        "RWTexture2D<float4> nrd_spec_radiance_hitdist",
+        "RWTexture2D<float4> nrd_residual_radiance",
+        "RWTexture2D<float4> nrd_material_factors",
+        "sample.first_indirect_hit_distance",
+        "sample.nrd_diffuse_radiance",
+        "sample.nrd_residual_signal",
+        "if (hit.hit && bounce > 0u && sample.first_indirect_hit_distance == VPT_NRD_INVALID_HIT_DISTANCE)",
+        "float3 nrd_diffuse_indirect = demodulate_by_primary_albedo(sample.nrd_diffuse_radiance, sample.first_hit);",
+        "float3 nrd_residual = sample.nrd_residual_signal;",
+        "nrd_diff_radiance_hitdist[tid.xy]",
+        "nrd_spec_radiance_hitdist[tid.xy]",
+        "nrd_residual_radiance[tid.xy]",
+        "nrd_material_factors[tid.xy]",
+    ] {
+        assert!(shader.contains(token), "VPT shader missing NRD noisy token {token}");
+    }
+
+    assert!(
+        compact_shader.contains(
+            "else{sample.indirect_radiance+=contribution;sample.nrd_residual_signal+=contribution;}break;"
+        ),
+        "secondary sky miss must bypass NRD diffuse through residual radiance"
+    );
+    assert!(
+        compact_shader.contains(
+            "else{sample.indirect_radiance+=contribution;sample.nrd_diffuse_radiance+=contribution;}break;"
+        ),
+        "secondary emissive hit must feed NRD diffuse with a real lobe hit distance"
+    );
+
+    for token in [
+        "pub struct VptNrdNoisyResources",
+        "pub diff_radiance_hitdist: ResourceHandle",
+        "pub spec_radiance_hitdist: ResourceHandle",
+        "pub residual_radiance: ResourceHandle",
+        "pub material_factors: ResourceHandle",
+        "pub nrd_diff_radiance_hitdist: GpuImage",
+        "pub nrd_spec_radiance_hitdist: GpuImage",
+        "pub nrd_residual_radiance: GpuImage",
+        "pub nrd_material_factors: GpuImage",
+        "descriptor_count: 6 * frame_count as u32",
+        "vpt_nrd_diff_radiance_hitdist",
+        "vpt_nrd_spec_radiance_hitdist",
+        "vpt_nrd_residual_radiance",
+        "vpt_nrd_material_factors",
+        "let noisy_image_usage = vk::ImageUsageFlags::STORAGE",
+        "| vk::ImageUsageFlags::SAMPLED",
+    ] {
+        assert!(
+            rust.contains(token),
+            "VPT Rust missing NRD noisy contract token {token}"
+        );
+    }
 }
 
 #[test]

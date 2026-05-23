@@ -23,6 +23,10 @@ pub struct VptPass {
     descriptor_sets: Vec<vk::DescriptorSet>,
     pub noisy_radiance_image: GpuImage,
     pub noisy_moments_image: GpuImage,
+    pub nrd_diff_radiance_hitdist: GpuImage,
+    pub nrd_spec_radiance_hitdist: GpuImage,
+    pub nrd_residual_radiance: GpuImage,
+    pub nrd_material_factors: GpuImage,
     disabled_restir_uniform_buffers: Vec<GpuBuffer>,
     disabled_restir_reservoir_buffer: GpuBuffer,
     disabled_area_restir_uniform_buffers: Vec<GpuBuffer>,
@@ -33,10 +37,19 @@ pub struct VptPass {
 pub struct VptGraphOutputs {
     pub noisy_radiance: ResourceHandle,
     pub noisy_moments: ResourceHandle,
+    pub nrd_noisy: VptNrdNoisyResources,
+}
+
+#[derive(Clone, Copy)]
+pub struct VptNrdNoisyResources {
+    pub diff_radiance_hitdist: ResourceHandle,
+    pub spec_radiance_hitdist: ResourceHandle,
+    pub residual_radiance: ResourceHandle,
+    pub material_factors: ResourceHandle,
 }
 
 impl VptPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 15] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 19] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -53,6 +66,10 @@ impl VptPass {
             DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(13, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(14, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_IMAGE),
         ]
     }
 
@@ -77,7 +94,7 @@ impl VptPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 2 * frame_count as u32,
+                descriptor_count: 6 * frame_count as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -116,6 +133,10 @@ impl VptPass {
             &VptImagesRef {
                 noisy_radiance_image: &images.noisy_radiance_image,
                 noisy_moments_image: &images.noisy_moments_image,
+                nrd_diff_radiance_hitdist: &images.nrd_diff_radiance_hitdist,
+                nrd_spec_radiance_hitdist: &images.nrd_spec_radiance_hitdist,
+                nrd_residual_radiance: &images.nrd_residual_radiance,
+                nrd_material_factors: &images.nrd_material_factors,
             },
             ucvh_gpu,
         );
@@ -222,6 +243,10 @@ impl VptPass {
             descriptor_sets,
             noisy_radiance_image: images.noisy_radiance_image,
             noisy_moments_image: images.noisy_moments_image,
+            nrd_diff_radiance_hitdist: images.nrd_diff_radiance_hitdist,
+            nrd_spec_radiance_hitdist: images.nrd_spec_radiance_hitdist,
+            nrd_residual_radiance: images.nrd_residual_radiance,
+            nrd_material_factors: images.nrd_material_factors,
             disabled_restir_uniform_buffers,
             disabled_restir_reservoir_buffer,
             disabled_area_restir_uniform_buffers,
@@ -248,6 +273,22 @@ impl VptPass {
                 &mut self.noisy_moments_image,
                 new_images.noisy_moments_image,
             ),
+            nrd_diff_radiance_hitdist: std::mem::replace(
+                &mut self.nrd_diff_radiance_hitdist,
+                new_images.nrd_diff_radiance_hitdist,
+            ),
+            nrd_spec_radiance_hitdist: std::mem::replace(
+                &mut self.nrd_spec_radiance_hitdist,
+                new_images.nrd_spec_radiance_hitdist,
+            ),
+            nrd_residual_radiance: std::mem::replace(
+                &mut self.nrd_residual_radiance,
+                new_images.nrd_residual_radiance,
+            ),
+            nrd_material_factors: std::mem::replace(
+                &mut self.nrd_material_factors,
+                new_images.nrd_material_factors,
+            ),
         };
         old_images.destroy(device, allocator);
         write_descriptor_sets(
@@ -257,6 +298,10 @@ impl VptPass {
             &VptImagesRef {
                 noisy_radiance_image: &self.noisy_radiance_image,
                 noisy_moments_image: &self.noisy_moments_image,
+                nrd_diff_radiance_hitdist: &self.nrd_diff_radiance_hitdist,
+                nrd_spec_radiance_hitdist: &self.nrd_spec_radiance_hitdist,
+                nrd_residual_radiance: &self.nrd_residual_radiance,
+                nrd_material_factors: &self.nrd_material_factors,
             },
             ucvh_gpu,
         );
@@ -366,12 +411,15 @@ impl VptPass {
         } else {
             AccessKind::ComputeShaderRead
         };
+        let noisy_image_usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::SAMPLED
+            | vk::ImageUsageFlags::TRANSFER_SRC;
         let noisy_radiance_resource = graph.import_image_with_access(
             self.noisy_radiance_image.handle,
             self.noisy_radiance_image.extent.width,
             self.noisy_radiance_image.extent.height,
             vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            noisy_image_usage,
             noisy_initial_access,
         );
         let noisy_moments_resource = graph.import_image_with_access(
@@ -379,12 +427,54 @@ impl VptPass {
             self.noisy_moments_image.extent.width,
             self.noisy_moments_image.extent.height,
             vk::Format::R16G16B16A16_SFLOAT,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            noisy_image_usage,
+            noisy_initial_access,
+        );
+        let nrd_diff_radiance_hitdist_resource = graph.import_image_with_access(
+            self.nrd_diff_radiance_hitdist.handle,
+            self.nrd_diff_radiance_hitdist.extent.width,
+            self.nrd_diff_radiance_hitdist.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            noisy_image_usage,
+            noisy_initial_access,
+        );
+        let nrd_spec_radiance_hitdist_resource = graph.import_image_with_access(
+            self.nrd_spec_radiance_hitdist.handle,
+            self.nrd_spec_radiance_hitdist.extent.width,
+            self.nrd_spec_radiance_hitdist.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            noisy_image_usage,
+            noisy_initial_access,
+        );
+        let nrd_residual_radiance_resource = graph.import_image_with_access(
+            self.nrd_residual_radiance.handle,
+            self.nrd_residual_radiance.extent.width,
+            self.nrd_residual_radiance.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            noisy_image_usage,
+            noisy_initial_access,
+        );
+        let nrd_material_factors_resource = graph.import_image_with_access(
+            self.nrd_material_factors.handle,
+            self.nrd_material_factors.extent.width,
+            self.nrd_material_factors.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            noisy_image_usage,
             noisy_initial_access,
         );
         let vpt_writes = graph.add_pass("vpt", QueueType::Compute, |builder| {
             builder.write_as(noisy_radiance_resource, AccessKind::ComputeShaderWrite);
             builder.write_as(noisy_moments_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(
+                nrd_diff_radiance_hitdist_resource,
+                AccessKind::ComputeShaderWrite,
+            );
+            builder.write_as(
+                nrd_spec_radiance_hitdist_resource,
+                AccessKind::ComputeShaderWrite,
+            );
+            builder.write_as(nrd_residual_radiance_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(nrd_material_factors_resource, AccessKind::ComputeShaderWrite);
             if let Some((restir_uniform_resource, restir_reservoir_resource)) = restir_reads {
                 builder.read_as(restir_uniform_resource, AccessKind::ComputeShaderRead);
                 builder.read_as(restir_reservoir_resource, AccessKind::ComputeShaderRead);
@@ -422,6 +512,12 @@ impl VptPass {
         VptGraphOutputs {
             noisy_radiance: vpt_writes[0],
             noisy_moments: vpt_writes[1],
+            nrd_noisy: VptNrdNoisyResources {
+                diff_radiance_hitdist: vpt_writes[2],
+                spec_radiance_hitdist: vpt_writes[3],
+                residual_radiance: vpt_writes[4],
+                material_factors: vpt_writes[5],
+            },
         }
     }
 
@@ -431,6 +527,10 @@ impl VptPass {
         unsafe { device.destroy_descriptor_set_layout(self.descriptor_set_layout, None) };
         self.noisy_radiance_image.destroy(device, allocator);
         self.noisy_moments_image.destroy(device, allocator);
+        self.nrd_diff_radiance_hitdist.destroy(device, allocator);
+        self.nrd_spec_radiance_hitdist.destroy(device, allocator);
+        self.nrd_residual_radiance.destroy(device, allocator);
+        self.nrd_material_factors.destroy(device, allocator);
         destroy_buffers(self.disabled_restir_uniform_buffers, device, allocator);
         self.disabled_restir_reservoir_buffer
             .destroy(device, allocator);
@@ -443,17 +543,29 @@ impl VptPass {
 struct VptImages {
     noisy_radiance_image: GpuImage,
     noisy_moments_image: GpuImage,
+    nrd_diff_radiance_hitdist: GpuImage,
+    nrd_spec_radiance_hitdist: GpuImage,
+    nrd_residual_radiance: GpuImage,
+    nrd_material_factors: GpuImage,
 }
 
 struct VptImagesRef<'a> {
     noisy_radiance_image: &'a GpuImage,
     noisy_moments_image: &'a GpuImage,
+    nrd_diff_radiance_hitdist: &'a GpuImage,
+    nrd_spec_radiance_hitdist: &'a GpuImage,
+    nrd_residual_radiance: &'a GpuImage,
+    nrd_material_factors: &'a GpuImage,
 }
 
 impl VptImages {
     fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
         self.noisy_radiance_image.destroy(device, allocator);
         self.noisy_moments_image.destroy(device, allocator);
+        self.nrd_diff_radiance_hitdist.destroy(device, allocator);
+        self.nrd_spec_radiance_hitdist.destroy(device, allocator);
+        self.nrd_residual_radiance.destroy(device, allocator);
+        self.nrd_material_factors.destroy(device, allocator);
     }
 }
 
@@ -473,10 +585,71 @@ fn create_vpt_images(
                 return Err(error);
             }
         };
+    let nrd_diff_radiance_hitdist = match create_vpt_image(
+        device,
+        allocator,
+        width,
+        height,
+        "vpt_nrd_diff_radiance_hitdist",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            noisy_moments_image.destroy(device, allocator);
+            noisy_radiance_image.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let nrd_spec_radiance_hitdist = match create_vpt_image(
+        device,
+        allocator,
+        width,
+        height,
+        "vpt_nrd_spec_radiance_hitdist",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            nrd_diff_radiance_hitdist.destroy(device, allocator);
+            noisy_moments_image.destroy(device, allocator);
+            noisy_radiance_image.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let nrd_residual_radiance = match create_vpt_image(
+        device,
+        allocator,
+        width,
+        height,
+        "vpt_nrd_residual_radiance",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            nrd_spec_radiance_hitdist.destroy(device, allocator);
+            nrd_diff_radiance_hitdist.destroy(device, allocator);
+            noisy_moments_image.destroy(device, allocator);
+            noisy_radiance_image.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let nrd_material_factors =
+        match create_vpt_image(device, allocator, width, height, "vpt_nrd_material_factors") {
+            Ok(image) => image,
+            Err(error) => {
+                nrd_residual_radiance.destroy(device, allocator);
+                nrd_spec_radiance_hitdist.destroy(device, allocator);
+                nrd_diff_radiance_hitdist.destroy(device, allocator);
+                noisy_moments_image.destroy(device, allocator);
+                noisy_radiance_image.destroy(device, allocator);
+                return Err(error);
+            }
+        };
 
     Ok(VptImages {
         noisy_radiance_image,
         noisy_moments_image,
+        nrd_diff_radiance_hitdist,
+        nrd_spec_radiance_hitdist,
+        nrd_residual_radiance,
+        nrd_material_factors,
     })
 }
 
@@ -533,6 +706,18 @@ fn write_descriptor_sets(
         let moments_info = vk::DescriptorImageInfo::default()
             .image_view(images.noisy_moments_image.view)
             .image_layout(vk::ImageLayout::GENERAL);
+        let nrd_diff_info = vk::DescriptorImageInfo::default()
+            .image_view(images.nrd_diff_radiance_hitdist.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let nrd_spec_info = vk::DescriptorImageInfo::default()
+            .image_view(images.nrd_spec_radiance_hitdist.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let nrd_residual_info = vk::DescriptorImageInfo::default()
+            .image_view(images.nrd_residual_radiance.view)
+            .image_layout(vk::ImageLayout::GENERAL);
+        let nrd_material_info = vk::DescriptorImageInfo::default()
+            .image_view(images.nrd_material_factors.view)
+            .image_layout(vk::ImageLayout::GENERAL);
         let buffer_infos: Vec<vk::DescriptorBufferInfo> = ucvh_buffers
             .iter()
             .map(|buf| {
@@ -569,6 +754,28 @@ fn write_descriptor_sets(
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(std::slice::from_ref(&moments_info)),
         );
+        writes.extend([
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(15)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&nrd_diff_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(16)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&nrd_spec_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(17)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&nrd_residual_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(18)
+                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                .image_info(std::slice::from_ref(&nrd_material_info)),
+        ]);
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 }
