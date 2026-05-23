@@ -12,7 +12,9 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt::VptPass;
-use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_surface::{
+    VptCurrentSurfaceResources, VptPreviousSurfaceResources, VptSurfacePass,
+};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
@@ -48,7 +50,7 @@ pub struct AreaRestirGraphBuffers<'a> {
     pub uniform_resource: ResourceHandle,
     pub selected_current_buffer: &'a GpuBuffer,
     pub selected_current_resource: ResourceHandle,
-    pub final_surface_writes: [ResourceHandle; 7],
+    pub final_surface_writes: VptCurrentSurfaceResources,
 }
 
 struct AreaRestirBuffers {
@@ -237,8 +239,8 @@ impl AreaRestirPass {
         frame_index: u64,
         settings: AreaRestirSettings,
         history_initialized: bool,
-        bootstrap_surface_writes: [ResourceHandle; 7],
-        previous_surface_resources: [ResourceHandle; 5],
+        bootstrap_surface_writes: VptCurrentSurfaceResources,
+        previous_surface_resources: VptPreviousSurfaceResources,
         profiler: Option<&'a GpuProfiler>,
     ) -> AreaRestirGraphBuffers<'a> {
         let settings = area_restir_effective_settings(settings, history_initialized);
@@ -309,9 +311,18 @@ impl AreaRestirPass {
 
         let initial_writes = graph.add_pass("area_restir_initial", QueueType::Compute, |builder| {
             builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
-            builder.read_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderRead);
-            builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
-            builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
+            builder.read_as(
+                bootstrap_surface_writes.position_depth,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                bootstrap_surface_writes.normal_roughness,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                bootstrap_surface_writes.albedo_material,
+                AccessKind::ComputeShaderRead,
+            );
             let initial_output_resource = if temporal_active {
                 initial_resource
             } else {
@@ -347,12 +358,12 @@ impl AreaRestirPass {
                     builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
                     builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
                     builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
-                    for surface_write in bootstrap_surface_writes.iter().copied() {
+                    bootstrap_surface_writes.for_each(|surface_write| {
                         builder.read_as(surface_write, AccessKind::ComputeShaderRead);
-                    }
-                    for previous_surface_resource in previous_surface_resources.iter().copied() {
+                    });
+                    previous_surface_resources.for_each(|previous_surface_resource| {
                         builder.read_as(previous_surface_resource, AccessKind::ComputeShaderRead);
-                    }
+                    });
                     let temporal_output_resource = if spatial_active {
                         temporal_resource
                     } else {
@@ -388,9 +399,18 @@ impl AreaRestirPass {
                 graph.add_pass("area_restir_spatial", QueueType::Compute, |builder| {
                     builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
                     builder.read_as(temporal_dep, AccessKind::ComputeShaderRead);
-                    builder.read_as(bootstrap_surface_writes[0], AccessKind::ComputeShaderRead);
-                    builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
-                    builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(
+                        bootstrap_surface_writes.position_depth,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        bootstrap_surface_writes.normal_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        bootstrap_surface_writes.albedo_material,
+                        AccessKind::ComputeShaderRead,
+                    );
                     builder.write_as(selected_current_resource, AccessKind::ComputeShaderWrite);
                     builder.write_as(debug_dep, AccessKind::ComputeShaderWrite);
                     Box::new(move |ctx| {
@@ -437,9 +457,9 @@ impl AreaRestirPass {
             graph.add_pass("vpt_surface_selected", QueueType::Compute, |builder| {
                 builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
                 builder.read_as(selected_resource, AccessKind::ComputeShaderRead);
-                for surface_write in bootstrap_surface_writes.iter().copied() {
+                bootstrap_surface_writes.for_each(|surface_write| {
                     builder.write_as(surface_write, AccessKind::ComputeShaderWrite);
-                }
+                });
                 Box::new(move |ctx| {
                     if let Some(profiler) = profiler {
                         profiler.begin_scope(
@@ -461,20 +481,15 @@ impl AreaRestirPass {
                 })
             });
 
+        let final_surface_writes =
+            VptCurrentSurfaceResources::from_graph_writes(selected_surface_writes);
+
         AreaRestirGraphBuffers {
             uniform_buffer,
             uniform_resource,
             selected_current_buffer,
             selected_current_resource: selected_resource,
-            final_surface_writes: [
-                selected_surface_writes[0],
-                selected_surface_writes[1],
-                selected_surface_writes[2],
-                selected_surface_writes[3],
-                selected_surface_writes[4],
-                selected_surface_writes[5],
-                selected_surface_writes[6],
-            ],
+            final_surface_writes,
         }
     }
 

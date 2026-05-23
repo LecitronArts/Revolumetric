@@ -9,7 +9,7 @@ use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, 
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
-use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_surface::{VptCurrentSurfaceResources, VptSurfacePass};
 use crate::render::passes::vpt_temporal::VptTemporalPass;
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
@@ -51,7 +51,7 @@ pub struct VptAtrousGraphInputs<'a> {
     pub lighting_settings: LightingSettings,
     pub temporal_radiance: ResourceHandle,
     pub temporal_moments: ResourceHandle,
-    pub surface_inputs: [ResourceHandle; 7],
+    pub surface_inputs: VptCurrentSurfaceResources,
     pub profiler: Option<&'a GpuProfiler>,
 }
 
@@ -334,10 +334,19 @@ impl VptAtrousPass {
             let atrous_writes = graph.add_pass("vpt_atrous", QueueType::Compute, |builder| {
                 builder.read_as(atrous_input_dep, AccessKind::ComputeShaderRead);
                 builder.read_as(temporal_moments, AccessKind::ComputeShaderRead);
-                builder.read_as(surface_inputs[0], AccessKind::ComputeShaderRead);
-                builder.read_as(surface_inputs[1], AccessKind::ComputeShaderRead);
-                builder.read_as(surface_inputs[2], AccessKind::ComputeShaderRead);
-                builder.read_as(surface_inputs[3], AccessKind::ComputeShaderRead);
+                builder.read_as(surface_inputs.position_depth, AccessKind::ComputeShaderRead);
+                builder.read_as(
+                    surface_inputs.normal_roughness,
+                    AccessKind::ComputeShaderRead,
+                );
+                builder.read_as(
+                    surface_inputs.albedo_material,
+                    AccessKind::ComputeShaderRead,
+                );
+                builder.read_as(
+                    surface_inputs.material_roughness,
+                    AccessKind::ComputeShaderRead,
+                );
                 builder.write_as(atrous_output_resource, AccessKind::ComputeShaderWrite);
                 Box::new(move |ctx| {
                     if begin_atrous_scope && let Some(profiler) = profiler {

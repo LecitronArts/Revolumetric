@@ -7,7 +7,9 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt::VptPass;
-use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_surface::{
+    VptCurrentSurfaceResources, VptPreviousSurfaceResources, VptSurfacePass,
+};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
@@ -37,8 +39,8 @@ pub struct VptTemporalGraphInputs<'a> {
     pub frame_slot: usize,
     pub history_initialized: bool,
     pub noisy_inputs: [ResourceHandle; 2],
-    pub surface_inputs: [ResourceHandle; 7],
-    pub previous_surface_inputs: [ResourceHandle; 5],
+    pub surface_inputs: VptCurrentSurfaceResources,
+    pub previous_surface_inputs: VptPreviousSurfaceResources,
     pub profiler: Option<&'a GpuProfiler>,
 }
 
@@ -330,12 +332,12 @@ impl VptTemporalPass {
         let temporal_writes = graph.add_pass("vpt_temporal", QueueType::Compute, |builder| {
             builder.read_as(noisy_inputs[0], AccessKind::ComputeShaderRead);
             builder.read_as(noisy_inputs[1], AccessKind::ComputeShaderRead);
-            for surface_input in surface_inputs {
+            surface_inputs.for_each(|surface_input| {
                 builder.read_as(surface_input, AccessKind::ComputeShaderRead);
-            }
-            for previous_surface_input in previous_surface_inputs {
+            });
+            previous_surface_inputs.for_each(|previous_surface_input| {
                 builder.read_as(previous_surface_input, AccessKind::ComputeShaderRead);
-            }
+            });
             builder.read_as(
                 previous_temporal_radiance_resource,
                 AccessKind::ComputeShaderRead,
@@ -380,8 +382,8 @@ impl VptTemporalPass {
         graph: &mut RenderGraph<'a>,
         vpt_surface: &'a VptSurfacePass,
         temporal_outputs: VptTemporalGraphOutputs,
-        surface_inputs: [ResourceHandle; 7],
-        previous_surface_inputs: [ResourceHandle; 5],
+        surface_inputs: VptCurrentSurfaceResources,
+        previous_surface_inputs: VptPreviousSurfaceResources,
     ) {
         graph.add_pass(
             "vpt_surface_history_update",
@@ -403,16 +405,33 @@ impl VptTemporalPass {
                     temporal_outputs.previous_accumulated_moments,
                     AccessKind::TransferWrite,
                 );
-                builder.read_as(surface_inputs[0], AccessKind::TransferRead);
-                builder.read_as(surface_inputs[1], AccessKind::TransferRead);
-                builder.read_as(surface_inputs[2], AccessKind::TransferRead);
-                builder.read_as(surface_inputs[3], AccessKind::TransferRead);
-                builder.read_as(surface_inputs[6], AccessKind::TransferRead);
-                builder.write_as(previous_surface_inputs[0], AccessKind::TransferWrite);
-                builder.write_as(previous_surface_inputs[1], AccessKind::TransferWrite);
-                builder.write_as(previous_surface_inputs[2], AccessKind::TransferWrite);
-                builder.write_as(previous_surface_inputs[3], AccessKind::TransferWrite);
-                builder.write_as(previous_surface_inputs[4], AccessKind::TransferWrite);
+                builder.read_as(surface_inputs.position_depth, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.normal_roughness, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.albedo_material, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.material_roughness, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.view_z, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.brick_generation, AccessKind::TransferRead);
+                builder.write_as(
+                    previous_surface_inputs.position_depth,
+                    AccessKind::TransferWrite,
+                );
+                builder.write_as(
+                    previous_surface_inputs.normal_roughness,
+                    AccessKind::TransferWrite,
+                );
+                builder.write_as(
+                    previous_surface_inputs.albedo_material,
+                    AccessKind::TransferWrite,
+                );
+                builder.write_as(
+                    previous_surface_inputs.material_roughness,
+                    AccessKind::TransferWrite,
+                );
+                builder.write_as(previous_surface_inputs.view_z, AccessKind::TransferWrite);
+                builder.write_as(
+                    previous_surface_inputs.brick_generation,
+                    AccessKind::TransferWrite,
+                );
                 Box::new(move |ctx| {
                     self.record_history_update(ctx.device, ctx.command_buffer);
                     vpt_surface.record_history_update(ctx.device, ctx.command_buffer);

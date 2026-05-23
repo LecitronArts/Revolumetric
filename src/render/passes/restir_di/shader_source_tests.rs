@@ -204,10 +204,7 @@ fn restir_di_pass_owns_graph_registration_contract() {
         .next()
         .expect("implementation section should exist");
     assert!(implementation.contains("pub fn register_graph"));
-    assert!(
-        implementation
-            .contains("builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead)")
-    );
+    assert!(implementation.contains("final_surface_writes.position_depth"));
     assert!(implementation.contains("vpt.update_restir_di_descriptors"));
 }
 
@@ -395,11 +392,11 @@ fn restir_di_shaders_are_surface_aware() {
     assert!(pipeline.contains("restir_di.update_surface_descriptors"));
     assert!(pipeline.contains("restir_di.register_graph("));
     assert!(
-        compact_pass
-            .contains("builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead)")
-            || compact_pass.contains(
-                "builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead,)"
-            )
+        compact_pass.contains(
+            "builder.read_as(final_surface_writes.position_depth,AccessKind::ComputeShaderRead)"
+        ) || compact_pass.contains(
+            "builder.read_as(final_surface_writes.position_depth,AccessKind::ComputeShaderRead,)"
+        )
     );
 }
 

@@ -26,8 +26,8 @@ RWTexture2D<float4> surface_normal_roughness;
 RWTexture2D<float4> surface_albedo_material;
 
 [[vk::binding(6, 0)]]
-[[vk::image_format("rgba32f")]]
-RWTexture2D<float4> surface_material_roughness;
+[[vk::image_format("r16f")]]
+RWTexture2D<float> surface_material_roughness;
 
 [[vk::binding(7, 0)]]
 [[vk::image_format("rgba32f")]]
@@ -42,8 +42,8 @@ RWTexture2D<float4> previous_surface_normal_roughness;
 RWTexture2D<float4> previous_surface_albedo_material;
 
 [[vk::binding(10, 0)]]
-[[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_material_roughness;
+[[vk::image_format("r16f")]]
+RWTexture2D<float> previous_surface_material_roughness;
 
 [[vk::binding(11, 0)]]
 [[vk::image_format("rgba32f")]]
@@ -174,7 +174,7 @@ bool compatible_current_surface(uint2 pixel, uint2 neighbor_pixel) {
         return false;
     }
 
-    float roughness_delta = abs(surface_material_roughness[pixel].x - surface_material_roughness[neighbor_pixel].x);
+    float roughness_delta = abs(surface_material_roughness[pixel] - surface_material_roughness[neighbor_pixel]);
     if (roughness_delta > 0.35) {
         return false;
     }
@@ -334,7 +334,7 @@ bool compatible_history(uint2 pixel, uint2 previous_pixel) {
         return false;
     }
 
-    float roughness_delta = abs(surface_material_roughness[pixel].x - previous_surface_material_roughness[previous_pixel].x);
+    float roughness_delta = abs(surface_material_roughness[pixel] - previous_surface_material_roughness[previous_pixel]);
     if (roughness_delta > 0.35) {
         return false;
     }

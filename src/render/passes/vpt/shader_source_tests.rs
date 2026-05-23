@@ -109,9 +109,10 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
     let compact_temporal = temporal.split_whitespace().collect::<String>();
 
     for token in [
-        "RWTexture2D<float4> surface_material_roughness",
-        "surface_material_roughness[pixel] = float4(material_cell_roughness(hit.cell), emissive_luma, 0.0, 1.0);",
-        "surface_material_roughness[pixel] = float4(1.0, 0.0, 0.0, 0.0);",
+        "RWTexture2D<float> surface_material_roughness",
+        "RWTexture2D<float> surface_view_z",
+        "surface_material_roughness[pixel] = material_cell_roughness(hit.cell);",
+        "surface_material_roughness[pixel] = 1.0;",
         "material_emissive_luminance(hit.cell)",
     ] {
         assert!(shader.contains(token), "VPT surface shader missing {token}");
@@ -120,20 +121,26 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
     for token in [
         "pub surface_material_roughness: GpuImage",
         "pub previous_surface_material_roughness: GpuImage",
-        "pub surface_writes: [ResourceHandle; 7]",
-        "pub previous_surface_resources: [ResourceHandle; 5]",
+        "pub surface_writes: VptCurrentSurfaceResources",
+        "pub previous_surface_resources: VptPreviousSurfaceResources",
         "vpt_surface_material_roughness",
         "vpt_previous_surface_material_roughness",
+        "vpt_surface_view_z",
+        "vpt_previous_surface_view_z",
     ] {
         assert!(rust.contains(token), "VPT surface pass missing {token}");
     }
 
     for token in [
-        "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.motion_history,];",
-        "letsurface_images=[self.surface_position_depth.handle,self.surface_normal_roughness.handle,self.surface_albedo_material.handle,self.surface_material_roughness.handle,self.motion_history.handle,self.motion_flags.handle,self.surface_brick_generation.handle,];",
-        "surface_writes:[bootstrap_writes[0],bootstrap_writes[1],bootstrap_writes[2],bootstrap_writes[3],bootstrap_writes[4],bootstrap_writes[5],bootstrap_writes[6],]",
-        "previous_surface_resources:[previous_surface_position_resource,previous_surface_normal_resource,previous_surface_albedo_resource,previous_surface_material_roughness_resource,previous_surface_brick_generation_resource,]",
-        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
+        "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.surface_view_z,images.motion_history,];",
+        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
+        "surface_writes.position_depth,self.surface_position_depth.handle,",
+        "graph.bind_image(surface_writes.material_roughness,self.surface_material_roughness.handle,);",
+        "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
+        "graph.bind_image(surface_writes.brick_generation,self.surface_brick_generation.handle,);",
+        "surface_writes,previous_surface_resources:VptPreviousSurfaceResources",
+        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,brick_generation:previous_surface_brick_generation_resource,}",
+        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
     ] {
         assert!(
             compact_rust.contains(token),
@@ -142,12 +149,240 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
     }
 
     for token in [
-        "builder.read_as(surface_inputs[0],AccessKind::TransferRead);builder.read_as(surface_inputs[1],AccessKind::TransferRead);builder.read_as(surface_inputs[2],AccessKind::TransferRead);builder.read_as(surface_inputs[3],AccessKind::TransferRead);builder.read_as(surface_inputs[6],AccessKind::TransferRead);",
-        "builder.write_as(previous_surface_inputs[0],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[1],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[2],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[3],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[4],AccessKind::TransferWrite);",
+        "builder.read_as(surface_inputs.position_depth,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.material_roughness,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.view_z,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.brick_generation,AccessKind::TransferRead);",
+        "previous_surface_inputs.position_depth,AccessKind::TransferWrite,",
+        "previous_surface_inputs.material_roughness,AccessKind::TransferWrite,",
+        "builder.write_as(previous_surface_inputs.view_z,AccessKind::TransferWrite);",
+        "previous_surface_inputs.brick_generation,AccessKind::TransferWrite,",
     ] {
         assert!(
             compact_temporal.contains(token),
             "VPT surface history update order contract missing {token}"
+        );
+    }
+}
+
+#[test]
+fn vpt_surface_writes_independent_view_z_guide() {
+    let scene_common = source("assets/shaders/shared/scene_common.slang");
+    let surface = source("assets/shaders/passes/vpt_surface.slang");
+
+    for token in [
+        "static const float VPT_VIEW_Z_MISS_SENTINEL = 1.0e20;",
+        "float scene_view_z(float3 world_position, SceneUniforms scene)",
+        "return max(dot(world_position - scene.pixel_to_ray[3].xyz, normalize(scene.camera_forward)), 0.0);",
+    ] {
+        assert!(scene_common.contains(token), "scene common missing {token}");
+    }
+
+    for token in [
+        "RWTexture2D<float> surface_view_z",
+        "surface_view_z[pixel] = VPT_VIEW_Z_MISS_SENTINEL;",
+        "float view_z = scene_view_z(hit.position, scene);",
+        "surface_view_z[pixel] = view_z;",
+        "surface_position_depth[pixel] = float4(hit.position, hit.t);",
+        "motion.z = float(hit.motion_id);",
+    ] {
+        assert!(
+            surface.contains(token),
+            "VPT surface shader missing {token}"
+        );
+    }
+
+    assert!(
+        !surface.contains("surface_position_depth[pixel] = float4(hit.position, view_z);"),
+        "viewZ must not replace the legacy hit.t lane in surface_position_depth"
+    );
+}
+
+#[test]
+fn vpt_material_roughness_guide_uses_single_channel_storage() {
+    let surface = source("assets/shaders/passes/vpt_surface.slang");
+    let temporal = source("assets/shaders/passes/vpt_temporal.slang");
+    let atrous = source("assets/shaders/passes/vpt_atrous.slang");
+    let surface_rs = source("src/render/passes/vpt_surface.rs");
+
+    for token in [
+        "[[vk::image_format(\"r16f\")]]",
+        "RWTexture2D<float> surface_material_roughness",
+        "surface_material_roughness[pixel] = material_cell_roughness(hit.cell);",
+        "surface_material_roughness[pixel] = 1.0;",
+    ] {
+        assert!(
+            surface.contains(token),
+            "surface roughness guide missing {token}"
+        );
+    }
+
+    for token in [
+        "RWTexture2D<float> surface_material_roughness",
+        "RWTexture2D<float> previous_surface_material_roughness",
+        "float roughness_delta = abs(surface_material_roughness[pixel] - previous_surface_material_roughness[previous_pixel]);",
+    ] {
+        assert!(
+            temporal.contains(token),
+            "temporal roughness guide missing {token}"
+        );
+    }
+
+    for token in [
+        "RWTexture2D<float> surface_material_roughness",
+        "float center_material_roughness = surface_material_roughness[pixel];",
+        "float neighbor_material_roughness = surface_material_roughness[neighbor_pixel];",
+    ] {
+        assert!(
+            atrous.contains(token),
+            "A-trous roughness guide missing {token}"
+        );
+    }
+
+    assert!(surface_rs.contains("vk::Format::R16_SFLOAT"));
+    assert!(
+        !surface.contains("RWTexture2D<float4> surface_material_roughness"),
+        "roughness guide must not allocate unused RGBA lanes"
+    );
+}
+
+#[test]
+fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
+    let surface_rs = source("src/render/passes/vpt_surface.rs");
+    let temporal_rs = source("src/render/passes/vpt_temporal.rs");
+    let atrous_rs = source("src/render/passes/vpt_atrous.rs");
+    let area_rs = source("src/render/passes/area_restir.rs");
+    let restir_rs = source("src/render/passes/restir_di.rs");
+    let compact_surface = surface_rs.split_whitespace().collect::<String>();
+    let compact_temporal = temporal_rs.split_whitespace().collect::<String>();
+
+    for token in [
+        "pub surface_view_z: GpuImage",
+        "pub previous_surface_view_z: GpuImage",
+        "pub surface_writes: VptCurrentSurfaceResources",
+        "pub previous_surface_resources: VptPreviousSurfaceResources",
+        "vpt_surface_view_z",
+        "vpt_previous_surface_view_z",
+        "vk::Format::R32_SFLOAT",
+    ] {
+        assert!(
+            surface_rs.contains(token),
+            "VPT surface pass missing {token}"
+        );
+    }
+
+    for token in [
+        "surface_view_z_resource",
+        "previous_surface_view_z_resource",
+        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
+        "surface_writes.position_depth,self.surface_position_depth.handle,",
+        "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
+        "graph.bind_image(surface_writes.brick_generation,self.surface_brick_generation.handle,);",
+        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,brick_generation:previous_surface_brick_generation_resource,}",
+        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
+    ] {
+        assert!(
+            compact_surface.contains(token),
+            "surface graph order missing {token}"
+        );
+    }
+
+    for token in [
+        "builder.read_as(surface_inputs.position_depth,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.view_z,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.brick_generation,AccessKind::TransferRead);",
+        "previous_surface_inputs.position_depth,AccessKind::TransferWrite,",
+        "builder.write_as(previous_surface_inputs.view_z,AccessKind::TransferWrite);",
+        "previous_surface_inputs.brick_generation,AccessKind::TransferWrite,",
+    ] {
+        assert!(
+            compact_temporal.contains(token),
+            "history copy order missing {token}"
+        );
+    }
+
+    for token in [
+        "surface_inputs: VptCurrentSurfaceResources",
+        "previous_surface_inputs: VptPreviousSurfaceResources",
+        "surface_inputs.view_z",
+        "previous_surface_inputs.view_z",
+    ] {
+        assert!(
+            temporal_rs.contains(token),
+            "temporal graph missing {token}"
+        );
+    }
+    assert!(atrous_rs.contains("surface_inputs: VptCurrentSurfaceResources"));
+    assert!(area_rs.contains("bootstrap_surface_writes: VptCurrentSurfaceResources"));
+    assert!(area_rs.contains("previous_surface_resources: VptPreviousSurfaceResources"));
+    assert!(restir_rs.contains("final_surface_writes: VptCurrentSurfaceResources"));
+    assert!(restir_rs.contains("previous_surface_resources: VptPreviousSurfaceResources"));
+}
+
+#[test]
+fn vpt_surface_graph_uses_named_resources_instead_of_magic_arrays() {
+    let surface_rs = source("src/render/passes/vpt_surface.rs");
+    let temporal_rs = source("src/render/passes/vpt_temporal.rs");
+    let atrous_rs = source("src/render/passes/vpt_atrous.rs");
+    let area_rs = source("src/render/passes/area_restir.rs");
+    let restir_rs = source("src/render/passes/restir_di.rs");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+
+    for token in [
+        "pub struct VptCurrentSurfaceResources",
+        "pub struct VptPreviousSurfaceResources",
+        "pub position_depth: ResourceHandle",
+        "pub material_roughness: ResourceHandle",
+        "pub view_z: ResourceHandle",
+        "pub brick_generation: ResourceHandle",
+    ] {
+        assert!(
+            surface_rs.contains(token),
+            "surface resources missing {token}"
+        );
+    }
+
+    for source in [
+        surface_rs.as_str(),
+        temporal_rs.as_str(),
+        atrous_rs.as_str(),
+        area_rs.as_str(),
+        restir_rs.as_str(),
+    ] {
+        for forbidden in [
+            "[ResourceHandle; 8]",
+            "[ResourceHandle; 6]",
+            "surface_inputs[",
+            "previous_surface_inputs[",
+            "final_surface_writes[",
+            "bootstrap_surface_writes[",
+            "bootstrap_writes[",
+            "selected_surface_writes[",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "surface graph code must not use magic resource array token {forbidden}"
+            );
+        }
+    }
+
+    for token in [
+        "surface_inputs.position_depth",
+        "surface_inputs.material_roughness",
+        "surface_inputs.view_z",
+        "surface_inputs.brick_generation",
+        "previous_surface_inputs.view_z",
+        "final_surface_writes.material_roughness",
+        "bootstrap_surface_writes.position_depth",
+        "area_graph.final_surface_writes",
+    ] {
+        assert!(
+            temporal_rs.contains(token)
+                || atrous_rs.contains(token)
+                || area_rs.contains(token)
+                || restir_rs.contains(token)
+                || pipeline.contains(token),
+            "named surface resource token missing {token}"
         );
     }
 }
@@ -166,22 +401,23 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
                 DescriptorKind::StorageImage,
                 "surface_material_roughness"
             ),
-            binding(5, DescriptorKind::StorageImage, "motion_history"),
-            binding(6, DescriptorKind::StorageBuffer, "ucvh_config"),
-            binding(7, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l1"),
-            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l2"),
-            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l3"),
-            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l4"),
-            binding(12, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(13, DescriptorKind::StorageBuffer, "brick_materials"),
-            binding(14, DescriptorKind::UniformBuffer, "vpt_history"),
-            binding(15, DescriptorKind::UniformBuffer, "area_restir"),
-            binding(16, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
-            binding(17, DescriptorKind::StorageImage, "motion_flags"),
-            binding(18, DescriptorKind::StorageImage, "surface_brick_generation"),
-            binding(19, DescriptorKind::StorageBuffer, "brick_generations"),
-            binding(20, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
+            binding(5, DescriptorKind::StorageImage, "surface_view_z"),
+            binding(6, DescriptorKind::StorageImage, "motion_history"),
+            binding(7, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(12, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(13, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(14, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(15, DescriptorKind::UniformBuffer, "vpt_history"),
+            binding(16, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(17, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(18, DescriptorKind::StorageImage, "motion_flags"),
+            binding(19, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(20, DescriptorKind::StorageBuffer, "brick_generations"),
+            binding(21, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
         ]
     );
 }
@@ -264,8 +500,8 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
     let compact_atrous_rs = atrous_rs.split_whitespace().collect::<String>();
 
     for token in [
-        "RWTexture2D<float4> surface_material_roughness",
-        "RWTexture2D<float4> previous_surface_material_roughness",
+        "RWTexture2D<float> surface_material_roughness",
+        "RWTexture2D<float> previous_surface_material_roughness",
         "roughness_delta",
         "surface_material_roughness[pixel]",
         "previous_surface_material_roughness[previous_pixel]",
@@ -274,7 +510,7 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
     }
 
     for token in [
-        "RWTexture2D<float4> surface_material_roughness",
+        "RWTexture2D<float> surface_material_roughness",
         "float roughness_weight(",
         "surface_material_roughness[neighbor_pixel]",
         "center_material_roughness",
@@ -282,9 +518,9 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
         assert!(atrous.contains(token), "A-trous shader missing {token}");
     }
 
-    assert!(temporal_rs.contains("surface_inputs: [ResourceHandle; 7]"));
-    assert!(temporal_rs.contains("previous_surface_inputs: [ResourceHandle; 5]"));
-    assert!(atrous_rs.contains("surface_inputs: [ResourceHandle; 7]"));
+    assert!(temporal_rs.contains("surface_inputs: VptCurrentSurfaceResources"));
+    assert!(temporal_rs.contains("previous_surface_inputs: VptPreviousSurfaceResources"));
+    assert!(atrous_rs.contains("surface_inputs: VptCurrentSurfaceResources"));
 
     for token in [
         "DescriptorBindingSpec::compute(18,vk::DescriptorType::STORAGE_IMAGE),",
@@ -297,7 +533,10 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
     }
 
     for token in [
-        "builder.read_as(surface_inputs[0],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[1],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[2],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[3],AccessKind::ComputeShaderRead);",
+        "surface_inputs.position_depth",
+        "surface_inputs.normal_roughness",
+        "surface_inputs.albedo_material",
+        "surface_inputs.material_roughness",
         "letimage_refs=[info.input_radiance,&info.temporal.accumulated_moments_history,&info.vpt_surface.surface_position_depth,&info.vpt_surface.surface_normal_roughness,&info.vpt_surface.surface_albedo_material,&info.vpt_surface.surface_material_roughness,info.output_radiance,];",
         ".dst_binding(8).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)",
     ] {
@@ -2127,15 +2366,15 @@ fn app_uses_selected_vpt_surface_after_area_restir_for_di_trace_and_temporal() {
     );
     assert!(
         compact_restir
-            .contains("builder.read_as(final_surface_writes[0],AccessKind::ComputeShaderRead)")
+            .contains("final_surface_writes.position_depth,AccessKind::ComputeShaderRead")
     );
     assert!(
         compact_restir
-            .contains("builder.read_as(final_surface_writes[1],AccessKind::ComputeShaderRead)")
+            .contains("final_surface_writes.normal_roughness,AccessKind::ComputeShaderRead")
     );
     assert!(
         compact_restir
-            .contains("builder.read_as(final_surface_writes[2],AccessKind::ComputeShaderRead)")
+            .contains("final_surface_writes.albedo_material,AccessKind::ComputeShaderRead")
     );
     assert!(
         compact_area_pass
@@ -2286,8 +2525,8 @@ fn app_wires_area_restir_between_surface_and_vpt_with_history_and_vpt_reads() {
         "builder.read_as(area_selected_reservoir_resource,AccessKind::ComputeShaderRead"
     ));
     assert!(
-        restir_pass
-            .contains("builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead)")
+        restir_pass.contains("final_surface_writes.position_depth")
+            && restir_pass.contains("AccessKind::ComputeShaderRead")
     );
     assert!(
         temporal_pass.contains("builder.read_as(surface_input, AccessKind::ComputeShaderRead)")

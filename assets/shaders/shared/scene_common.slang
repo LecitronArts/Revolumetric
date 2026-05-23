@@ -31,6 +31,7 @@ static const uint VPT_DEBUG_VIEW_AREA_JACOBIAN = 16u;
 static const uint VPT_DEBUG_VIEW_VOXEL_BRICK = 17u;
 static const uint VPT_DEBUG_VIEW_VOXEL_LOCAL = 18u;
 static const uint VPT_DEBUG_VIEW_VOXEL_HIT = 19u;
+static const float VPT_VIEW_Z_MISS_SENTINEL = 1.0e20;
 
 uint lighting_debug_view(uint flags) {
     return (flags & LIGHTING_DEBUG_VIEW_MASK) >> LIGHTING_DEBUG_VIEW_SHIFT;
@@ -68,6 +69,10 @@ struct ScenePrimaryRay {
     float3 origin;
     float3 direction;
 };
+
+float scene_view_z(float3 world_position, SceneUniforms scene) {
+    return max(dot(world_position - scene.pixel_to_ray[3].xyz, normalize(scene.camera_forward)), 0.0);
+}
 
 float2 sample_disk_for_lens(float2 uv) {
     float radius = sqrt(saturate(uv.x));

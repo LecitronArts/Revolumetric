@@ -9,7 +9,9 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::GpuImage;
 use crate::render::passes::vpt::VptPass;
-use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_surface::{
+    VptCurrentSurfaceResources, VptPreviousSurfaceResources, VptSurfacePass,
+};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::{
@@ -253,8 +255,8 @@ impl RestirDiPass {
         frame_index: u64,
         settings: RestirDiSettings,
         history_initialized: bool,
-        final_surface_writes: [ResourceHandle; 7],
-        previous_surface_resources: [ResourceHandle; 5],
+        final_surface_writes: VptCurrentSurfaceResources,
+        previous_surface_resources: VptPreviousSurfaceResources,
         profiler: Option<&'a GpuProfiler>,
     ) -> RestirDiGraphBuffers<'a> {
         let settings = restir_di_effective_settings(settings, history_initialized);
@@ -323,9 +325,18 @@ impl RestirDiPass {
 
         let initial_writes = graph.add_pass("restir_di_initial", QueueType::Compute, |builder| {
             builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
-            builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
-            builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
-            builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
+            builder.read_as(
+                final_surface_writes.position_depth,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                final_surface_writes.normal_roughness,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                final_surface_writes.albedo_material,
+                AccessKind::ComputeShaderRead,
+            );
             builder.read_as(direct_light_resource, AccessKind::ComputeShaderRead);
             let initial_output_resource = if temporal_active {
                 initial_resource
@@ -358,12 +369,59 @@ impl RestirDiPass {
             let temporal_writes =
                 graph.add_pass("restir_di_temporal", QueueType::Compute, |builder| {
                     builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
-                    for surface_write in final_surface_writes.iter().copied() {
-                        builder.read_as(surface_write, AccessKind::ComputeShaderRead);
-                    }
-                    for previous_surface_resource in previous_surface_resources.iter().copied() {
-                        builder.read_as(previous_surface_resource, AccessKind::ComputeShaderRead);
-                    }
+                    builder.read_as(
+                        final_surface_writes.position_depth,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.normal_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.albedo_material,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.material_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(final_surface_writes.view_z, AccessKind::ComputeShaderRead);
+                    builder.read_as(
+                        final_surface_writes.motion_history,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.motion_flags,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.brick_generation,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.position_depth,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.normal_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.albedo_material,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.material_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.view_z,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        previous_surface_resources.brick_generation,
+                        AccessKind::ComputeShaderRead,
+                    );
                     builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
                     builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
                     let temporal_output_resource = if spatial_active {
@@ -400,9 +458,18 @@ impl RestirDiPass {
             let spatial_writes =
                 graph.add_pass("restir_di_spatial", QueueType::Compute, |builder| {
                     builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(
+                        final_surface_writes.position_depth,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.normal_roughness,
+                        AccessKind::ComputeShaderRead,
+                    );
+                    builder.read_as(
+                        final_surface_writes.albedo_material,
+                        AccessKind::ComputeShaderRead,
+                    );
                     builder.read_as(temporal_dep, AccessKind::ComputeShaderRead);
                     builder.write_as(selected_current_resource, AccessKind::ComputeShaderWrite);
                     Box::new(move |ctx| {
