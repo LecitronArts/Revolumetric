@@ -5,7 +5,7 @@ use gpu_allocator::MemoryLocation;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
@@ -73,6 +73,20 @@ pub struct VptAtrousPassResizeInfo<'a> {
 }
 
 impl VptAtrousPass {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 9] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::UNIFORM_BUFFER),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -378,60 +392,7 @@ impl VptAtrousPass {
 
 fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
     DescriptorLayoutBuilder::new()
-        .add_binding(
-            0,
-            vk::DescriptorType::UNIFORM_BUFFER,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            1,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            2,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            3,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            4,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            5,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            6,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            7,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
-        .add_binding(
-            8,
-            vk::DescriptorType::UNIFORM_BUFFER,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        )
+        .add_binding_specs(&VptAtrousPass::descriptor_binding_specs())
         .build(device)
 }
 

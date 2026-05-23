@@ -2,7 +2,7 @@ use anyhow::Result;
 use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
-use crate::render::descriptor::{DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
@@ -60,6 +60,30 @@ pub struct VptTemporalPassResizeInfo<'a> {
 }
 
 impl VptTemporalPass {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 19] {
+        [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(14, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_IMAGE),
+        ]
+    }
+
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
@@ -411,21 +435,9 @@ impl VptTemporalPass {
 }
 
 fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSetLayout> {
-    let mut builder = DescriptorLayoutBuilder::new().add_binding(
-        0,
-        vk::DescriptorType::UNIFORM_BUFFER,
-        vk::ShaderStageFlags::COMPUTE,
-        1,
-    );
-    for binding in 1..=18 {
-        builder = builder.add_binding(
-            binding,
-            vk::DescriptorType::STORAGE_IMAGE,
-            vk::ShaderStageFlags::COMPUTE,
-            1,
-        );
-    }
-    builder.build(device)
+    DescriptorLayoutBuilder::new()
+        .add_binding_specs(&VptTemporalPass::descriptor_binding_specs())
+        .build(device)
 }
 
 struct VptTemporalImages {

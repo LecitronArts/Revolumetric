@@ -1,4 +1,7 @@
 use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
+use crate::render::passes::vpt_atrous::VptAtrousPass;
+use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_temporal::VptTemporalPass;
 
 use super::VptPass;
 
@@ -34,6 +37,25 @@ fn vpt_descriptor_specs_match_shader_manifest() {
         "VPT trace",
         &VptPass::descriptor_binding_specs(),
         &shader_reflection("assets/shaders/passes/vpt.slang"),
+    );
+}
+
+#[test]
+fn vpt_svgf_descriptor_specs_match_shader_manifests() {
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT surface",
+        &VptSurfacePass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_surface.slang"),
+    );
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT temporal",
+        &VptTemporalPass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_temporal.slang"),
+    );
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT A-trous",
+        &VptAtrousPass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_atrous.slang"),
     );
 }
 
@@ -111,6 +133,7 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
         "letsurface_images=[self.surface_position_depth.handle,self.surface_normal_roughness.handle,self.surface_albedo_material.handle,self.surface_material_roughness.handle,self.motion_history.handle,self.motion_flags.handle,self.surface_brick_generation.handle,];",
         "surface_writes:[bootstrap_writes[0],bootstrap_writes[1],bootstrap_writes[2],bootstrap_writes[3],bootstrap_writes[4],bootstrap_writes[5],bootstrap_writes[6],]",
         "previous_surface_resources:[previous_surface_position_resource,previous_surface_normal_resource,previous_surface_albedo_resource,previous_surface_material_roughness_resource,previous_surface_brick_generation_resource,]",
+        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
     ] {
         assert!(
             compact_rust.contains(token),
@@ -264,7 +287,7 @@ fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
     assert!(atrous_rs.contains("surface_inputs: [ResourceHandle; 7]"));
 
     for token in [
-        "forbindingin1..=18",
+        "DescriptorBindingSpec::compute(18,vk::DescriptorType::STORAGE_IMAGE),",
         "letimage_refs=[&vpt.noisy_radiance_image,&vpt.noisy_moments_image,&vpt_surface.surface_position_depth,&vpt_surface.surface_normal_roughness,&vpt_surface.surface_albedo_material,&vpt_surface.surface_material_roughness,&vpt_surface.previous_surface_position_depth,&vpt_surface.previous_surface_normal_roughness,&vpt_surface.previous_surface_albedo_material,&vpt_surface.previous_surface_material_roughness,&vpt_surface.motion_history,temporal.accumulated_radiance,temporal.accumulated_moments_history,temporal.previous_accumulated_radiance,temporal.previous_accumulated_moments_history,&vpt_surface.motion_flags,&vpt_surface.surface_brick_generation,&vpt_surface.previous_surface_brick_generation,];",
     ] {
         assert!(
