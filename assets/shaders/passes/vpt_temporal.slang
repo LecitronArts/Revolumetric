@@ -1,5 +1,6 @@
 #include "scene_common.slang"
 #include "vpt_history_common.slang"
+#include "vpt_motion_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<SceneUniforms> scene_ubo;
@@ -55,6 +56,18 @@ RWTexture2D<float4> previous_accumulated_radiance_image;
 [[vk::binding(13, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> previous_accumulated_moments_history_image;
+
+[[vk::binding(14, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> motion_flags;
+
+[[vk::binding(15, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> surface_brick_generation;
+
+[[vk::binding(16, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> previous_surface_brick_generation;
 
 static const int2 history_tap_offsets[4] = {
     int2(0, 0),
@@ -284,6 +297,12 @@ ClampedRadianceSample clamp_noisy_radiance_to_spatial_firefly_stats(
 }
 
 bool compatible_history(uint2 pixel, uint2 previous_pixel) {
+    if (vpt_surface_generation_rejects_history(
+        previous_surface_brick_generation[previous_pixel],
+        surface_brick_generation[pixel])) {
+        return false;
+    }
+
     float4 current_position_depth = surface_position_depth[pixel];
     float4 previous_position_depth = previous_surface_position_depth[previous_pixel];
     if (current_position_depth.w < 0.0 || previous_position_depth.w < 0.0) {
@@ -399,6 +418,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 noisy_radiance = noisy_radiance_image[pixel];
     float4 noisy_moments = noisy_moments_image[pixel];
     float4 motion = motion_history[pixel];
+    uint flags = motion_flags[pixel];
     bool current_surface_valid = surface_position_depth[pixel].w >= 0.0;
     FireflyClampStats firefly_stats = (FireflyClampStats)0;
 
@@ -439,7 +459,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float history_valid = current_surface_valid ? 1.0 : 0.0;
     float history_reused = 0.0;
 
-    if (motion.w > 0.0) {
+    if (!vpt_motion_flags_reject_history(flags)) {
         if (current_surface_valid) {
             float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
             int2 previous_base_pixel = int2(floor(history_sample));
@@ -482,8 +502,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (scene.vpt_debug_view == VPT_DEBUG_VIEW_HISTORY_VALID) {
         accumulated = float3(history_reused);
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_MOTION) {
-        float2 delta = motion.w > 0.0 ? motion.xy : float2(0.0);
-        accumulated = float3(delta * 0.05 + 0.5, motion.w > 0.0 ? 1.0 : 0.0);
+        float2 delta = !vpt_motion_flags_reject_history(flags) ? motion.xy : float2(0.0);
+        accumulated = float3(delta * 0.05 + 0.5, !vpt_motion_flags_reject_history(flags) ? 1.0 : 0.0);
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_VARIANCE) {
         accumulated = visualize_luminance_variance(accumulated_moments);
     } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_TEMPORAL) {

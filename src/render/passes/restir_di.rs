@@ -87,7 +87,7 @@ impl RestirDiPass {
         ]
     }
 
-    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 14] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -100,6 +100,9 @@ impl RestirDiPass {
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_IMAGE),
         ]
     }
 
@@ -171,7 +174,7 @@ impl RestirDiPass {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: 8 * info.frame_count as u32,
+                    descriptor_count: 10 * info.frame_count as u32,
                 },
             ],
         ) {
@@ -250,8 +253,8 @@ impl RestirDiPass {
         frame_index: u64,
         settings: RestirDiSettings,
         history_initialized: bool,
-        final_surface_writes: [ResourceHandle; 4],
-        previous_surface_resources: [ResourceHandle; 3],
+        final_surface_writes: [ResourceHandle; 6],
+        previous_surface_resources: [ResourceHandle; 4],
         profiler: Option<&'a GpuProfiler>,
     ) -> RestirDiGraphBuffers<'a> {
         let settings = restir_di_effective_settings(settings, history_initialized);
@@ -359,9 +362,12 @@ impl RestirDiPass {
                     builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
                     builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
                     builder.read_as(final_surface_writes[3], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[4], AccessKind::ComputeShaderRead);
+                    builder.read_as(final_surface_writes[5], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[0], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[1], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[3], AccessKind::ComputeShaderRead);
                     builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
                     builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
                     let temporal_output_resource = if spatial_active {
@@ -457,6 +463,9 @@ impl RestirDiPass {
             &surface.previous_surface_normal_roughness,
             &surface.previous_surface_albedo_material,
             &surface.motion_history,
+            &surface.motion_flags,
+            &surface.surface_brick_generation,
+            &surface.previous_surface_brick_generation,
         ];
         self.initial_stage
             .write_image_descriptors(device, 3, &current_surface_images);

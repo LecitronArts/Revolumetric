@@ -57,6 +57,7 @@ pub struct VptFrameInputs<'a> {
     pub area_restir_enabled: bool,
     pub ucvh_ready: bool,
     pub ucvh_frame_changes: UcvhFrameChanges,
+    pub ucvh_motion_event_count: u32,
     pub capture: Option<&'a mut RenderCapture>,
     pub profiler: Option<&'a GpuProfiler>,
 }
@@ -76,10 +77,6 @@ impl UcvhFrameChanges {
             invalidation_regions,
             motion_events,
         }
-    }
-
-    pub fn invalidates_history(&self) -> bool {
-        !self.invalidation_regions.is_empty() || !self.motion_events.is_empty()
     }
 }
 
@@ -139,17 +136,6 @@ impl VptPipelineFrameState {
         self.vpt_sample_index = 0;
         self.last_vpt_camera_key = None;
         self.last_vpt_scene_key = None;
-        self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
-        self.vpt_accumulation_needs_init = true;
-        self.vpt_temporal_history_initialized = false;
-        self.postprocess_output_initialized = false;
-        self.area_restir_history_initialized = false;
-        self.restir_di_history_initialized = false;
-    }
-
-    pub fn reset_for_ucvh_content_change(&mut self) {
-        self.vpt_sample_index = 0;
-        self.last_vpt_camera_key = None;
         self.history_reset_generation = self.history_reset_generation.wrapping_add(1);
         self.vpt_accumulation_needs_init = true;
         self.vpt_temporal_history_initialized = false;
@@ -361,6 +347,9 @@ impl VptRuntimePipeline {
             },
         ) {
             Ok(pass) => {
+                if let Some(vpt_surface) = &self.vpt_surface_pass {
+                    pass.update_surface_descriptors(renderer.device(), vpt_surface);
+                }
                 tracing::info!(
                     width = extent.width,
                     height = extent.height,
@@ -418,6 +407,9 @@ impl VptRuntimePipeline {
             },
         ) {
             Ok(pass) => {
+                if let Some(vpt_surface) = &self.vpt_surface_pass {
+                    pass.update_surface_descriptors(renderer.device(), vpt_surface);
+                }
                 tracing::info!(
                     width = extent.width,
                     height = extent.height,
@@ -608,12 +600,9 @@ impl VptRuntimePipeline {
             inputs.area_restir_enabled,
         );
         let scene_changed = self.frame_state.last_vpt_scene_key != Some(scene_key);
-        let ucvh_history_invalidated = inputs.ucvh_frame_changes.invalidates_history();
         if scene_changed {
             self.frame_state.reset_for_scene_change();
             self.frame_state.last_vpt_scene_key = Some(scene_key);
-        } else if ucvh_history_invalidated {
-            self.frame_state.reset_for_ucvh_content_change();
         }
 
         if inputs.ucvh_ready {
@@ -703,8 +692,6 @@ impl VptRuntimePipeline {
             };
             let scene_history_flags = if scene_changed {
                 VPT_HISTORY_FLAG_SCENE_INVALIDATED | VPT_HISTORY_FLAG_LIGHTS_INVALIDATED
-            } else if ucvh_history_invalidated {
-                VPT_HISTORY_FLAG_SCENE_INVALIDATED
             } else {
                 0
             };
@@ -720,8 +707,10 @@ impl VptRuntimePipeline {
                 flags: history_flags | scene_history_flags,
                 _pad0: 0,
             };
-            if let Some(vpt_surface) = &self.vpt_surface_pass {
+            if let Some(vpt_surface) = &mut self.vpt_surface_pass {
                 vpt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
+                vpt_surface
+                    .update_motion_guide_state(frame.frame_slot, inputs.ucvh_motion_event_count);
             }
 
             if let (
@@ -1309,40 +1298,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_ucvh_content_reset_clears_history_without_forgetting_scene_or_camera_history() {
-        let mut state = VptPipelineFrameState {
-            vpt_sample_index: 11,
-            last_vpt_camera_key: Some([1; 15]),
-            last_vpt_scene_key: Some([2; 14]),
-            history_reset_generation: 3,
-            vpt_accumulation_needs_init: false,
-            vpt_temporal_history_initialized: true,
-            postprocess_output_initialized: true,
-            area_restir_history_initialized: true,
-            restir_di_history_initialized: true,
-            previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
-            previous_vpt_resolution: Some([1280, 720]),
-        };
-
-        state.reset_for_ucvh_content_change();
-
-        assert_eq!(state.vpt_sample_index, 0);
-        assert_eq!(state.last_vpt_camera_key, None);
-        assert_eq!(state.last_vpt_scene_key, Some([2; 14]));
-        assert_eq!(state.history_reset_generation, 4);
-        assert!(state.vpt_accumulation_needs_init);
-        assert!(!state.vpt_temporal_history_initialized);
-        assert!(!state.postprocess_output_initialized);
-        assert!(!state.area_restir_history_initialized);
-        assert!(!state.restir_di_history_initialized);
-        assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
-        assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
-    }
-
-    #[test]
-    fn ucvh_frame_changes_invalidate_history_when_regions_or_motion_events_are_present() {
+    fn ucvh_frame_changes_preserve_motion_guide_events_without_implying_reset() {
         let no_changes = UcvhFrameChanges::default();
-        assert!(!no_changes.invalidates_history());
+        assert!(no_changes.invalidation_regions.is_empty());
+        assert!(no_changes.motion_events.is_empty());
 
         let invalidated = UcvhFrameChanges::new(
             vec![UcvhInvalidationRegion {
@@ -1352,7 +1311,8 @@ mod tests {
             }],
             Vec::new(),
         );
-        assert!(invalidated.invalidates_history());
+        assert_eq!(invalidated.invalidation_regions.len(), 1);
+        assert!(invalidated.motion_events.is_empty());
 
         let moved = UcvhFrameChanges::new(
             Vec::new(),
@@ -1363,7 +1323,26 @@ mod tests {
                 generation: 8,
             }],
         );
-        assert!(moved.invalidates_history());
+        assert!(moved.invalidation_regions.is_empty());
+        assert_eq!(moved.motion_events.len(), 1);
+    }
+
+    #[test]
+    fn ucvh_frame_changes_do_not_request_frame_wide_history_reset() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation section should exist");
+
+        assert!(
+            !implementation.contains("reset_for_ucvh_content_change"),
+            "UCVH content and motion events must be handled by per-pixel motion guide generation checks"
+        );
+        assert!(
+            !implementation.contains("invalidates_history"),
+            "UcvhFrameChanges must not be used as a frame-wide history invalidation trigger"
+        );
     }
 
     #[test]

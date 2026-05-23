@@ -296,6 +296,22 @@ impl RevolumetricApp {
                 } else {
                     UcvhFrameChanges::default()
                 };
+                let mut ucvh_motion_event_count = 0u32;
+                if self.ucvh_uploaded
+                    && let (Some(ucvh), Some(gpu)) = (self.ucvh.as_ref(), &self.ucvh_gpu)
+                {
+                    match gpu.upload_motion_guide(
+                        renderer.device(),
+                        frame.command_buffer,
+                        ucvh,
+                        &ucvh_frame_changes.motion_events,
+                    ) {
+                        Ok(count) => {
+                            ucvh_motion_event_count = count;
+                        }
+                        Err(error) => tracing::error!(%error, "failed to upload UCVH motion guide"),
+                    }
+                }
 
                 if let Some(scene_ubo) = &self.scene_ubo {
                     let record_result = self.vpt_pipeline.record_and_execute_frame(
@@ -314,6 +330,7 @@ impl RevolumetricApp {
                             area_restir_enabled,
                             ucvh_ready: self.ucvh_uploaded,
                             ucvh_frame_changes,
+                            ucvh_motion_event_count,
                             capture: self.capture.as_mut(),
                             profiler: self.gpu_profiler.as_ref(),
                         },
@@ -897,7 +914,6 @@ mod tests {
 
         assert_eq!(changes.invalidation_regions.len(), 1);
         assert_eq!(changes.motion_events.len(), 1);
-        assert!(changes.invalidates_history());
         assert_eq!(ucvh.invalidation_regions().len(), 1);
         assert_eq!(ucvh.motion_events().len(), 1);
     }

@@ -85,8 +85,9 @@ struct HitResult {
     float3 normal;   // face normal at hit (axis-aligned, from DDA step)
     uint  brick_id;  // which brick was hit
     uint3 local;     // local voxel coordinate within brick [0,7]³
+    uint3 brick_coord;
     uint  motion_id; // stable motion source identity for future rigid hit reprojection
     VoxelCell cell;  // material + emissive data for the hit voxel
 };
 
-static const HitResult NO_HIT = { false, 1e30, float3(0), float3(0), 0xFFFFFFFFu, uint3(0), VPT_MOTION_ID_INVALID, {0, 0} };
+static const HitResult NO_HIT = { false, 1e30, float3(0), float3(0), 0xFFFFFFFFu, uint3(0), uint3(0), VPT_MOTION_ID_INVALID, {0, 0} };

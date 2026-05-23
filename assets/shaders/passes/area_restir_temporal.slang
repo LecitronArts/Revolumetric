@@ -1,6 +1,7 @@
 #include "area_restir_common.slang"
 #include "scene_common.slang"
 #include "vpt_history_common.slang"
+#include "vpt_motion_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<AreaRestirUniforms> area_restir;
@@ -41,6 +42,18 @@ RWTexture2D<float4> previous_surface_albedo_material;
 [[vk::binding(10, 0)]]
 [[vk::image_format("rgba32f")]]
 RWTexture2D<float4> motion_history;
+
+[[vk::binding(11, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> motion_flags;
+
+[[vk::binding(12, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> surface_brick_generation;
+
+[[vk::binding(13, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> previous_surface_brick_generation;
 
 static const float AREA_RESTIR_TEMPORAL_MIN_TAP_WEIGHT = 0.0625;
 static const uint AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID = 1u;
@@ -146,7 +159,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     bool accepted_history = false;
     uint history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_HISTORY_INVALID;
     float4 motion = center_context.motion_history;
-    if (motion.w == 0.0) {
+    uint flags = motion_flags[pixel];
+    if (vpt_motion_flags_reject_history(flags)) {
         history_rejection_reason = AREA_RESTIR_TEMPORAL_REJECTION_MOTION_INVALID;
     } else {
         float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
@@ -163,6 +177,11 @@ void main(uint3 tid : SV_DispatchThreadID) {
             }
 
             uint2 previous_pixel = uint2(tap_pixel_i);
+            if (vpt_surface_generation_rejects_history(
+                previous_surface_brick_generation[previous_pixel],
+                surface_brick_generation[pixel])) {
+                continue;
+            }
             uint previous_index = previous_pixel.y * area_restir.width + previous_pixel.x;
             AreaRestirReservoir history = history_reservoirs[previous_index];
             if (!area_restir_is_valid_reservoir(history)) {

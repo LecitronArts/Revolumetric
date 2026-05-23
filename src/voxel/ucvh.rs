@@ -5,6 +5,8 @@ use crate::voxel::morton;
 use crate::voxel::occupancy::CascadedOccupancy;
 use glam::{IVec3, UVec3};
 
+pub const UCVH_NO_BRICK_GENERATION: u32 = u32::MAX;
+
 fn div_ceil_uvec3(value: UVec3, divisor: u32) -> UVec3 {
     UVec3::new(
         value.x.div_ceil(divisor),
@@ -75,6 +77,7 @@ pub struct Ucvh {
     brick_map: Vec<Option<BrickId>>,
     /// Brick IDs that need GPU re-upload
     dirty_bricks: Vec<BrickId>,
+    brick_generations: Vec<u32>,
     /// Brick-space regions whose content edits should invalidate temporal history.
     invalidation_regions: Vec<UcvhInvalidationRegion>,
     /// Explicit semantic content motion. Ordinary edits never synthesize these.
@@ -94,6 +97,7 @@ impl Ucvh {
             hierarchy: CascadedOccupancy::new(config.brick_grid_size),
             brick_map: vec![None; l0_count],
             dirty_bricks: Vec::new(),
+            brick_generations: vec![UCVH_NO_BRICK_GENERATION; config.brick_capacity as usize],
             invalidation_regions: Vec::new(),
             motion_events: Vec::new(),
             content_generation: 0,
@@ -124,9 +128,21 @@ impl Ucvh {
     }
 
     fn next_content_generation(&mut self) -> u32 {
+        if self.content_generation == UCVH_NO_BRICK_GENERATION {
+            self.content_generation = 0;
+        }
         let generation = self.content_generation;
         self.content_generation = self.content_generation.wrapping_add(1);
+        if self.content_generation == UCVH_NO_BRICK_GENERATION {
+            self.content_generation = 0;
+        }
         generation
+    }
+
+    fn set_brick_generation(&mut self, id: BrickId, generation: u32) {
+        if let Some(slot) = self.brick_generations.get_mut(id as usize) {
+            *slot = generation;
+        }
     }
 
     fn record_invalidation_region(&mut self, brick_pos: UVec3, generation: u32) {
@@ -194,6 +210,7 @@ impl Ucvh {
             self.dirty_bricks.push(id);
         }
         let generation = self.next_content_generation();
+        self.set_brick_generation(id, generation);
         self.record_invalidation_region(bp, generation);
         self.hierarchy_dirty = true;
         true
@@ -238,6 +255,7 @@ impl Ucvh {
             self.dirty_bricks.push(id);
         }
         let generation = self.next_content_generation();
+        self.set_brick_generation(id, generation);
         self.record_invalidation_region(brick_pos, generation);
         self.hierarchy_dirty = true;
         true
@@ -278,6 +296,21 @@ impl Ucvh {
 
     pub fn invalidation_regions(&self) -> &[UcvhInvalidationRegion] {
         &self.invalidation_regions
+    }
+
+    pub fn brick_id_at(&self, brick_pos: UVec3) -> Option<BrickId> {
+        if !self.contains_brick_pos(brick_pos) {
+            return None;
+        }
+        self.brick_map[self.l0_index(brick_pos)]
+    }
+
+    pub fn brick_generation(&self, brick_id: BrickId) -> Option<u32> {
+        self.brick_generations.get(brick_id as usize).copied()
+    }
+
+    pub fn brick_generations(&self) -> &[u32] {
+        &self.brick_generations
     }
 
     pub fn push_motion_event(&mut self, event: UcvhMotionEvent) -> bool {
@@ -575,5 +608,38 @@ mod tests {
             world_delta_current_from_previous: glam::IVec3::new(0, 1, 0),
             generation: 43,
         }));
+    }
+
+    #[test]
+    fn next_content_generation_skips_sentinel() {
+        let mut u = test_ucvh();
+        u.content_generation = UCVH_NO_BRICK_GENERATION - 1;
+
+        assert_eq!(u.next_content_generation(), UCVH_NO_BRICK_GENERATION - 1);
+        let wrapped = u.next_content_generation();
+
+        assert_ne!(wrapped, UCVH_NO_BRICK_GENERATION);
+        assert_eq!(wrapped, 0);
+    }
+
+    #[test]
+    fn set_voxel_updates_generation_for_allocated_brick_slot() {
+        let mut u = test_ucvh();
+
+        assert!(u.set_voxel(UVec3::new(2, 3, 4), VoxelCell::new(8, 0, [0; 3])));
+
+        let invalidation = u.invalidation_regions()[0];
+        let brick_id = u
+            .brick_id_at(UVec3::ZERO)
+            .expect("brick should be allocated");
+        assert_eq!(u.brick_generation(brick_id), Some(invalidation.generation));
+    }
+
+    #[test]
+    fn unallocated_brick_generation_is_sentinel() {
+        let u = test_ucvh();
+
+        assert_eq!(u.brick_generation(0), Some(UCVH_NO_BRICK_GENERATION));
+        assert_eq!(u.brick_id_at(UVec3::new(1, 2, 3)), None);
     }
 }

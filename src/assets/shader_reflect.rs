@@ -113,6 +113,16 @@ impl ShaderReflection {
                 .to_string();
             let binding_object = top_level_field(parameter, "binding")
                 .ok_or_else(|| anyhow!("Slang reflection parameter {name} missing binding"))?;
+            let binding_kind = string_field(binding_object, "kind")
+                .ok_or_else(|| anyhow!("Slang reflection parameter {name} missing binding kind"))?;
+            if binding_kind == "pushConstantBuffer" {
+                continue;
+            }
+            if binding_kind != "descriptorTableSlot" {
+                return Err(anyhow!(
+                    "Slang reflection parameter {name} uses unsupported binding kind {binding_kind:?}"
+                ));
+            }
             let binding = number_field(binding_object, "index").ok_or_else(|| {
                 anyhow!("Slang reflection parameter {name} missing descriptor binding index")
             })? as u32;
@@ -483,6 +493,38 @@ SamplerState sampler_state;
                     name: "reservoirs".to_string(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn ignores_push_constant_buffers_in_reflection_json_bindings() {
+        let json = r#"
+{
+  "parameters": [
+    {
+      "name": "scene_ubo",
+      "binding": { "kind": "descriptorTableSlot", "index": 0 },
+      "type": { "kind": "constantBuffer" }
+    },
+    {
+      "name": "vpt_motion_guide",
+      "binding": { "kind": "pushConstantBuffer", "index": 0 },
+      "type": { "kind": "constantBuffer" }
+    }
+  ]
+}
+"#;
+
+        let reflection = ShaderReflection::from_slang_reflection_json("main", json).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::UniformBuffer,
+                name: "scene_ubo".to_string(),
+            }]
         );
     }
 

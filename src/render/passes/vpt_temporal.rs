@@ -37,8 +37,8 @@ pub struct VptTemporalGraphInputs<'a> {
     pub frame_slot: usize,
     pub history_initialized: bool,
     pub noisy_inputs: [ResourceHandle; 2],
-    pub surface_inputs: [ResourceHandle; 4],
-    pub previous_surface_inputs: [ResourceHandle; 3],
+    pub surface_inputs: [ResourceHandle; 6],
+    pub previous_surface_inputs: [ResourceHandle; 4],
     pub profiler: Option<&'a GpuProfiler>,
 }
 
@@ -74,7 +74,7 @@ impl VptTemporalPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 13 * frame_count as u32,
+                descriptor_count: 16 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -356,8 +356,8 @@ impl VptTemporalPass {
         graph: &mut RenderGraph<'a>,
         vpt_surface: &'a VptSurfacePass,
         temporal_outputs: VptTemporalGraphOutputs,
-        surface_inputs: [ResourceHandle; 4],
-        previous_surface_inputs: [ResourceHandle; 3],
+        surface_inputs: [ResourceHandle; 6],
+        previous_surface_inputs: [ResourceHandle; 4],
     ) {
         graph.add_pass(
             "vpt_surface_history_update",
@@ -382,9 +382,11 @@ impl VptTemporalPass {
                 builder.read_as(surface_inputs[0], AccessKind::TransferRead);
                 builder.read_as(surface_inputs[1], AccessKind::TransferRead);
                 builder.read_as(surface_inputs[2], AccessKind::TransferRead);
+                builder.read_as(surface_inputs[5], AccessKind::TransferRead);
                 builder.write_as(previous_surface_inputs[0], AccessKind::TransferWrite);
                 builder.write_as(previous_surface_inputs[1], AccessKind::TransferWrite);
                 builder.write_as(previous_surface_inputs[2], AccessKind::TransferWrite);
+                builder.write_as(previous_surface_inputs[3], AccessKind::TransferWrite);
                 Box::new(move |ctx| {
                     self.record_history_update(ctx.device, ctx.command_buffer);
                     vpt_surface.record_history_update(ctx.device, ctx.command_buffer);
@@ -413,7 +415,7 @@ fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSe
         vk::ShaderStageFlags::COMPUTE,
         1,
     );
-    for binding in 1..=13 {
+    for binding in 1..=16 {
         builder = builder.add_binding(
             binding,
             vk::DescriptorType::STORAGE_IMAGE,
@@ -593,6 +595,9 @@ fn write_descriptor_sets(
             temporal.accumulated_moments_history,
             temporal.previous_accumulated_radiance,
             temporal.previous_accumulated_moments_history,
+            &vpt_surface.motion_flags,
+            &vpt_surface.surface_brick_generation,
+            &vpt_surface.previous_surface_brick_generation,
         ];
         let image_infos: Vec<_> = image_refs
             .iter()

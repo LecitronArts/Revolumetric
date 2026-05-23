@@ -48,7 +48,7 @@ pub struct AreaRestirGraphBuffers<'a> {
     pub uniform_resource: ResourceHandle,
     pub selected_current_buffer: &'a GpuBuffer,
     pub selected_current_resource: ResourceHandle,
-    pub final_surface_writes: [ResourceHandle; 4],
+    pub final_surface_writes: [ResourceHandle; 6],
 }
 
 struct AreaRestirBuffers {
@@ -106,7 +106,7 @@ impl AreaRestirPass {
         ]
     }
 
-    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 11] {
+    pub(crate) fn temporal_descriptor_binding_specs() -> [DescriptorBindingSpec; 14] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -119,6 +119,9 @@ impl AreaRestirPass {
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_IMAGE),
         ]
     }
 
@@ -234,8 +237,8 @@ impl AreaRestirPass {
         frame_index: u64,
         settings: AreaRestirSettings,
         history_initialized: bool,
-        bootstrap_surface_writes: [ResourceHandle; 4],
-        previous_surface_resources: [ResourceHandle; 3],
+        bootstrap_surface_writes: [ResourceHandle; 6],
+        previous_surface_resources: [ResourceHandle; 4],
         profiler: Option<&'a GpuProfiler>,
     ) -> AreaRestirGraphBuffers<'a> {
         let settings = area_restir_effective_settings(settings, history_initialized);
@@ -348,9 +351,12 @@ impl AreaRestirPass {
                     builder.read_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderRead);
                     builder.read_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderRead);
                     builder.read_as(bootstrap_surface_writes[3], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[4], AccessKind::ComputeShaderRead);
+                    builder.read_as(bootstrap_surface_writes[5], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[0], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[1], AccessKind::ComputeShaderRead);
                     builder.read_as(previous_surface_resources[2], AccessKind::ComputeShaderRead);
+                    builder.read_as(previous_surface_resources[3], AccessKind::ComputeShaderRead);
                     let temporal_output_resource = if spatial_active {
                         temporal_resource
                     } else {
@@ -439,6 +445,8 @@ impl AreaRestirPass {
                 builder.write_as(bootstrap_surface_writes[1], AccessKind::ComputeShaderWrite);
                 builder.write_as(bootstrap_surface_writes[2], AccessKind::ComputeShaderWrite);
                 builder.write_as(bootstrap_surface_writes[3], AccessKind::ComputeShaderWrite);
+                builder.write_as(bootstrap_surface_writes[4], AccessKind::ComputeShaderWrite);
+                builder.write_as(bootstrap_surface_writes[5], AccessKind::ComputeShaderWrite);
                 Box::new(move |ctx| {
                     if let Some(profiler) = profiler {
                         profiler.begin_scope(
@@ -470,6 +478,8 @@ impl AreaRestirPass {
                 selected_surface_writes[1],
                 selected_surface_writes[2],
                 selected_surface_writes[3],
+                selected_surface_writes[4],
+                selected_surface_writes[5],
             ],
         }
     }
@@ -488,6 +498,9 @@ impl AreaRestirPass {
             &surface.previous_surface_normal_roughness,
             &surface.previous_surface_albedo_material,
             &surface.motion_history,
+            &surface.motion_flags,
+            &surface.surface_brick_generation,
+            &surface.previous_surface_brick_generation,
         ];
         self.initial_stage
             .write_image_descriptors(device, 2, &current_surface_images);

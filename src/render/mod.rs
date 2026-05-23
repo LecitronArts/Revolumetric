@@ -1,5 +1,6 @@
 pub mod allocator;
 pub mod area_restir;
+pub mod brick_generation_atlas;
 pub mod buffer;
 pub mod camera;
 pub mod capture;

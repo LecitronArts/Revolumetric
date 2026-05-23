@@ -4,8 +4,22 @@ use std::collections::HashMap;
 pub const VPT_MOTION_SOURCE_FLAG_HISTORY_VALID: u32 = 1 << 0;
 pub const VPT_MOTION_SOURCE_FLAG_GENERATION_MISMATCH: u32 = 1 << 1;
 
+pub const VPT_MOTION_FLAG_HISTORY_VALID: u32 = 1 << 0;
+pub const VPT_MOTION_FLAG_CAMERA_STATIC: u32 = 1 << 1;
+pub const VPT_MOTION_FLAG_UCVH_REGION_MOVE: u32 = 1 << 2;
+pub const VPT_MOTION_FLAG_DISOCCLUDED: u32 = 1 << 4;
+pub const VPT_MOTION_FLAG_HISTORY_RESET: u32 = 1 << 5;
+pub const VPT_MOTION_FLAG_BEHIND_CAMERA: u32 = 1 << 6;
+pub const VPT_NO_BRICK_GENERATION: u32 = u32::MAX;
+
 const VPT_MOTION_SOURCE_STATUS_MASK: u32 =
     VPT_MOTION_SOURCE_FLAG_HISTORY_VALID | VPT_MOTION_SOURCE_FLAG_GENERATION_MISMATCH;
+const VPT_MOTION_FLAG_KNOWN_MASK: u32 = VPT_MOTION_FLAG_HISTORY_VALID
+    | VPT_MOTION_FLAG_CAMERA_STATIC
+    | VPT_MOTION_FLAG_UCVH_REGION_MOVE
+    | VPT_MOTION_FLAG_DISOCCLUDED
+    | VPT_MOTION_FLAG_HISTORY_RESET
+    | VPT_MOTION_FLAG_BEHIND_CAMERA;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MotionSource {
@@ -95,6 +109,51 @@ impl MotionSourceHistory {
     pub fn clear(&mut self) {
         self.snapshots.clear();
     }
+}
+
+pub fn vpt_motion_flag_is_history_valid(flags: u32) -> bool {
+    (flags & VPT_MOTION_FLAG_HISTORY_VALID) != 0
+        && (flags
+            & (VPT_MOTION_FLAG_DISOCCLUDED
+                | VPT_MOTION_FLAG_HISTORY_RESET
+                | VPT_MOTION_FLAG_BEHIND_CAMERA))
+            == 0
+}
+
+pub fn vpt_motion_flag_is_camera_static(flags: u32) -> bool {
+    (flags & VPT_MOTION_FLAG_CAMERA_STATIC) != 0
+        && vpt_motion_flag_is_history_valid(flags)
+        && (flags & VPT_MOTION_FLAG_UCVH_REGION_MOVE) == 0
+}
+
+pub fn vpt_motion_flag_requires_disocclusion(flags: u32) -> bool {
+    (flags & VPT_MOTION_FLAG_BEHIND_CAMERA) != 0
+        || (flags & VPT_MOTION_FLAG_HISTORY_RESET) != 0
+        || (flags & VPT_MOTION_FLAG_DISOCCLUDED) != 0
+}
+
+pub fn vpt_motion_flag_requires_history_reset(flags: u32) -> bool {
+    (flags & VPT_MOTION_FLAG_HISTORY_RESET) != 0
+        && (flags & VPT_MOTION_FLAG_DISOCCLUDED) != 0
+        && (flags
+            & (VPT_MOTION_FLAG_HISTORY_VALID
+                | VPT_MOTION_FLAG_UCVH_REGION_MOVE
+                | VPT_MOTION_FLAG_CAMERA_STATIC))
+            == 0
+}
+
+pub fn vpt_motion_flags_are_legal(flags: u32) -> bool {
+    if flags == 0 || (flags & !VPT_MOTION_FLAG_KNOWN_MASK) != 0 {
+        return false;
+    }
+    matches!(
+        flags,
+        x if x == (VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_CAMERA_STATIC)
+            || x == (VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_UCVH_REGION_MOVE)
+            || x == VPT_MOTION_FLAG_DISOCCLUDED
+            || x == (VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_BEHIND_CAMERA)
+            || x == (VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET)
+    )
 }
 
 #[cfg(test)]
@@ -190,5 +249,80 @@ mod tests {
                 .previous_world_position_from_current_hit(glam::vec3(3.0, 0.0, 0.0))
                 .is_none()
         );
+    }
+
+    #[test]
+    fn motion_flag_bits_are_pinned() {
+        assert_eq!(VPT_MOTION_FLAG_HISTORY_VALID, 1 << 0);
+        assert_eq!(VPT_MOTION_FLAG_CAMERA_STATIC, 1 << 1);
+        assert_eq!(VPT_MOTION_FLAG_UCVH_REGION_MOVE, 1 << 2);
+        assert_eq!(VPT_MOTION_FLAG_DISOCCLUDED, 1 << 4);
+        assert_eq!(VPT_MOTION_FLAG_HISTORY_RESET, 1 << 5);
+        assert_eq!(VPT_MOTION_FLAG_BEHIND_CAMERA, 1 << 6);
+        assert_eq!(
+            VPT_MOTION_FLAG_HISTORY_RESET
+                & (VPT_MOTION_FLAG_HISTORY_VALID
+                    | VPT_MOTION_FLAG_CAMERA_STATIC
+                    | VPT_MOTION_FLAG_UCVH_REGION_MOVE
+                    | VPT_MOTION_FLAG_DISOCCLUDED
+                    | VPT_MOTION_FLAG_BEHIND_CAMERA),
+            0
+        );
+    }
+
+    #[test]
+    fn motion_flag_combinations_are_legal() {
+        for flags in [
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_CAMERA_STATIC,
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_UCVH_REGION_MOVE,
+            VPT_MOTION_FLAG_DISOCCLUDED,
+            VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_BEHIND_CAMERA,
+            VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET,
+        ] {
+            assert!(
+                vpt_motion_flags_are_legal(flags),
+                "flags {flags:#010x} should be legal"
+            );
+        }
+
+        for flags in [
+            0,
+            VPT_MOTION_FLAG_HISTORY_VALID,
+            VPT_MOTION_FLAG_CAMERA_STATIC,
+            VPT_MOTION_FLAG_UCVH_REGION_MOVE,
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_BEHIND_CAMERA,
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_HISTORY_RESET,
+            VPT_MOTION_FLAG_CAMERA_STATIC | VPT_MOTION_FLAG_DISOCCLUDED,
+        ] {
+            assert!(
+                !vpt_motion_flags_are_legal(flags),
+                "flags {flags:#010x} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn motion_flag_predicates_match_temporal_rejection_rules() {
+        assert!(vpt_motion_flag_requires_disocclusion(
+            VPT_MOTION_FLAG_BEHIND_CAMERA
+        ));
+        assert!(vpt_motion_flag_requires_disocclusion(
+            VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET
+        ));
+        assert!(vpt_motion_flag_requires_history_reset(
+            VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET
+        ));
+        assert!(vpt_motion_flag_is_camera_static(
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_CAMERA_STATIC
+        ));
+        assert!(!vpt_motion_flag_is_camera_static(
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_UCVH_REGION_MOVE
+        ));
+        assert!(vpt_motion_flag_is_history_valid(
+            VPT_MOTION_FLAG_HISTORY_VALID | VPT_MOTION_FLAG_CAMERA_STATIC
+        ));
+        assert!(!vpt_motion_flag_is_history_valid(
+            VPT_MOTION_FLAG_DISOCCLUDED
+        ));
     }
 }

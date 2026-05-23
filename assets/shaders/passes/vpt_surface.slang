@@ -2,6 +2,7 @@
 #include "voxel_traverse.slang"
 #include "material_common.slang"
 #include "vpt_history_common.slang"
+#include "vpt_motion_common.slang"
 #include "area_restir_common.slang"
 #include "vpt_primary_sample_common.slang"
 
@@ -57,25 +58,58 @@ ConstantBuffer<AreaRestirUniforms> area_restir;
 [[vk::binding(15, 0)]]
 StructuredBuffer<AreaRestirReservoir> area_restir_reservoirs;
 
+[[vk::binding(16, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> motion_flags;
+
+[[vk::binding(17, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> surface_brick_generation;
+
+[[vk::binding(18, 0)]]
+StructuredBuffer<uint> brick_generations;
+
+[[vk::binding(19, 0)]]
+StructuredBuffer<UcvhMotionEvent> ucvh_motion_events;
+
+[[vk::push_constant]]
+VptMotionGuidePushConstants vpt_motion_guide;
+
+bool vpt_history_reset_active() {
+    return (vpt_history.flags & VPT_HISTORY_FLAG_CAMERA_CUT) != 0u
+        || (vpt_history.flags & VPT_HISTORY_FLAG_RESIZE) != 0u
+        || (vpt_history.flags & VPT_HISTORY_FLAG_SCENE_INVALIDATED) != 0u
+        || (vpt_history.flags & VPT_HISTORY_FLAG_LIGHTS_INVALIDATED) != 0u;
+}
+
+void write_surface_motion_outputs(uint2 pixel, float4 motion, uint flags, uint brick_generation) {
+    motion_history[pixel] = motion;
+    motion_flags[pixel] = flags;
+    surface_brick_generation[pixel] = brick_generation;
+}
+
 void write_miss(uint2 pixel) {
     float4 position_depth = float4(0.0, 0.0, 0.0, -1.0);
     surface_position_depth[pixel] = position_depth;
     surface_normal_roughness[pixel] = float4(0.0, 0.0, 0.0, 0.0);
     surface_albedo_material[pixel] = float4(0.0, 0.0, 0.0, 0.0);
-    motion_history[pixel] = float4(0.0, 0.0, 0.0, 0.0);
+    uint flags = vpt_history_reset_active()
+        ? (VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET)
+        : VPT_MOTION_FLAG_DISOCCLUDED;
+    write_surface_motion_outputs(pixel, float4(0.0, 0.0, 0.0, 0.0), flags, VPT_NO_BRICK_GENERATION);
 }
 
-float4 project_previous_pixel(uint2 pixel, float3 world_position) {
-    if ((vpt_history.flags & VPT_HISTORY_FLAG_CAMERA_CUT) != 0u
-        || (vpt_history.flags & VPT_HISTORY_FLAG_RESIZE) != 0u
-        || (vpt_history.flags & VPT_HISTORY_FLAG_SCENE_INVALIDATED) != 0u
-        || (vpt_history.flags & VPT_HISTORY_FLAG_LIGHTS_INVALIDATED) != 0u) {
+float4 project_previous_pixel(uint2 pixel, float3 world_position, inout uint flags) {
+    if (vpt_history_reset_active()) {
+        flags = VPT_MOTION_FLAG_DISOCCLUDED | VPT_MOTION_FLAG_HISTORY_RESET;
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
     float4 current_clip = mul(float4(world_position, 1.0), vpt_history.current_view_proj);
     float4 previous_clip = mul(float4(world_position, 1.0), vpt_history.previous_view_proj);
     if (current_clip.w <= 1.0e-5 || previous_clip.w <= 1.0e-5) {
+        flags &= ~VPT_MOTION_FLAG_UCVH_REGION_MOVE;
+        flags |= VPT_MOTION_FLAG_BEHIND_CAMERA | VPT_MOTION_FLAG_DISOCCLUDED;
         return float4(0.0, 0.0, 0.0, 0.0);
     }
 
@@ -91,7 +125,17 @@ float4 project_previous_pixel(uint2 pixel, float3 world_position) {
         && previous_pixel.y >= 0.0
         && previous_pixel.x < float(vpt_history.previous_resolution.x)
         && previous_pixel.y < float(vpt_history.previous_resolution.y);
-    return valid ? float4(motion, 0.0, 1.0) : float4(0.0, 0.0, 0.0, 0.0);
+    if (!valid) {
+        flags &= ~VPT_MOTION_FLAG_UCVH_REGION_MOVE;
+        flags |= VPT_MOTION_FLAG_DISOCCLUDED;
+        return float4(0.0, 0.0, 0.0, 0.0);
+    }
+
+    flags |= VPT_MOTION_FLAG_HISTORY_VALID;
+    if ((flags & VPT_MOTION_FLAG_UCVH_REGION_MOVE) == 0u) {
+        flags |= VPT_MOTION_FLAG_CAMERA_STATIC;
+    }
+    return float4(motion, 0.0, 1.0);
 }
 
 [shader("compute")]
@@ -130,7 +174,25 @@ void main(uint3 tid : SV_DispatchThreadID) {
     surface_position_depth[pixel] = float4(hit.position, hit.t);
     surface_normal_roughness[pixel] = float4(normalize(hit.normal), emissive_luma);
     surface_albedo_material[pixel] = float4(albedo, material_id);
-    float4 motion = project_previous_pixel(pixel, hit.position);
+    uint flags = 0u;
+    float3 previous_world_position = hit.position;
+    uint3 hit_voxel = hit.brick_coord * 8u + hit.local;
+    uint motion_event_count = min(vpt_motion_guide.motion_event_count, VPT_UCVH_MOTION_EVENT_CAPACITY);
+    for (uint event_index = 0u; event_index < motion_event_count; event_index++) {
+        UcvhMotionEvent event = ucvh_motion_events[event_index];
+        if (vpt_ucvh_motion_event_contains(event, hit_voxel)) {
+            previous_world_position = hit.position - float3(event.world_delta_current_from_previous.xyz);
+            flags |= VPT_MOTION_FLAG_UCVH_REGION_MOVE;
+            break;
+        }
+    }
+    float4 motion = project_previous_pixel(pixel, previous_world_position, flags);
     motion.z = float(hit.motion_id);
-    motion_history[pixel] = motion;
+    uint brick_generation = hit.brick_id == 0xffffffffu
+        ? VPT_NO_BRICK_GENERATION
+        : brick_generations[hit.brick_id];
+    if ((flags & VPT_MOTION_FLAG_HISTORY_VALID) == 0u) {
+        brick_generation = VPT_NO_BRICK_GENERATION;
+    }
+    write_surface_motion_outputs(pixel, motion, flags, brick_generation);
 }

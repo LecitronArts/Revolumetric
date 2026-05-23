@@ -73,6 +73,45 @@ fn area_restir_initial_shader_binding_manifest_matches_expected_resources() {
 }
 
 #[test]
+fn area_restir_temporal_shader_binding_manifest_matches_motion_guide_resources() {
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/area_restir_temporal.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(1, DescriptorKind::StorageBuffer, "input_reservoirs"),
+            binding(2, DescriptorKind::StorageBuffer, "history_reservoirs"),
+            binding(3, DescriptorKind::StorageBuffer, "output_reservoirs"),
+            binding(4, DescriptorKind::StorageImage, "surface_position_depth"),
+            binding(5, DescriptorKind::StorageImage, "surface_normal_roughness"),
+            binding(6, DescriptorKind::StorageImage, "surface_albedo_material"),
+            binding(
+                7,
+                DescriptorKind::StorageImage,
+                "previous_surface_position_depth"
+            ),
+            binding(
+                8,
+                DescriptorKind::StorageImage,
+                "previous_surface_normal_roughness"
+            ),
+            binding(
+                9,
+                DescriptorKind::StorageImage,
+                "previous_surface_albedo_material"
+            ),
+            binding(10, DescriptorKind::StorageImage, "motion_history"),
+            binding(11, DescriptorKind::StorageImage, "motion_flags"),
+            binding(12, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(
+                13,
+                DescriptorKind::StorageImage,
+                "previous_surface_brick_generation",
+            ),
+        ]
+    );
+}
+
+#[test]
 fn area_restir_pass_owns_graph_registration_contract() {
     let pass = source("src/render/passes/area_restir.rs");
     let implementation = pass
@@ -82,6 +121,24 @@ fn area_restir_pass_owns_graph_registration_contract() {
     assert!(implementation.contains("pub fn register_graph"));
     assert!(implementation.contains("vpt_surface.update_area_restir_descriptors"));
     assert!(implementation.contains("vpt.update_area_restir_descriptors"));
+}
+
+#[test]
+fn area_restir_surface_descriptors_are_initialized_when_pass_is_created() {
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let ensure_area = pipeline
+        .split("fn ensure_area_restir_pass")
+        .nth(1)
+        .expect("ensure_area_restir_pass should exist");
+    let ensure_area = ensure_area
+        .split("fn sync_area_restir_descriptors")
+        .next()
+        .expect("sync_area_restir_descriptors should follow ensure_area_restir_pass");
+
+    assert!(
+        ensure_area.contains("pass.update_surface_descriptors(renderer.device(), vpt_surface);"),
+        "Area ReSTIR pass creation must initialize surface image descriptors before first use"
+    );
 }
 
 #[test]

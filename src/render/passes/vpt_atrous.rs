@@ -51,7 +51,7 @@ pub struct VptAtrousGraphInputs<'a> {
     pub lighting_settings: LightingSettings,
     pub temporal_radiance: ResourceHandle,
     pub temporal_moments: ResourceHandle,
-    pub surface_inputs: [ResourceHandle; 4],
+    pub surface_inputs: [ResourceHandle; 6],
     pub profiler: Option<&'a GpuProfiler>,
 }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use ash::vk;
-use bytemuck::Zeroable;
+use bytemuck::{Pod, Zeroable};
 use gpu_allocator::MemoryLocation;
 
 use crate::render::allocator::GpuAllocator;
@@ -32,16 +32,29 @@ pub struct VptSurfacePass {
     pub previous_surface_normal_roughness: GpuImage,
     pub previous_surface_albedo_material: GpuImage,
     pub motion_history: GpuImage,
+    pub motion_flags: GpuImage,
+    pub surface_brick_generation: GpuImage,
+    pub previous_surface_brick_generation: GpuImage,
+    motion_event_counts: Vec<u32>,
 }
 
 #[derive(Clone, Copy)]
 pub struct VptSurfaceBootstrapGraph {
-    pub surface_writes: [ResourceHandle; 4],
-    pub previous_surface_resources: [ResourceHandle; 3],
+    pub surface_writes: [ResourceHandle; 6],
+    pub previous_surface_resources: [ResourceHandle; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct VptSurfacePushConstants {
+    motion_event_count: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
 impl VptSurfacePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 16] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 20] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -59,6 +72,10 @@ impl VptSurfacePass {
             DescriptorBindingSpec::compute(13, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(14, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(19, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -83,11 +100,11 @@ impl VptSurfacePass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 8 * frame_count as u32,
+                descriptor_count: 12 * frame_count as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 18 * frame_count as u32,
+                descriptor_count: 22 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, 2 * frame_count as u32, &pool_sizes)
@@ -196,7 +213,11 @@ impl VptSurfacePass {
             shader_module,
             c"main",
             &[descriptor_set_layout],
-            &[],
+            &[vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                offset: 0,
+                size: std::mem::size_of::<VptSurfacePushConstants>() as u32,
+            }],
         ) {
             Ok(pipeline) => pipeline,
             Err(error) => {
@@ -228,6 +249,10 @@ impl VptSurfacePass {
             previous_surface_normal_roughness: images.previous_surface_normal_roughness,
             previous_surface_albedo_material: images.previous_surface_albedo_material,
             motion_history: images.motion_history,
+            motion_flags: images.motion_flags,
+            surface_brick_generation: images.surface_brick_generation,
+            previous_surface_brick_generation: images.previous_surface_brick_generation,
+            motion_event_counts: vec![0; frame_count],
         })
     }
 
@@ -267,6 +292,15 @@ impl VptSurfacePass {
                 new_images.previous_surface_albedo_material,
             ),
             motion_history: std::mem::replace(&mut self.motion_history, new_images.motion_history),
+            motion_flags: std::mem::replace(&mut self.motion_flags, new_images.motion_flags),
+            surface_brick_generation: std::mem::replace(
+                &mut self.surface_brick_generation,
+                new_images.surface_brick_generation,
+            ),
+            previous_surface_brick_generation: std::mem::replace(
+                &mut self.previous_surface_brick_generation,
+                new_images.previous_surface_brick_generation,
+            ),
         };
         old_images.destroy(device, allocator);
 
@@ -275,6 +309,8 @@ impl VptSurfacePass {
             surface_normal_roughness: &self.surface_normal_roughness,
             surface_albedo_material: &self.surface_albedo_material,
             motion_history: &self.motion_history,
+            motion_flags: &self.motion_flags,
+            surface_brick_generation: &self.surface_brick_generation,
         };
         write_descriptor_sets_from_refs(
             device,
@@ -310,6 +346,10 @@ impl VptSurfacePass {
         );
     }
 
+    pub fn update_motion_guide_state(&mut self, frame_slot: usize, motion_event_count: u32) {
+        self.motion_event_counts[frame_slot] = motion_event_count;
+    }
+
     pub fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         self.record_bootstrap(device, cmd, frame_slot);
     }
@@ -335,11 +375,21 @@ impl VptSurfacePass {
         cmd: vk::CommandBuffer,
         frame_slot: usize,
     ) {
-        self.record_with_descriptor_set(device, cmd, self.bootstrap_descriptor_sets[frame_slot]);
+        self.record_with_descriptor_set(
+            device,
+            cmd,
+            self.bootstrap_descriptor_sets[frame_slot],
+            frame_slot,
+        );
     }
 
     pub fn record_selected(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
-        self.record_with_descriptor_set(device, cmd, self.selected_descriptor_sets[frame_slot]);
+        self.record_with_descriptor_set(
+            device,
+            cmd,
+            self.selected_descriptor_sets[frame_slot],
+            frame_slot,
+        );
     }
 
     pub fn register_bootstrap_graph<'a>(
@@ -381,6 +431,22 @@ impl VptSurfacePass {
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             AccessKind::Undefined,
         );
+        let motion_flags_resource = graph.import_image_with_access(
+            self.motion_flags.handle,
+            self.motion_flags.extent.width,
+            self.motion_flags.extent.height,
+            vk::Format::R32_UINT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
+        let surface_brick_generation_resource = graph.import_image_with_access(
+            self.surface_brick_generation.handle,
+            self.surface_brick_generation.extent.width,
+            self.surface_brick_generation.extent.height,
+            vk::Format::R32_UINT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
         let previous_surface_access = if history_initialized {
             AccessKind::TransferWrite
         } else {
@@ -416,6 +482,16 @@ impl VptSurfacePass {
                 | vk::ImageUsageFlags::TRANSFER_DST,
             previous_surface_access,
         );
+        let previous_surface_brick_generation_resource = graph.import_image_with_access(
+            self.previous_surface_brick_generation.handle,
+            self.previous_surface_brick_generation.extent.width,
+            self.previous_surface_brick_generation.extent.height,
+            vk::Format::R32_UINT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_surface_access,
+        );
 
         let bootstrap_writes =
             graph.add_pass("vpt_surface_bootstrap", QueueType::Compute, |builder| {
@@ -423,6 +499,11 @@ impl VptSurfacePass {
                 builder.write_as(surface_normal_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(surface_albedo_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(motion_history_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(motion_flags_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(
+                    surface_brick_generation_resource,
+                    AccessKind::ComputeShaderWrite,
+                );
                 Box::new(move |ctx| {
                     if let Some(profiler) = profiler {
                         profiler.begin_scope(
@@ -448,6 +529,8 @@ impl VptSurfacePass {
             self.surface_normal_roughness.handle,
             self.surface_albedo_material.handle,
             self.motion_history.handle,
+            self.motion_flags.handle,
+            self.surface_brick_generation.handle,
         ];
         for (&resource, &image) in bootstrap_writes.iter().zip(surface_images.iter()) {
             graph.bind_image(resource, image);
@@ -459,11 +542,14 @@ impl VptSurfacePass {
                 bootstrap_writes[1],
                 bootstrap_writes[2],
                 bootstrap_writes[3],
+                bootstrap_writes[4],
+                bootstrap_writes[5],
             ],
             previous_surface_resources: [
                 previous_surface_position_resource,
                 previous_surface_normal_resource,
                 previous_surface_albedo_resource,
+                previous_surface_brick_generation_resource,
             ],
         }
     }
@@ -473,8 +559,15 @@ impl VptSurfacePass {
         device: &ash::Device,
         cmd: vk::CommandBuffer,
         descriptor_set: vk::DescriptorSet,
+        frame_slot: usize,
     ) {
         let extent = self.surface_position_depth.extent;
+        let push_constants = VptSurfacePushConstants {
+            motion_event_count: self.motion_event_counts[frame_slot],
+            _pad0: 0,
+            _pad1: 0,
+            _pad2: 0,
+        };
 
         unsafe {
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline.handle);
@@ -485,6 +578,13 @@ impl VptSurfacePass {
                 0,
                 &[descriptor_set],
                 &[],
+            );
+            device.cmd_push_constants(
+                cmd,
+                self.pipeline.layout,
+                vk::ShaderStageFlags::COMPUTE,
+                0,
+                bytemuck::bytes_of(&push_constants),
             );
             device.cmd_dispatch(cmd, extent.width.div_ceil(8), extent.height.div_ceil(8), 1);
         }
@@ -509,6 +609,12 @@ impl VptSurfacePass {
             &self.surface_albedo_material,
             &self.previous_surface_albedo_material,
         );
+        copy_surface_image(
+            device,
+            cmd,
+            &self.surface_brick_generation,
+            &self.previous_surface_brick_generation,
+        );
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
@@ -529,6 +635,10 @@ impl VptSurfacePass {
         self.previous_surface_albedo_material
             .destroy(device, allocator);
         self.motion_history.destroy(device, allocator);
+        self.motion_flags.destroy(device, allocator);
+        self.surface_brick_generation.destroy(device, allocator);
+        self.previous_surface_brick_generation
+            .destroy(device, allocator);
     }
 }
 
@@ -576,6 +686,9 @@ struct VptSurfaceImages {
     previous_surface_normal_roughness: GpuImage,
     previous_surface_albedo_material: GpuImage,
     motion_history: GpuImage,
+    motion_flags: GpuImage,
+    surface_brick_generation: GpuImage,
+    previous_surface_brick_generation: GpuImage,
 }
 
 #[derive(Clone, Copy)]
@@ -584,6 +697,8 @@ struct VptSurfaceImageRefs<'a> {
     surface_normal_roughness: &'a GpuImage,
     surface_albedo_material: &'a GpuImage,
     motion_history: &'a GpuImage,
+    motion_flags: &'a GpuImage,
+    surface_brick_generation: &'a GpuImage,
 }
 
 #[derive(Clone, Copy)]
@@ -604,6 +719,10 @@ impl VptSurfaceImages {
         self.previous_surface_albedo_material
             .destroy(device, allocator);
         self.motion_history.destroy(device, allocator);
+        self.motion_flags.destroy(device, allocator);
+        self.surface_brick_generation.destroy(device, allocator);
+        self.previous_surface_brick_generation
+            .destroy(device, allocator);
     }
 }
 
@@ -666,6 +785,41 @@ fn create_surface_images(
             return Err(error);
         }
     };
+    let motion_flags = match create_surface_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R32_UINT,
+        "vpt_motion_flags",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            motion_history.destroy(device, allocator);
+            surface_albedo_material.destroy(device, allocator);
+            surface_normal_roughness.destroy(device, allocator);
+            surface_position_depth.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let surface_brick_generation = match create_surface_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R32_UINT,
+        "vpt_surface_brick_generation",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            motion_flags.destroy(device, allocator);
+            motion_history.destroy(device, allocator);
+            surface_albedo_material.destroy(device, allocator);
+            surface_normal_roughness.destroy(device, allocator);
+            surface_position_depth.destroy(device, allocator);
+            return Err(error);
+        }
+    };
     let previous_surface_position_depth = match create_surface_image(
         device,
         allocator,
@@ -676,6 +830,8 @@ fn create_surface_images(
     ) {
         Ok(image) => image,
         Err(error) => {
+            surface_brick_generation.destroy(device, allocator);
+            motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
@@ -694,6 +850,8 @@ fn create_surface_images(
         Ok(image) => image,
         Err(error) => {
             previous_surface_position_depth.destroy(device, allocator);
+            surface_brick_generation.destroy(device, allocator);
+            motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
@@ -713,6 +871,30 @@ fn create_surface_images(
         Err(error) => {
             previous_surface_normal_roughness.destroy(device, allocator);
             previous_surface_position_depth.destroy(device, allocator);
+            surface_brick_generation.destroy(device, allocator);
+            motion_flags.destroy(device, allocator);
+            motion_history.destroy(device, allocator);
+            surface_albedo_material.destroy(device, allocator);
+            surface_normal_roughness.destroy(device, allocator);
+            surface_position_depth.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let previous_surface_brick_generation = match create_surface_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R32_UINT,
+        "vpt_previous_surface_brick_generation",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            previous_surface_albedo_material.destroy(device, allocator);
+            previous_surface_normal_roughness.destroy(device, allocator);
+            previous_surface_position_depth.destroy(device, allocator);
+            surface_brick_generation.destroy(device, allocator);
+            motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
@@ -729,6 +911,9 @@ fn create_surface_images(
         previous_surface_normal_roughness,
         previous_surface_albedo_material,
         motion_history,
+        motion_flags,
+        surface_brick_generation,
+        previous_surface_brick_generation,
     })
 }
 
@@ -775,6 +960,8 @@ fn write_descriptor_sets(
             surface_normal_roughness: &images.surface_normal_roughness,
             surface_albedo_material: &images.surface_albedo_material,
             motion_history: &images.motion_history,
+            motion_flags: &images.motion_flags,
+            surface_brick_generation: &images.surface_brick_generation,
         },
         ucvh_gpu,
         history_uniform_buffers,
@@ -797,6 +984,7 @@ fn write_descriptor_sets_from_refs(
         images.surface_albedo_material,
         images.motion_history,
     ];
+    let motion_guide_images = [images.motion_flags, images.surface_brick_generation];
     let ucvh_buffers = [
         &ucvh_gpu.config_buffer,
         &ucvh_gpu.hierarchy_l0_buffer,
@@ -806,6 +994,10 @@ fn write_descriptor_sets_from_refs(
         &ucvh_gpu.hierarchy_ln_buffers[3],
         &ucvh_gpu.occupancy_buffer,
         &ucvh_gpu.material_buffer,
+    ];
+    let motion_guide_buffers = [
+        &ucvh_gpu.brick_generation_buffer,
+        &ucvh_gpu.motion_event_buffer,
     ];
 
     for (set_idx, &ds) in descriptor_sets.iter().enumerate() {
@@ -862,6 +1054,47 @@ fn write_descriptor_sets_from_refs(
                 .dst_binding(13)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&history_ubo_info)),
+        );
+        let motion_guide_image_infos: Vec<_> = motion_guide_images
+            .iter()
+            .map(|image| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image.view)
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect();
+        writes.extend(
+            motion_guide_image_infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(16 + idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .image_info(std::slice::from_ref(info))
+                }),
+        );
+        let motion_guide_buffer_infos: Vec<_> = motion_guide_buffers
+            .iter()
+            .map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.handle)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+        writes.extend(
+            motion_guide_buffer_infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(18 + idx as u32)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                }),
         );
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }

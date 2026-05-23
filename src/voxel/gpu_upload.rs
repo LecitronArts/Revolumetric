@@ -8,7 +8,20 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::voxel::brick::{BRICK_VOLUME, BrickOccupancy, VoxelCell};
 use crate::voxel::occupancy::{NodeL0, NodeLN};
-use crate::voxel::ucvh::Ucvh;
+use crate::voxel::ucvh::{Ucvh, UcvhMotionEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+pub const UCVH_MOTION_EVENT_CAPACITY: usize = 64;
+static MOTION_EVENT_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn capped_motion_event_upload_count(event_len: usize) -> usize {
+    event_len.min(UCVH_MOTION_EVENT_CAPACITY)
+}
+
+fn should_warn_motion_event_overflow(event_len: usize) -> bool {
+    event_len > UCVH_MOTION_EVENT_CAPACITY
+        && !MOTION_EVENT_OVERFLOW_WARNED.swap(true, Ordering::Relaxed)
+}
 
 /// GPU-side config matching the shader UBO.
 #[repr(C)]
@@ -28,11 +41,52 @@ pub struct UcvhGpuResources {
     pub material_buffer: GpuBuffer,
     pub hierarchy_l0_buffer: GpuBuffer,
     pub hierarchy_ln_buffers: [GpuBuffer; 4], // L1-L4
+    pub brick_generation_buffer: GpuBuffer,
+    pub motion_event_buffer: GpuBuffer,
     // Staging buffers (host-visible, used for transfer)
     staging_occupancy: GpuBuffer,
     staging_material: GpuBuffer,
     staging_hierarchy: GpuBuffer,
     staging_config: GpuBuffer,
+    staging_brick_generations: GpuBuffer,
+    staging_motion_events: GpuBuffer,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GpuUcvhMotionEvent {
+    pub region_min: [u32; 4],
+    pub region_max_exclusive: [u32; 4],
+    pub world_delta_current_from_previous: [i32; 4],
+    pub generation: u32,
+    pub _pad: [u32; 3],
+}
+
+impl From<UcvhMotionEvent> for GpuUcvhMotionEvent {
+    fn from(event: UcvhMotionEvent) -> Self {
+        Self {
+            region_min: [
+                event.region_min.x,
+                event.region_min.y,
+                event.region_min.z,
+                0,
+            ],
+            region_max_exclusive: [
+                event.region_max_exclusive.x,
+                event.region_max_exclusive.y,
+                event.region_max_exclusive.z,
+                0,
+            ],
+            world_delta_current_from_previous: [
+                event.world_delta_current_from_previous.x,
+                event.world_delta_current_from_previous.y,
+                event.world_delta_current_from_previous.z,
+                0,
+            ],
+            generation: event.generation,
+            _pad: [0; 3],
+        }
+    }
 }
 
 impl UcvhGpuResources {
@@ -40,6 +94,9 @@ impl UcvhGpuResources {
         let cap = ucvh.pool.capacity() as usize;
         let occ_size = cap * std::mem::size_of::<BrickOccupancy>();
         let mat_size = cap * BRICK_VOLUME * std::mem::size_of::<VoxelCell>();
+        let generation_size = cap * std::mem::size_of::<u32>();
+        let motion_event_size =
+            UCVH_MOTION_EVENT_CAPACITY * std::mem::size_of::<GpuUcvhMotionEvent>();
 
         let ssbo_usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let staging_usage = vk::BufferUsageFlags::TRANSFER_SRC;
@@ -68,6 +125,22 @@ impl UcvhGpuResources {
             ssbo_usage,
             MemoryLocation::GpuOnly,
             "ucvh_materials",
+        )?;
+        let brick_generation_buffer = GpuBuffer::new(
+            device,
+            allocator,
+            generation_size.max(16) as u64,
+            ssbo_usage,
+            MemoryLocation::GpuOnly,
+            "ucvh_brick_generations",
+        )?;
+        let motion_event_buffer = GpuBuffer::new(
+            device,
+            allocator,
+            motion_event_size.max(16) as u64,
+            ssbo_usage,
+            MemoryLocation::GpuOnly,
+            "ucvh_motion_events",
         )?;
 
         // Hierarchy buffers
@@ -153,6 +226,22 @@ impl UcvhGpuResources {
             MemoryLocation::CpuToGpu,
             "staging_config",
         )?;
+        let staging_brick_generations = GpuBuffer::new(
+            device,
+            allocator,
+            generation_size.max(16) as u64,
+            staging_usage,
+            MemoryLocation::CpuToGpu,
+            "staging_brick_generations",
+        )?;
+        let staging_motion_events = GpuBuffer::new(
+            device,
+            allocator,
+            motion_event_size.max(16) as u64,
+            staging_usage,
+            MemoryLocation::CpuToGpu,
+            "staging_motion_events",
+        )?;
 
         Ok(Self {
             config_buffer,
@@ -160,10 +249,14 @@ impl UcvhGpuResources {
             material_buffer,
             hierarchy_l0_buffer,
             hierarchy_ln_buffers,
+            brick_generation_buffer,
+            motion_event_buffer,
             staging_occupancy,
             staging_material,
             staging_hierarchy,
             staging_config,
+            staging_brick_generations,
+            staging_motion_events,
         })
     }
 
@@ -203,6 +296,9 @@ impl UcvhGpuResources {
         let mat_bytes = cast_slice::<VoxelCell, u8>(ucvh.pool.material_pool());
         Self::copy_to_staging(&self.staging_material, mat_bytes)?;
 
+        let generation_bytes = cast_slice::<u32, u8>(ucvh.brick_generations());
+        Self::copy_to_staging(&self.staging_brick_generations, generation_bytes)?;
+
         // Upload hierarchy
         let mut offset = 0u64;
         let l0_bytes = cast_slice::<NodeL0, u8>(&ucvh.hierarchy.level0);
@@ -237,6 +333,13 @@ impl UcvhGpuResources {
             &self.staging_material,
             &self.material_buffer,
             mat_bytes.len() as u64,
+        );
+        Self::record_copy(
+            device,
+            cmd,
+            &self.staging_brick_generations,
+            &self.brick_generation_buffer,
+            generation_bytes.len() as u64,
         );
 
         // Record copies: staging_hierarchy -> individual device-local buffers
@@ -280,6 +383,63 @@ impl UcvhGpuResources {
         }
 
         Ok(())
+    }
+
+    pub fn upload_motion_guide(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ucvh: &Ucvh,
+        motion_events: &[UcvhMotionEvent],
+    ) -> Result<u32> {
+        let generation_bytes = cast_slice::<u32, u8>(ucvh.brick_generations());
+        Self::copy_to_staging(&self.staging_brick_generations, generation_bytes)?;
+        Self::record_copy(
+            device,
+            cmd,
+            &self.staging_brick_generations,
+            &self.brick_generation_buffer,
+            generation_bytes.len() as u64,
+        );
+
+        let event_count = capped_motion_event_upload_count(motion_events.len());
+        if should_warn_motion_event_overflow(motion_events.len()) {
+            tracing::warn!(
+                count = motion_events.len(),
+                cap = UCVH_MOTION_EVENT_CAPACITY,
+                "dropping excess UCVH motion events for this frame"
+            );
+        }
+        let mut gpu_events = [GpuUcvhMotionEvent::zeroed(); UCVH_MOTION_EVENT_CAPACITY];
+        for (dst, src) in gpu_events.iter_mut().zip(motion_events.iter().copied()) {
+            *dst = src.into();
+        }
+        let event_bytes = cast_slice::<GpuUcvhMotionEvent, u8>(&gpu_events);
+        Self::copy_to_staging(&self.staging_motion_events, event_bytes)?;
+        Self::record_copy(
+            device,
+            cmd,
+            &self.staging_motion_events,
+            &self.motion_event_buffer,
+            event_bytes.len() as u64,
+        );
+
+        let barrier = vk::MemoryBarrier::default()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        unsafe {
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[barrier],
+                &[],
+                &[],
+            );
+        }
+
+        Ok(event_count as u32)
     }
 
     fn copy_to_staging(buffer: &GpuBuffer, data: &[u8]) -> Result<()> {
@@ -366,10 +526,14 @@ impl UcvhGpuResources {
         for buf in self.hierarchy_ln_buffers {
             buf.destroy(device, allocator);
         }
+        self.brick_generation_buffer.destroy(device, allocator);
+        self.motion_event_buffer.destroy(device, allocator);
         self.staging_occupancy.destroy(device, allocator);
         self.staging_material.destroy(device, allocator);
         self.staging_hierarchy.destroy(device, allocator);
         self.staging_config.destroy(device, allocator);
+        self.staging_brick_generations.destroy(device, allocator);
+        self.staging_motion_events.destroy(device, allocator);
     }
 }
 
@@ -454,5 +618,51 @@ mod tests {
         .expect("offset staging copy should succeed");
 
         assert_eq!(storage, [9, 1, 2, 3, 9]);
+    }
+
+    #[test]
+    fn ucvh_motion_event_shader_layout_matches_gpu_upload_abi() {
+        assert_eq!(std::mem::size_of::<GpuUcvhMotionEvent>(), 64);
+        assert_eq!(std::mem::offset_of!(GpuUcvhMotionEvent, region_min), 0);
+        assert_eq!(
+            std::mem::offset_of!(GpuUcvhMotionEvent, region_max_exclusive),
+            16
+        );
+        assert_eq!(
+            std::mem::offset_of!(GpuUcvhMotionEvent, world_delta_current_from_previous),
+            32
+        );
+        assert_eq!(std::mem::offset_of!(GpuUcvhMotionEvent, generation), 48);
+
+        let shader = crate::render::source_checks::read_source(
+            "assets/shaders/shared/vpt_motion_common.slang",
+        );
+        for token in [
+            "uint4 region_min",
+            "uint4 region_max_exclusive",
+            "int4 world_delta_current_from_previous",
+            "uint generation",
+            "uint3 _pad",
+            "event.region_min.xyz",
+            "event.region_max_exclusive.xyz",
+        ] {
+            assert!(
+                shader.contains(token),
+                "vpt_motion_common.slang must match GpuUcvhMotionEvent ABI token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn motion_event_buffer_overflow_drops_tail() {
+        assert_eq!(capped_motion_event_upload_count(0), 0);
+        assert_eq!(
+            capped_motion_event_upload_count(UCVH_MOTION_EVENT_CAPACITY),
+            UCVH_MOTION_EVENT_CAPACITY
+        );
+        assert_eq!(
+            capped_motion_event_upload_count(UCVH_MOTION_EVENT_CAPACITY + 1),
+            UCVH_MOTION_EVENT_CAPACITY
+        );
     }
 }

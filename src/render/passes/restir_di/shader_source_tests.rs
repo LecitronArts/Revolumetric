@@ -76,6 +76,127 @@ fn restir_di_initial_shader_binding_manifest_matches_expected_resources() {
 }
 
 #[test]
+fn restir_di_temporal_shader_binding_manifest_matches_motion_guide_resources() {
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/restir_di_temporal.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "restir"),
+            binding(1, DescriptorKind::StorageBuffer, "input_reservoirs"),
+            binding(2, DescriptorKind::StorageBuffer, "history_reservoirs"),
+            binding(3, DescriptorKind::StorageBuffer, "output_reservoirs"),
+            binding(
+                4,
+                DescriptorKind::StorageImage,
+                "current_surface_position_depth",
+            ),
+            binding(
+                5,
+                DescriptorKind::StorageImage,
+                "current_surface_normal_roughness",
+            ),
+            binding(
+                6,
+                DescriptorKind::StorageImage,
+                "current_surface_albedo_material",
+            ),
+            binding(
+                7,
+                DescriptorKind::StorageImage,
+                "previous_surface_position_depth",
+            ),
+            binding(
+                8,
+                DescriptorKind::StorageImage,
+                "previous_surface_normal_roughness",
+            ),
+            binding(
+                9,
+                DescriptorKind::StorageImage,
+                "previous_surface_albedo_material",
+            ),
+            binding(10, DescriptorKind::StorageImage, "motion_history"),
+            binding(11, DescriptorKind::StorageImage, "motion_flags"),
+            binding(12, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(
+                13,
+                DescriptorKind::StorageImage,
+                "previous_surface_brick_generation",
+            ),
+        ]
+    );
+}
+
+#[test]
+fn restir_di_temporal_descriptor_refresh_writes_all_motion_guide_images() {
+    let pass = source("src/render/passes/restir_di.rs");
+    let pass_impl = pass
+        .split("#[cfg(test)]")
+        .next()
+        .expect("implementation section should exist");
+    let update_surface = pass_impl
+        .split("pub fn update_surface_descriptors")
+        .nth(1)
+        .expect("update_surface_descriptors should exist");
+    let update_surface = update_surface
+        .split("pub fn resize_buffers")
+        .next()
+        .expect("resize_buffers should follow update_surface_descriptors");
+
+    for token in [
+        "&surface.motion_history",
+        "&surface.motion_flags",
+        "&surface.surface_brick_generation",
+        "&surface.previous_surface_brick_generation",
+        ".write_image_descriptors(device, 4, &temporal_surface_images)",
+    ] {
+        assert!(
+            update_surface.contains(token),
+            "ReSTIR-DI temporal descriptor refresh missing {token}"
+        );
+    }
+}
+
+#[test]
+fn restir_di_temporal_descriptor_pool_covers_all_surface_images() {
+    let pass = source("src/render/passes/restir_di.rs");
+    let pass_impl = pass
+        .split("#[cfg(test)]")
+        .next()
+        .expect("implementation section should exist");
+    let temporal_stage = pass_impl
+        .split("let temporal_stage = match RestirDiStage::new")
+        .nth(1)
+        .expect("temporal stage creation should exist");
+    let temporal_stage = temporal_stage
+        .split("let spatial_stage = match RestirDiStage::new")
+        .next()
+        .expect("spatial stage should follow temporal stage");
+
+    assert!(
+        temporal_stage.contains("descriptor_count: 10 * info.frame_count as u32"),
+        "ReSTIR-DI temporal descriptor pool must cover bindings 4..=13"
+    );
+}
+
+#[test]
+fn restir_di_surface_descriptors_are_initialized_when_pass_is_created() {
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let ensure_restir = pipeline
+        .split("fn ensure_restir_di_pass")
+        .nth(1)
+        .expect("ensure_restir_di_pass should exist");
+    let ensure_restir = ensure_restir
+        .split("fn ensure_area_restir_pass")
+        .next()
+        .expect("ensure_area_restir_pass should follow ensure_restir_di_pass");
+
+    assert!(
+        ensure_restir.contains("pass.update_surface_descriptors(renderer.device(), vpt_surface);"),
+        "ReSTIR-DI pass creation must initialize surface image descriptors before first use"
+    );
+}
+
+#[test]
 fn restir_di_pass_owns_graph_registration_contract() {
     let pass = source("src/render/passes/restir_di.rs");
     let implementation = pass

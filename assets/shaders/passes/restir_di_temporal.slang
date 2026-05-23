@@ -1,5 +1,6 @@
 #include "restir_di_common.slang"
 #include "vpt_history_common.slang"
+#include "vpt_motion_common.slang"
 
 [[vk::binding(0, 0)]]
 ConstantBuffer<RestirDiUniforms> restir;
@@ -40,6 +41,18 @@ RWTexture2D<float4> previous_surface_albedo_material;
 [[vk::binding(10, 0)]]
 [[vk::image_format("rgba32f")]]
 RWTexture2D<float4> motion_history;
+
+[[vk::binding(11, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> motion_flags;
+
+[[vk::binding(12, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> surface_brick_generation;
+
+[[vk::binding(13, 0)]]
+[[vk::image_format("r32ui")]]
+RWTexture2D<uint> previous_surface_brick_generation;
 
 uint hash_u32(uint x) {
     x ^= x >> 16;
@@ -99,12 +112,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 surface_normal_roughness = current_surface_normal_roughness[pixel];
     float4 surface_albedo_material = current_surface_albedo_material[pixel];
     float4 motion = motion_history[tid.xy];
+    uint flags = motion_flags[pixel];
     float2 history_sample = vpt_history_sample_from_motion(pixel, motion);
-    bool previous_pixel_valid = motion.w >= 0.5
+    bool previous_pixel_valid = !vpt_motion_flags_reject_history(flags)
         && history_sample.x >= 0.0
         && history_sample.y >= 0.0
         && history_sample.x < float(restir.width)
         && history_sample.y < float(restir.height);
+
+    if (restir.temporal_enabled != 0u && previous_pixel_valid) {
+        uint2 previous_pixel = uint2(history_sample);
+        previous_pixel_valid = !vpt_surface_generation_rejects_history(
+            previous_surface_brick_generation[previous_pixel],
+            surface_brick_generation[pixel]);
+    }
 
     if (restir.temporal_enabled != 0u && previous_pixel_valid) {
         uint2 previous_pixel = uint2(history_sample);

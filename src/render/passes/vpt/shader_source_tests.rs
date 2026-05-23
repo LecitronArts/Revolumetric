@@ -82,8 +82,124 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
             binding(13, DescriptorKind::UniformBuffer, "vpt_history"),
             binding(14, DescriptorKind::UniformBuffer, "area_restir"),
             binding(15, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(16, DescriptorKind::StorageImage, "motion_flags"),
+            binding(17, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(18, DescriptorKind::StorageBuffer, "brick_generations"),
+            binding(19, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
         ]
     );
+}
+
+#[test]
+fn vpt_temporal_shader_binding_manifest_matches_motion_guide_resources() {
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/vpt_temporal.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+            binding(1, DescriptorKind::StorageImage, "noisy_radiance_image"),
+            binding(2, DescriptorKind::StorageImage, "noisy_moments_image"),
+            binding(3, DescriptorKind::StorageImage, "surface_position_depth"),
+            binding(4, DescriptorKind::StorageImage, "surface_normal_roughness"),
+            binding(5, DescriptorKind::StorageImage, "surface_albedo_material"),
+            binding(
+                6,
+                DescriptorKind::StorageImage,
+                "previous_surface_position_depth"
+            ),
+            binding(
+                7,
+                DescriptorKind::StorageImage,
+                "previous_surface_normal_roughness"
+            ),
+            binding(
+                8,
+                DescriptorKind::StorageImage,
+                "previous_surface_albedo_material"
+            ),
+            binding(9, DescriptorKind::StorageImage, "motion_history"),
+            binding(
+                10,
+                DescriptorKind::StorageImage,
+                "accumulated_radiance_image"
+            ),
+            binding(
+                11,
+                DescriptorKind::StorageImage,
+                "accumulated_moments_history_image",
+            ),
+            binding(
+                12,
+                DescriptorKind::StorageImage,
+                "previous_accumulated_radiance_image"
+            ),
+            binding(
+                13,
+                DescriptorKind::StorageImage,
+                "previous_accumulated_moments_history_image",
+            ),
+            binding(14, DescriptorKind::StorageImage, "motion_flags"),
+            binding(15, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(
+                16,
+                DescriptorKind::StorageImage,
+                "previous_surface_brick_generation",
+            ),
+        ]
+    );
+}
+
+#[test]
+fn phase4_motion_guide_shader_contract_is_declared() {
+    let surface = source("assets/shaders/passes/vpt_surface.slang");
+    let temporal = source("assets/shaders/passes/vpt_temporal.slang");
+    let restir = source("assets/shaders/passes/restir_di_temporal.slang");
+    let area = source("assets/shaders/passes/area_restir_temporal.slang");
+    let motion_common = source("assets/shaders/shared/vpt_motion_common.slang");
+
+    for token in [
+        "VPT_MOTION_FLAG_HISTORY_VALID",
+        "VPT_MOTION_FLAG_CAMERA_STATIC",
+        "VPT_MOTION_FLAG_UCVH_REGION_MOVE",
+        "VPT_MOTION_FLAG_DISOCCLUDED",
+        "VPT_MOTION_FLAG_HISTORY_RESET",
+        "VPT_MOTION_FLAG_BEHIND_CAMERA",
+        "VPT_NO_BRICK_GENERATION",
+    ] {
+        assert!(
+            motion_common.contains(token),
+            "motion common missing {token}"
+        );
+    }
+
+    for token in [
+        "#include \"vpt_motion_common.slang\"",
+        "RWTexture2D<uint> motion_flags",
+        "RWTexture2D<uint> surface_brick_generation",
+        "StructuredBuffer<uint> brick_generations",
+        "StructuredBuffer<UcvhMotionEvent> ucvh_motion_events",
+        "write_surface_motion_outputs",
+        "motion_flags[pixel]",
+        "surface_brick_generation[pixel]",
+    ] {
+        assert!(surface.contains(token), "surface shader missing {token}");
+    }
+
+    for (name, shader) in [
+        ("VPT temporal", temporal.as_str()),
+        ("ReSTIR-DI temporal", restir.as_str()),
+        ("Area ReSTIR temporal", area.as_str()),
+    ] {
+        for token in [
+            "#include \"vpt_motion_common.slang\"",
+            "RWTexture2D<uint> motion_flags",
+            "RWTexture2D<uint> surface_brick_generation",
+            "RWTexture2D<uint> previous_surface_brick_generation",
+            "vpt_motion_flags_reject_history",
+            "vpt_surface_generation_rejects_history",
+        ] {
+            assert!(shader.contains(token), "{name} missing {token}");
+        }
+    }
 }
 
 #[test]
