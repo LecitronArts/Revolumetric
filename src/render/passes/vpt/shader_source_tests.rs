@@ -296,7 +296,11 @@ fn vpt_atrous_shader_binding_manifest_matches_roughness_guide_resources() {
             binding(3, DescriptorKind::StorageImage, "surface_position_depth"),
             binding(4, DescriptorKind::StorageImage, "surface_normal_roughness"),
             binding(5, DescriptorKind::StorageImage, "surface_albedo_material"),
-            binding(6, DescriptorKind::StorageImage, "surface_material_roughness"),
+            binding(
+                6,
+                DescriptorKind::StorageImage,
+                "surface_material_roughness"
+            ),
             binding(7, DescriptorKind::StorageImage, "filtered_radiance_image"),
             binding(8, DescriptorKind::UniformBuffer, "vpt_atrous"),
         ]
