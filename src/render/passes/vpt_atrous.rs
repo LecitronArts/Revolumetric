@@ -218,7 +218,7 @@ impl VptAtrousPass {
     }
 
     pub fn active_iteration_count(settings: LightingSettings) -> u32 {
-        if settings.denoiser_enabled && settings.vpt_debug_view == VptDebugView::Final {
+        if settings.denoiser_enabled() && settings.vpt_debug_view == VptDebugView::Final {
             settings
                 .denoiser_atrous_iterations
                 .min(MAX_ATROUS_ITERATIONS)
@@ -740,10 +740,10 @@ mod tests {
         let mut settings = LightingSettings::default();
         assert_eq!(VptAtrousPass::active_iteration_count(settings), 4);
 
-        settings.denoiser_enabled = false;
+        settings.denoiser_mode = crate::render::scene_ubo::VptDenoiserMode::Off;
         assert_eq!(VptAtrousPass::active_iteration_count(settings), 0);
 
-        settings.denoiser_enabled = true;
+        settings.denoiser_mode = crate::render::scene_ubo::VptDenoiserMode::Svgf;
         settings.vpt_debug_view = VptDebugView::Raw;
         assert_eq!(VptAtrousPass::active_iteration_count(settings), 0);
 
@@ -753,5 +753,20 @@ mod tests {
             VptAtrousPass::active_iteration_count(settings),
             MAX_ATROUS_ITERATIONS
         );
+    }
+
+    #[test]
+    fn active_iteration_count_uses_svgf_fallback_for_nrd_modes() {
+        for denoiser_mode in [
+            crate::render::scene_ubo::VptDenoiserMode::Relax,
+            crate::render::scene_ubo::VptDenoiserMode::Reblur,
+        ] {
+            let settings = LightingSettings {
+                denoiser_mode,
+                ..LightingSettings::default()
+            };
+
+            assert_eq!(VptAtrousPass::active_iteration_count(settings), 4);
+        }
     }
 }

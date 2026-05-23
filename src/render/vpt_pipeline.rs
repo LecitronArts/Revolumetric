@@ -181,7 +181,7 @@ impl VptRuntimePipeline {
             lighting_settings.skip_backface_shadows as u32,
             lighting_settings.vpt_max_bounces,
             lighting_settings.sun_angular_radius.to_bits(),
-            lighting_settings.denoiser_enabled as u32,
+            lighting_settings.denoiser_mode.as_scene_key_value(),
             lighting_settings.denoiser_atrous_iterations,
             restir_di_enabled as u32,
             area_restir_enabled as u32,
@@ -914,7 +914,11 @@ impl VptRuntimePipeline {
                         vpt_debug_view: vpt_debug_view_name(
                             inputs.lighting_settings.vpt_debug_view,
                         ),
-                        denoiser_enabled: inputs.lighting_settings.denoiser_enabled,
+                        denoiser_enabled: inputs.lighting_settings.denoiser_enabled(),
+                        denoiser_mode: inputs.lighting_settings.denoiser_mode_name(),
+                        effective_denoiser_mode: inputs
+                            .lighting_settings
+                            .effective_denoiser_mode_name(),
                     });
                     tracing::info!(
                         frame_index = frame.frame_index,
@@ -1232,7 +1236,9 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::scene_ubo::{LightingDebugView, LightingSettings, RenderMode, VptDebugView};
+    use crate::render::scene_ubo::{
+        LightingDebugView, LightingSettings, RenderMode, VptDebugView, VptDenoiserMode,
+    };
     use crate::voxel::ucvh::{UcvhInvalidationRegion, UcvhMotionEvent};
 
     #[test]
@@ -1358,7 +1364,7 @@ mod tests {
                 sun_angular_radius: 0.02,
                 debug_view: LightingDebugView::Final,
                 exposure: 1.0,
-                denoiser_enabled: true,
+                denoiser_mode: VptDenoiserMode::Svgf,
                 denoiser_atrous_iterations: 4,
                 vpt_debug_view: VptDebugView::Final,
             },
@@ -1376,7 +1382,7 @@ mod tests {
                 sun_angular_radius: 0.05,
                 debug_view: LightingDebugView::Final,
                 exposure: 1.0,
-                denoiser_enabled: false,
+                denoiser_mode: VptDenoiserMode::Off,
                 denoiser_atrous_iterations: 2,
                 vpt_debug_view: VptDebugView::Final,
             },
@@ -1385,5 +1391,34 @@ mod tests {
         );
 
         assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn scene_key_tracks_requested_denoiser_mode() {
+        let base_settings = LightingSettings {
+            denoiser_mode: VptDenoiserMode::Svgf,
+            ..LightingSettings::default()
+        };
+        let relax_settings = LightingSettings {
+            denoiser_mode: VptDenoiserMode::Relax,
+            ..LightingSettings::default()
+        };
+
+        let base = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            base_settings,
+            false,
+            false,
+        );
+        let relax = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            relax_settings,
+            false,
+            false,
+        );
+
+        assert_ne!(base, relax);
     }
 }

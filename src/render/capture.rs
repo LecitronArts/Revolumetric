@@ -42,6 +42,8 @@ pub struct CaptureMetadata {
     pub area_restir_spatial_enabled: bool,
     pub vpt_debug_view: &'static str,
     pub denoiser_enabled: bool,
+    pub denoiser_mode: &'static str,
+    pub effective_denoiser_mode: &'static str,
 }
 
 pub struct RenderCapture {
@@ -115,7 +117,9 @@ impl CaptureMetadata {
                 "  \"area_restir_temporal_enabled\": {},\n",
                 "  \"area_restir_spatial_enabled\": {},\n",
                 "  \"vpt_debug_view\": \"{}\",\n",
-                "  \"denoiser_enabled\": {}\n",
+                "  \"denoiser_enabled\": {},\n",
+                "  \"denoiser_mode\": \"{}\",\n",
+                "  \"effective_denoiser_mode\": \"{}\"\n",
                 "}}\n"
             ),
             self.frame_index,
@@ -132,7 +136,9 @@ impl CaptureMetadata {
             self.area_restir_temporal_enabled,
             self.area_restir_spatial_enabled,
             json_escape(self.vpt_debug_view),
-            self.denoiser_enabled
+            self.denoiser_enabled,
+            json_escape(self.denoiser_mode),
+            json_escape(self.effective_denoiser_mode)
         )
     }
 }
@@ -427,6 +433,8 @@ mod tests {
             area_restir_spatial_enabled: false,
             vpt_debug_view: "final",
             denoiser_enabled: true,
+            denoiser_mode: "relax",
+            effective_denoiser_mode: "svgf",
         };
 
         let json = metadata.to_json();
@@ -437,5 +445,8 @@ mod tests {
         assert!(json.contains("\"restir_di_enabled\": true"));
         assert!(json.contains("\"area_restir_enabled\": true"));
         assert!(json.contains("\"vpt_debug_view\": \"final\""));
+        assert!(json.contains("\"denoiser_enabled\": true"));
+        assert!(json.contains("\"denoiser_mode\": \"relax\""));
+        assert!(json.contains("\"effective_denoiser_mode\": \"svgf\""));
     }
 }

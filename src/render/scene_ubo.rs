@@ -72,6 +72,14 @@ pub enum VptDebugView {
     VoxelHit,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VptDenoiserMode {
+    Off,
+    Svgf,
+    Relax,
+    Reblur,
+}
+
 impl RenderMode {
     pub fn as_gpu_value(self) -> u32 {
         match self {
@@ -117,6 +125,26 @@ impl VptDebugView {
     }
 }
 
+impl VptDenoiserMode {
+    pub fn as_config_value(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Svgf => "svgf",
+            Self::Relax => "relax",
+            Self::Reblur => "reblur",
+        }
+    }
+
+    pub fn as_scene_key_value(self) -> u32 {
+        match self {
+            Self::Off => 0,
+            Self::Svgf => 1,
+            Self::Relax => 2,
+            Self::Reblur => 3,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LightingSettings {
     pub shadows_enabled: bool,
@@ -126,7 +154,7 @@ pub struct LightingSettings {
     pub sun_angular_radius: f32,
     pub debug_view: LightingDebugView,
     pub exposure: f32,
-    pub denoiser_enabled: bool,
+    pub denoiser_mode: VptDenoiserMode,
     pub denoiser_atrous_iterations: u32,
     pub vpt_debug_view: VptDebugView,
 }
@@ -154,7 +182,7 @@ impl Default for LightingSettings {
             sun_angular_radius: 0.02,
             debug_view: LightingDebugView::Final,
             exposure: 1.0,
-            denoiser_enabled: true,
+            denoiser_mode: VptDenoiserMode::Svgf,
             denoiser_atrous_iterations: 4,
             vpt_debug_view: VptDebugView::Final,
         }
@@ -298,11 +326,11 @@ impl LightingSettings {
             &mut warnings,
         );
         apply_optional_override(
-            &mut settings.denoiser_enabled,
+            &mut settings.denoiser_mode,
             denoiser,
             "REVOLUMETRIC_DENOISER",
-            "on|off|1|0|true|false",
-            parse_bool_value,
+            "off|svgf|relax|reblur|on|1|true|false|0",
+            parse_vpt_denoiser_mode,
             &mut warnings,
         );
         apply_optional_override(
@@ -346,8 +374,29 @@ impl LightingSettings {
         flags
     }
 
+    pub fn effective_denoiser_mode(self) -> VptDenoiserMode {
+        match self.denoiser_mode {
+            VptDenoiserMode::Off => VptDenoiserMode::Off,
+            VptDenoiserMode::Svgf | VptDenoiserMode::Relax | VptDenoiserMode::Reblur => {
+                VptDenoiserMode::Svgf
+            }
+        }
+    }
+
+    pub fn denoiser_enabled(self) -> bool {
+        self.effective_denoiser_mode() != VptDenoiserMode::Off
+    }
+
+    pub fn denoiser_mode_name(self) -> &'static str {
+        self.denoiser_mode.as_config_value()
+    }
+
+    pub fn effective_denoiser_mode_name(self) -> &'static str {
+        self.effective_denoiser_mode().as_config_value()
+    }
+
     pub fn denoiser_flags(self) -> u32 {
-        if self.denoiser_enabled {
+        if self.denoiser_enabled() {
             DENOISER_FLAG_ENABLED
         } else {
             0
@@ -364,6 +413,25 @@ fn parse_bool_value(value: &str) -> Option<bool> {
         || value.eq_ignore_ascii_case("off")
     {
         Some(false)
+    } else {
+        None
+    }
+}
+
+fn parse_vpt_denoiser_mode(value: &str) -> Option<VptDenoiserMode> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("off") || value.eq_ignore_ascii_case("false") || value == "0" {
+        Some(VptDenoiserMode::Off)
+    } else if value.eq_ignore_ascii_case("svgf")
+        || value.eq_ignore_ascii_case("on")
+        || value.eq_ignore_ascii_case("true")
+        || value == "1"
+    {
+        Some(VptDenoiserMode::Svgf)
+    } else if value.eq_ignore_ascii_case("relax") {
+        Some(VptDenoiserMode::Relax)
+    } else if value.eq_ignore_ascii_case("reblur") {
+        Some(VptDenoiserMode::Reblur)
     } else {
         None
     }
@@ -657,6 +725,12 @@ mod tests {
             156
         );
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, vpt_max_bounces), 160);
+        assert_eq!(std::mem::offset_of!(GpuSceneUniforms, denoiser_flags), 164);
+        assert_eq!(
+            std::mem::offset_of!(GpuSceneUniforms, denoiser_atrous_iterations),
+            168
+        );
+        assert_eq!(std::mem::offset_of!(GpuSceneUniforms, vpt_debug_view), 172);
         assert_eq!(std::mem::offset_of!(GpuSceneUniforms, camera_right), 176);
     }
 
@@ -822,7 +896,7 @@ mod tests {
             sun_angular_radius: 0.02,
             debug_view: LightingDebugView::Final,
             exposure: 1.0,
-            denoiser_enabled: true,
+            denoiser_mode: VptDenoiserMode::Svgf,
             denoiser_atrous_iterations: 4,
             vpt_debug_view: VptDebugView::Final,
         };
@@ -894,6 +968,75 @@ mod tests {
     }
 
     #[test]
+    fn lighting_settings_parse_vpt_denoiser_modes_and_bool_aliases() {
+        let cases = [
+            ("off", VptDenoiserMode::Off),
+            ("false", VptDenoiserMode::Off),
+            ("0", VptDenoiserMode::Off),
+            ("svgf", VptDenoiserMode::Svgf),
+            ("on", VptDenoiserMode::Svgf),
+            ("true", VptDenoiserMode::Svgf),
+            ("1", VptDenoiserMode::Svgf),
+            ("relax", VptDenoiserMode::Relax),
+            ("reblur", VptDenoiserMode::Reblur),
+        ];
+
+        for (raw, expected) in cases {
+            let result = LightingSettings::from_values_report_with_denoiser(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(raw),
+                None,
+                None,
+                None,
+            );
+
+            assert!(
+                result.warnings.is_empty(),
+                "denoiser mode {raw} should parse without warnings"
+            );
+            assert_eq!(result.settings.denoiser_mode, expected);
+        }
+    }
+
+    #[test]
+    fn nrd_requested_modes_fall_back_to_svgf_until_backend_exists() {
+        for requested in [VptDenoiserMode::Relax, VptDenoiserMode::Reblur] {
+            let settings = LightingSettings {
+                denoiser_mode: requested,
+                ..LightingSettings::default()
+            };
+
+            assert_eq!(settings.effective_denoiser_mode(), VptDenoiserMode::Svgf);
+            assert!(settings.denoiser_enabled());
+            assert_eq!(settings.denoiser_flags(), DENOISER_FLAG_ENABLED);
+        }
+    }
+
+    #[test]
+    fn denoiser_flags_follow_effective_mode_without_growing_scene_ubo() {
+        let off = LightingSettings {
+            denoiser_mode: VptDenoiserMode::Off,
+            ..LightingSettings::default()
+        };
+        let svgf = LightingSettings {
+            denoiser_mode: VptDenoiserMode::Svgf,
+            ..LightingSettings::default()
+        };
+
+        assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 224);
+        assert_eq!(off.denoiser_flags() & DENOISER_FLAG_ENABLED, 0);
+        assert_eq!(
+            svgf.denoiser_flags() & DENOISER_FLAG_ENABLED,
+            DENOISER_FLAG_ENABLED
+        );
+    }
+
+    #[test]
     fn lighting_settings_encode_debug_view_without_colliding_with_boolean_flags() {
         let cases = [
             (LightingDebugView::Final, LIGHTING_DEBUG_VIEW_FINAL),
@@ -913,7 +1056,7 @@ mod tests {
                 sun_angular_radius: 0.02,
                 debug_view,
                 exposure: 1.0,
-                denoiser_enabled: true,
+                denoiser_mode: VptDenoiserMode::Svgf,
                 denoiser_atrous_iterations: 4,
                 vpt_debug_view: VptDebugView::Final,
             };
@@ -979,7 +1122,7 @@ mod tests {
 
         uniforms.apply_lighting_settings(settings);
 
-        assert!(!settings.denoiser_enabled);
+        assert_eq!(settings.denoiser_mode, VptDenoiserMode::Off);
         assert_eq!(settings.denoiser_atrous_iterations, 4);
         assert_eq!(settings.vpt_debug_view, VptDebugView::HistoryValid);
         assert_eq!(uniforms.denoiser_flags & DENOISER_FLAG_ENABLED, 0);
