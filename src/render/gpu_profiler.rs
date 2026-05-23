@@ -82,13 +82,14 @@ pub enum GpuProfileScope {
     AreaRestirSpatial = 8,
     VptTemporal = 9,
     VptAtrous = 10,
-    VptNrdFrontend = 11,
-    Postprocess = 12,
-    BlitToSwapchain = 13,
+    VptNrdConfidence = 11,
+    VptNrdFrontend = 12,
+    Postprocess = 13,
+    BlitToSwapchain = 14,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 14;
+    pub const COUNT: usize = 15;
     pub const ALL: [Self; Self::COUNT] = [
         Self::VptSurfaceBootstrap,
         Self::VptSurfaceSelected,
@@ -101,6 +102,7 @@ impl GpuProfileScope {
         Self::AreaRestirSpatial,
         Self::VptTemporal,
         Self::VptAtrous,
+        Self::VptNrdConfidence,
         Self::VptNrdFrontend,
         Self::Postprocess,
         Self::BlitToSwapchain,
@@ -119,6 +121,7 @@ impl GpuProfileScope {
             Self::AreaRestirSpatial => "AreaRestirSpatial",
             Self::VptTemporal => "VptTemporal",
             Self::VptAtrous => "VptAtrous",
+            Self::VptNrdConfidence => "VptNrdConfidence",
             Self::VptNrdFrontend => "VptNrdFrontend",
             Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
@@ -138,6 +141,7 @@ impl GpuProfileScope {
             Self::AreaRestirSpatial => "area_restir_spatial_ms",
             Self::VptTemporal => "vpt_temporal_ms",
             Self::VptAtrous => "vpt_atrous_ms",
+            Self::VptNrdConfidence => "vpt_nrd_confidence_ms",
             Self::VptNrdFrontend => "vpt_nrd_frontend_ms",
             Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
@@ -157,6 +161,7 @@ impl GpuProfileScope {
             | Self::AreaRestirSpatial
             | Self::VptTemporal
             | Self::VptAtrous
+            | Self::VptNrdConfidence
             | Self::VptNrdFrontend
             | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
             Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
@@ -673,7 +678,7 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 14);
+        assert_eq!(GpuProfileScope::COUNT, 15);
         assert_eq!(names[0], "VptSurfaceBootstrap");
         assert_eq!(names[1], "VptSurfaceSelected");
         assert_eq!(names[2], "Vpt");
@@ -685,9 +690,10 @@ mod tests {
         assert_eq!(names[8], "AreaRestirSpatial");
         assert_eq!(names[9], "VptTemporal");
         assert_eq!(names[10], "VptAtrous");
-        assert_eq!(names[11], "VptNrdFrontend");
-        assert_eq!(names[12], "Postprocess");
-        assert_eq!(names[13], "Blit");
+        assert_eq!(names[11], "VptNrdConfidence");
+        assert_eq!(names[12], "VptNrdFrontend");
+        assert_eq!(names[13], "Postprocess");
+        assert_eq!(names[14], "Blit");
         assert_eq!(columns[0], "vpt_surface_bootstrap_ms");
         assert_eq!(columns[1], "vpt_surface_selected_ms");
         assert_eq!(columns[2], "vpt_ms");
@@ -699,9 +705,10 @@ mod tests {
         assert_eq!(columns[8], "area_restir_spatial_ms");
         assert_eq!(columns[9], "vpt_temporal_ms");
         assert_eq!(columns[10], "vpt_atrous_ms");
-        assert_eq!(columns[11], "vpt_nrd_frontend_ms");
-        assert_eq!(columns[12], "postprocess_ms");
-        assert_eq!(columns[13], "blit_to_swapchain_ms");
+        assert_eq!(columns[11], "vpt_nrd_confidence_ms");
+        assert_eq!(columns[12], "vpt_nrd_frontend_ms");
+        assert_eq!(columns[13], "postprocess_ms");
+        assert_eq!(columns[14], "blit_to_swapchain_ms");
     }
 
     #[test]
@@ -718,6 +725,7 @@ mod tests {
             GpuProfileScope::AreaRestirSpatial,
             GpuProfileScope::VptTemporal,
             GpuProfileScope::VptAtrous,
+            GpuProfileScope::VptNrdConfidence,
             GpuProfileScope::VptNrdFrontend,
             GpuProfileScope::Postprocess,
         ] {
@@ -864,11 +872,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_frontend_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
+            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
+            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
         );
     }
 }

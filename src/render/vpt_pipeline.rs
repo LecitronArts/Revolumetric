@@ -17,6 +17,10 @@ use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_atrous::{
     VptAtrousGraphInputs, VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
 };
+use crate::render::passes::vpt_nrd_confidence::{
+    VptNrdConfidenceGraphInputs, VptNrdConfidencePass, VptNrdConfidencePassCreateInfo,
+    VptNrdConfidencePassResizeInfo,
+};
 use crate::render::passes::vpt_nrd_frontend::{
     VptNrdFrontendGraphInputs, VptNrdFrontendPass, VptNrdFrontendPassCreateInfo,
     VptNrdFrontendPassResizeInfo,
@@ -153,6 +157,7 @@ impl VptPipelineFrameState {
 pub struct VptRuntimePipeline {
     pub postprocess_pass: Option<PostprocessPass>,
     pub vpt_surface_pass: Option<VptSurfacePass>,
+    pub vpt_nrd_confidence_pass: Option<VptNrdConfidencePass>,
     pub vpt_pass: Option<VptPass>,
     pub vpt_nrd_frontend_pass: Option<VptNrdFrontendPass>,
     pub vpt_temporal_pass: Option<VptTemporalPass>,
@@ -198,6 +203,7 @@ impl VptRuntimePipeline {
         Self {
             postprocess_pass: None,
             vpt_surface_pass: None,
+            vpt_nrd_confidence_pass: None,
             vpt_pass: None,
             vpt_nrd_frontend_pass: None,
             vpt_temporal_pass: None,
@@ -218,6 +224,7 @@ impl VptRuntimePipeline {
         area_restir_enabled: bool,
     ) {
         self.ensure_vpt_surface_pass(renderer, scene_ubo, ucvh_gpu);
+        self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_nrd_frontend_pass(renderer, scene_ubo);
         self.ensure_restir_di_pass(renderer, scene_ubo, ucvh, restir_di_enabled);
@@ -310,6 +317,50 @@ impl VptRuntimePipeline {
             }
             Err(error) => {
                 tracing::error!(%error, "failed to create VPT pass");
+            }
+        }
+    }
+
+    fn ensure_vpt_nrd_confidence_pass(
+        &mut self,
+        renderer: &RenderDevice,
+        scene_ubo: &SceneUniformBuffer,
+    ) {
+        if self.vpt_nrd_confidence_pass.is_some() {
+            return;
+        }
+        let Some(vpt_surface) = &self.vpt_surface_pass else {
+            return;
+        };
+
+        let extent = renderer.swapchain_extent();
+        let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vpt_nrd_confidence.spv"));
+        if spirv.is_empty() {
+            tracing::warn!("vpt_nrd_confidence.spv is empty; slangc may not be installed");
+            return;
+        }
+
+        match VptNrdConfidencePass::new(
+            renderer.device(),
+            renderer.allocator(),
+            VptNrdConfidencePassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                spirv_bytes: spirv,
+                scene_ubo,
+                vpt_surface,
+            },
+        ) {
+            Ok(pass) => {
+                tracing::info!(
+                    width = extent.width,
+                    height = extent.height,
+                    "initialized VPT NRD confidence pass"
+                );
+                self.vpt_nrd_confidence_pass = Some(pass);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to create VPT NRD confidence pass");
             }
         }
     }
@@ -837,6 +888,27 @@ impl VptRuntimePipeline {
                     restir_di_selected_written = true;
                 }
 
+                let _nrd_confidence_outputs = if matches!(
+                    inputs.lighting_settings.denoiser_mode,
+                    VptDenoiserMode::Relax | VptDenoiserMode::Reblur
+                ) {
+                    self.vpt_nrd_confidence_pass
+                        .as_ref()
+                        .map(|vpt_nrd_confidence| {
+                            vpt_nrd_confidence.register_graph(
+                                &mut graph,
+                                VptNrdConfidenceGraphInputs {
+                                    frame_slot: slot,
+                                    surface_inputs: final_surface_writes,
+                                    previous_surface_inputs: previous_surface_resources,
+                                    profiler,
+                                },
+                            )
+                        })
+                } else {
+                    None
+                };
+
                 vpt_accumulation_written = true;
                 rendered_vpt = true;
 
@@ -1045,6 +1117,7 @@ impl VptRuntimePipeline {
                 self.frame_state.last_vpt_camera_key = None;
                 tracing::warn!(
                     vpt_ready = self.vpt_pass.is_some(),
+                    vpt_nrd_confidence_ready = self.vpt_nrd_confidence_pass.is_some(),
                     vpt_nrd_frontend_ready = self.vpt_nrd_frontend_pass.is_some(),
                     vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
                     vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
@@ -1141,6 +1214,22 @@ impl VptRuntimePipeline {
                 area_restir.update_surface_descriptors(&device, vpt_surface);
             }
         }
+        if let (Some(vpt_nrd_confidence), Some(vpt_surface)) =
+            (&mut self.vpt_nrd_confidence_pass, &self.vpt_surface_pass)
+        {
+            vpt_nrd_confidence
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdConfidencePassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        vpt_surface,
+                    },
+                )
+                .context("failed to resize VPT NRD confidence images")?;
+        }
         if restir_di_enabled && let Some(restir_di) = &mut self.restir_di_pass {
             restir_di
                 .resize_buffers(&device, allocator, width, height)
@@ -1227,6 +1316,9 @@ impl VptRuntimePipeline {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_atrous_pass {
+            pass.destroy(device, allocator);
+        }
+        if let Some(pass) = self.vpt_nrd_confidence_pass {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_nrd_frontend_pass {

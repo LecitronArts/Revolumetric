@@ -6,6 +6,7 @@ pub mod restir_di;
 pub mod voxel_upload;
 pub mod vpt;
 pub mod vpt_atrous;
+pub mod vpt_nrd_confidence;
 pub mod vpt_nrd_frontend;
 pub mod vpt_surface;
 pub mod vpt_temporal;

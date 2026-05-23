@@ -1,5 +1,6 @@
 use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
 use crate::render::passes::vpt_atrous::VptAtrousPass;
+use crate::render::passes::vpt_nrd_confidence::VptNrdConfidencePass;
 use crate::render::passes::vpt_nrd_frontend::VptNrdFrontendPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::VptTemporalPass;
@@ -927,6 +928,181 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         .expect("SVGF temporal graph registration should exist");
     assert!(vpt_idx < nrd_idx);
     assert!(vpt_idx < temporal_idx);
+}
+
+#[test]
+fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
+    let shader = source("assets/shaders/passes/vpt_nrd_confidence.slang");
+    let pass = source("src/render/passes/vpt_nrd_confidence.rs");
+    let pass_mod = source("src/render/passes/mod.rs");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let compact_shader = shader.split_whitespace().collect::<String>();
+    let compact_pass = pass.split_whitespace().collect::<String>();
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT NRD confidence",
+        &VptNrdConfidencePass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_nrd_confidence.slang"),
+    );
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/vpt_nrd_confidence.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+            binding(1, DescriptorKind::StorageImage, "motion_history"),
+            binding(2, DescriptorKind::StorageImage, "motion_flags"),
+            binding(3, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(
+                4,
+                DescriptorKind::StorageImage,
+                "previous_surface_brick_generation"
+            ),
+            binding(5, DescriptorKind::StorageImage, "diff_confidence"),
+            binding(6, DescriptorKind::StorageImage, "spec_confidence"),
+        ]
+    );
+
+    for token in [
+        "#include \"scene_common.slang\"",
+        "#include \"vpt_motion_common.slang\"",
+        "[[vk::image_format(\"rgba32f\")]]",
+        "[[vk::image_format(\"r32ui\")]]",
+        "[[vk::image_format(\"r16f\")]]",
+        "RWTexture2D<float4> motion_history",
+        "RWTexture2D<uint> motion_flags",
+        "RWTexture2D<uint> surface_brick_generation",
+        "RWTexture2D<uint> previous_surface_brick_generation",
+        "RWTexture2D<float> diff_confidence",
+        "RWTexture2D<float> spec_confidence",
+        "float vpt_nrd_diffuse_history_confidence(uint2 pixel, SceneUniforms scene)",
+        "vpt_motion_flags_reject_history(flags)",
+        "vpt_surface_generation_rejects_history(previous_generation, current_generation)",
+        "spec_confidence[tid.xy] = 0.0;",
+    ] {
+        assert!(
+            shader.contains(token),
+            "NRD confidence shader missing {token}"
+        );
+    }
+    for token in [
+        "float2previous_pixel_f=motion_history[pixel].xy+float2(pixel)+0.5;",
+        "int2previous_pixel=int2(floor(previous_pixel_f));",
+        "if(previous_pixel.x<0||previous_pixel.y<0||previous_pixel.x>=int(scene.resolution.x)||previous_pixel.y>=int(scene.resolution.y)){return0.0;}",
+        "uintprevious_generation=previous_surface_brick_generation[uint2(previous_pixel)];",
+        "uintcurrent_generation=surface_brick_generation[pixel];",
+        "return1.0;",
+        "diff_confidence[tid.xy]=vpt_nrd_diffuse_history_confidence(tid.xy,scene);",
+        "spec_confidence[tid.xy]=0.0;",
+    ] {
+        assert!(
+            compact_shader.contains(token),
+            "NRD confidence shader missing compact token {token}"
+        );
+    }
+
+    for token in [
+        "pub struct VptNrdConfidencePass",
+        "pub struct VptNrdConfidenceGraphInputs",
+        "pub struct VptNrdConfidenceGraphOutputs",
+        "pub struct VptNrdConfidenceResources",
+        "pub surface_inputs: VptCurrentSurfaceResources",
+        "pub previous_surface_inputs: VptPreviousSurfaceResources",
+        "pub confidence: VptNrdConfidenceResources",
+        "pub diff_confidence: GpuImage",
+        "pub spec_confidence: GpuImage",
+        "pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 7]",
+        "descriptor_count: 6 * frame_count as u32",
+        "vk::Format::R16_SFLOAT",
+        "vpt_nrd_diff_confidence",
+        "vpt_nrd_spec_confidence",
+        "graph.add_pass(\"vpt_nrd_confidence\"",
+        "GpuProfileScope::VptNrdConfidence",
+    ] {
+        assert!(pass.contains(token), "NRD confidence pass missing {token}");
+    }
+    for token in [
+        "builder.read_as(surface_inputs.motion_history,AccessKind::ComputeShaderRead);",
+        "builder.read_as(surface_inputs.motion_flags,AccessKind::ComputeShaderRead);",
+        "builder.read_as(surface_inputs.brick_generation,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(previous_surface_inputs.brick_generation,AccessKind::ComputeShaderRead,);",
+        "builder.write_as(diff_resource,AccessKind::ComputeShaderWrite);",
+        "builder.write_as(spec_resource,AccessKind::ComputeShaderWrite);",
+    ] {
+        assert!(
+            compact_pass.contains(token),
+            "NRD confidence pass missing compact token {token}"
+        );
+    }
+    for forbidden in [
+        "[ResourceHandle; 4]",
+        "[ResourceHandle; 6]",
+        "surface_inputs[",
+        "previous_surface_inputs[",
+        "confidence_outputs[",
+    ] {
+        assert!(
+            !pass.contains(forbidden),
+            "NRD confidence pass must use named resources, found {forbidden}"
+        );
+    }
+    assert!(pass_mod.contains("pub mod vpt_nrd_confidence;"));
+
+    for token in [
+        "use crate::render::passes::vpt_nrd_confidence::{",
+        "pub vpt_nrd_confidence_pass: Option<VptNrdConfidencePass>",
+        "vpt_nrd_confidence_pass: None",
+        "self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);",
+        "fn ensure_vpt_nrd_confidence_pass(",
+        "include_bytes!(concat!(env!(\"OUT_DIR\"), \"/shaders/vpt_nrd_confidence.spv\"))",
+        "VptNrdConfidencePass::new(",
+        "failed to resize VPT NRD confidence images",
+        "vpt_nrd_confidence_ready = self.vpt_nrd_confidence_pass.is_some()",
+        "pass.destroy(device, allocator);",
+    ] {
+        assert!(pipeline.contains(token), "pipeline missing {token}");
+    }
+    assert!(
+        compact_pipeline.contains(
+            "let_nrd_confidence_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
+        ),
+        "pipeline must record NRD confidence only for requested NRD modes"
+    );
+    assert!(
+        compact_pipeline
+            .contains("vpt_nrd_confidence.register_graph(&mutgraph,VptNrdConfidenceGraphInputs{"),
+        "pipeline must register confidence graph"
+    );
+    assert!(
+        compact_pipeline.contains("surface_inputs:final_surface_writes,"),
+        "confidence pass must consume final selected surface writes"
+    );
+    assert!(
+        compact_pipeline.contains("previous_surface_inputs:previous_surface_resources,"),
+        "confidence pass must compare against previous surface resources"
+    );
+    assert!(
+        compact_pipeline.contains("let_nrd_confidence_outputs="),
+        "pipeline must make the unused confidence output explicit until NRD adapter wiring"
+    );
+    assert!(
+        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
+        "SVGF fallback output must remain the postprocess input"
+    );
+    let surface_idx = pipeline
+        .find("vpt_surface.register_bootstrap_graph(")
+        .expect("surface graph registration should exist");
+    let confidence_idx = pipeline
+        .find("vpt_nrd_confidence.register_graph(")
+        .expect("confidence graph registration should exist");
+    let frontend_idx = pipeline
+        .find("vpt_nrd_frontend.register_graph(")
+        .expect("NRD frontend graph registration should exist");
+    let temporal_idx = pipeline
+        .find("vpt_temporal.register_graph(")
+        .expect("SVGF temporal graph registration should exist");
+    assert!(surface_idx < confidence_idx);
+    assert!(confidence_idx < frontend_idx);
+    assert!(confidence_idx < temporal_idx);
 }
 
 #[test]
