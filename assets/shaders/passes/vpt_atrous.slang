@@ -31,10 +31,14 @@ RWTexture2D<float4> surface_normal_roughness;
 RWTexture2D<float4> surface_albedo_material;
 
 [[vk::binding(6, 0)]]
+[[vk::image_format("rgba32f")]]
+RWTexture2D<float4> surface_material_roughness;
+
+[[vk::binding(7, 0)]]
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> filtered_radiance_image;
 
-[[vk::binding(7, 0)]]
+[[vk::binding(8, 0)]]
 ConstantBuffer<VptAtrousUniforms> vpt_atrous;
 
 static const int2 atrous_offsets[5] = {
@@ -96,6 +100,10 @@ float material_weight(float center_material, float neighbor_material) {
     return abs(center_material - neighbor_material) <= 0.5 ? 1.0 : 0.0;
 }
 
+float roughness_weight(float center_roughness, float neighbor_roughness) {
+    return exp(-abs(center_roughness - neighbor_roughness) * 6.0);
+}
+
 float albedo_weight(float3 center_albedo, float3 neighbor_albedo) {
     float3 albedo_delta = abs(center_albedo - neighbor_albedo);
     float max_delta = max(albedo_delta.x, max(albedo_delta.y, albedo_delta.z));
@@ -108,12 +116,15 @@ float surface_guide_weight(
     float4 center_normal_roughness,
     float4 neighbor_normal_roughness,
     float4 center_albedo_material,
-    float4 neighbor_albedo_material
+    float4 neighbor_albedo_material,
+    float4 center_material_roughness,
+    float4 neighbor_material_roughness
 ) {
     return normal_weight(center_normal_roughness.xyz, neighbor_normal_roughness.xyz)
         * depth_weight(center_position_depth, neighbor_position_depth)
         * albedo_weight(center_albedo_material.rgb, neighbor_albedo_material.rgb)
-        * material_weight(center_albedo_material.w, neighbor_albedo_material.w);
+        * material_weight(center_albedo_material.w, neighbor_albedo_material.w)
+        * roughness_weight(center_material_roughness.x, neighbor_material_roughness.x);
 }
 
 struct AtrousLuminanceStats {
@@ -129,7 +140,8 @@ AtrousLuminanceStats gather_atrous_luminance_stats(
     SceneUniforms scene,
     float4 center_position_depth,
     float4 center_normal_roughness,
-    float4 center_albedo_material
+    float4 center_albedo_material,
+    float4 center_material_roughness
 ) {
     float weighted_luma = 0.0;
     float weighted_luma_sq = 0.0;
@@ -156,13 +168,16 @@ AtrousLuminanceStats gather_atrous_luminance_stats(
 
             float4 neighbor_normal_roughness = surface_normal_roughness[neighbor_pixel];
             float4 neighbor_albedo_material = surface_albedo_material[neighbor_pixel];
+            float4 neighbor_material_roughness = surface_material_roughness[neighbor_pixel];
             float guide_weight = surface_guide_weight(
                 center_position_depth,
                 neighbor_position_depth,
                 center_normal_roughness,
                 neighbor_normal_roughness,
                 center_albedo_material,
-                neighbor_albedo_material
+                neighbor_albedo_material,
+                center_material_roughness,
+                neighbor_material_roughness
             );
             float tap_weight = atrous_kernel[x] * atrous_kernel[y] * guide_weight;
             if (tap_weight <= 1.0e-5) {
@@ -279,6 +294,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     float4 center_position_depth = surface_position_depth[pixel];
     float4 center_normal_roughness = surface_normal_roughness[pixel];
     float4 center_albedo_material = surface_albedo_material[pixel];
+    float4 center_material_roughness = surface_material_roughness[pixel];
     float4 center_moments_history = moments_history_image[pixel];
 
     if (atrous_passthrough(scene) || center_position_depth.w < 0.0 || center_moments_history.w <= 0.0) {
@@ -294,7 +310,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
             scene,
             center_position_depth,
             center_normal_roughness,
-            center_albedo_material
+            center_albedo_material,
+            center_material_roughness
         )
         : (AtrousLuminanceStats)0;
     float3 center_filtered_radiance = gather_spatial_stats
@@ -335,6 +352,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
 
             float4 neighbor_normal_roughness = surface_normal_roughness[neighbor_pixel];
             float4 neighbor_albedo_material = surface_albedo_material[neighbor_pixel];
+            float4 neighbor_material_roughness = surface_material_roughness[neighbor_pixel];
             float4 neighbor_moments_history = moments_history_image[neighbor_pixel];
             if (neighbor_moments_history.w <= 0.0) {
                 continue;
@@ -360,7 +378,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
                     center_normal_roughness,
                     neighbor_normal_roughness,
                     center_albedo_material,
-                    neighbor_albedo_material
+                    neighbor_albedo_material,
+                    center_material_roughness,
+                    neighbor_material_roughness
                 )
                 * variance_weight(center_radiance.rgb, clamped_neighbor_radiance, combined_variance);
             float tap_weight = kernel_weight * guide_weight;

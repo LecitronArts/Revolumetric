@@ -177,46 +177,128 @@ fn vpt_temporal_shader_binding_manifest_matches_motion_guide_resources() {
             binding(
                 6,
                 DescriptorKind::StorageImage,
-                "previous_surface_position_depth"
+                "surface_material_roughness"
             ),
             binding(
                 7,
                 DescriptorKind::StorageImage,
-                "previous_surface_normal_roughness"
+                "previous_surface_position_depth"
             ),
             binding(
                 8,
                 DescriptorKind::StorageImage,
+                "previous_surface_normal_roughness"
+            ),
+            binding(
+                9,
+                DescriptorKind::StorageImage,
                 "previous_surface_albedo_material"
             ),
-            binding(9, DescriptorKind::StorageImage, "motion_history"),
             binding(
                 10,
+                DescriptorKind::StorageImage,
+                "previous_surface_material_roughness"
+            ),
+            binding(11, DescriptorKind::StorageImage, "motion_history"),
+            binding(
+                12,
                 DescriptorKind::StorageImage,
                 "accumulated_radiance_image"
             ),
             binding(
-                11,
+                13,
                 DescriptorKind::StorageImage,
                 "accumulated_moments_history_image",
             ),
             binding(
-                12,
+                14,
                 DescriptorKind::StorageImage,
                 "previous_accumulated_radiance_image"
             ),
             binding(
-                13,
+                15,
                 DescriptorKind::StorageImage,
                 "previous_accumulated_moments_history_image",
             ),
-            binding(14, DescriptorKind::StorageImage, "motion_flags"),
-            binding(15, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(16, DescriptorKind::StorageImage, "motion_flags"),
+            binding(17, DescriptorKind::StorageImage, "surface_brick_generation"),
             binding(
-                16,
+                18,
                 DescriptorKind::StorageImage,
                 "previous_surface_brick_generation",
             ),
+        ]
+    );
+}
+
+#[test]
+fn vpt_temporal_and_atrous_consume_material_roughness_guide() {
+    let temporal = source("assets/shaders/passes/vpt_temporal.slang");
+    let atrous = source("assets/shaders/passes/vpt_atrous.slang");
+    let temporal_rs = source("src/render/passes/vpt_temporal.rs");
+    let atrous_rs = source("src/render/passes/vpt_atrous.rs");
+    let compact_temporal_rs = temporal_rs.split_whitespace().collect::<String>();
+    let compact_atrous_rs = atrous_rs.split_whitespace().collect::<String>();
+
+    for token in [
+        "RWTexture2D<float4> surface_material_roughness",
+        "RWTexture2D<float4> previous_surface_material_roughness",
+        "roughness_delta",
+        "surface_material_roughness[pixel]",
+        "previous_surface_material_roughness[previous_pixel]",
+    ] {
+        assert!(temporal.contains(token), "temporal shader missing {token}");
+    }
+
+    for token in [
+        "RWTexture2D<float4> surface_material_roughness",
+        "float roughness_weight(",
+        "surface_material_roughness[neighbor_pixel]",
+        "center_material_roughness",
+    ] {
+        assert!(atrous.contains(token), "A-trous shader missing {token}");
+    }
+
+    assert!(temporal_rs.contains("surface_inputs: [ResourceHandle; 7]"));
+    assert!(temporal_rs.contains("previous_surface_inputs: [ResourceHandle; 5]"));
+    assert!(atrous_rs.contains("surface_inputs: [ResourceHandle; 7]"));
+
+    for token in [
+        "forbindingin1..=18",
+        "letimage_refs=[&vpt.noisy_radiance_image,&vpt.noisy_moments_image,&vpt_surface.surface_position_depth,&vpt_surface.surface_normal_roughness,&vpt_surface.surface_albedo_material,&vpt_surface.surface_material_roughness,&vpt_surface.previous_surface_position_depth,&vpt_surface.previous_surface_normal_roughness,&vpt_surface.previous_surface_albedo_material,&vpt_surface.previous_surface_material_roughness,&vpt_surface.motion_history,temporal.accumulated_radiance,temporal.accumulated_moments_history,temporal.previous_accumulated_radiance,temporal.previous_accumulated_moments_history,&vpt_surface.motion_flags,&vpt_surface.surface_brick_generation,&vpt_surface.previous_surface_brick_generation,];",
+    ] {
+        assert!(
+            compact_temporal_rs.contains(token),
+            "temporal Rust roughness descriptor order missing {token}"
+        );
+    }
+
+    for token in [
+        "builder.read_as(surface_inputs[0],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[1],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[2],AccessKind::ComputeShaderRead);builder.read_as(surface_inputs[3],AccessKind::ComputeShaderRead);",
+        "letimage_refs=[info.input_radiance,&info.temporal.accumulated_moments_history,&info.vpt_surface.surface_position_depth,&info.vpt_surface.surface_normal_roughness,&info.vpt_surface.surface_albedo_material,&info.vpt_surface.surface_material_roughness,info.output_radiance,];",
+        ".dst_binding(8).descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)",
+    ] {
+        assert!(
+            compact_atrous_rs.contains(token),
+            "A-trous Rust roughness descriptor order missing {token}"
+        );
+    }
+}
+
+#[test]
+fn vpt_atrous_shader_binding_manifest_matches_roughness_guide_resources() {
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/vpt_atrous.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+            binding(1, DescriptorKind::StorageImage, "input_radiance_image"),
+            binding(2, DescriptorKind::StorageImage, "moments_history_image"),
+            binding(3, DescriptorKind::StorageImage, "surface_position_depth"),
+            binding(4, DescriptorKind::StorageImage, "surface_normal_roughness"),
+            binding(5, DescriptorKind::StorageImage, "surface_albedo_material"),
+            binding(6, DescriptorKind::StorageImage, "surface_material_roughness"),
+            binding(7, DescriptorKind::StorageImage, "filtered_radiance_image"),
+            binding(8, DescriptorKind::UniformBuffer, "vpt_atrous"),
         ]
     );
 }

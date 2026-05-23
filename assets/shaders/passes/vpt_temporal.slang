@@ -27,45 +27,53 @@ RWTexture2D<float4> surface_albedo_material;
 
 [[vk::binding(6, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_position_depth;
+RWTexture2D<float4> surface_material_roughness;
 
 [[vk::binding(7, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_normal_roughness;
+RWTexture2D<float4> previous_surface_position_depth;
 
 [[vk::binding(8, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> previous_surface_albedo_material;
+RWTexture2D<float4> previous_surface_normal_roughness;
 
 [[vk::binding(9, 0)]]
 [[vk::image_format("rgba32f")]]
-RWTexture2D<float4> motion_history;
+RWTexture2D<float4> previous_surface_albedo_material;
 
 [[vk::binding(10, 0)]]
-[[vk::image_format("rgba16f")]]
-RWTexture2D<float4> accumulated_radiance_image;
+[[vk::image_format("rgba32f")]]
+RWTexture2D<float4> previous_surface_material_roughness;
 
 [[vk::binding(11, 0)]]
-[[vk::image_format("rgba16f")]]
-RWTexture2D<float4> accumulated_moments_history_image;
+[[vk::image_format("rgba32f")]]
+RWTexture2D<float4> motion_history;
 
 [[vk::binding(12, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> previous_accumulated_radiance_image;
+RWTexture2D<float4> accumulated_radiance_image;
 
 [[vk::binding(13, 0)]]
 [[vk::image_format("rgba16f")]]
-RWTexture2D<float4> previous_accumulated_moments_history_image;
+RWTexture2D<float4> accumulated_moments_history_image;
 
 [[vk::binding(14, 0)]]
+[[vk::image_format("rgba16f")]]
+RWTexture2D<float4> previous_accumulated_radiance_image;
+
+[[vk::binding(15, 0)]]
+[[vk::image_format("rgba16f")]]
+RWTexture2D<float4> previous_accumulated_moments_history_image;
+
+[[vk::binding(16, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> motion_flags;
 
-[[vk::binding(15, 0)]]
+[[vk::binding(17, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> surface_brick_generation;
 
-[[vk::binding(16, 0)]]
+[[vk::binding(18, 0)]]
 [[vk::image_format("r32ui")]]
 RWTexture2D<uint> previous_surface_brick_generation;
 
@@ -163,6 +171,11 @@ bool compatible_current_surface(uint2 pixel, uint2 neighbor_pixel) {
     float4 center_albedo_material = surface_albedo_material[pixel];
     float4 neighbor_albedo_material = surface_albedo_material[neighbor_pixel];
     if (abs(center_albedo_material.w - neighbor_albedo_material.w) > 0.5) {
+        return false;
+    }
+
+    float roughness_delta = abs(surface_material_roughness[pixel].x - surface_material_roughness[neighbor_pixel].x);
+    if (roughness_delta > 0.35) {
         return false;
     }
 
@@ -318,6 +331,11 @@ bool compatible_history(uint2 pixel, uint2 previous_pixel) {
     float4 current_albedo_material = surface_albedo_material[pixel];
     float4 previous_albedo_material = previous_surface_albedo_material[previous_pixel];
     if (abs(current_albedo_material.w - previous_albedo_material.w) > 0.5) {
+        return false;
+    }
+
+    float roughness_delta = abs(surface_material_roughness[pixel].x - previous_surface_material_roughness[previous_pixel].x);
+    if (roughness_delta > 0.35) {
         return false;
     }
 

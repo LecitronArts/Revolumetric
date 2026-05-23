@@ -74,7 +74,7 @@ impl VptTemporalPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 16 * frame_count as u32,
+                descriptor_count: 18 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -417,7 +417,7 @@ fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSe
         vk::ShaderStageFlags::COMPUTE,
         1,
     );
-    for binding in 1..=16 {
+    for binding in 1..=18 {
         builder = builder.add_binding(
             binding,
             vk::DescriptorType::STORAGE_IMAGE,
@@ -589,9 +589,11 @@ fn write_descriptor_sets(
             &vpt_surface.surface_position_depth,
             &vpt_surface.surface_normal_roughness,
             &vpt_surface.surface_albedo_material,
+            &vpt_surface.surface_material_roughness,
             &vpt_surface.previous_surface_position_depth,
             &vpt_surface.previous_surface_normal_roughness,
             &vpt_surface.previous_surface_albedo_material,
+            &vpt_surface.previous_surface_material_roughness,
             &vpt_surface.motion_history,
             temporal.accumulated_radiance,
             temporal.accumulated_moments_history,

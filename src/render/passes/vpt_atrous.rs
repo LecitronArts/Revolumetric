@@ -88,7 +88,7 @@ impl VptAtrousPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: (6 * set_count) as u32,
+                descriptor_count: (7 * set_count) as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, set_count as u32, &pool_sizes) {
@@ -323,6 +323,7 @@ impl VptAtrousPass {
                 builder.read_as(surface_inputs[0], AccessKind::ComputeShaderRead);
                 builder.read_as(surface_inputs[1], AccessKind::ComputeShaderRead);
                 builder.read_as(surface_inputs[2], AccessKind::ComputeShaderRead);
+                builder.read_as(surface_inputs[3], AccessKind::ComputeShaderRead);
                 builder.write_as(atrous_output_resource, AccessKind::ComputeShaderWrite);
                 Box::new(move |ctx| {
                     if begin_atrous_scope && let Some(profiler) = profiler {
@@ -421,6 +422,12 @@ fn create_descriptor_set_layout(device: &ash::Device) -> Result<vk::DescriptorSe
         )
         .add_binding(
             7,
+            vk::DescriptorType::STORAGE_IMAGE,
+            vk::ShaderStageFlags::COMPUTE,
+            1,
+        )
+        .add_binding(
+            8,
             vk::DescriptorType::UNIFORM_BUFFER,
             vk::ShaderStageFlags::COMPUTE,
             1,
@@ -608,6 +615,7 @@ fn write_descriptor_set(device: &ash::Device, info: VptAtrousDescriptorWriteInfo
         &info.vpt_surface.surface_position_depth,
         &info.vpt_surface.surface_normal_roughness,
         &info.vpt_surface.surface_albedo_material,
+        &info.vpt_surface.surface_material_roughness,
         info.output_radiance,
     ];
     let image_infos: Vec<_> = image_refs
@@ -635,7 +643,7 @@ fn write_descriptor_set(device: &ash::Device, info: VptAtrousDescriptorWriteInfo
     writes.push(
         vk::WriteDescriptorSet::default()
             .dst_set(info.descriptor_set)
-            .dst_binding(7)
+            .dst_binding(8)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&atrous_info)),
     );
