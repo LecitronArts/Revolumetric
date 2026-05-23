@@ -132,15 +132,16 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
     }
 
     for token in [
-        "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.surface_view_z,images.motion_history,];",
+        "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.surface_view_z,images.surface_motion_id,images.motion_history,];",
         "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
         "surface_writes.position_depth,self.surface_position_depth.handle,",
         "graph.bind_image(surface_writes.material_roughness,self.surface_material_roughness.handle,);",
         "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
+        "graph.bind_image(surface_writes.motion_id,self.surface_motion_id.handle);",
         "graph.bind_image(surface_writes.brick_generation,self.surface_brick_generation.handle,);",
         "surface_writes,previous_surface_resources:VptPreviousSurfaceResources",
-        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,brick_generation:previous_surface_brick_generation_resource,}",
-        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
+        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,motion_id:previous_surface_motion_id_resource,brick_generation:previous_surface_brick_generation_resource,}",
+        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_motion_id,&self.previous_surface_motion_id,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
     ] {
         assert!(
             compact_rust.contains(token),
@@ -152,10 +153,12 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
         "builder.read_as(surface_inputs.position_depth,AccessKind::TransferRead);",
         "builder.read_as(surface_inputs.material_roughness,AccessKind::TransferRead);",
         "builder.read_as(surface_inputs.view_z,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.motion_id,AccessKind::TransferRead);",
         "builder.read_as(surface_inputs.brick_generation,AccessKind::TransferRead);",
         "previous_surface_inputs.position_depth,AccessKind::TransferWrite,",
         "previous_surface_inputs.material_roughness,AccessKind::TransferWrite,",
         "builder.write_as(previous_surface_inputs.view_z,AccessKind::TransferWrite);",
+        "builder.write_as(previous_surface_inputs.motion_id,AccessKind::TransferWrite);",
         "previous_surface_inputs.brick_generation,AccessKind::TransferWrite,",
     ] {
         assert!(
@@ -184,7 +187,7 @@ fn vpt_surface_writes_independent_view_z_guide() {
         "float view_z = scene_view_z(hit.position, scene);",
         "surface_view_z[pixel] = view_z;",
         "surface_position_depth[pixel] = float4(hit.position, hit.t);",
-        "motion.z = float(hit.motion_id);",
+        "motion.z = previous_view_z - view_z;",
     ] {
         assert!(
             surface.contains(token),
@@ -259,11 +262,17 @@ fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
     for token in [
         "pub surface_view_z: GpuImage",
         "pub previous_surface_view_z: GpuImage",
+        "pub surface_motion_id: GpuImage",
+        "pub previous_surface_motion_id: GpuImage",
         "pub surface_writes: VptCurrentSurfaceResources",
         "pub previous_surface_resources: VptPreviousSurfaceResources",
         "vpt_surface_view_z",
         "vpt_previous_surface_view_z",
+        "vpt_surface_motion_id",
+        "vpt_previous_surface_motion_id",
+        "descriptor_count: 18 * frame_count as u32",
         "vk::Format::R32_SFLOAT",
+        "vk::Format::R32_UINT",
     ] {
         assert!(
             surface_rs.contains(token),
@@ -273,13 +282,16 @@ fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
 
     for token in [
         "surface_view_z_resource",
+        "surface_motion_id_resource",
         "previous_surface_view_z_resource",
+        "previous_surface_motion_id_resource",
         "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
         "surface_writes.position_depth,self.surface_position_depth.handle,",
         "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
+        "graph.bind_image(surface_writes.motion_id,self.surface_motion_id.handle);",
         "graph.bind_image(surface_writes.brick_generation,self.surface_brick_generation.handle,);",
-        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,brick_generation:previous_surface_brick_generation_resource,}",
-        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
+        "previous_surface_resources:VptPreviousSurfaceResources{position_depth:previous_surface_position_resource,normal_roughness:previous_surface_normal_resource,albedo_material:previous_surface_albedo_resource,material_roughness:previous_surface_material_roughness_resource,view_z:previous_surface_view_z_resource,motion_id:previous_surface_motion_id_resource,brick_generation:previous_surface_brick_generation_resource,}",
+        "copy_surface_image(device,cmd,&self.surface_material_roughness,&self.previous_surface_material_roughness,);copy_surface_image(device,cmd,&self.surface_view_z,&self.previous_surface_view_z,);copy_surface_image(device,cmd,&self.surface_motion_id,&self.previous_surface_motion_id,);copy_surface_image(device,cmd,&self.surface_brick_generation,&self.previous_surface_brick_generation,);",
     ] {
         assert!(
             compact_surface.contains(token),
@@ -290,9 +302,11 @@ fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
     for token in [
         "builder.read_as(surface_inputs.position_depth,AccessKind::TransferRead);",
         "builder.read_as(surface_inputs.view_z,AccessKind::TransferRead);",
+        "builder.read_as(surface_inputs.motion_id,AccessKind::TransferRead);",
         "builder.read_as(surface_inputs.brick_generation,AccessKind::TransferRead);",
         "previous_surface_inputs.position_depth,AccessKind::TransferWrite,",
         "builder.write_as(previous_surface_inputs.view_z,AccessKind::TransferWrite);",
+        "builder.write_as(previous_surface_inputs.motion_id,AccessKind::TransferWrite);",
         "previous_surface_inputs.brick_generation,AccessKind::TransferWrite,",
     ] {
         assert!(
@@ -306,6 +320,8 @@ fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
         "previous_surface_inputs: VptPreviousSurfaceResources",
         "surface_inputs.view_z",
         "previous_surface_inputs.view_z",
+        "surface_inputs.motion_id",
+        "previous_surface_inputs.motion_id",
     ] {
         assert!(
             temporal_rs.contains(token),
@@ -334,6 +350,7 @@ fn vpt_surface_graph_uses_named_resources_instead_of_magic_arrays() {
         "pub position_depth: ResourceHandle",
         "pub material_roughness: ResourceHandle",
         "pub view_z: ResourceHandle",
+        "pub motion_id: ResourceHandle",
         "pub brick_generation: ResourceHandle",
     ] {
         assert!(
@@ -351,7 +368,9 @@ fn vpt_surface_graph_uses_named_resources_instead_of_magic_arrays() {
     ] {
         for forbidden in [
             "[ResourceHandle; 8]",
+            "[ResourceHandle; 9]",
             "[ResourceHandle; 6]",
+            "[ResourceHandle; 7]",
             "surface_inputs[",
             "previous_surface_inputs[",
             "final_surface_writes[",
@@ -370,8 +389,10 @@ fn vpt_surface_graph_uses_named_resources_instead_of_magic_arrays() {
         "surface_inputs.position_depth",
         "surface_inputs.material_roughness",
         "surface_inputs.view_z",
+        "surface_inputs.motion_id",
         "surface_inputs.brick_generation",
         "previous_surface_inputs.view_z",
+        "previous_surface_inputs.motion_id",
         "final_surface_writes.material_roughness",
         "bootstrap_surface_writes.position_depth",
         "area_graph.final_surface_writes",
@@ -402,22 +423,23 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
                 "surface_material_roughness"
             ),
             binding(5, DescriptorKind::StorageImage, "surface_view_z"),
-            binding(6, DescriptorKind::StorageImage, "motion_history"),
-            binding(7, DescriptorKind::StorageBuffer, "ucvh_config"),
-            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l1"),
-            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l2"),
-            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l3"),
-            binding(12, DescriptorKind::StorageBuffer, "hierarchy_l4"),
-            binding(13, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(14, DescriptorKind::StorageBuffer, "brick_materials"),
-            binding(15, DescriptorKind::UniformBuffer, "vpt_history"),
-            binding(16, DescriptorKind::UniformBuffer, "area_restir"),
-            binding(17, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
-            binding(18, DescriptorKind::StorageImage, "motion_flags"),
-            binding(19, DescriptorKind::StorageImage, "surface_brick_generation"),
-            binding(20, DescriptorKind::StorageBuffer, "brick_generations"),
-            binding(21, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
+            binding(6, DescriptorKind::StorageImage, "surface_motion_id"),
+            binding(7, DescriptorKind::StorageImage, "motion_history"),
+            binding(8, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(12, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(13, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(14, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(15, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(16, DescriptorKind::UniformBuffer, "vpt_history"),
+            binding(17, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(18, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(19, DescriptorKind::StorageImage, "motion_flags"),
+            binding(20, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(21, DescriptorKind::StorageBuffer, "brick_generations"),
+            binding(22, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
         ]
     );
 }
@@ -1262,7 +1284,9 @@ fn vpt_surface_motion_uses_history_uniform_reprojection() {
     assert!(shader.contains("current_clip.w <= 1.0e-5"));
     assert!(shader.contains("previous_clip.w <= 1.0e-5"));
     assert!(shader.contains("float2 current_pixel = float2(pixel) + 0.5"));
-    assert!(shader.contains("float2 motion = previous_pixel - current_pixel"));
+    assert!(shader.contains("float2 motion_delta = previous_pixel - current_pixel"));
+    assert!(shader.contains("float4 motion = float4(motion_delta, 0.0, 1.0);"));
+    assert!(shader.contains("motion.z = previous_view_z - view_z;"));
     assert!(!shader.contains("motion_history[pixel] = float4(float2(pixel), 0.0, 1.0);"));
 
     assert!(rust.contains("GpuVptHistoryUniforms"));
@@ -1276,7 +1300,7 @@ fn vpt_surface_motion_uses_history_uniform_reprojection() {
 }
 
 #[test]
-fn vpt_hit_payload_carries_motion_id_without_changing_reprojection_consumers() {
+fn vpt_motion_id_uses_independent_guide_without_changing_reprojection_consumers() {
     let ray = source("assets/shaders/shared/ray.slang");
     let traversal = source("assets/shaders/shared/voxel_traverse.slang");
     let surface = source("assets/shaders/passes/vpt_surface.slang");
@@ -1297,9 +1321,16 @@ fn vpt_hit_payload_carries_motion_id_without_changing_reprojection_consumers() {
         "primary UCVH hits should carry an explicit static motion source id"
     );
     assert!(
-        surface.contains("motion.z = float(hit.motion_id);")
-            && surface.contains("motion_history[pixel] = motion;"),
-        "surface motion guide should preserve the hit motion id in the unused z lane"
+        surface.contains("RWTexture2D<uint> surface_motion_id")
+            && surface.contains("surface_motion_id[pixel] = hit.motion_id;")
+            && surface.contains("surface_motion_id[pixel] = VPT_MOTION_ID_INVALID;"),
+        "surface motion guide should preserve the hit motion id in an independent uint guide"
+    );
+    assert!(
+        surface.contains("motion.z = previous_view_z - view_z;")
+            && surface.contains("motion_history[pixel] = motion;")
+            && !surface.contains("motion.z = float(hit.motion_id);"),
+        "motion.z must carry the NRD 2.5D depth delta, not the semantic motion id"
     );
     for consumer in [temporal, restir_di, area_restir] {
         assert!(

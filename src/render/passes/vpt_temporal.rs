@@ -410,6 +410,7 @@ impl VptTemporalPass {
                 builder.read_as(surface_inputs.albedo_material, AccessKind::TransferRead);
                 builder.read_as(surface_inputs.material_roughness, AccessKind::TransferRead);
                 builder.read_as(surface_inputs.view_z, AccessKind::TransferRead);
+                builder.read_as(surface_inputs.motion_id, AccessKind::TransferRead);
                 builder.read_as(surface_inputs.brick_generation, AccessKind::TransferRead);
                 builder.write_as(
                     previous_surface_inputs.position_depth,
@@ -428,6 +429,7 @@ impl VptTemporalPass {
                     AccessKind::TransferWrite,
                 );
                 builder.write_as(previous_surface_inputs.view_z, AccessKind::TransferWrite);
+                builder.write_as(previous_surface_inputs.motion_id, AccessKind::TransferWrite);
                 builder.write_as(
                     previous_surface_inputs.brick_generation,
                     AccessKind::TransferWrite,
