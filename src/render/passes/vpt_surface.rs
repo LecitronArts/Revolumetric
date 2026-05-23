@@ -28,9 +28,11 @@ pub struct VptSurfacePass {
     pub surface_position_depth: GpuImage,
     pub surface_normal_roughness: GpuImage,
     pub surface_albedo_material: GpuImage,
+    pub surface_material_roughness: GpuImage,
     pub previous_surface_position_depth: GpuImage,
     pub previous_surface_normal_roughness: GpuImage,
     pub previous_surface_albedo_material: GpuImage,
+    pub previous_surface_material_roughness: GpuImage,
     pub motion_history: GpuImage,
     pub motion_flags: GpuImage,
     pub surface_brick_generation: GpuImage,
@@ -40,8 +42,8 @@ pub struct VptSurfacePass {
 
 #[derive(Clone, Copy)]
 pub struct VptSurfaceBootstrapGraph {
-    pub surface_writes: [ResourceHandle; 6],
-    pub previous_surface_resources: [ResourceHandle; 4],
+    pub surface_writes: [ResourceHandle; 7],
+    pub previous_surface_resources: [ResourceHandle; 5],
 }
 
 #[repr(C)]
@@ -54,14 +56,14 @@ struct VptSurfacePushConstants {
 }
 
 impl VptSurfacePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 20] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 21] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(2, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(3, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
-            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
@@ -69,13 +71,14 @@ impl VptSurfacePass {
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_BUFFER),
-            DescriptorBindingSpec::compute(13, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(14, vk::DescriptorType::UNIFORM_BUFFER),
-            DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_BUFFER),
-            DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(15, vk::DescriptorType::UNIFORM_BUFFER),
+            DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
-            DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(19, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(20, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -100,7 +103,7 @@ impl VptSurfacePass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 12 * frame_count as u32,
+                descriptor_count: 14 * frame_count as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
@@ -245,9 +248,11 @@ impl VptSurfacePass {
             surface_position_depth: images.surface_position_depth,
             surface_normal_roughness: images.surface_normal_roughness,
             surface_albedo_material: images.surface_albedo_material,
+            surface_material_roughness: images.surface_material_roughness,
             previous_surface_position_depth: images.previous_surface_position_depth,
             previous_surface_normal_roughness: images.previous_surface_normal_roughness,
             previous_surface_albedo_material: images.previous_surface_albedo_material,
+            previous_surface_material_roughness: images.previous_surface_material_roughness,
             motion_history: images.motion_history,
             motion_flags: images.motion_flags,
             surface_brick_generation: images.surface_brick_generation,
@@ -279,6 +284,10 @@ impl VptSurfacePass {
                 &mut self.surface_albedo_material,
                 new_images.surface_albedo_material,
             ),
+            surface_material_roughness: std::mem::replace(
+                &mut self.surface_material_roughness,
+                new_images.surface_material_roughness,
+            ),
             previous_surface_position_depth: std::mem::replace(
                 &mut self.previous_surface_position_depth,
                 new_images.previous_surface_position_depth,
@@ -290,6 +299,10 @@ impl VptSurfacePass {
             previous_surface_albedo_material: std::mem::replace(
                 &mut self.previous_surface_albedo_material,
                 new_images.previous_surface_albedo_material,
+            ),
+            previous_surface_material_roughness: std::mem::replace(
+                &mut self.previous_surface_material_roughness,
+                new_images.previous_surface_material_roughness,
             ),
             motion_history: std::mem::replace(&mut self.motion_history, new_images.motion_history),
             motion_flags: std::mem::replace(&mut self.motion_flags, new_images.motion_flags),
@@ -308,6 +321,7 @@ impl VptSurfacePass {
             surface_position_depth: &self.surface_position_depth,
             surface_normal_roughness: &self.surface_normal_roughness,
             surface_albedo_material: &self.surface_albedo_material,
+            surface_material_roughness: &self.surface_material_roughness,
             motion_history: &self.motion_history,
             motion_flags: &self.motion_flags,
             surface_brick_generation: &self.surface_brick_generation,
@@ -423,6 +437,14 @@ impl VptSurfacePass {
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
             AccessKind::Undefined,
         );
+        let surface_material_roughness_resource = graph.import_image_with_access(
+            self.surface_material_roughness.handle,
+            self.surface_material_roughness.extent.width,
+            self.surface_material_roughness.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            AccessKind::Undefined,
+        );
         let motion_history_resource = graph.import_image_with_access(
             self.motion_history.handle,
             self.motion_history.extent.width,
@@ -482,6 +504,16 @@ impl VptSurfacePass {
                 | vk::ImageUsageFlags::TRANSFER_DST,
             previous_surface_access,
         );
+        let previous_surface_material_roughness_resource = graph.import_image_with_access(
+            self.previous_surface_material_roughness.handle,
+            self.previous_surface_material_roughness.extent.width,
+            self.previous_surface_material_roughness.extent.height,
+            vk::Format::R32G32B32A32_SFLOAT,
+            vk::ImageUsageFlags::STORAGE
+                | vk::ImageUsageFlags::TRANSFER_SRC
+                | vk::ImageUsageFlags::TRANSFER_DST,
+            previous_surface_access,
+        );
         let previous_surface_brick_generation_resource = graph.import_image_with_access(
             self.previous_surface_brick_generation.handle,
             self.previous_surface_brick_generation.extent.width,
@@ -498,6 +530,10 @@ impl VptSurfacePass {
                 builder.write_as(surface_position_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(surface_normal_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(surface_albedo_resource, AccessKind::ComputeShaderWrite);
+                builder.write_as(
+                    surface_material_roughness_resource,
+                    AccessKind::ComputeShaderWrite,
+                );
                 builder.write_as(motion_history_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(motion_flags_resource, AccessKind::ComputeShaderWrite);
                 builder.write_as(
@@ -528,6 +564,7 @@ impl VptSurfacePass {
             self.surface_position_depth.handle,
             self.surface_normal_roughness.handle,
             self.surface_albedo_material.handle,
+            self.surface_material_roughness.handle,
             self.motion_history.handle,
             self.motion_flags.handle,
             self.surface_brick_generation.handle,
@@ -544,11 +581,13 @@ impl VptSurfacePass {
                 bootstrap_writes[3],
                 bootstrap_writes[4],
                 bootstrap_writes[5],
+                bootstrap_writes[6],
             ],
             previous_surface_resources: [
                 previous_surface_position_resource,
                 previous_surface_normal_resource,
                 previous_surface_albedo_resource,
+                previous_surface_material_roughness_resource,
                 previous_surface_brick_generation_resource,
             ],
         }
@@ -612,6 +651,12 @@ impl VptSurfacePass {
         copy_surface_image(
             device,
             cmd,
+            &self.surface_material_roughness,
+            &self.previous_surface_material_roughness,
+        );
+        copy_surface_image(
+            device,
+            cmd,
             &self.surface_brick_generation,
             &self.previous_surface_brick_generation,
         );
@@ -628,11 +673,14 @@ impl VptSurfacePass {
         self.surface_position_depth.destroy(device, allocator);
         self.surface_normal_roughness.destroy(device, allocator);
         self.surface_albedo_material.destroy(device, allocator);
+        self.surface_material_roughness.destroy(device, allocator);
         self.previous_surface_position_depth
             .destroy(device, allocator);
         self.previous_surface_normal_roughness
             .destroy(device, allocator);
         self.previous_surface_albedo_material
+            .destroy(device, allocator);
+        self.previous_surface_material_roughness
             .destroy(device, allocator);
         self.motion_history.destroy(device, allocator);
         self.motion_flags.destroy(device, allocator);
@@ -682,9 +730,11 @@ struct VptSurfaceImages {
     surface_position_depth: GpuImage,
     surface_normal_roughness: GpuImage,
     surface_albedo_material: GpuImage,
+    surface_material_roughness: GpuImage,
     previous_surface_position_depth: GpuImage,
     previous_surface_normal_roughness: GpuImage,
     previous_surface_albedo_material: GpuImage,
+    previous_surface_material_roughness: GpuImage,
     motion_history: GpuImage,
     motion_flags: GpuImage,
     surface_brick_generation: GpuImage,
@@ -696,6 +746,7 @@ struct VptSurfaceImageRefs<'a> {
     surface_position_depth: &'a GpuImage,
     surface_normal_roughness: &'a GpuImage,
     surface_albedo_material: &'a GpuImage,
+    surface_material_roughness: &'a GpuImage,
     motion_history: &'a GpuImage,
     motion_flags: &'a GpuImage,
     surface_brick_generation: &'a GpuImage,
@@ -712,11 +763,14 @@ impl VptSurfaceImages {
         self.surface_position_depth.destroy(device, allocator);
         self.surface_normal_roughness.destroy(device, allocator);
         self.surface_albedo_material.destroy(device, allocator);
+        self.surface_material_roughness.destroy(device, allocator);
         self.previous_surface_position_depth
             .destroy(device, allocator);
         self.previous_surface_normal_roughness
             .destroy(device, allocator);
         self.previous_surface_albedo_material
+            .destroy(device, allocator);
+        self.previous_surface_material_roughness
             .destroy(device, allocator);
         self.motion_history.destroy(device, allocator);
         self.motion_flags.destroy(device, allocator);
@@ -769,6 +823,22 @@ fn create_surface_images(
             return Err(error);
         }
     };
+    let surface_material_roughness = match create_surface_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R32G32B32A32_SFLOAT,
+        "vpt_surface_material_roughness",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            surface_albedo_material.destroy(device, allocator);
+            surface_normal_roughness.destroy(device, allocator);
+            surface_position_depth.destroy(device, allocator);
+            return Err(error);
+        }
+    };
     let motion_history = match create_surface_image(
         device,
         allocator,
@@ -779,6 +849,7 @@ fn create_surface_images(
     ) {
         Ok(image) => image,
         Err(error) => {
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -796,6 +867,7 @@ fn create_surface_images(
         Ok(image) => image,
         Err(error) => {
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -814,6 +886,7 @@ fn create_surface_images(
         Err(error) => {
             motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -833,6 +906,7 @@ fn create_surface_images(
             surface_brick_generation.destroy(device, allocator);
             motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -853,6 +927,7 @@ fn create_surface_images(
             surface_brick_generation.destroy(device, allocator);
             motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -874,6 +949,30 @@ fn create_surface_images(
             surface_brick_generation.destroy(device, allocator);
             motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
+            surface_albedo_material.destroy(device, allocator);
+            surface_normal_roughness.destroy(device, allocator);
+            surface_position_depth.destroy(device, allocator);
+            return Err(error);
+        }
+    };
+    let previous_surface_material_roughness = match create_surface_image(
+        device,
+        allocator,
+        width,
+        height,
+        vk::Format::R32G32B32A32_SFLOAT,
+        "vpt_previous_surface_material_roughness",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            previous_surface_albedo_material.destroy(device, allocator);
+            previous_surface_normal_roughness.destroy(device, allocator);
+            previous_surface_position_depth.destroy(device, allocator);
+            surface_brick_generation.destroy(device, allocator);
+            motion_flags.destroy(device, allocator);
+            motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -890,12 +989,14 @@ fn create_surface_images(
     ) {
         Ok(image) => image,
         Err(error) => {
+            previous_surface_material_roughness.destroy(device, allocator);
             previous_surface_albedo_material.destroy(device, allocator);
             previous_surface_normal_roughness.destroy(device, allocator);
             previous_surface_position_depth.destroy(device, allocator);
             surface_brick_generation.destroy(device, allocator);
             motion_flags.destroy(device, allocator);
             motion_history.destroy(device, allocator);
+            surface_material_roughness.destroy(device, allocator);
             surface_albedo_material.destroy(device, allocator);
             surface_normal_roughness.destroy(device, allocator);
             surface_position_depth.destroy(device, allocator);
@@ -907,9 +1008,11 @@ fn create_surface_images(
         surface_position_depth,
         surface_normal_roughness,
         surface_albedo_material,
+        surface_material_roughness,
         previous_surface_position_depth,
         previous_surface_normal_roughness,
         previous_surface_albedo_material,
+        previous_surface_material_roughness,
         motion_history,
         motion_flags,
         surface_brick_generation,
@@ -959,6 +1062,7 @@ fn write_descriptor_sets(
             surface_position_depth: &images.surface_position_depth,
             surface_normal_roughness: &images.surface_normal_roughness,
             surface_albedo_material: &images.surface_albedo_material,
+            surface_material_roughness: &images.surface_material_roughness,
             motion_history: &images.motion_history,
             motion_flags: &images.motion_flags,
             surface_brick_generation: &images.surface_brick_generation,
@@ -982,6 +1086,7 @@ fn write_descriptor_sets_from_refs(
         images.surface_position_depth,
         images.surface_normal_roughness,
         images.surface_albedo_material,
+        images.surface_material_roughness,
         images.motion_history,
     ];
     let motion_guide_images = [images.motion_flags, images.surface_brick_generation];
@@ -1044,14 +1149,14 @@ fn write_descriptor_sets_from_refs(
         writes.extend(buffer_infos.iter().enumerate().map(|(idx, info)| {
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding((idx + 5) as u32)
+                .dst_binding((idx + 6) as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(info))
         }));
         writes.push(
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding(13)
+                .dst_binding(14)
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&history_ubo_info)),
         );
@@ -1070,7 +1175,7 @@ fn write_descriptor_sets_from_refs(
                 .map(|(idx, info)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(ds)
-                        .dst_binding(16 + idx as u32)
+                        .dst_binding(17 + idx as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                         .image_info(std::slice::from_ref(info))
                 }),
@@ -1091,7 +1196,7 @@ fn write_descriptor_sets_from_refs(
                 .map(|(idx, info)| {
                     vk::WriteDescriptorSet::default()
                         .dst_set(ds)
-                        .dst_binding(18 + idx as u32)
+                        .dst_binding(19 + idx as u32)
                         .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                         .buffer_info(std::slice::from_ref(info))
                 }),
@@ -1123,12 +1228,12 @@ fn write_area_restir_descriptor_set(
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(14)
+            .dst_binding(15)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .buffer_info(std::slice::from_ref(&area_uniform_info)),
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
-            .dst_binding(15)
+            .dst_binding(16)
             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
             .buffer_info(std::slice::from_ref(&area_reservoir_info)),
     ];

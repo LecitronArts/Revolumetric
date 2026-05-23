@@ -79,6 +79,57 @@ fn material_common_declares_deterministic_roughness_helpers() {
 }
 
 #[test]
+fn vpt_surface_writes_explicit_material_roughness_guide() {
+    let shader = source("assets/shaders/passes/vpt_surface.slang");
+    let rust = source("src/render/passes/vpt_surface.rs");
+    let compact_rust = rust.split_whitespace().collect::<String>();
+    let temporal = source("src/render/passes/vpt_temporal.rs");
+    let compact_temporal = temporal.split_whitespace().collect::<String>();
+
+    for token in [
+        "RWTexture2D<float4> surface_material_roughness",
+        "surface_material_roughness[pixel] = float4(material_cell_roughness(hit.cell), emissive_luma, 0.0, 1.0);",
+        "surface_material_roughness[pixel] = float4(1.0, 0.0, 0.0, 0.0);",
+        "material_emissive_luminance(hit.cell)",
+    ] {
+        assert!(shader.contains(token), "VPT surface shader missing {token}");
+    }
+
+    for token in [
+        "pub surface_material_roughness: GpuImage",
+        "pub previous_surface_material_roughness: GpuImage",
+        "pub surface_writes: [ResourceHandle; 7]",
+        "pub previous_surface_resources: [ResourceHandle; 5]",
+        "vpt_surface_material_roughness",
+        "vpt_previous_surface_material_roughness",
+    ] {
+        assert!(rust.contains(token), "VPT surface pass missing {token}");
+    }
+
+    for token in [
+        "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.motion_history,];",
+        "letsurface_images=[self.surface_position_depth.handle,self.surface_normal_roughness.handle,self.surface_albedo_material.handle,self.surface_material_roughness.handle,self.motion_history.handle,self.motion_flags.handle,self.surface_brick_generation.handle,];",
+        "surface_writes:[bootstrap_writes[0],bootstrap_writes[1],bootstrap_writes[2],bootstrap_writes[3],bootstrap_writes[4],bootstrap_writes[5],bootstrap_writes[6],]",
+        "previous_surface_resources:[previous_surface_position_resource,previous_surface_normal_resource,previous_surface_albedo_resource,previous_surface_material_roughness_resource,previous_surface_brick_generation_resource,]",
+    ] {
+        assert!(
+            compact_rust.contains(token),
+            "VPT surface pass order contract missing {token}"
+        );
+    }
+
+    for token in [
+        "builder.read_as(surface_inputs[0],AccessKind::TransferRead);builder.read_as(surface_inputs[1],AccessKind::TransferRead);builder.read_as(surface_inputs[2],AccessKind::TransferRead);builder.read_as(surface_inputs[3],AccessKind::TransferRead);builder.read_as(surface_inputs[6],AccessKind::TransferRead);",
+        "builder.write_as(previous_surface_inputs[0],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[1],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[2],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[3],AccessKind::TransferWrite);builder.write_as(previous_surface_inputs[4],AccessKind::TransferWrite);",
+    ] {
+        assert!(
+            compact_temporal.contains(token),
+            "VPT surface history update order contract missing {token}"
+        );
+    }
+}
+
+#[test]
 fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
     assert_eq!(
         shader_bindings("assets/shaders/passes/vpt_surface.slang"),
@@ -87,22 +138,27 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
             binding(1, DescriptorKind::StorageImage, "surface_position_depth"),
             binding(2, DescriptorKind::StorageImage, "surface_normal_roughness"),
             binding(3, DescriptorKind::StorageImage, "surface_albedo_material"),
-            binding(4, DescriptorKind::StorageImage, "motion_history"),
-            binding(5, DescriptorKind::StorageBuffer, "ucvh_config"),
-            binding(6, DescriptorKind::StorageBuffer, "hierarchy_l0"),
-            binding(7, DescriptorKind::StorageBuffer, "hierarchy_l1"),
-            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l2"),
-            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l3"),
-            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l4"),
-            binding(11, DescriptorKind::StorageBuffer, "brick_occupancy"),
-            binding(12, DescriptorKind::StorageBuffer, "brick_materials"),
-            binding(13, DescriptorKind::UniformBuffer, "vpt_history"),
-            binding(14, DescriptorKind::UniformBuffer, "area_restir"),
-            binding(15, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
-            binding(16, DescriptorKind::StorageImage, "motion_flags"),
-            binding(17, DescriptorKind::StorageImage, "surface_brick_generation"),
-            binding(18, DescriptorKind::StorageBuffer, "brick_generations"),
-            binding(19, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
+            binding(
+                4,
+                DescriptorKind::StorageImage,
+                "surface_material_roughness"
+            ),
+            binding(5, DescriptorKind::StorageImage, "motion_history"),
+            binding(6, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(7, DescriptorKind::StorageBuffer, "hierarchy_l0"),
+            binding(8, DescriptorKind::StorageBuffer, "hierarchy_l1"),
+            binding(9, DescriptorKind::StorageBuffer, "hierarchy_l2"),
+            binding(10, DescriptorKind::StorageBuffer, "hierarchy_l3"),
+            binding(11, DescriptorKind::StorageBuffer, "hierarchy_l4"),
+            binding(12, DescriptorKind::StorageBuffer, "brick_occupancy"),
+            binding(13, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(14, DescriptorKind::UniformBuffer, "vpt_history"),
+            binding(15, DescriptorKind::UniformBuffer, "area_restir"),
+            binding(16, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
+            binding(17, DescriptorKind::StorageImage, "motion_flags"),
+            binding(18, DescriptorKind::StorageImage, "surface_brick_generation"),
+            binding(19, DescriptorKind::StorageBuffer, "brick_generations"),
+            binding(20, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
         ]
     );
 }
@@ -1016,7 +1072,7 @@ fn vpt_temporal_applies_edge_aware_spatial_firefly_clamp_before_history() {
         "firefly clamp must keep luminance moments consistent with the clamped radiance"
     );
     assert!(
-        surface.contains("float emissive_luma = dot(material_emissive(hit.cell)")
+        surface.contains("float emissive_luma = material_emissive_luminance(hit.cell);")
             && surface.contains(
                 "surface_normal_roughness[pixel] = float4(normalize(hit.normal), emissive_luma);"
             ),

@@ -253,8 +253,8 @@ impl RestirDiPass {
         frame_index: u64,
         settings: RestirDiSettings,
         history_initialized: bool,
-        final_surface_writes: [ResourceHandle; 6],
-        previous_surface_resources: [ResourceHandle; 4],
+        final_surface_writes: [ResourceHandle; 7],
+        previous_surface_resources: [ResourceHandle; 5],
         profiler: Option<&'a GpuProfiler>,
     ) -> RestirDiGraphBuffers<'a> {
         let settings = restir_di_effective_settings(settings, history_initialized);
@@ -358,16 +358,12 @@ impl RestirDiPass {
             let temporal_writes =
                 graph.add_pass("restir_di_temporal", QueueType::Compute, |builder| {
                     builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[0], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[1], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[2], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[3], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[4], AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes[5], AccessKind::ComputeShaderRead);
-                    builder.read_as(previous_surface_resources[0], AccessKind::ComputeShaderRead);
-                    builder.read_as(previous_surface_resources[1], AccessKind::ComputeShaderRead);
-                    builder.read_as(previous_surface_resources[2], AccessKind::ComputeShaderRead);
-                    builder.read_as(previous_surface_resources[3], AccessKind::ComputeShaderRead);
+                    for surface_write in final_surface_writes.iter().copied() {
+                        builder.read_as(surface_write, AccessKind::ComputeShaderRead);
+                    }
+                    for previous_surface_resource in previous_surface_resources.iter().copied() {
+                        builder.read_as(previous_surface_resource, AccessKind::ComputeShaderRead);
+                    }
                     builder.read_as(initial_dep, AccessKind::ComputeShaderRead);
                     builder.read_as(selected_history_resource, AccessKind::ComputeShaderRead);
                     let temporal_output_resource = if spatial_active {
