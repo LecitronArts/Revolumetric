@@ -358,7 +358,19 @@ Required semantics:
 - `material_factors`
   - primary albedo and any BRDF factors required for remodulation
 
-The initial ReLAX target can be `RELAX_DIFFUSE` if specular inputs remain zero.
+Phase 3 initial target is **demodulated indirect diffuse only**:
+
+- denoise indirect diffuse radiance with `RELAX_DIFFUSE`
+- keep analytic sun direct, ReSTIR-DI direct, sky, primary-hit emissive, and
+  debug radiance in `residual_radiance`
+- do not fold direct lighting into `diff_radiance_hitdist` until direct-light
+  hit-distance semantics are defined and tested
+- use the first bounce after the primary hit as the baseline indirect diffuse
+  lobe hit distance
+
+This choice keeps the first NRD path honest: it avoids assigning a single fake
+hit distance to mixed direct/indirect lighting.
+
 `RELAX_DIFFUSE_SPECULAR` is allowed only when specular is represented honestly,
 even if the initial specular signal is intentionally zero and tested as such.
 
@@ -408,6 +420,12 @@ Build and license boundary:
 - Gate all SDK-dependent Rust/C++ build steps behind a Cargo feature such as
   `nrd`.
 - Builds without `nrd` must keep working and use `svgf` fallback.
+- Enabling the `nrd` feature without `REVOLUMETRIC_NRD_ROOT` must fail early
+  with a clear message that names the missing environment variable and the
+  NVIDIA RTX SDK license requirement.
+- CI/default verification does not require the NRD SDK. NRD feature
+  verification runs only when `REVOLUMETRIC_NRD_ROOT` is set and points to an
+  accepted local SDK checkout.
 
 Rust/C++ boundary:
 
@@ -435,7 +453,21 @@ Vulkan/ash responsibilities:
 - record all NRD dispatches inside RenderGraph-owned passes
 - recreate the NRD instance and resources on resize
 
-Resource mapping:
+`RELAX_DIFFUSE` initial resource mapping:
+
+```text
+IN_MV                       -> vpt_nrd_motion
+IN_NORMAL_ROUGHNESS         -> vpt_nrd_normal_roughness
+IN_VIEWZ                    -> vpt_nrd_view_z
+IN_DIFF_RADIANCE_HITDIST    -> vpt_nrd_diff_radiance_hitdist
+IN_DIFF_CONFIDENCE          -> vpt_nrd_diff_confidence, when enabled
+OUT_DIFF_RADIANCE_HITDIST   -> vpt_nrd_out_diff_radiance_hitdist
+OUT_VALIDATION              -> vpt_nrd_validation, when enabled
+TRANSIENT_POOL              -> adapter-owned transient textures
+PERMANENT_POOL              -> adapter-owned permanent textures
+```
+
+Diffuse/specular method mapping, enabled only after specular support is real:
 
 ```text
 IN_MV                       -> vpt_nrd_motion
@@ -508,10 +540,13 @@ nrd_residual
 
 ### Phase 3: Noisy NRD Frontend
 
-- Refactor `vpt.slang` output so NRD mode emits demodulated diffuse radiance.
+- Refactor `vpt.slang` output so NRD mode emits demodulated indirect diffuse
+  radiance.
 - Add lobe hit distance tracking.
 - Add zero-filled, tested specular input while specular is disabled.
 - Add residual radiance and material factors.
+- Keep analytic sun direct, ReSTIR-DI direct, sky, primary-hit emissive, and
+  debug radiance in residual radiance for the first NRD path.
 - Add ReLAX packing pass.
 - Keep current `noisy_radiance/noisy_moments` for SVGF fallback.
 
@@ -590,8 +625,10 @@ $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='3'; $env:REVOLUMETRIC_DENOISER='svgf'; carg
 Required runtime smoke for NRD feature builds:
 
 ```powershell
+$env:REVOLUMETRIC_NRD_ROOT='<accepted-local-nrd-sdk>'; cargo build --features 'desktop nrd' --bin revolumetric
 $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='3'; $env:REVOLUMETRIC_DENOISER='relax'; cargo run --features 'desktop nrd' --bin revolumetric; Remove-Item Env:\REVOLUMETRIC_EXIT_AFTER_FRAMES; Remove-Item Env:\REVOLUMETRIC_DENOISER
 $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='3'; $env:REVOLUMETRIC_DENOISER='relax'; $env:REVOLUMETRIC_VPT_DEBUG_VIEW='nrd_validation'; cargo run --features 'desktop nrd' --bin revolumetric; Remove-Item Env:\REVOLUMETRIC_EXIT_AFTER_FRAMES; Remove-Item Env:\REVOLUMETRIC_DENOISER; Remove-Item Env:\REVOLUMETRIC_VPT_DEBUG_VIEW
+Remove-Item Env:\REVOLUMETRIC_NRD_ROOT
 ```
 
 ReBLUR runtime smoke is required only after Phase 7:
