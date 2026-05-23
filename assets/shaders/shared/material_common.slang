@@ -14,16 +14,39 @@ static const float3 MATERIAL_ALBEDO[8] = {
     float3(0.45, 0.30, 0.18),    // 7: wood
 };
 
+static const float MATERIAL_ROUGHNESS[8] = {
+    1.00, // 0: default diffuse
+    0.95, // 1: stone
+    0.90, // 2: red cloth
+    0.90, // 3: green cloth
+    0.85, // 4: blue
+    0.88, // 5: brick
+    0.98, // 6: dark stone
+    0.72, // 7: wood
+};
+
 float3 material_albedo(uint material_id) {
     return MATERIAL_ALBEDO[min(material_id, 7u)];
+}
+
+float material_roughness(uint material_id) {
+    return MATERIAL_ROUGHNESS[min(material_id, 7u)];
 }
 
 float3 material_cell_albedo(VoxelCell cell) {
     return material_albedo(voxel_material(cell));
 }
 
+float material_cell_roughness(VoxelCell cell) {
+    return material_roughness(voxel_material(cell));
+}
+
 float3 material_emissive(VoxelCell cell) {
     return voxel_emissive(cell);
+}
+
+float material_emissive_luminance(VoxelCell cell) {
+    return dot(material_emissive(cell), float3(0.2126, 0.7152, 0.0722));
 }
 
 bool material_has_emissive(float3 emissive) {

@@ -62,6 +62,23 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
 }
 
 #[test]
+fn material_common_declares_deterministic_roughness_helpers() {
+    let material = source("assets/shaders/shared/material_common.slang");
+
+    for token in [
+        "static const float MATERIAL_ROUGHNESS[8]",
+        "float material_roughness(uint material_id)",
+        "float material_cell_roughness(VoxelCell cell)",
+        "float material_emissive_luminance(VoxelCell cell)",
+        "return MATERIAL_ROUGHNESS[min(material_id, 7u)]",
+        "return material_roughness(voxel_material(cell));",
+        "return dot(material_emissive(cell), float3(0.2126, 0.7152, 0.0722));",
+    ] {
+        assert!(material.contains(token), "material common missing {token}");
+    }
+}
+
+#[test]
 fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
     assert_eq!(
         shader_bindings("assets/shaders/passes/vpt_surface.slang"),
