@@ -1,5 +1,6 @@
 use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
 use crate::render::passes::vpt_atrous::VptAtrousPass;
+use crate::render::passes::vpt_nrd_frontend::VptNrdFrontendPass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::VptTemporalPass;
 
@@ -79,8 +80,16 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
             binding(12, DescriptorKind::StorageImage, "noisy_moments_image"),
             binding(13, DescriptorKind::UniformBuffer, "area_restir"),
             binding(14, DescriptorKind::StorageBuffer, "area_restir_reservoirs"),
-            binding(15, DescriptorKind::StorageImage, "nrd_diff_radiance_hitdist"),
-            binding(16, DescriptorKind::StorageImage, "nrd_spec_radiance_hitdist"),
+            binding(
+                15,
+                DescriptorKind::StorageImage,
+                "nrd_diff_radiance_hitdist"
+            ),
+            binding(
+                16,
+                DescriptorKind::StorageImage,
+                "nrd_spec_radiance_hitdist"
+            ),
             binding(17, DescriptorKind::StorageImage, "nrd_residual_radiance"),
             binding(18, DescriptorKind::StorageImage, "nrd_material_factors"),
         ]
@@ -696,7 +705,10 @@ fn vpt_nrd_noisy_frontend_contract() {
         "nrd_residual_radiance[tid.xy]",
         "nrd_material_factors[tid.xy]",
     ] {
-        assert!(shader.contains(token), "VPT shader missing NRD noisy token {token}");
+        assert!(
+            shader.contains(token),
+            "VPT shader missing NRD noisy token {token}"
+        );
     }
 
     assert!(
@@ -735,6 +747,186 @@ fn vpt_nrd_noisy_frontend_contract() {
             "VPT Rust missing NRD noisy contract token {token}"
         );
     }
+}
+
+#[test]
+fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
+    let shader = source("assets/shaders/passes/vpt_nrd_frontend.slang");
+    let pass = source("src/render/passes/vpt_nrd_frontend.rs");
+    let pass_mod = source("src/render/passes/mod.rs");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let compact_pass = pass.split_whitespace().collect::<String>();
+    let compact_shader = shader.split_whitespace().collect::<String>();
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT NRD frontend",
+        &VptNrdFrontendPass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_nrd_frontend.slang"),
+    );
+    assert_eq!(
+        shader_bindings("assets/shaders/passes/vpt_nrd_frontend.slang"),
+        vec![
+            binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
+            binding(
+                1,
+                DescriptorKind::StorageImage,
+                "input_diff_radiance_hitdist"
+            ),
+            binding(
+                2,
+                DescriptorKind::StorageImage,
+                "input_spec_radiance_hitdist"
+            ),
+            binding(3, DescriptorKind::StorageImage, "input_residual_radiance"),
+            binding(4, DescriptorKind::StorageImage, "input_material_factors"),
+            binding(
+                5,
+                DescriptorKind::StorageImage,
+                "packed_diff_radiance_hitdist"
+            ),
+            binding(
+                6,
+                DescriptorKind::StorageImage,
+                "packed_spec_radiance_hitdist"
+            ),
+            binding(7, DescriptorKind::StorageImage, "residual_radiance"),
+            binding(8, DescriptorKind::StorageImage, "material_factors"),
+        ]
+    );
+
+    for token in [
+        "#include \"scene_common.slang\"",
+        "static const float VPT_NRD_FRONTEND_INVALID_HIT_DISTANCE = 65504.0;",
+        "if (value != value)",
+        "return min(max(value, 0.0), VPT_NRD_FRONTEND_INVALID_HIT_DISTANCE);",
+        "if (hit_distance != hit_distance || hit_distance < 0.0)",
+        "float3 sanitize_relax_radiance(float3 radiance)",
+        "float sanitize_relax_hit_distance(float hit_distance)",
+        "float4 pack_relax_radiance_hitdist(float4 radiance_hitdist)",
+    ] {
+        assert!(
+            shader.contains(token),
+            "NRD frontend shader missing {token}"
+        );
+    }
+    for token in [
+        "returnfloat4(sanitize_relax_radiance(radiance_hitdist.rgb),sanitize_relax_hit_distance(radiance_hitdist.a));",
+        "packed_diff_radiance_hitdist[tid.xy]=pack_relax_radiance_hitdist(input_diff_radiance_hitdist[tid.xy]);",
+        "packed_spec_radiance_hitdist[tid.xy]=pack_relax_radiance_hitdist(input_spec_radiance_hitdist[tid.xy]);",
+        "residual_radiance[tid.xy]=float4(sanitize_relax_radiance(input_residual_radiance[tid.xy].rgb),1.0);",
+        "material_factors[tid.xy]=float4(saturate(input_material_factors[tid.xy].rgb),saturate(input_material_factors[tid.xy].a));",
+    ] {
+        assert!(
+            compact_shader.contains(token),
+            "NRD frontend shader missing compact token {token}"
+        );
+    }
+    for forbidden in [
+        "NRD.hlsli",
+        "REBLUR_FrontEnd",
+        "RELAX_FrontEnd",
+        "PackRadiance.cs.slang",
+    ] {
+        assert!(
+            !shader.contains(forbidden),
+            "local frontend must not copy SDK helper token {forbidden}"
+        );
+    }
+
+    for token in [
+        "pub struct VptNrdFrontendPass",
+        "pub struct VptNrdFrontendGraphInputs",
+        "pub struct VptNrdFrontendGraphOutputs",
+        "pub struct VptNrdPackedResources",
+        "pub raw_noisy: VptNrdNoisyResources",
+        "pub packed: VptNrdPackedResources",
+        "pub packed_diff_radiance_hitdist: GpuImage",
+        "pub packed_spec_radiance_hitdist: GpuImage",
+        "pub residual_radiance: GpuImage",
+        "pub material_factors: GpuImage",
+        "pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 9]",
+        "descriptor_count: 8 * frame_count as u32",
+        "vpt_nrd_packed_diff_radiance_hitdist",
+        "vpt_nrd_packed_spec_radiance_hitdist",
+        "vpt_nrd_frontend_residual_radiance",
+        "vpt_nrd_frontend_material_factors",
+        "graph.add_pass(\"vpt_nrd_frontend\"",
+        "GpuProfileScope::VptNrdFrontend",
+    ] {
+        assert!(pass.contains(token), "NRD frontend pass missing {token}");
+    }
+    for token in [
+        "builder.read_as(raw_noisy.diff_radiance_hitdist,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(raw_noisy.spec_radiance_hitdist,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(raw_noisy.residual_radiance,AccessKind::ComputeShaderRead);",
+        "builder.read_as(raw_noisy.material_factors,AccessKind::ComputeShaderRead);",
+    ] {
+        assert!(
+            compact_pass.contains(token),
+            "NRD frontend pass missing compact token {token}"
+        );
+    }
+    for forbidden in [
+        "[ResourceHandle; 4]",
+        "[ResourceHandle; 8]",
+        "raw_noisy[",
+        "packed_outputs[",
+    ] {
+        assert!(
+            !pass.contains(forbidden),
+            "NRD frontend pass must use named resources, found {forbidden}"
+        );
+    }
+    assert!(compact_pass.contains(
+        "letpacked_writes=graph.add_pass(\"vpt_nrd_frontend\",QueueType::Compute,|builder|{"
+    ));
+    assert!(pass_mod.contains("pub mod vpt_nrd_frontend;"));
+
+    for token in [
+        "use crate::render::passes::vpt_nrd_frontend::{",
+        "pub vpt_nrd_frontend_pass: Option<VptNrdFrontendPass>",
+        "vpt_nrd_frontend_pass: None",
+        "self.ensure_vpt_nrd_frontend_pass(renderer, scene_ubo);",
+        "fn ensure_vpt_nrd_frontend_pass(",
+        "include_bytes!(concat!(env!(\"OUT_DIR\"), \"/shaders/vpt_nrd_frontend.spv\"))",
+        "VptNrdFrontendPass::new(",
+        ".resize_images(",
+        "failed to resize VPT NRD frontend images",
+        "pass.destroy(device, allocator);",
+    ] {
+        assert!(pipeline.contains(token), "pipeline missing {token}");
+    }
+    assert!(
+        compact_pipeline.contains(
+            "let_nrd_frontend_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
+        ),
+        "pipeline must record NRD frontend only for requested NRD modes"
+    );
+    assert!(
+        compact_pipeline
+            .contains("vpt_nrd_frontend.register_graph(&mutgraph,VptNrdFrontendGraphInputs{"),
+        "pipeline must register frontend graph"
+    );
+    assert!(
+        compact_pipeline.contains("let_nrd_frontend_outputs="),
+        "pipeline must make the unused NRD frontend output explicit until resolve/backend wiring"
+    );
+    assert!(
+        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
+        "SVGF fallback output must remain the postprocess input"
+    );
+    let vpt_idx = pipeline
+        .find("vpt.register_graph(")
+        .expect("VPT graph registration should exist");
+    let nrd_idx = pipeline
+        .find("vpt_nrd_frontend.register_graph(")
+        .expect("NRD frontend graph registration should exist");
+    let temporal_idx = pipeline
+        .find("vpt_temporal.register_graph(")
+        .expect("SVGF temporal graph registration should exist");
+    assert!(vpt_idx < nrd_idx);
+    assert!(vpt_idx < temporal_idx);
 }
 
 #[test]

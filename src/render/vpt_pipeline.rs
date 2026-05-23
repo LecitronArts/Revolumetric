@@ -17,6 +17,10 @@ use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_atrous::{
     VptAtrousGraphInputs, VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
 };
+use crate::render::passes::vpt_nrd_frontend::{
+    VptNrdFrontendGraphInputs, VptNrdFrontendPass, VptNrdFrontendPassCreateInfo,
+    VptNrdFrontendPassResizeInfo,
+};
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
     VptTemporalGraphInputs, VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
@@ -25,7 +29,8 @@ use crate::render::resource::{AccessKind, QueueType};
 use crate::render::restir_di::RestirDiSettings;
 use crate::render::restir_di::build_direct_lights_from_ucvh;
 use crate::render::scene_ubo::{
-    LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, build_scene_uniforms,
+    LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, VptDenoiserMode,
+    build_scene_uniforms,
 };
 use crate::render::vpt_history::{
     GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_LIGHTS_INVALIDATED,
@@ -149,6 +154,7 @@ pub struct VptRuntimePipeline {
     pub postprocess_pass: Option<PostprocessPass>,
     pub vpt_surface_pass: Option<VptSurfacePass>,
     pub vpt_pass: Option<VptPass>,
+    pub vpt_nrd_frontend_pass: Option<VptNrdFrontendPass>,
     pub vpt_temporal_pass: Option<VptTemporalPass>,
     pub vpt_atrous_pass: Option<VptAtrousPass>,
     pub area_restir_pass: Option<AreaRestirPass>,
@@ -193,6 +199,7 @@ impl VptRuntimePipeline {
             postprocess_pass: None,
             vpt_surface_pass: None,
             vpt_pass: None,
+            vpt_nrd_frontend_pass: None,
             vpt_temporal_pass: None,
             vpt_atrous_pass: None,
             area_restir_pass: None,
@@ -212,6 +219,7 @@ impl VptRuntimePipeline {
     ) {
         self.ensure_vpt_surface_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
+        self.ensure_vpt_nrd_frontend_pass(renderer, scene_ubo);
         self.ensure_restir_di_pass(renderer, scene_ubo, ucvh, restir_di_enabled);
         self.ensure_area_restir_pass(renderer, scene_ubo, ucvh_gpu, area_restir_enabled);
         self.ensure_vpt_temporal_pass(renderer, scene_ubo);
@@ -302,6 +310,50 @@ impl VptRuntimePipeline {
             }
             Err(error) => {
                 tracing::error!(%error, "failed to create VPT pass");
+            }
+        }
+    }
+
+    fn ensure_vpt_nrd_frontend_pass(
+        &mut self,
+        renderer: &RenderDevice,
+        scene_ubo: &SceneUniformBuffer,
+    ) {
+        if self.vpt_nrd_frontend_pass.is_some() {
+            return;
+        }
+        let Some(vpt) = &self.vpt_pass else {
+            return;
+        };
+
+        let extent = renderer.swapchain_extent();
+        let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vpt_nrd_frontend.spv"));
+        if spirv.is_empty() {
+            tracing::warn!("vpt_nrd_frontend.spv is empty; slangc may not be installed");
+            return;
+        }
+
+        match VptNrdFrontendPass::new(
+            renderer.device(),
+            renderer.allocator(),
+            VptNrdFrontendPassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                spirv_bytes: spirv,
+                scene_ubo,
+                vpt,
+            },
+        ) {
+            Ok(pass) => {
+                tracing::info!(
+                    width = extent.width,
+                    height = extent.height,
+                    "initialized VPT NRD frontend pass"
+                );
+                self.vpt_nrd_frontend_pass = Some(pass);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to create VPT NRD frontend pass");
             }
         }
     }
@@ -798,6 +850,23 @@ impl VptRuntimePipeline {
                 );
                 let noisy_radiance_dep = vpt_outputs.noisy_radiance;
                 let noisy_moments_dep = vpt_outputs.noisy_moments;
+                let _nrd_frontend_outputs = if matches!(
+                    inputs.lighting_settings.denoiser_mode,
+                    VptDenoiserMode::Relax | VptDenoiserMode::Reblur
+                ) {
+                    self.vpt_nrd_frontend_pass.as_ref().map(|vpt_nrd_frontend| {
+                        vpt_nrd_frontend.register_graph(
+                            &mut graph,
+                            VptNrdFrontendGraphInputs {
+                                frame_slot: slot,
+                                raw_noisy: vpt_outputs.nrd_noisy,
+                                profiler,
+                            },
+                        )
+                    })
+                } else {
+                    None
+                };
 
                 let temporal_outputs = vpt_temporal.register_graph(
                     &mut graph,
@@ -976,6 +1045,7 @@ impl VptRuntimePipeline {
                 self.frame_state.last_vpt_camera_key = None;
                 tracing::warn!(
                     vpt_ready = self.vpt_pass.is_some(),
+                    vpt_nrd_frontend_ready = self.vpt_nrd_frontend_pass.is_some(),
                     vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
                     vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
                     postprocess_ready = self.postprocess_pass.is_some(),
@@ -1043,6 +1113,22 @@ impl VptRuntimePipeline {
         if let Some(vpt) = &mut self.vpt_pass {
             vpt.resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
                 .context("failed to resize VPT images")?;
+        }
+        if let (Some(vpt_nrd_frontend), Some(vpt)) =
+            (&mut self.vpt_nrd_frontend_pass, &self.vpt_pass)
+        {
+            vpt_nrd_frontend
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdFrontendPassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        vpt,
+                    },
+                )
+                .context("failed to resize VPT NRD frontend images")?;
         }
         if let Some(vpt_surface) = &mut self.vpt_surface_pass {
             vpt_surface
@@ -1141,6 +1227,9 @@ impl VptRuntimePipeline {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_atrous_pass {
+            pass.destroy(device, allocator);
+        }
+        if let Some(pass) = self.vpt_nrd_frontend_pass {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_temporal_pass {

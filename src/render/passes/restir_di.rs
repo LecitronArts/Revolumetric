@@ -386,7 +386,10 @@ impl RestirDiPass {
                         AccessKind::ComputeShaderRead,
                     );
                     builder.read_as(final_surface_writes.view_z, AccessKind::ComputeShaderRead);
-                    builder.read_as(final_surface_writes.motion_id, AccessKind::ComputeShaderRead);
+                    builder.read_as(
+                        final_surface_writes.motion_id,
+                        AccessKind::ComputeShaderRead,
+                    );
                     builder.read_as(
                         final_surface_writes.motion_history,
                         AccessKind::ComputeShaderRead,

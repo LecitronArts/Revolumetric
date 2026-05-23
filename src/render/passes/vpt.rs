@@ -473,8 +473,14 @@ impl VptPass {
                 nrd_spec_radiance_hitdist_resource,
                 AccessKind::ComputeShaderWrite,
             );
-            builder.write_as(nrd_residual_radiance_resource, AccessKind::ComputeShaderWrite);
-            builder.write_as(nrd_material_factors_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(
+                nrd_residual_radiance_resource,
+                AccessKind::ComputeShaderWrite,
+            );
+            builder.write_as(
+                nrd_material_factors_resource,
+                AccessKind::ComputeShaderWrite,
+            );
             if let Some((restir_uniform_resource, restir_reservoir_resource)) = restir_reads {
                 builder.read_as(restir_uniform_resource, AccessKind::ComputeShaderRead);
                 builder.read_as(restir_reservoir_resource, AccessKind::ComputeShaderRead);
