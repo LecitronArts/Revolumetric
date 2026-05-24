@@ -40,6 +40,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub dispatch_count: usize,
     pub dispatch_resource_plan_count: usize,
     pub pipeline_layout_plan_count: usize,
+    pub pipeline_shader_plan_count: usize,
     pub pipeline_descriptor_binding_plan_count: usize,
     pub descriptor_pool_size_count: usize,
     pub dispatch_descriptor_write_plan_count: usize,
@@ -153,6 +154,7 @@ struct VptNrdReadyBackendState {
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
     pipeline_layout_plans: Vec<VptNrdPipelineLayoutPlan>,
+    pipeline_shader_plans: Vec<VptNrdPipelineShaderPlan>,
     pipeline_descriptor_binding_plans: Vec<VptNrdPipelineDescriptorBindingPlan>,
     descriptor_pool_plan: VptNrdDescriptorPoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
@@ -515,6 +517,9 @@ impl VptNrdReadyBackendState {
         let pipeline_layout_plans =
             VptNrdPipelineLayoutPlan::from_instance_snapshot(&instance_snapshot)
                 .context("failed to build VPT NRD pipeline layout plans")?;
+        let pipeline_shader_plans =
+            VptNrdPipelineShaderPlan::from_instance_snapshot(&instance_snapshot)
+                .context("failed to build VPT NRD pipeline shader plans")?;
         let pipeline_descriptor_binding_plans =
             VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&pipeline_layout_plans)
                 .context("failed to build VPT NRD pipeline descriptor binding plans")?;
@@ -535,6 +540,7 @@ impl VptNrdReadyBackendState {
             instance_snapshot,
             texture_pool_plan,
             pipeline_layout_plans,
+            pipeline_shader_plans,
             pipeline_descriptor_binding_plans,
             descriptor_pool_plan,
             dispatches,
@@ -554,6 +560,7 @@ impl VptNrdReadyBackendState {
             dispatch_count: self.dispatches.len(),
             dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
             pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
+            pipeline_shader_plan_count: self.pipeline_shader_plans.len(),
             pipeline_descriptor_binding_plan_count: self.pipeline_descriptor_binding_plans.len(),
             descriptor_pool_size_count: self.descriptor_pool_plan.pool_sizes.len(),
             dispatch_descriptor_write_plan_count: self.dispatch_descriptor_write_plans.len(),
@@ -2192,9 +2199,91 @@ mod tests {
         assert_eq!(metadata.dispatch_count, 2);
         assert_eq!(metadata.dispatch_resource_plan_count, 2);
         assert_eq!(metadata.pipeline_layout_plan_count, 1);
+        assert_eq!(metadata.pipeline_shader_plan_count, 1);
         assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 1);
         assert_eq!(metadata.descriptor_pool_size_count, 1);
         assert_eq!(metadata.dispatch_descriptor_write_plan_count, 2);
+    }
+
+    #[test]
+    fn ready_backend_state_rejects_empty_pipeline_spirv() {
+        let library_desc = NrdLibraryDesc {
+            texture_offset: 10,
+            sampler_offset: 20,
+            constant_buffer_offset: 30,
+            storage_texture_and_buffer_offset: 40,
+        };
+        let mut instance_snapshot = instance_snapshot_with_pipelines(vec![NrdPipelineSnapshot {
+            spirv_bytecode: Vec::new(),
+            resource_ranges: vec![resource_range(NrdDescriptorType::Texture, 1)],
+            has_constant_data: false,
+            shader_identifier: "empty_shader".to_owned(),
+        }]);
+        instance_snapshot.permanent_pool = vec![texture(NrdTextureFormat::R16Sfloat, 1)];
+        let dispatches = vec![dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::PermanentPool,
+            0,
+        )])];
+
+        let error = match VptNrdReadyBackendState::from_snapshots(
+            library_desc,
+            instance_snapshot,
+            dispatches,
+            32,
+            16,
+        ) {
+            Ok(_) => panic!("ready backend state should reject empty NRD pipeline SPIR-V"),
+            Err(error) => error,
+        };
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("NRD pipeline shader bytecode is empty")
+        }));
+    }
+
+    #[test]
+    fn ready_backend_metadata_counts_each_pipeline_artifact_plan() {
+        let library_desc = NrdLibraryDesc {
+            texture_offset: 10,
+            sampler_offset: 20,
+            constant_buffer_offset: 30,
+            storage_texture_and_buffer_offset: 40,
+        };
+        let instance_snapshot = instance_snapshot_with_pipelines(vec![
+            pipeline(
+                "relax_prepass",
+                &[resource_range(NrdDescriptorType::Texture, 1)],
+                false,
+            ),
+            pipeline(
+                "relax_temporal",
+                &[resource_range(NrdDescriptorType::StorageTexture, 1)],
+                true,
+            ),
+        ]);
+        let dispatches = vec![dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::InMv,
+            0,
+        )])];
+
+        let state = VptNrdReadyBackendState::from_snapshots(
+            library_desc,
+            instance_snapshot,
+            dispatches,
+            32,
+            16,
+        )
+        .unwrap();
+        let metadata = state.metadata();
+
+        assert_eq!(metadata.pipeline_count, 2);
+        assert_eq!(metadata.pipeline_layout_plan_count, 2);
+        assert_eq!(metadata.pipeline_shader_plan_count, 2);
+        assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 2);
     }
 
     #[test]
