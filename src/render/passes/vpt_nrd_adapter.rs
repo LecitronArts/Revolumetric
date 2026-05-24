@@ -13,6 +13,7 @@ use crate::render::nrd_adapter::{
 use crate::render::passes::vpt_nrd_confidence::VptNrdConfidenceResources;
 use crate::render::passes::vpt_nrd_frontend::VptNrdPackedResources;
 use crate::render::passes::vpt_surface::VptCurrentSurfaceResources;
+use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::SceneUniformBuffer;
 
@@ -22,6 +23,7 @@ pub struct VptNrdAdapterPass {
     backend: VptNrdAdapterBackend,
     texture_pools: Option<VptNrdTexturePools>,
     descriptor_resources: Option<VptNrdDescriptorResources>,
+    pipeline_resources: Option<VptNrdPipelineResources>,
 }
 
 pub enum VptNrdAdapterBackend {
@@ -90,6 +92,15 @@ pub struct VptNrdPipelineCreatePlan {
     pub shader_identifier: String,
     pub has_constant_data: bool,
     pub descriptor_binding_count: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineResourcesPlan {
+    pub pipeline_index: usize,
+    pub shader_identifier: String,
+    pub spirv_bytes: Vec<u8>,
+    pub descriptor_set_layout: vk::DescriptorSetLayout,
+    pub descriptor_set: vk::DescriptorSet,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +197,10 @@ struct VptNrdDescriptorResources {
     descriptor_sets: Vec<vk::DescriptorSet>,
 }
 
+struct VptNrdPipelineResources {
+    pipelines: Vec<ComputePipeline>,
+}
+
 pub struct VptNrdAdapterGraphInputs<'a> {
     pub frame_slot: usize,
     pub packed: VptNrdPackedResources,
@@ -241,9 +256,25 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
+        let pipeline_resources =
+            match create_pipeline_resources(device, &backend, descriptor_resources.as_ref()) {
+                Ok(resources) => resources,
+                Err(error) => {
+                    if let Some(descriptor_resources) = descriptor_resources {
+                        descriptor_resources.destroy(device);
+                    }
+                    if let Some(texture_pools) = texture_pools {
+                        texture_pools.destroy(device, allocator);
+                    }
+                    return Err(error);
+                }
+            };
         let images = match create_adapter_images(device, allocator, info.width, info.height) {
             Ok(images) => images,
             Err(error) => {
+                if let Some(pipeline_resources) = pipeline_resources {
+                    pipeline_resources.destroy(device);
+                }
                 if let Some(descriptor_resources) = descriptor_resources {
                     descriptor_resources.destroy(device);
                 }
@@ -259,6 +290,7 @@ impl VptNrdAdapterPass {
             backend,
             texture_pools,
             descriptor_resources,
+            pipeline_resources,
         })
     }
 
@@ -294,6 +326,23 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
+        let new_pipeline_resources = match create_pipeline_resources(
+            device,
+            &new_backend,
+            new_descriptor_resources.as_ref(),
+        ) {
+            Ok(resources) => resources,
+            Err(error) => {
+                if let Some(new_descriptor_resources) = new_descriptor_resources {
+                    new_descriptor_resources.destroy(device);
+                }
+                if let Some(new_texture_pools) = new_texture_pools {
+                    new_texture_pools.destroy(device, allocator);
+                }
+                new_images.destroy(device, allocator);
+                return Err(error);
+            }
+        };
         let old_images = VptNrdAdapterImages {
             nrd_diff_radiance_hitdist: std::mem::replace(
                 &mut self.nrd_diff_radiance_hitdist,
@@ -304,7 +353,12 @@ impl VptNrdAdapterPass {
         let old_texture_pools = std::mem::replace(&mut self.texture_pools, new_texture_pools);
         let old_descriptor_resources =
             std::mem::replace(&mut self.descriptor_resources, new_descriptor_resources);
+        let old_pipeline_resources =
+            std::mem::replace(&mut self.pipeline_resources, new_pipeline_resources);
         let old_backend = std::mem::replace(&mut self.backend, new_backend);
+        if let Some(old_pipeline_resources) = old_pipeline_resources {
+            old_pipeline_resources.destroy(device);
+        }
         if let Some(old_descriptor_resources) = old_descriptor_resources {
             old_descriptor_resources.destroy(device);
         }
@@ -324,6 +378,7 @@ impl VptNrdAdapterPass {
             self.backend.ready_metadata(),
             self.backend.texture_pool_plan(),
             self.descriptor_resources.as_ref(),
+            self.pipeline_resources.as_ref(),
         );
     }
 
@@ -408,6 +463,9 @@ impl VptNrdAdapterPass {
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
+        if let Some(pipeline_resources) = self.pipeline_resources {
+            pipeline_resources.destroy(device);
+        }
         if let Some(descriptor_resources) = self.descriptor_resources {
             descriptor_resources.destroy(device);
         }
@@ -644,6 +702,13 @@ impl VptNrdPipelineShaderPlan {
         snapshot.pipelines.iter().map(Self::from_pipeline).collect()
     }
 
+    pub fn spirv_bytes(&self) -> Vec<u8> {
+        self.spirv_words
+            .iter()
+            .flat_map(|word| word.to_ne_bytes())
+            .collect()
+    }
+
     fn from_pipeline(pipeline: &crate::render::nrd_adapter::NrdPipelineSnapshot) -> Result<Self> {
         anyhow::ensure!(
             !pipeline.spirv_bytecode.is_empty(),
@@ -695,6 +760,58 @@ impl VptNrdPipelineCreatePlan {
                     })
                 },
             )
+            .collect()
+    }
+}
+
+impl VptNrdPipelineResourcesPlan {
+    fn from_plans(
+        create_plans: &[VptNrdPipelineCreatePlan],
+        shader_plans: &[VptNrdPipelineShaderPlan],
+        descriptor_resources: &VptNrdDescriptorResources,
+    ) -> Result<Vec<Self>> {
+        create_plans
+            .iter()
+            .map(|plan| {
+                let shader_plan = shader_plans.get(plan.shader_plan_index).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "NRD pipeline shader plan index {} is out of bounds",
+                        plan.shader_plan_index
+                    )
+                })?;
+                let descriptor_set_layout = descriptor_resources
+                    .descriptor_set_layouts
+                    .get(plan.descriptor_set_layout_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "NRD descriptor set layout index {} is out of bounds",
+                            plan.descriptor_set_layout_index
+                        )
+                    })?;
+                let descriptor_set = descriptor_resources
+                    .descriptor_sets
+                    .get(plan.descriptor_set_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "NRD descriptor set index {} is out of bounds",
+                            plan.descriptor_set_index
+                        )
+                    })?;
+                anyhow::ensure!(
+                    shader_plan.shader_identifier == plan.shader_identifier
+                        && shader_plan.has_constant_data == plan.has_constant_data,
+                    "NRD pipeline resource plan shader metadata does not match create plan"
+                );
+                Ok(Self {
+                    pipeline_index: plan.pipeline_index,
+                    shader_identifier: plan.shader_identifier.clone(),
+                    spirv_bytes: shader_plan.spirv_bytes(),
+                    descriptor_set_layout,
+                    descriptor_set,
+                })
+            })
             .collect()
     }
 }
@@ -1038,6 +1155,64 @@ impl VptNrdDescriptorResources {
     }
 }
 
+impl VptNrdPipelineResources {
+    fn create(
+        device: &ash::Device,
+        create_plans: &[VptNrdPipelineCreatePlan],
+        shader_plans: &[VptNrdPipelineShaderPlan],
+        descriptor_resources: &VptNrdDescriptorResources,
+    ) -> Result<Self> {
+        let resource_plans = VptNrdPipelineResourcesPlan::from_plans(
+            create_plans,
+            shader_plans,
+            descriptor_resources,
+        )?;
+        let mut pipelines = Vec::with_capacity(resource_plans.len());
+
+        for plan in resource_plans {
+            let shader_module = match create_shader_module(device, &plan.spirv_bytes) {
+                Ok(module) => module,
+                Err(error) => {
+                    destroy_compute_pipelines(device, pipelines);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create NRD shader module for {}",
+                            plan.shader_identifier
+                        )
+                    });
+                }
+            };
+            let pipeline = match ComputePipeline::new(
+                device,
+                shader_module,
+                c"main",
+                &[plan.descriptor_set_layout],
+                &[],
+            ) {
+                Ok(pipeline) => pipeline,
+                Err(error) => {
+                    unsafe { device.destroy_shader_module(shader_module, None) };
+                    destroy_compute_pipelines(device, pipelines);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "failed to create NRD compute pipeline for {}",
+                            plan.shader_identifier
+                        )
+                    });
+                }
+            };
+            unsafe { device.destroy_shader_module(shader_module, None) };
+            pipelines.push(pipeline);
+        }
+
+        Ok(Self { pipelines })
+    }
+
+    fn destroy(self, device: &ash::Device) {
+        destroy_compute_pipelines(device, self.pipelines);
+    }
+}
+
 fn create_descriptor_resources(
     device: &ash::Device,
     backend: &VptNrdAdapterBackend,
@@ -1049,6 +1224,26 @@ fn create_descriptor_resources(
         return Ok(None);
     };
     VptNrdDescriptorResources::create(device, binding_plans, pool_plan).map(Some)
+}
+
+fn create_pipeline_resources(
+    device: &ash::Device,
+    backend: &VptNrdAdapterBackend,
+    descriptor_resources: Option<&VptNrdDescriptorResources>,
+) -> Result<Option<VptNrdPipelineResources>> {
+    let VptNrdAdapterBackend::Ready(backend) = backend else {
+        return Ok(None);
+    };
+    let Some(descriptor_resources) = descriptor_resources else {
+        return Ok(None);
+    };
+    VptNrdPipelineResources::create(
+        device,
+        &backend.state.pipeline_create_plans,
+        &backend.state.pipeline_shader_plans,
+        descriptor_resources,
+    )
+    .map(Some)
 }
 
 fn create_descriptor_set_layouts(
@@ -1074,6 +1269,12 @@ fn create_descriptor_set_layouts(
 fn destroy_descriptor_set_layouts(device: &ash::Device, layouts: Vec<vk::DescriptorSetLayout>) {
     for layout in layouts {
         unsafe { device.destroy_descriptor_set_layout(layout, None) };
+    }
+}
+
+fn destroy_compute_pipelines(device: &ash::Device, pipelines: Vec<ComputePipeline>) {
+    for pipeline in pipelines {
+        pipeline.destroy(device);
     }
 }
 
@@ -1252,6 +1453,7 @@ fn create_adapter_image(
 mod tests {
     use super::*;
     use crate::render::nrd_adapter::{NrdPipelineSnapshot, NrdSamplerDesc, NrdTextureFormat};
+    use ash::vk::Handle;
 
     #[cfg(not(feature = "nrd"))]
     #[test]
@@ -1567,6 +1769,138 @@ mod tests {
         assert!(error.to_string().contains(
             "NRD pipeline layout plan count does not match descriptor binding plan count"
         ));
+    }
+
+    #[test]
+    fn pipeline_shader_plan_exposes_spirv_as_native_endian_bytes() {
+        let shader_plan = VptNrdPipelineShaderPlan {
+            spirv_words: vec![0x0723_0203, 0x0102_0304],
+            shader_identifier: "relax_prepass".to_owned(),
+            has_constant_data: false,
+        };
+
+        assert_eq!(
+            shader_plan.spirv_bytes(),
+            vec![0x03, 0x02, 0x23, 0x07, 0x04, 0x03, 0x02, 0x01]
+        );
+    }
+
+    #[test]
+    fn pipeline_resources_plan_resolves_descriptor_layout_and_set_slots() {
+        let create_plans = vec![
+            VptNrdPipelineCreatePlan {
+                pipeline_index: 0,
+                shader_plan_index: 0,
+                descriptor_set_layout_index: 0,
+                descriptor_set_index: 0,
+                shader_identifier: "relax_prepass".to_owned(),
+                has_constant_data: false,
+                descriptor_binding_count: 1,
+            },
+            VptNrdPipelineCreatePlan {
+                pipeline_index: 1,
+                shader_plan_index: 1,
+                descriptor_set_layout_index: 1,
+                descriptor_set_index: 1,
+                shader_identifier: "relax_temporal".to_owned(),
+                has_constant_data: true,
+                descriptor_binding_count: 2,
+            },
+        ];
+        let shader_plans = vec![
+            VptNrdPipelineShaderPlan {
+                spirv_words: vec![0x0723_0203],
+                shader_identifier: "relax_prepass".to_owned(),
+                has_constant_data: false,
+            },
+            VptNrdPipelineShaderPlan {
+                spirv_words: vec![0x0723_0203, 0x0102_0304],
+                shader_identifier: "relax_temporal".to_owned(),
+                has_constant_data: true,
+            },
+        ];
+        let descriptor_resources = descriptor_resources_for_test(2);
+
+        let snapshots = VptNrdPipelineResourcesPlan::from_plans(
+            &create_plans,
+            &shader_plans,
+            &descriptor_resources,
+        )
+        .unwrap();
+
+        assert_eq!(
+            snapshots,
+            vec![
+                VptNrdPipelineResourcesPlan {
+                    pipeline_index: 0,
+                    shader_identifier: "relax_prepass".to_owned(),
+                    spirv_bytes: vec![0x03, 0x02, 0x23, 0x07],
+                    descriptor_set_layout: vk::DescriptorSetLayout::from_raw(101),
+                    descriptor_set: vk::DescriptorSet::from_raw(201),
+                },
+                VptNrdPipelineResourcesPlan {
+                    pipeline_index: 1,
+                    shader_identifier: "relax_temporal".to_owned(),
+                    spirv_bytes: vec![0x03, 0x02, 0x23, 0x07, 0x04, 0x03, 0x02, 0x01],
+                    descriptor_set_layout: vk::DescriptorSetLayout::from_raw(102),
+                    descriptor_set: vk::DescriptorSet::from_raw(202),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_resources_plan_rejects_out_of_bounds_resource_slots() {
+        let create_plans = vec![VptNrdPipelineCreatePlan {
+            pipeline_index: 0,
+            shader_plan_index: 1,
+            descriptor_set_layout_index: 0,
+            descriptor_set_index: 1,
+            shader_identifier: "relax_prepass".to_owned(),
+            has_constant_data: false,
+            descriptor_binding_count: 1,
+        }];
+        let shader_plans = vec![VptNrdPipelineShaderPlan {
+            spirv_words: vec![0x0723_0203],
+            shader_identifier: "relax_prepass".to_owned(),
+            has_constant_data: false,
+        }];
+        let descriptor_resources = descriptor_resources_for_test(1);
+
+        let error = VptNrdPipelineResourcesPlan::from_plans(
+            &create_plans,
+            &shader_plans,
+            &descriptor_resources,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline shader plan index 1 is out of bounds")
+        );
+
+        let create_plans = vec![VptNrdPipelineCreatePlan {
+            pipeline_index: 0,
+            shader_plan_index: 0,
+            descriptor_set_layout_index: 1,
+            descriptor_set_index: 0,
+            shader_identifier: "relax_prepass".to_owned(),
+            has_constant_data: false,
+            descriptor_binding_count: 1,
+        }];
+        let error = VptNrdPipelineResourcesPlan::from_plans(
+            &create_plans,
+            &shader_plans,
+            &descriptor_resources,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD descriptor set layout index 1 is out of bounds")
+        );
     }
 
     #[test]
@@ -2591,6 +2925,20 @@ mod tests {
             height: 16,
             format: vk::Format::R16_SFLOAT,
             downsample_factor: 1,
+        }
+    }
+
+    fn descriptor_resources_for_test(count: usize) -> VptNrdDescriptorResources {
+        VptNrdDescriptorResources {
+            descriptor_set_layouts: (0..count)
+                .map(|index| vk::DescriptorSetLayout::from_raw(101 + index as u64))
+                .collect(),
+            descriptor_pool: DescriptorPool {
+                handle: vk::DescriptorPool::from_raw(301),
+            },
+            descriptor_sets: (0..count)
+                .map(|index| vk::DescriptorSet::from_raw(201 + index as u64))
+                .collect(),
         }
     }
 
