@@ -5,6 +5,9 @@ use crate::render::allocator::GpuAllocator;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
+use crate::render::nrd_adapter::{
+    NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc, NrdResult,
+};
 use crate::render::passes::vpt_nrd_confidence::VptNrdConfidenceResources;
 use crate::render::passes::vpt_nrd_frontend::VptNrdPackedResources;
 use crate::render::passes::vpt_surface::VptCurrentSurfaceResources;
@@ -14,6 +17,30 @@ use crate::render::scene_ubo::SceneUniformBuffer;
 pub struct VptNrdAdapterPass {
     pub nrd_diff_radiance_hitdist: GpuImage,
     pub nrd_validation: GpuImage,
+    backend: VptNrdAdapterBackend,
+}
+
+pub enum VptNrdAdapterBackend {
+    Ready(VptNrdReadyBackend),
+    Unavailable(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdAdapterBackendMetadata {
+    pub library_desc: NrdLibraryDesc,
+    pub constant_buffer_max_data_size: u32,
+    pub sampler_count: usize,
+    pub pipeline_count: usize,
+    pub permanent_pool_size: usize,
+    pub transient_pool_size: usize,
+    pub dispatch_count: usize,
+}
+
+pub struct VptNrdReadyBackend {
+    _instance: NrdInstance,
+    library_desc: NrdLibraryDesc,
+    instance_snapshot: NrdInstanceSnapshot,
+    dispatches: Vec<NrdDispatchSnapshot>,
 }
 
 pub struct VptNrdAdapterGraphInputs<'a> {
@@ -54,10 +81,18 @@ impl VptNrdAdapterPass {
         info: VptNrdAdapterPassCreateInfo<'_>,
     ) -> Result<Self> {
         let _ = info.scene_ubo.frame_count();
+        let backend = VptNrdAdapterBackend::initialize_relax(info.width, info.height);
+        if let Some(reason) = backend.unavailable_reason() {
+            tracing::warn!(
+                reason,
+                "VPT NRD adapter backend unavailable; RELAX dispatch remains disabled"
+            );
+        }
         let images = create_adapter_images(device, allocator, info.width, info.height)?;
         Ok(Self {
             nrd_diff_radiance_hitdist: images.nrd_diff_radiance_hitdist,
             nrd_validation: images.nrd_validation,
+            backend,
         })
     }
 
@@ -80,7 +115,14 @@ impl VptNrdAdapterPass {
         Ok(())
     }
 
-    pub fn record(&self, _device: &ash::Device, _cmd: vk::CommandBuffer, _frame_slot: usize) {}
+    pub fn record(&self, _device: &ash::Device, _cmd: vk::CommandBuffer, _frame_slot: usize) {
+        let _ = (
+            self.backend.is_ready(),
+            self.backend.dispatch_count(),
+            self.backend.unavailable_reason(),
+            self.backend.ready_metadata(),
+        );
+    }
 
     pub fn register_graph<'a>(
         &'a self,
@@ -168,6 +210,66 @@ impl VptNrdAdapterPass {
     }
 }
 
+impl VptNrdAdapterBackend {
+    pub fn initialize_relax(width: u32, height: u32) -> Self {
+        match VptNrdReadyBackend::initialize_relax(width, height) {
+            Ok(backend) => Self::Ready(backend),
+            Err(error) => Self::Unavailable(error.to_string()),
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    pub fn dispatch_count(&self) -> usize {
+        match self {
+            Self::Ready(backend) => backend.dispatches.len(),
+            Self::Unavailable(_) => 0,
+        }
+    }
+
+    pub fn ready_metadata(&self) -> Option<VptNrdAdapterBackendMetadata> {
+        match self {
+            Self::Ready(backend) => Some(backend.metadata()),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    pub fn unavailable_reason(&self) -> Option<&str> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Unavailable(reason) => Some(reason.as_str()),
+        }
+    }
+}
+
+impl VptNrdReadyBackend {
+    fn initialize_relax(width: u32, height: u32) -> NrdResult<Self> {
+        let instance = NrdInstance::relax_diffuse(width, height)?;
+        let library_desc = NrdInstance::library_desc()?;
+        let instance_snapshot = instance.instance_snapshot()?;
+        Ok(Self {
+            _instance: instance,
+            library_desc,
+            instance_snapshot,
+            dispatches: Vec::new(),
+        })
+    }
+
+    fn metadata(&self) -> VptNrdAdapterBackendMetadata {
+        VptNrdAdapterBackendMetadata {
+            library_desc: self.library_desc,
+            constant_buffer_max_data_size: self.instance_snapshot.constant_buffer_max_data_size,
+            sampler_count: self.instance_snapshot.samplers.len(),
+            pipeline_count: self.instance_snapshot.pipelines.len(),
+            permanent_pool_size: self.instance_snapshot.permanent_pool.len(),
+            transient_pool_size: self.instance_snapshot.transient_pool.len(),
+            dispatch_count: self.dispatches.len(),
+        }
+    }
+}
+
 struct VptNrdAdapterImages {
     nrd_diff_radiance_hitdist: GpuImage,
     nrd_validation: GpuImage,
@@ -234,4 +336,25 @@ fn create_adapter_image(
             name,
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(not(feature = "nrd"))]
+    #[test]
+    fn default_backend_reports_nrd_unavailable_without_dispatch_readiness() {
+        let backend = VptNrdAdapterBackend::initialize_relax(1280, 720);
+
+        assert!(!backend.is_ready());
+        assert_eq!(backend.dispatch_count(), 0);
+        assert_eq!(backend.ready_metadata(), None);
+        assert!(
+            backend
+                .unavailable_reason()
+                .expect("default build should report why NRD is unavailable")
+                .contains("nrd Cargo feature is disabled")
+        );
+    }
 }
