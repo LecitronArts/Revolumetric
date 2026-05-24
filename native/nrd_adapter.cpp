@@ -129,6 +129,14 @@ static void cache_instance_desc(RevolumetricNrdInstance& out) {
     out.transientPool.clear();
 
     const nrd::InstanceDesc& desc = *nrd::GetInstanceDesc(*out.instance);
+    uint32_t resource_ranges_num = 0;
+    for (uint32_t i = 0; i < desc.pipelinesNum; ++i) {
+        resource_ranges_num += desc.pipelines[i].resourceRangesNum;
+    }
+    out.resourceRanges.reserve(resource_ranges_num);
+    out.pipelines.reserve(desc.pipelinesNum);
+    out.permanentPool.reserve(desc.permanentPoolSize);
+    out.transientPool.reserve(desc.transientPoolSize);
     out.samplers.reserve(desc.samplersNum);
     for (uint32_t i = 0; i < desc.samplersNum; ++i) {
         out.samplers.push_back({static_cast<uint32_t>(desc.samplers[i])});
@@ -291,8 +299,14 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_get_dispatches(
         return from_result(result);
     }
 
+    uint32_t resources_num = 0;
+    for (uint32_t i = 0; i < dispatches_num; ++i) {
+        resources_num += native_dispatches[i].resourcesNum;
+    }
     instance->dispatchResources.clear();
     instance->dispatches.clear();
+    instance->dispatchResources.reserve(resources_num);
+    instance->dispatches.reserve(dispatches_num);
     for (uint32_t i = 0; i < dispatches_num; ++i) {
         const nrd::DispatchDesc& native_dispatch = native_dispatches[i];
         const uint32_t resource_offset =

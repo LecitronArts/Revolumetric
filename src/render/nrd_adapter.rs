@@ -1,3 +1,4 @@
+use std::ffi::CStr;
 use std::fmt;
 use std::os::raw::{c_char, c_void};
 
@@ -35,7 +36,7 @@ pub struct NrdResourceRangeDesc {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NrdSamplerDesc {
     pub mode: u32,
 }
@@ -148,6 +149,40 @@ pub struct NrdRelaxDiffuseSettings {
     pub enable_roughness_edge_stopping: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NrdPipelineSnapshot {
+    pub spirv_bytecode: Vec<u32>,
+    pub resource_ranges: Vec<NrdResourceRangeDesc>,
+    pub has_constant_data: bool,
+    pub shader_identifier: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NrdInstanceSnapshot {
+    pub constant_buffer_and_samplers_space_index: u32,
+    pub resources_space_index: u32,
+    pub constant_buffer_register_index: u32,
+    pub samplers_base_register_index: u32,
+    pub resources_base_register_index: u32,
+    pub constant_buffer_max_data_size: u32,
+    pub samplers: Vec<NrdSamplerDesc>,
+    pub pipelines: Vec<NrdPipelineSnapshot>,
+    pub permanent_pool: Vec<NrdTextureDesc>,
+    pub transient_pool: Vec<NrdTextureDesc>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NrdDispatchSnapshot {
+    pub name: String,
+    pub identifier: u32,
+    pub resources: Vec<NrdResourceDesc>,
+    pub constant_buffer_data: Vec<u8>,
+    pub constant_buffer_data_matches_previous_dispatch: bool,
+    pub pipeline_index: u16,
+    pub grid_width: u16,
+    pub grid_height: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NrdUnavailableError {
     reason: &'static str,
@@ -168,6 +203,133 @@ impl fmt::Display for NrdUnavailableError {
 impl std::error::Error for NrdUnavailableError {}
 
 pub type NrdResult<T> = Result<T, NrdUnavailableError>;
+
+impl NrdInstanceSnapshot {
+    pub fn from_ffi(desc: &NrdInstanceDesc) -> NrdResult<Self> {
+        let samplers = copy_ffi_slice(desc.samplers, desc.samplers_num, "NRD samplers")?;
+        let permanent_pool = copy_ffi_slice(
+            desc.permanent_pool,
+            desc.permanent_pool_size,
+            "NRD permanent texture pool",
+        )?;
+        let transient_pool = copy_ffi_slice(
+            desc.transient_pool,
+            desc.transient_pool_size,
+            "NRD transient texture pool",
+        )?;
+        let pipelines = copy_ffi_slice(desc.pipelines, desc.pipelines_num, "NRD pipelines")?
+            .into_iter()
+            .map(|pipeline| {
+                let spirv_bytecode =
+                    copy_spirv_bytecode(pipeline.spirv_bytecode, pipeline.spirv_bytecode_size)?;
+                let resource_ranges = copy_ffi_slice(
+                    pipeline.resource_ranges,
+                    pipeline.resource_ranges_num,
+                    "NRD pipeline resource ranges",
+                )?;
+                Ok(NrdPipelineSnapshot {
+                    spirv_bytecode,
+                    resource_ranges,
+                    has_constant_data: pipeline.has_constant_data != 0,
+                    shader_identifier: copy_shader_identifier(&pipeline.shader_identifier),
+                })
+            })
+            .collect::<NrdResult<Vec<_>>>()?;
+
+        Ok(Self {
+            constant_buffer_and_samplers_space_index: desc.constant_buffer_and_samplers_space_index,
+            resources_space_index: desc.resources_space_index,
+            constant_buffer_register_index: desc.constant_buffer_register_index,
+            samplers_base_register_index: desc.samplers_base_register_index,
+            resources_base_register_index: desc.resources_base_register_index,
+            constant_buffer_max_data_size: desc.constant_buffer_max_data_size,
+            samplers,
+            pipelines,
+            permanent_pool,
+            transient_pool,
+        })
+    }
+}
+
+impl NrdDispatchSnapshot {
+    pub fn copy_slice(
+        dispatches: *const NrdDispatchDesc,
+        dispatches_num: u32,
+    ) -> NrdResult<Vec<Self>> {
+        copy_ffi_slice(dispatches, dispatches_num, "NRD dispatches")?
+            .into_iter()
+            .map(Self::from_ffi)
+            .collect()
+    }
+
+    fn from_ffi(desc: NrdDispatchDesc) -> NrdResult<Self> {
+        Ok(Self {
+            name: copy_c_string(desc.name, "NRD dispatch name")?,
+            identifier: desc.identifier,
+            resources: copy_ffi_slice(
+                desc.resources,
+                desc.resources_num,
+                "NRD dispatch resources",
+            )?,
+            constant_buffer_data: copy_ffi_slice(
+                desc.constant_buffer_data,
+                desc.constant_buffer_data_size,
+                "NRD dispatch constant buffer data",
+            )?,
+            constant_buffer_data_matches_previous_dispatch: desc
+                .constant_buffer_data_matches_previous_dispatch
+                != 0,
+            pipeline_index: desc.pipeline_index,
+            grid_width: desc.grid_width,
+            grid_height: desc.grid_height,
+        })
+    }
+}
+
+fn copy_ffi_slice<T: Copy>(ptr: *const T, len: u32, context: &'static str) -> NrdResult<Vec<T>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err(NrdUnavailableError::new(context));
+    }
+    Ok(unsafe { std::slice::from_raw_parts(ptr, len as usize) }.to_vec())
+}
+
+fn copy_spirv_bytecode(ptr: *const u32, byte_size: u64) -> NrdResult<Vec<u32>> {
+    if byte_size == 0 {
+        return Ok(Vec::new());
+    }
+    if !byte_size.is_multiple_of(std::mem::size_of::<u32>() as u64) {
+        return Err(NrdUnavailableError::new(
+            "NRD SPIR-V bytecode size is not u32 aligned",
+        ));
+    }
+    let word_count = byte_size / std::mem::size_of::<u32>() as u64;
+    if word_count > usize::MAX as u64 {
+        return Err(NrdUnavailableError::new(
+            "NRD SPIR-V bytecode is too large to copy",
+        ));
+    }
+    copy_ffi_slice(ptr, word_count as u32, "NRD SPIR-V bytecode")
+}
+
+fn copy_shader_identifier(identifier: &[c_char; 256]) -> String {
+    let bytes: Vec<u8> = identifier
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn copy_c_string(ptr: *const c_char, context: &'static str) -> NrdResult<String> {
+    if ptr.is_null() {
+        return Err(NrdUnavailableError::new(context));
+    }
+    let string = unsafe { CStr::from_ptr(ptr) };
+    Ok(string.to_string_lossy().into_owned())
+}
 
 #[derive(Debug)]
 pub struct NrdInstance {
@@ -196,6 +358,124 @@ impl NrdInstance {
             NrdUnavailableError::new("NRD returned a null RELAX_DIFFUSE instance")
         })?;
         Ok(Self { ptr })
+    }
+
+    #[cfg(not(feature = "nrd"))]
+    pub fn library_desc() -> NrdResult<NrdLibraryDesc> {
+        Err(NrdUnavailableError::new(
+            "NRD is unavailable because the nrd Cargo feature is disabled",
+        ))
+    }
+
+    #[cfg(feature = "nrd")]
+    pub fn library_desc() -> NrdResult<NrdLibraryDesc> {
+        let mut desc = NrdLibraryDesc::default();
+        let status = unsafe { revolumetric_nrd_get_library_desc(&mut desc) };
+        if status != REVOLUMETRIC_NRD_STATUS_OK {
+            return Err(NrdUnavailableError::new(
+                "failed to query NRD library descriptor",
+            ));
+        }
+        Ok(desc)
+    }
+
+    #[cfg(not(feature = "nrd"))]
+    pub fn instance_snapshot(&self) -> NrdResult<NrdInstanceSnapshot> {
+        Err(NrdUnavailableError::new(
+            "NRD is unavailable because the nrd Cargo feature is disabled",
+        ))
+    }
+
+    #[cfg(feature = "nrd")]
+    pub fn instance_snapshot(&self) -> NrdResult<NrdInstanceSnapshot> {
+        let mut desc = NrdInstanceDesc {
+            constant_buffer_and_samplers_space_index: 0,
+            resources_space_index: 0,
+            constant_buffer_register_index: 0,
+            samplers_base_register_index: 0,
+            resources_base_register_index: 0,
+            constant_buffer_max_data_size: 0,
+            samplers: std::ptr::null(),
+            samplers_num: 0,
+            pipelines: std::ptr::null(),
+            pipelines_num: 0,
+            permanent_pool: std::ptr::null(),
+            permanent_pool_size: 0,
+            transient_pool: std::ptr::null(),
+            transient_pool_size: 0,
+        };
+        let status = unsafe { revolumetric_nrd_get_instance_desc(self.ptr.as_ptr(), &mut desc) };
+        if status != REVOLUMETRIC_NRD_STATUS_OK {
+            return Err(NrdUnavailableError::new(
+                "failed to query NRD instance descriptor",
+            ));
+        }
+        NrdInstanceSnapshot::from_ffi(&desc)
+    }
+
+    #[cfg(not(feature = "nrd"))]
+    pub fn set_common_settings(&mut self, _settings: &NrdCommonSettings) -> NrdResult<()> {
+        Err(NrdUnavailableError::new(
+            "NRD is unavailable because the nrd Cargo feature is disabled",
+        ))
+    }
+
+    #[cfg(feature = "nrd")]
+    pub fn set_common_settings(&mut self, settings: &NrdCommonSettings) -> NrdResult<()> {
+        let status = unsafe { revolumetric_nrd_set_common_settings(self.ptr.as_ptr(), settings) };
+        if status != REVOLUMETRIC_NRD_STATUS_OK {
+            return Err(NrdUnavailableError::new(
+                "failed to upload NRD common settings",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nrd"))]
+    pub fn set_relax_diffuse_settings(
+        &mut self,
+        _settings: &NrdRelaxDiffuseSettings,
+    ) -> NrdResult<()> {
+        Err(NrdUnavailableError::new(
+            "NRD is unavailable because the nrd Cargo feature is disabled",
+        ))
+    }
+
+    #[cfg(feature = "nrd")]
+    pub fn set_relax_diffuse_settings(
+        &mut self,
+        settings: &NrdRelaxDiffuseSettings,
+    ) -> NrdResult<()> {
+        let status =
+            unsafe { revolumetric_nrd_set_relax_diffuse_settings(self.ptr.as_ptr(), settings) };
+        if status != REVOLUMETRIC_NRD_STATUS_OK {
+            return Err(NrdUnavailableError::new(
+                "failed to upload NRD RELAX_DIFFUSE settings",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "nrd"))]
+    pub fn dispatch_snapshot(&mut self) -> NrdResult<Vec<NrdDispatchSnapshot>> {
+        Err(NrdUnavailableError::new(
+            "NRD is unavailable because the nrd Cargo feature is disabled",
+        ))
+    }
+
+    #[cfg(feature = "nrd")]
+    pub fn dispatch_snapshot(&mut self) -> NrdResult<Vec<NrdDispatchSnapshot>> {
+        let mut dispatches = std::ptr::null();
+        let mut dispatches_num = 0;
+        let status = unsafe {
+            revolumetric_nrd_get_dispatches(self.ptr.as_ptr(), &mut dispatches, &mut dispatches_num)
+        };
+        if status != REVOLUMETRIC_NRD_STATUS_OK {
+            return Err(NrdUnavailableError::new(
+                "failed to query NRD compute dispatches",
+            ));
+        }
+        NrdDispatchSnapshot::copy_slice(dispatches, dispatches_num)
     }
 }
 
@@ -249,6 +529,7 @@ type OpaqueVoid = c_void;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CString;
 
     #[test]
     fn ffi_descriptor_layouts_are_pod_c_abi_shapes() {
@@ -270,5 +551,118 @@ mod tests {
             let error = NrdInstance::relax_diffuse(1, 1).unwrap_err();
             assert!(error.to_string().contains("nrd Cargo feature is disabled"));
         }
+    }
+
+    #[test]
+    fn owned_instance_snapshot_deep_copies_ffi_arrays() {
+        let mut samplers = [NrdSamplerDesc { mode: 7 }];
+        let mut permanent_pool = [NrdTextureDesc {
+            format: 1,
+            downsample_factor: 2,
+            reserved0: 0,
+        }];
+        let mut transient_pool = [NrdTextureDesc {
+            format: 3,
+            downsample_factor: 4,
+            reserved0: 0,
+        }];
+        let mut resource_ranges = [NrdResourceRangeDesc {
+            descriptor_type: 5,
+            descriptors_num: 6,
+        }];
+        let mut spirv = [0x0723_0203, 1, 2, 3];
+        let mut shader_identifier = [0 as std::os::raw::c_char; 256];
+        for (dst, src) in shader_identifier.iter_mut().zip(b"relax") {
+            *dst = *src as std::os::raw::c_char;
+        }
+        let mut pipelines = [NrdPipelineDesc {
+            spirv_bytecode: spirv.as_ptr(),
+            spirv_bytecode_size: (spirv.len() * std::mem::size_of::<u32>()) as u64,
+            resource_ranges: resource_ranges.as_ptr(),
+            resource_ranges_num: resource_ranges.len() as u32,
+            has_constant_data: 1,
+            shader_identifier,
+        }];
+        let desc = NrdInstanceDesc {
+            constant_buffer_and_samplers_space_index: 10,
+            resources_space_index: 11,
+            constant_buffer_register_index: 12,
+            samplers_base_register_index: 13,
+            resources_base_register_index: 14,
+            constant_buffer_max_data_size: 512,
+            samplers: samplers.as_ptr(),
+            samplers_num: samplers.len() as u32,
+            pipelines: pipelines.as_ptr(),
+            pipelines_num: pipelines.len() as u32,
+            permanent_pool: permanent_pool.as_ptr(),
+            permanent_pool_size: permanent_pool.len() as u32,
+            transient_pool: transient_pool.as_ptr(),
+            transient_pool_size: transient_pool.len() as u32,
+        };
+
+        let snapshot = NrdInstanceSnapshot::from_ffi(&desc).unwrap();
+
+        samplers[0].mode = 99;
+        permanent_pool[0].format = 99;
+        transient_pool[0].format = 99;
+        resource_ranges[0].descriptor_type = 99;
+        spirv[0] = 99;
+        pipelines[0].has_constant_data = 0;
+        assert_eq!(samplers[0].mode, 99);
+        assert_eq!(permanent_pool[0].format, 99);
+        assert_eq!(transient_pool[0].format, 99);
+        assert_eq!(resource_ranges[0].descriptor_type, 99);
+        assert_eq!(spirv[0], 99);
+        assert_eq!(pipelines[0].has_constant_data, 0);
+
+        assert_eq!(snapshot.samplers[0].mode, 7);
+        assert_eq!(snapshot.permanent_pool[0].format, 1);
+        assert_eq!(snapshot.transient_pool[0].format, 3);
+        assert_eq!(snapshot.pipelines[0].resource_ranges[0].descriptor_type, 5);
+        assert_eq!(snapshot.pipelines[0].spirv_bytecode[0], 0x0723_0203);
+        assert!(snapshot.pipelines[0].has_constant_data);
+        assert_eq!(snapshot.pipelines[0].shader_identifier, "relax");
+    }
+
+    #[test]
+    fn owned_dispatch_snapshot_deep_copies_ffi_arrays() {
+        let name = CString::new("Relax Diffuse Prepass").unwrap();
+        let mut resources = [NrdResourceDesc {
+            descriptor_type: 1,
+            resource_type: 2,
+            index_in_pool: 3,
+            reserved0: 0,
+        }];
+        let mut constant_data = [4_u8, 5, 6, 7];
+        let dispatches = [NrdDispatchDesc {
+            name: name.as_ptr(),
+            identifier: 8,
+            resources: resources.as_ptr(),
+            resources_num: resources.len() as u32,
+            constant_buffer_data: constant_data.as_ptr(),
+            constant_buffer_data_size: constant_data.len() as u32,
+            constant_buffer_data_matches_previous_dispatch: 1,
+            pipeline_index: 9,
+            grid_width: 10,
+            grid_height: 11,
+            reserved0: 0,
+        }];
+
+        let snapshot =
+            NrdDispatchSnapshot::copy_slice(dispatches.as_ptr(), dispatches.len() as u32).unwrap();
+
+        resources[0].index_in_pool = 99;
+        constant_data[0] = 99;
+        assert_eq!(resources[0].index_in_pool, 99);
+        assert_eq!(constant_data[0], 99);
+
+        assert_eq!(snapshot[0].name, "Relax Diffuse Prepass");
+        assert_eq!(snapshot[0].identifier, 8);
+        assert_eq!(snapshot[0].resources[0].index_in_pool, 3);
+        assert_eq!(snapshot[0].constant_buffer_data, vec![4, 5, 6, 7]);
+        assert!(snapshot[0].constant_buffer_data_matches_previous_dispatch);
+        assert_eq!(snapshot[0].pipeline_index, 9);
+        assert_eq!(snapshot[0].grid_width, 10);
+        assert_eq!(snapshot[0].grid_height, 11);
     }
 }

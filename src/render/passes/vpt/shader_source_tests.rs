@@ -1169,6 +1169,17 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
             "native NRD wrapper missing {token}"
         );
     }
+    for token in [
+        "out.resourceRanges.reserve(",
+        "out.pipelines.reserve(desc.pipelinesNum)",
+        "instance->dispatchResources.reserve(",
+        "instance->dispatches.reserve(dispatches_num)",
+    ] {
+        assert!(
+            native_cpp.contains(token),
+            "native NRD wrapper must reserve vector storage before exposing internal pointers: missing {token}"
+        );
+    }
 
     for token in [
         "pub struct VptNrdAdapterPass",
