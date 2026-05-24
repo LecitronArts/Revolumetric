@@ -621,6 +621,16 @@ impl VptNrdDescriptorPoolPlan {
             pool_sizes,
         })
     }
+
+    pub fn vk_pool_sizes(&self) -> Vec<vk::DescriptorPoolSize> {
+        self.pool_sizes
+            .iter()
+            .map(|pool_size| vk::DescriptorPoolSize {
+                ty: pool_size.descriptor_type,
+                descriptor_count: pool_size.descriptor_count,
+            })
+            .collect()
+    }
 }
 
 impl VptNrdDispatchResourcePlan {
@@ -1208,6 +1218,31 @@ mod tests {
                 ],
             }
         );
+    }
+
+    #[test]
+    fn descriptor_pool_plan_exports_vulkan_pool_sizes() {
+        let pool_plan = VptNrdDescriptorPoolPlan {
+            max_sets: 3,
+            pool_sizes: vec![
+                VptNrdDescriptorPoolSizePlan {
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 9,
+                },
+                VptNrdDescriptorPoolSizePlan {
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 6,
+                },
+            ],
+        };
+
+        let pool_sizes = pool_plan.vk_pool_sizes();
+
+        assert_eq!(pool_sizes.len(), 2);
+        assert_eq!(pool_sizes[0].ty, vk::DescriptorType::SAMPLED_IMAGE);
+        assert_eq!(pool_sizes[0].descriptor_count, 9);
+        assert_eq!(pool_sizes[1].ty, vk::DescriptorType::STORAGE_IMAGE);
+        assert_eq!(pool_sizes[1].descriptor_count, 6);
     }
 
     #[test]
