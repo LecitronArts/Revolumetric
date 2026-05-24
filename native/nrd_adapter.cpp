@@ -33,8 +33,95 @@ static uint32_t to_u32(nrd::ResourceType value) {
     return static_cast<uint32_t>(value);
 }
 
-static uint32_t to_u32(nrd::Format value) {
-    return static_cast<uint32_t>(value);
+static uint32_t to_texture_format(nrd::Format value) {
+    switch (value) {
+        case nrd::Format::R8_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R8_UNORM;
+        case nrd::Format::R8_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R8_SNORM;
+        case nrd::Format::R8_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R8_UINT;
+        case nrd::Format::R8_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R8_SINT;
+        case nrd::Format::RG8_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG8_UNORM;
+        case nrd::Format::RG8_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG8_SNORM;
+        case nrd::Format::RG8_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG8_UINT;
+        case nrd::Format::RG8_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG8_SINT;
+        case nrd::Format::RGBA8_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA8_UNORM;
+        case nrd::Format::RGBA8_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA8_SNORM;
+        case nrd::Format::RGBA8_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA8_UINT;
+        case nrd::Format::RGBA8_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA8_SINT;
+        case nrd::Format::RGBA8_SRGB:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA8_SRGB;
+        case nrd::Format::R16_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_UNORM;
+        case nrd::Format::R16_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SNORM;
+        case nrd::Format::R16_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_UINT;
+        case nrd::Format::R16_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SINT;
+        case nrd::Format::R16_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SFLOAT;
+        case nrd::Format::RG16_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG16_UNORM;
+        case nrd::Format::RG16_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG16_SNORM;
+        case nrd::Format::RG16_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG16_UINT;
+        case nrd::Format::RG16_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG16_SINT;
+        case nrd::Format::RG16_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG16_SFLOAT;
+        case nrd::Format::RGBA16_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_UNORM;
+        case nrd::Format::RGBA16_SNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SNORM;
+        case nrd::Format::RGBA16_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_UINT;
+        case nrd::Format::RGBA16_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SINT;
+        case nrd::Format::RGBA16_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SFLOAT;
+        case nrd::Format::R32_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R32_UINT;
+        case nrd::Format::R32_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R32_SINT;
+        case nrd::Format::R32_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R32_SFLOAT;
+        case nrd::Format::RG32_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG32_UINT;
+        case nrd::Format::RG32_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG32_SINT;
+        case nrd::Format::RG32_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RG32_SFLOAT;
+        case nrd::Format::RGB32_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGB32_UINT;
+        case nrd::Format::RGB32_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGB32_SINT;
+        case nrd::Format::RGB32_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGB32_SFLOAT;
+        case nrd::Format::RGBA32_UINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA32_UINT;
+        case nrd::Format::RGBA32_SINT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA32_SINT;
+        case nrd::Format::RGBA32_SFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA32_SFLOAT;
+        case nrd::Format::R10_G10_B10_A2_UNORM:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R10_G10_B10_A2_UNORM;
+        case nrd::Format::R11_G11_B10_UFLOAT:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_R11_G11_B10_UFLOAT;
+        default:
+            return REVOLUMETRIC_NRD_TEXTURE_FORMAT_UNSUPPORTED;
+    }
 }
 
 static void copy_matrix(float* dst, const float* src) {
@@ -145,12 +232,12 @@ static void cache_instance_desc(RevolumetricNrdInstance& out) {
     for (uint32_t i = 0; i < desc.permanentPoolSize; ++i) {
         const nrd::TextureDesc& texture = desc.permanentPool[i];
         out.permanentPool.push_back(
-            {to_u32(texture.format), texture.downsampleFactor, 0});
+            {to_texture_format(texture.format), texture.downsampleFactor, 0});
     }
     for (uint32_t i = 0; i < desc.transientPoolSize; ++i) {
         const nrd::TextureDesc& texture = desc.transientPool[i];
         out.transientPool.push_back(
-            {to_u32(texture.format), texture.downsampleFactor, 0});
+            {to_texture_format(texture.format), texture.downsampleFactor, 0});
     }
 
     for (uint32_t i = 0; i < desc.pipelinesNum; ++i) {

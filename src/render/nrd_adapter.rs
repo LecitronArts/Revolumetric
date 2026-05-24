@@ -19,6 +19,60 @@ pub struct NrdTextureDesc {
     pub reserved0: u16,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NrdTextureFormat {
+    Unknown = 0,
+    R8Unorm = 1,
+    R8Snorm = 2,
+    R8Uint = 3,
+    R8Sint = 4,
+    Rg8Unorm = 5,
+    Rg8Snorm = 6,
+    Rg8Uint = 7,
+    Rg8Sint = 8,
+    Rgba8Unorm = 9,
+    Rgba8Snorm = 10,
+    Rgba8Uint = 11,
+    Rgba8Sint = 12,
+    Rgba8Srgb = 13,
+    R16Unorm = 14,
+    R16Snorm = 15,
+    R16Uint = 16,
+    R16Sint = 17,
+    R16Sfloat = 18,
+    Rg16Unorm = 19,
+    Rg16Snorm = 20,
+    Rg16Uint = 21,
+    Rg16Sint = 22,
+    Rg16Sfloat = 23,
+    Rgba16Unorm = 24,
+    Rgba16Snorm = 25,
+    Rgba16Uint = 26,
+    Rgba16Sint = 27,
+    Rgba16Sfloat = 28,
+    R32Uint = 29,
+    R32Sint = 30,
+    R32Sfloat = 31,
+    Rg32Uint = 32,
+    Rg32Sint = 33,
+    Rg32Sfloat = 34,
+    Rgb32Uint = 35,
+    Rgb32Sint = 36,
+    Rgb32Sfloat = 37,
+    Rgba32Uint = 38,
+    Rgba32Sint = 39,
+    Rgba32Sfloat = 40,
+    R10G10B10A2Unorm = 41,
+    R11G11B10Ufloat = 42,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NrdTextureImageDesc {
+    pub format: ash::vk::Format,
+    pub downsample_factor: u16,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct NrdResourceDesc {
@@ -203,6 +257,80 @@ impl fmt::Display for NrdUnavailableError {
 impl std::error::Error for NrdUnavailableError {}
 
 pub type NrdResult<T> = Result<T, NrdUnavailableError>;
+
+impl NrdTextureDesc {
+    pub fn image_desc(self) -> NrdResult<NrdTextureImageDesc> {
+        Ok(NrdTextureImageDesc {
+            format: nrd_texture_format_to_vk(self.format)?,
+            downsample_factor: self.downsample_factor,
+        })
+    }
+}
+
+fn nrd_texture_format_to_vk(format: u32) -> NrdResult<ash::vk::Format> {
+    let format = match format {
+        value if value == NrdTextureFormat::R8Unorm as u32 => ash::vk::Format::R8_UNORM,
+        value if value == NrdTextureFormat::R8Snorm as u32 => ash::vk::Format::R8_SNORM,
+        value if value == NrdTextureFormat::R8Uint as u32 => ash::vk::Format::R8_UINT,
+        value if value == NrdTextureFormat::R8Sint as u32 => ash::vk::Format::R8_SINT,
+        value if value == NrdTextureFormat::Rg8Unorm as u32 => ash::vk::Format::R8G8_UNORM,
+        value if value == NrdTextureFormat::Rg8Snorm as u32 => ash::vk::Format::R8G8_SNORM,
+        value if value == NrdTextureFormat::Rg8Uint as u32 => ash::vk::Format::R8G8_UINT,
+        value if value == NrdTextureFormat::Rg8Sint as u32 => ash::vk::Format::R8G8_SINT,
+        value if value == NrdTextureFormat::Rgba8Unorm as u32 => ash::vk::Format::R8G8B8A8_UNORM,
+        value if value == NrdTextureFormat::Rgba8Snorm as u32 => ash::vk::Format::R8G8B8A8_SNORM,
+        value if value == NrdTextureFormat::Rgba8Uint as u32 => ash::vk::Format::R8G8B8A8_UINT,
+        value if value == NrdTextureFormat::Rgba8Sint as u32 => ash::vk::Format::R8G8B8A8_SINT,
+        value if value == NrdTextureFormat::Rgba8Srgb as u32 => ash::vk::Format::R8G8B8A8_SRGB,
+        value if value == NrdTextureFormat::R16Unorm as u32 => ash::vk::Format::R16_UNORM,
+        value if value == NrdTextureFormat::R16Snorm as u32 => ash::vk::Format::R16_SNORM,
+        value if value == NrdTextureFormat::R16Uint as u32 => ash::vk::Format::R16_UINT,
+        value if value == NrdTextureFormat::R16Sint as u32 => ash::vk::Format::R16_SINT,
+        value if value == NrdTextureFormat::R16Sfloat as u32 => ash::vk::Format::R16_SFLOAT,
+        value if value == NrdTextureFormat::Rg16Unorm as u32 => ash::vk::Format::R16G16_UNORM,
+        value if value == NrdTextureFormat::Rg16Snorm as u32 => ash::vk::Format::R16G16_SNORM,
+        value if value == NrdTextureFormat::Rg16Uint as u32 => ash::vk::Format::R16G16_UINT,
+        value if value == NrdTextureFormat::Rg16Sint as u32 => ash::vk::Format::R16G16_SINT,
+        value if value == NrdTextureFormat::Rg16Sfloat as u32 => ash::vk::Format::R16G16_SFLOAT,
+        value if value == NrdTextureFormat::Rgba16Unorm as u32 => {
+            ash::vk::Format::R16G16B16A16_UNORM
+        }
+        value if value == NrdTextureFormat::Rgba16Snorm as u32 => {
+            ash::vk::Format::R16G16B16A16_SNORM
+        }
+        value if value == NrdTextureFormat::Rgba16Uint as u32 => ash::vk::Format::R16G16B16A16_UINT,
+        value if value == NrdTextureFormat::Rgba16Sint as u32 => ash::vk::Format::R16G16B16A16_SINT,
+        value if value == NrdTextureFormat::Rgba16Sfloat as u32 => {
+            ash::vk::Format::R16G16B16A16_SFLOAT
+        }
+        value if value == NrdTextureFormat::R32Uint as u32 => ash::vk::Format::R32_UINT,
+        value if value == NrdTextureFormat::R32Sint as u32 => ash::vk::Format::R32_SINT,
+        value if value == NrdTextureFormat::R32Sfloat as u32 => ash::vk::Format::R32_SFLOAT,
+        value if value == NrdTextureFormat::Rg32Uint as u32 => ash::vk::Format::R32G32_UINT,
+        value if value == NrdTextureFormat::Rg32Sint as u32 => ash::vk::Format::R32G32_SINT,
+        value if value == NrdTextureFormat::Rg32Sfloat as u32 => ash::vk::Format::R32G32_SFLOAT,
+        value if value == NrdTextureFormat::Rgb32Uint as u32 => ash::vk::Format::R32G32B32_UINT,
+        value if value == NrdTextureFormat::Rgb32Sint as u32 => ash::vk::Format::R32G32B32_SINT,
+        value if value == NrdTextureFormat::Rgb32Sfloat as u32 => ash::vk::Format::R32G32B32_SFLOAT,
+        value if value == NrdTextureFormat::Rgba32Uint as u32 => ash::vk::Format::R32G32B32A32_UINT,
+        value if value == NrdTextureFormat::Rgba32Sint as u32 => ash::vk::Format::R32G32B32A32_SINT,
+        value if value == NrdTextureFormat::Rgba32Sfloat as u32 => {
+            ash::vk::Format::R32G32B32A32_SFLOAT
+        }
+        value if value == NrdTextureFormat::R10G10B10A2Unorm as u32 => {
+            ash::vk::Format::A2B10G10R10_UNORM_PACK32
+        }
+        value if value == NrdTextureFormat::R11G11B10Ufloat as u32 => {
+            ash::vk::Format::B10G11R11_UFLOAT_PACK32
+        }
+        _ => {
+            return Err(NrdUnavailableError::new(
+                "unsupported NRD texture format from adapter ABI",
+            ));
+        }
+    };
+    Ok(format)
+}
 
 impl NrdInstanceSnapshot {
     pub fn from_ffi(desc: &NrdInstanceDesc) -> NrdResult<Self> {
@@ -664,5 +792,51 @@ mod tests {
         assert_eq!(snapshot[0].pipeline_index, 9);
         assert_eq!(snapshot[0].grid_width, 10);
         assert_eq!(snapshot[0].grid_height, 11);
+    }
+
+    #[test]
+    fn nrd_texture_desc_maps_stable_abi_formats_to_vulkan_formats() {
+        for (format, expected_vk_format) in [
+            (NrdTextureFormat::R16Sfloat, ash::vk::Format::R16_SFLOAT),
+            (NrdTextureFormat::Rg16Sfloat, ash::vk::Format::R16G16_SFLOAT),
+            (
+                NrdTextureFormat::Rgba16Sfloat,
+                ash::vk::Format::R16G16B16A16_SFLOAT,
+            ),
+            (NrdTextureFormat::R32Sfloat, ash::vk::Format::R32_SFLOAT),
+            (NrdTextureFormat::Rg32Sfloat, ash::vk::Format::R32G32_SFLOAT),
+            (
+                NrdTextureFormat::Rgba32Sfloat,
+                ash::vk::Format::R32G32B32A32_SFLOAT,
+            ),
+            (
+                NrdTextureFormat::R11G11B10Ufloat,
+                ash::vk::Format::B10G11R11_UFLOAT_PACK32,
+            ),
+        ] {
+            let desc = NrdTextureDesc {
+                format: format as u32,
+                downsample_factor: 2,
+                reserved0: 0,
+            };
+
+            let image_desc = desc.image_desc().unwrap();
+
+            assert_eq!(image_desc.format, expected_vk_format);
+            assert_eq!(image_desc.downsample_factor, 2);
+        }
+    }
+
+    #[test]
+    fn nrd_texture_desc_rejects_unknown_format() {
+        let desc = NrdTextureDesc {
+            format: NrdTextureFormat::Unknown as u32,
+            downsample_factor: 1,
+            reserved0: 0,
+        };
+
+        let error = desc.image_desc().unwrap_err();
+
+        assert!(error.to_string().contains("unsupported NRD texture format"));
     }
 }

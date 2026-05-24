@@ -1147,6 +1147,9 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         assert!(build_rs.contains(token), "NRD build gate missing {token}");
     }
     for token in [
+        "typedef enum RevolumetricNrdTextureFormat",
+        "REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SFLOAT",
+        "REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SFLOAT",
         "struct NrdLibraryDesc",
         "struct NrdInstanceDesc",
         "struct NrdTextureDesc",
@@ -1170,6 +1173,10 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         );
     }
     for token in [
+        "static uint32_t to_texture_format(nrd::Format value)",
+        "case nrd::Format::R16_SFLOAT:",
+        "case nrd::Format::RGBA16_SFLOAT:",
+        "REVOLUMETRIC_NRD_TEXTURE_FORMAT_UNSUPPORTED",
         "out.resourceRanges.reserve(",
         "out.pipelines.reserve(desc.pipelinesNum)",
         "instance->dispatchResources.reserve(",
