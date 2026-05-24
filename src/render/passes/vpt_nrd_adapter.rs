@@ -24,6 +24,7 @@ pub struct VptNrdAdapterPass {
     texture_pools: Option<VptNrdTexturePools>,
     descriptor_resources: Option<VptNrdDescriptorResources>,
     pipeline_resources: Option<VptNrdPipelineResources>,
+    descriptor_update_plan: Option<VptNrdDescriptorUpdatePlan>,
 }
 
 pub enum VptNrdAdapterBackend {
@@ -341,25 +342,28 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
-        if let Err(error) = build_descriptor_update_plan(
+        let descriptor_update_plan = match build_descriptor_update_plan(
             &backend,
             descriptor_resources.as_ref(),
             texture_pools.as_ref(),
             &images,
             info.image_refs,
         ) {
-            images.destroy(device, allocator);
-            if let Some(pipeline_resources) = pipeline_resources {
-                pipeline_resources.destroy(device);
+            Ok(plan) => plan,
+            Err(error) => {
+                images.destroy(device, allocator);
+                if let Some(pipeline_resources) = pipeline_resources {
+                    pipeline_resources.destroy(device);
+                }
+                if let Some(descriptor_resources) = descriptor_resources {
+                    descriptor_resources.destroy(device);
+                }
+                if let Some(texture_pools) = texture_pools {
+                    texture_pools.destroy(device, allocator);
+                }
+                return Err(error).context("failed to build VPT NRD descriptor update plan");
             }
-            if let Some(descriptor_resources) = descriptor_resources {
-                descriptor_resources.destroy(device);
-            }
-            if let Some(texture_pools) = texture_pools {
-                texture_pools.destroy(device, allocator);
-            }
-            return Err(error).context("failed to build VPT NRD descriptor update plan");
-        }
+        };
         Ok(Self {
             nrd_diff_radiance_hitdist: images.nrd_diff_radiance_hitdist,
             nrd_validation: images.nrd_validation,
@@ -367,6 +371,7 @@ impl VptNrdAdapterPass {
             texture_pools,
             descriptor_resources,
             pipeline_resources,
+            descriptor_update_plan,
         })
     }
 
@@ -419,25 +424,28 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
-        if let Err(error) = build_descriptor_update_plan(
+        let descriptor_update_plan = match build_descriptor_update_plan(
             &new_backend,
             new_descriptor_resources.as_ref(),
             new_texture_pools.as_ref(),
             &new_images,
             info.image_refs,
         ) {
-            if let Some(new_pipeline_resources) = new_pipeline_resources {
-                new_pipeline_resources.destroy(device);
+            Ok(plan) => plan,
+            Err(error) => {
+                if let Some(new_pipeline_resources) = new_pipeline_resources {
+                    new_pipeline_resources.destroy(device);
+                }
+                if let Some(new_descriptor_resources) = new_descriptor_resources {
+                    new_descriptor_resources.destroy(device);
+                }
+                if let Some(new_texture_pools) = new_texture_pools {
+                    new_texture_pools.destroy(device, allocator);
+                }
+                new_images.destroy(device, allocator);
+                return Err(error).context("failed to rebuild VPT NRD descriptor update plan");
             }
-            if let Some(new_descriptor_resources) = new_descriptor_resources {
-                new_descriptor_resources.destroy(device);
-            }
-            if let Some(new_texture_pools) = new_texture_pools {
-                new_texture_pools.destroy(device, allocator);
-            }
-            new_images.destroy(device, allocator);
-            return Err(error).context("failed to rebuild VPT NRD descriptor update plan");
-        }
+        };
         let old_images = VptNrdAdapterImages {
             nrd_diff_radiance_hitdist: std::mem::replace(
                 &mut self.nrd_diff_radiance_hitdist,
@@ -450,6 +458,8 @@ impl VptNrdAdapterPass {
             std::mem::replace(&mut self.descriptor_resources, new_descriptor_resources);
         let old_pipeline_resources =
             std::mem::replace(&mut self.pipeline_resources, new_pipeline_resources);
+        let old_descriptor_update_plan =
+            std::mem::replace(&mut self.descriptor_update_plan, descriptor_update_plan);
         let old_backend = std::mem::replace(&mut self.backend, new_backend);
         if let Some(old_pipeline_resources) = old_pipeline_resources {
             old_pipeline_resources.destroy(device);
@@ -457,6 +467,7 @@ impl VptNrdAdapterPass {
         if let Some(old_descriptor_resources) = old_descriptor_resources {
             old_descriptor_resources.destroy(device);
         }
+        let _ = old_descriptor_update_plan;
         old_images.destroy(device, allocator);
         if let Some(old_texture_pools) = old_texture_pools {
             old_texture_pools.destroy(device, allocator);
