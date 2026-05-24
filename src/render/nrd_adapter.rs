@@ -67,10 +67,69 @@ pub enum NrdTextureFormat {
     R11G11B10Ufloat = 42,
 }
 
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NrdDescriptorType {
+    Unsupported = 0,
+    Texture = 1,
+    StorageTexture = 2,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NrdResourceType {
+    Unsupported = 0,
+    InMv = 1,
+    InNormalRoughness = 2,
+    InViewZ = 3,
+    InDiffConfidence = 4,
+    InSpecConfidence = 5,
+    InDisocclusionThresholdMix = 6,
+    InDiffRadianceHitdist = 7,
+    InSpecRadianceHitdist = 8,
+    InDiffHitdist = 9,
+    InSpecHitdist = 10,
+    InDiffDirectionHitdist = 11,
+    InDiffSh0 = 12,
+    InDiffSh1 = 13,
+    InSpecSh0 = 14,
+    InSpecSh1 = 15,
+    InPenumbra = 16,
+    InTranslucency = 17,
+    InSignal = 18,
+    OutDiffRadianceHitdist = 19,
+    OutSpecRadianceHitdist = 20,
+    OutDiffSh0 = 21,
+    OutDiffSh1 = 22,
+    OutSpecSh0 = 23,
+    OutSpecSh1 = 24,
+    OutDiffHitdist = 25,
+    OutSpecHitdist = 26,
+    OutDiffDirectionHitdist = 27,
+    OutShadowTranslucency = 28,
+    OutSignal = 29,
+    OutValidation = 30,
+    TransientPool = 31,
+    PermanentPool = 32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NrdTextureImageDesc {
     pub format: ash::vk::Format,
     pub downsample_factor: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NrdResourceBindingDesc {
+    pub descriptor_type: NrdDescriptorType,
+    pub resource_type: NrdResourceType,
+    pub index_in_pool: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NrdResourceRangeBindingDesc {
+    pub descriptor_type: NrdDescriptorType,
+    pub descriptors_num: u32,
 }
 
 #[repr(C)]
@@ -265,6 +324,105 @@ impl NrdTextureDesc {
             downsample_factor: self.downsample_factor,
         })
     }
+}
+
+impl NrdResourceDesc {
+    pub fn binding_desc(self) -> NrdResult<NrdResourceBindingDesc> {
+        Ok(NrdResourceBindingDesc {
+            descriptor_type: nrd_descriptor_type_from_abi(self.descriptor_type)?,
+            resource_type: nrd_resource_type_from_abi(self.resource_type)?,
+            index_in_pool: self.index_in_pool,
+        })
+    }
+}
+
+impl NrdResourceRangeDesc {
+    pub fn binding_desc(self) -> NrdResult<NrdResourceRangeBindingDesc> {
+        Ok(NrdResourceRangeBindingDesc {
+            descriptor_type: nrd_descriptor_type_from_abi(self.descriptor_type)?,
+            descriptors_num: self.descriptors_num,
+        })
+    }
+}
+
+fn nrd_descriptor_type_from_abi(value: u32) -> NrdResult<NrdDescriptorType> {
+    let descriptor_type = match value {
+        value if value == NrdDescriptorType::Texture as u32 => NrdDescriptorType::Texture,
+        value if value == NrdDescriptorType::StorageTexture as u32 => {
+            NrdDescriptorType::StorageTexture
+        }
+        _ => {
+            return Err(NrdUnavailableError::new(
+                "unsupported NRD descriptor type from adapter ABI",
+            ));
+        }
+    };
+    Ok(descriptor_type)
+}
+
+fn nrd_resource_type_from_abi(value: u32) -> NrdResult<NrdResourceType> {
+    let resource_type = match value {
+        value if value == NrdResourceType::InMv as u32 => NrdResourceType::InMv,
+        value if value == NrdResourceType::InNormalRoughness as u32 => {
+            NrdResourceType::InNormalRoughness
+        }
+        value if value == NrdResourceType::InViewZ as u32 => NrdResourceType::InViewZ,
+        value if value == NrdResourceType::InDiffConfidence as u32 => {
+            NrdResourceType::InDiffConfidence
+        }
+        value if value == NrdResourceType::InSpecConfidence as u32 => {
+            NrdResourceType::InSpecConfidence
+        }
+        value if value == NrdResourceType::InDisocclusionThresholdMix as u32 => {
+            NrdResourceType::InDisocclusionThresholdMix
+        }
+        value if value == NrdResourceType::InDiffRadianceHitdist as u32 => {
+            NrdResourceType::InDiffRadianceHitdist
+        }
+        value if value == NrdResourceType::InSpecRadianceHitdist as u32 => {
+            NrdResourceType::InSpecRadianceHitdist
+        }
+        value if value == NrdResourceType::InDiffHitdist as u32 => NrdResourceType::InDiffHitdist,
+        value if value == NrdResourceType::InSpecHitdist as u32 => NrdResourceType::InSpecHitdist,
+        value if value == NrdResourceType::InDiffDirectionHitdist as u32 => {
+            NrdResourceType::InDiffDirectionHitdist
+        }
+        value if value == NrdResourceType::InDiffSh0 as u32 => NrdResourceType::InDiffSh0,
+        value if value == NrdResourceType::InDiffSh1 as u32 => NrdResourceType::InDiffSh1,
+        value if value == NrdResourceType::InSpecSh0 as u32 => NrdResourceType::InSpecSh0,
+        value if value == NrdResourceType::InSpecSh1 as u32 => NrdResourceType::InSpecSh1,
+        value if value == NrdResourceType::InPenumbra as u32 => NrdResourceType::InPenumbra,
+        value if value == NrdResourceType::InTranslucency as u32 => NrdResourceType::InTranslucency,
+        value if value == NrdResourceType::InSignal as u32 => NrdResourceType::InSignal,
+        value if value == NrdResourceType::OutDiffRadianceHitdist as u32 => {
+            NrdResourceType::OutDiffRadianceHitdist
+        }
+        value if value == NrdResourceType::OutSpecRadianceHitdist as u32 => {
+            NrdResourceType::OutSpecRadianceHitdist
+        }
+        value if value == NrdResourceType::OutDiffSh0 as u32 => NrdResourceType::OutDiffSh0,
+        value if value == NrdResourceType::OutDiffSh1 as u32 => NrdResourceType::OutDiffSh1,
+        value if value == NrdResourceType::OutSpecSh0 as u32 => NrdResourceType::OutSpecSh0,
+        value if value == NrdResourceType::OutSpecSh1 as u32 => NrdResourceType::OutSpecSh1,
+        value if value == NrdResourceType::OutDiffHitdist as u32 => NrdResourceType::OutDiffHitdist,
+        value if value == NrdResourceType::OutSpecHitdist as u32 => NrdResourceType::OutSpecHitdist,
+        value if value == NrdResourceType::OutDiffDirectionHitdist as u32 => {
+            NrdResourceType::OutDiffDirectionHitdist
+        }
+        value if value == NrdResourceType::OutShadowTranslucency as u32 => {
+            NrdResourceType::OutShadowTranslucency
+        }
+        value if value == NrdResourceType::OutSignal as u32 => NrdResourceType::OutSignal,
+        value if value == NrdResourceType::OutValidation as u32 => NrdResourceType::OutValidation,
+        value if value == NrdResourceType::TransientPool as u32 => NrdResourceType::TransientPool,
+        value if value == NrdResourceType::PermanentPool as u32 => NrdResourceType::PermanentPool,
+        _ => {
+            return Err(NrdUnavailableError::new(
+                "unsupported NRD resource type from adapter ABI",
+            ));
+        }
+    };
+    Ok(resource_type)
 }
 
 fn nrd_texture_format_to_vk(format: u32) -> NrdResult<ash::vk::Format> {
@@ -792,6 +950,85 @@ mod tests {
         assert_eq!(snapshot[0].pipeline_index, 9);
         assert_eq!(snapshot[0].grid_width, 10);
         assert_eq!(snapshot[0].grid_height, 11);
+    }
+
+    #[test]
+    fn nrd_resource_desc_maps_stable_abi_resource_semantics() {
+        let desc = NrdResourceDesc {
+            descriptor_type: NrdDescriptorType::Texture as u32,
+            resource_type: NrdResourceType::InDiffRadianceHitdist as u32,
+            index_in_pool: 7,
+            reserved0: 0,
+        };
+
+        let image_desc = desc.binding_desc().unwrap();
+
+        assert_eq!(image_desc.descriptor_type, NrdDescriptorType::Texture);
+        assert_eq!(
+            image_desc.resource_type,
+            NrdResourceType::InDiffRadianceHitdist
+        );
+        assert_eq!(image_desc.index_in_pool, 7);
+    }
+
+    #[test]
+    fn nrd_resource_desc_rejects_unknown_stable_abi_values() {
+        let unknown_descriptor = NrdResourceDesc {
+            descriptor_type: NrdDescriptorType::Unsupported as u32,
+            resource_type: NrdResourceType::InMv as u32,
+            index_in_pool: 0,
+            reserved0: 0,
+        };
+        let unknown_resource = NrdResourceDesc {
+            descriptor_type: NrdDescriptorType::Texture as u32,
+            resource_type: NrdResourceType::Unsupported as u32,
+            index_in_pool: 0,
+            reserved0: 0,
+        };
+
+        assert!(
+            unknown_descriptor
+                .binding_desc()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported NRD descriptor type")
+        );
+        assert!(
+            unknown_resource
+                .binding_desc()
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported NRD resource type")
+        );
+    }
+
+    #[test]
+    fn nrd_resource_range_desc_maps_stable_abi_descriptor_type() {
+        let range = NrdResourceRangeDesc {
+            descriptor_type: NrdDescriptorType::StorageTexture as u32,
+            descriptors_num: 5,
+        };
+
+        let binding = range.binding_desc().unwrap();
+
+        assert_eq!(binding.descriptor_type, NrdDescriptorType::StorageTexture);
+        assert_eq!(binding.descriptors_num, 5);
+    }
+
+    #[test]
+    fn nrd_resource_range_desc_rejects_unknown_descriptor_type() {
+        let range = NrdResourceRangeDesc {
+            descriptor_type: NrdDescriptorType::Unsupported as u32,
+            descriptors_num: 1,
+        };
+
+        let error = range.binding_desc().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported NRD descriptor type")
+        );
     }
 
     #[test]

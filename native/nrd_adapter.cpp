@@ -25,12 +25,86 @@ static RevolumetricNrdStatus from_result(nrd::Result result) {
                                           : REVOLUMETRIC_NRD_STATUS_SDK_ERROR;
 }
 
-static uint32_t to_u32(nrd::DescriptorType value) {
-    return static_cast<uint32_t>(value);
+static uint32_t to_descriptor_type(nrd::DescriptorType value) {
+    switch (value) {
+        case nrd::DescriptorType::TEXTURE:
+            return REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_TEXTURE;
+        case nrd::DescriptorType::STORAGE_TEXTURE:
+            return REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_STORAGE_TEXTURE;
+        default:
+            return REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_UNSUPPORTED;
+    }
 }
 
-static uint32_t to_u32(nrd::ResourceType value) {
-    return static_cast<uint32_t>(value);
+static uint32_t to_resource_type(nrd::ResourceType value) {
+    switch (value) {
+        case nrd::ResourceType::IN_MV:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_MV;
+        case nrd::ResourceType::IN_NORMAL_ROUGHNESS:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_NORMAL_ROUGHNESS;
+        case nrd::ResourceType::IN_VIEWZ:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_VIEWZ;
+        case nrd::ResourceType::IN_DIFF_CONFIDENCE:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_CONFIDENCE;
+        case nrd::ResourceType::IN_SPEC_CONFIDENCE:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SPEC_CONFIDENCE;
+        case nrd::ResourceType::IN_DISOCCLUSION_THRESHOLD_MIX:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DISOCCLUSION_THRESHOLD_MIX;
+        case nrd::ResourceType::IN_DIFF_RADIANCE_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_RADIANCE_HITDIST;
+        case nrd::ResourceType::IN_SPEC_RADIANCE_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SPEC_RADIANCE_HITDIST;
+        case nrd::ResourceType::IN_DIFF_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_HITDIST;
+        case nrd::ResourceType::IN_SPEC_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SPEC_HITDIST;
+        case nrd::ResourceType::IN_DIFF_DIRECTION_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_DIRECTION_HITDIST;
+        case nrd::ResourceType::IN_DIFF_SH0:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_SH0;
+        case nrd::ResourceType::IN_DIFF_SH1:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_SH1;
+        case nrd::ResourceType::IN_SPEC_SH0:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SPEC_SH0;
+        case nrd::ResourceType::IN_SPEC_SH1:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SPEC_SH1;
+        case nrd::ResourceType::IN_PENUMBRA:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_PENUMBRA;
+        case nrd::ResourceType::IN_TRANSLUCENCY:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_TRANSLUCENCY;
+        case nrd::ResourceType::IN_SIGNAL:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_SIGNAL;
+        case nrd::ResourceType::OUT_DIFF_RADIANCE_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_RADIANCE_HITDIST;
+        case nrd::ResourceType::OUT_SPEC_RADIANCE_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SPEC_RADIANCE_HITDIST;
+        case nrd::ResourceType::OUT_DIFF_SH0:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_SH0;
+        case nrd::ResourceType::OUT_DIFF_SH1:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_SH1;
+        case nrd::ResourceType::OUT_SPEC_SH0:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SPEC_SH0;
+        case nrd::ResourceType::OUT_SPEC_SH1:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SPEC_SH1;
+        case nrd::ResourceType::OUT_DIFF_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_HITDIST;
+        case nrd::ResourceType::OUT_SPEC_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SPEC_HITDIST;
+        case nrd::ResourceType::OUT_DIFF_DIRECTION_HITDIST:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_DIRECTION_HITDIST;
+        case nrd::ResourceType::OUT_SHADOW_TRANSLUCENCY:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SHADOW_TRANSLUCENCY;
+        case nrd::ResourceType::OUT_SIGNAL:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_SIGNAL;
+        case nrd::ResourceType::OUT_VALIDATION:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_VALIDATION;
+        case nrd::ResourceType::TRANSIENT_POOL:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_TRANSIENT_POOL;
+        case nrd::ResourceType::PERMANENT_POOL:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_PERMANENT_POOL;
+        default:
+            return REVOLUMETRIC_NRD_RESOURCE_TYPE_UNSUPPORTED;
+    }
 }
 
 static uint32_t to_texture_format(nrd::Format value) {
@@ -247,8 +321,8 @@ static void cache_instance_desc(RevolumetricNrdInstance& out) {
         for (uint32_t range = 0; range < pipeline.resourceRangesNum; ++range) {
             const nrd::ResourceRangeDesc& native_range =
                 pipeline.resourceRanges[range];
-            out.resourceRanges.push_back(
-                {to_u32(native_range.descriptorType), native_range.descriptorsNum});
+            out.resourceRanges.push_back({to_descriptor_type(native_range.descriptorType),
+                                          native_range.descriptorsNum});
         }
 
         NrdPipelineDesc copied = {};
@@ -403,8 +477,8 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_get_dispatches(
             const nrd::ResourceDesc& native_resource =
                 native_dispatch.resources[resource];
             instance->dispatchResources.push_back({
-                to_u32(native_resource.descriptorType),
-                to_u32(native_resource.type),
+                to_descriptor_type(native_resource.descriptorType),
+                to_resource_type(native_resource.type),
                 native_resource.indexInPool,
                 0,
             });

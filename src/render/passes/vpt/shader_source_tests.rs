@@ -1148,8 +1148,18 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     }
     for token in [
         "typedef enum RevolumetricNrdTextureFormat",
+        "typedef enum RevolumetricNrdDescriptorType",
+        "typedef enum RevolumetricNrdResourceType",
         "REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SFLOAT",
         "REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SFLOAT",
+        "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_TEXTURE",
+        "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_STORAGE_TEXTURE",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_MV",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_RADIANCE_HITDIST",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_RADIANCE_HITDIST",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_VALIDATION",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_TRANSIENT_POOL",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_PERMANENT_POOL",
         "struct NrdLibraryDesc",
         "struct NrdInstanceDesc",
         "struct NrdTextureDesc",
@@ -1174,9 +1184,18 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     }
     for token in [
         "static uint32_t to_texture_format(nrd::Format value)",
+        "static uint32_t to_descriptor_type(nrd::DescriptorType value)",
+        "static uint32_t to_resource_type(nrd::ResourceType value)",
         "case nrd::Format::R16_SFLOAT:",
         "case nrd::Format::RGBA16_SFLOAT:",
         "REVOLUMETRIC_NRD_TEXTURE_FORMAT_UNSUPPORTED",
+        "case nrd::DescriptorType::TEXTURE:",
+        "case nrd::DescriptorType::STORAGE_TEXTURE:",
+        "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_UNSUPPORTED",
+        "case nrd::ResourceType::IN_MV:",
+        "case nrd::ResourceType::OUT_VALIDATION:",
+        "case nrd::ResourceType::PERMANENT_POOL:",
+        "REVOLUMETRIC_NRD_RESOURCE_TYPE_UNSUPPORTED",
         "out.resourceRanges.reserve(",
         "out.pipelines.reserve(desc.pipelinesNum)",
         "instance->dispatchResources.reserve(",
@@ -1187,6 +1206,11 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
             "native NRD wrapper must reserve vector storage before exposing internal pointers: missing {token}"
         );
     }
+    assert!(
+        !native_cpp.contains("static uint32_t to_u32(nrd::DescriptorType value)")
+            && !native_cpp.contains("static uint32_t to_u32(nrd::ResourceType value)"),
+        "native NRD wrapper must not expose SDK enum ordinals as stable ABI values"
+    );
 
     for token in [
         "pub struct VptNrdAdapterPass",
