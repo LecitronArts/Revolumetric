@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
-use crate::render::descriptor::DescriptorBindingSpec;
+use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
@@ -21,6 +21,7 @@ pub struct VptNrdAdapterPass {
     pub nrd_validation: GpuImage,
     backend: VptNrdAdapterBackend,
     texture_pools: Option<VptNrdTexturePools>,
+    descriptor_resources: Option<VptNrdDescriptorResources>,
 }
 
 pub enum VptNrdAdapterBackend {
@@ -141,6 +142,12 @@ struct VptNrdTexturePools {
     transient_pool: Vec<GpuImage>,
 }
 
+struct VptNrdDescriptorResources {
+    descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
+    descriptor_pool: DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+}
+
 pub struct VptNrdAdapterGraphInputs<'a> {
     pub frame_slot: usize,
     pub packed: VptNrdPackedResources,
@@ -187,9 +194,21 @@ impl VptNrdAdapterPass {
             );
         }
         let texture_pools = create_texture_pools(device, allocator, &backend)?;
+        let descriptor_resources = match create_descriptor_resources(device, &backend) {
+            Ok(resources) => resources,
+            Err(error) => {
+                if let Some(texture_pools) = texture_pools {
+                    texture_pools.destroy(device, allocator);
+                }
+                return Err(error);
+            }
+        };
         let images = match create_adapter_images(device, allocator, info.width, info.height) {
             Ok(images) => images,
             Err(error) => {
+                if let Some(descriptor_resources) = descriptor_resources {
+                    descriptor_resources.destroy(device);
+                }
                 if let Some(texture_pools) = texture_pools {
                     texture_pools.destroy(device, allocator);
                 }
@@ -201,6 +220,7 @@ impl VptNrdAdapterPass {
             nrd_validation: images.nrd_validation,
             backend,
             texture_pools,
+            descriptor_resources,
         })
     }
 
@@ -226,6 +246,16 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
+        let new_descriptor_resources = match create_descriptor_resources(device, &new_backend) {
+            Ok(resources) => resources,
+            Err(error) => {
+                if let Some(new_texture_pools) = new_texture_pools {
+                    new_texture_pools.destroy(device, allocator);
+                }
+                new_images.destroy(device, allocator);
+                return Err(error);
+            }
+        };
         let old_images = VptNrdAdapterImages {
             nrd_diff_radiance_hitdist: std::mem::replace(
                 &mut self.nrd_diff_radiance_hitdist,
@@ -234,7 +264,12 @@ impl VptNrdAdapterPass {
             nrd_validation: std::mem::replace(&mut self.nrd_validation, new_images.nrd_validation),
         };
         let old_texture_pools = std::mem::replace(&mut self.texture_pools, new_texture_pools);
+        let old_descriptor_resources =
+            std::mem::replace(&mut self.descriptor_resources, new_descriptor_resources);
         let old_backend = std::mem::replace(&mut self.backend, new_backend);
+        if let Some(old_descriptor_resources) = old_descriptor_resources {
+            old_descriptor_resources.destroy(device);
+        }
         old_images.destroy(device, allocator);
         if let Some(old_texture_pools) = old_texture_pools {
             old_texture_pools.destroy(device, allocator);
@@ -250,6 +285,7 @@ impl VptNrdAdapterPass {
             self.backend.unavailable_reason(),
             self.backend.ready_metadata(),
             self.backend.texture_pool_plan(),
+            self.descriptor_resources.as_ref(),
         );
     }
 
@@ -334,6 +370,9 @@ impl VptNrdAdapterPass {
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
+        if let Some(descriptor_resources) = self.descriptor_resources {
+            descriptor_resources.destroy(device);
+        }
         if let Some(texture_pools) = self.texture_pools {
             texture_pools.destroy(device, allocator);
         }
@@ -371,6 +410,20 @@ impl VptNrdAdapterBackend {
     pub fn texture_pool_plan(&self) -> Option<&VptNrdTexturePoolPlan> {
         match self {
             Self::Ready(backend) => Some(&backend.state.texture_pool_plan),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    fn pipeline_descriptor_binding_plans(&self) -> Option<&[VptNrdPipelineDescriptorBindingPlan]> {
+        match self {
+            Self::Ready(backend) => Some(&backend.state.pipeline_descriptor_binding_plans),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    fn descriptor_pool_plan(&self) -> Option<&VptNrdDescriptorPoolPlan> {
+        match self {
+            Self::Ready(backend) => Some(&backend.state.descriptor_pool_plan),
             Self::Unavailable(_) => None,
         }
     }
@@ -740,6 +793,91 @@ impl VptNrdTexturePools {
     fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
         destroy_texture_pool_images(self.transient_pool, device, allocator);
         destroy_texture_pool_images(self.permanent_pool, device, allocator);
+    }
+}
+
+impl VptNrdDescriptorResources {
+    fn create(
+        device: &ash::Device,
+        binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+        pool_plan: &VptNrdDescriptorPoolPlan,
+    ) -> Result<Self> {
+        let descriptor_set_layouts = create_descriptor_set_layouts(device, binding_plans)?;
+        let pool_sizes = pool_plan.vk_pool_sizes();
+        let descriptor_pool = match DescriptorPool::new(device, pool_plan.max_sets, &pool_sizes) {
+            Ok(pool) => pool,
+            Err(error) => {
+                destroy_descriptor_set_layouts(device, descriptor_set_layouts);
+                return Err(error);
+            }
+        };
+        let descriptor_sets = match descriptor_pool.allocate(device, &descriptor_set_layouts) {
+            Ok(sets) => sets,
+            Err(error) => {
+                descriptor_pool.destroy(device);
+                destroy_descriptor_set_layouts(device, descriptor_set_layouts);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            descriptor_set_layouts,
+            descriptor_pool,
+            descriptor_sets,
+        })
+    }
+
+    fn layout_specs(
+        binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+    ) -> Vec<Vec<DescriptorBindingSpec>> {
+        binding_plans
+            .iter()
+            .map(VptNrdPipelineDescriptorBindingPlan::descriptor_binding_specs)
+            .collect()
+    }
+
+    fn destroy(self, device: &ash::Device) {
+        let _ = self.descriptor_sets;
+        self.descriptor_pool.destroy(device);
+        destroy_descriptor_set_layouts(device, self.descriptor_set_layouts);
+    }
+}
+
+fn create_descriptor_resources(
+    device: &ash::Device,
+    backend: &VptNrdAdapterBackend,
+) -> Result<Option<VptNrdDescriptorResources>> {
+    let (Some(binding_plans), Some(pool_plan)) = (
+        backend.pipeline_descriptor_binding_plans(),
+        backend.descriptor_pool_plan(),
+    ) else {
+        return Ok(None);
+    };
+    VptNrdDescriptorResources::create(device, binding_plans, pool_plan).map(Some)
+}
+
+fn create_descriptor_set_layouts(
+    device: &ash::Device,
+    binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+) -> Result<Vec<vk::DescriptorSetLayout>> {
+    let mut layouts = Vec::with_capacity(binding_plans.len());
+    for specs in VptNrdDescriptorResources::layout_specs(binding_plans) {
+        match DescriptorLayoutBuilder::new()
+            .add_binding_specs(&specs)
+            .build(device)
+        {
+            Ok(layout) => layouts.push(layout),
+            Err(error) => {
+                destroy_descriptor_set_layouts(device, layouts);
+                return Err(error);
+            }
+        }
+    }
+    Ok(layouts)
+}
+
+fn destroy_descriptor_set_layouts(device: &ash::Device, layouts: Vec<vk::DescriptorSetLayout>) {
+    for layout in layouts {
+        unsafe { device.destroy_descriptor_set_layout(layout, None) };
     }
 }
 
@@ -1299,6 +1437,52 @@ mod tests {
                 max_sets: 1,
                 pool_sizes: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn descriptor_resources_plan_layout_specs_follow_pipeline_binding_plans() {
+        let binding_plans = vec![
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 3,
+                    },
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                    },
+                ],
+            },
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: Vec::new(),
+            },
+        ];
+
+        let layout_specs = VptNrdDescriptorResources::layout_specs(&binding_plans);
+
+        assert_eq!(
+            layout_specs,
+            vec![
+                vec![
+                    DescriptorBindingSpec {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        stage_flags: vk::ShaderStageFlags::COMPUTE,
+                        count: 3,
+                    },
+                    DescriptorBindingSpec {
+                        binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        stage_flags: vk::ShaderStageFlags::COMPUTE,
+                        count: 1,
+                    },
+                ],
+                Vec::new(),
+            ]
         );
     }
 
