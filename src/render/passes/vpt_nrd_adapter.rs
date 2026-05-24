@@ -39,6 +39,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub dispatch_resource_plan_count: usize,
     pub pipeline_layout_plan_count: usize,
     pub pipeline_descriptor_binding_plan_count: usize,
+    pub descriptor_pool_size_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,6 +87,18 @@ pub struct VptNrdPipelineDescriptorBinding {
     pub descriptor_count: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdDescriptorPoolPlan {
+    pub max_sets: u32,
+    pub pool_sizes: Vec<VptNrdDescriptorPoolSizePlan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdDescriptorPoolSizePlan {
+    pub descriptor_type: vk::DescriptorType,
+    pub descriptor_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VptNrdDispatchResourceBindingPlan {
     pub descriptor_type: NrdDescriptorType,
@@ -117,6 +130,7 @@ struct VptNrdReadyBackendState {
     texture_pool_plan: VptNrdTexturePoolPlan,
     pipeline_layout_plans: Vec<VptNrdPipelineLayoutPlan>,
     pipeline_descriptor_binding_plans: Vec<VptNrdPipelineDescriptorBindingPlan>,
+    descriptor_pool_plan: VptNrdDescriptorPoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
     dispatch_resource_plans: Vec<VptNrdDispatchResourcePlan>,
 }
@@ -427,6 +441,9 @@ impl VptNrdReadyBackendState {
         let pipeline_descriptor_binding_plans =
             VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&pipeline_layout_plans)
                 .context("failed to build VPT NRD pipeline descriptor binding plans")?;
+        let descriptor_pool_plan =
+            VptNrdDescriptorPoolPlan::from_binding_plans(&pipeline_descriptor_binding_plans)
+                .context("failed to build VPT NRD descriptor pool plan")?;
         let dispatch_resource_plans =
             VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
                 .context("failed to build VPT NRD dispatch resource plans")?;
@@ -436,6 +453,7 @@ impl VptNrdReadyBackendState {
             texture_pool_plan,
             pipeline_layout_plans,
             pipeline_descriptor_binding_plans,
+            descriptor_pool_plan,
             dispatches,
             dispatch_resource_plans,
         })
@@ -453,6 +471,7 @@ impl VptNrdReadyBackendState {
             dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
             pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
             pipeline_descriptor_binding_plan_count: self.pipeline_descriptor_binding_plans.len(),
+            descriptor_pool_size_count: self.descriptor_pool_plan.pool_sizes.len(),
         }
     }
 }
@@ -535,6 +554,59 @@ impl VptNrdPipelineDescriptorBindingPlan {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { bindings })
+    }
+}
+
+impl VptNrdDescriptorPoolPlan {
+    pub fn from_binding_plans(
+        binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+    ) -> Result<Self> {
+        let max_sets = u32::try_from(binding_plans.len())
+            .context("NRD pipeline descriptor set count exceeds u32")?;
+        let mut sampled_image_count = 0u32;
+        let mut storage_image_count = 0u32;
+        for plan in binding_plans {
+            anyhow::ensure!(
+                !plan.bindings.is_empty(),
+                "NRD pipeline descriptor binding plan is empty"
+            );
+            for binding in &plan.bindings {
+                match binding.descriptor_type {
+                    vk::DescriptorType::SAMPLED_IMAGE => {
+                        sampled_image_count = sampled_image_count
+                            .checked_add(binding.descriptor_count)
+                            .context("NRD sampled image descriptor pool size overflow")?;
+                    }
+                    vk::DescriptorType::STORAGE_IMAGE => {
+                        storage_image_count = storage_image_count
+                            .checked_add(binding.descriptor_count)
+                            .context("NRD storage image descriptor pool size overflow")?;
+                    }
+                    other => {
+                        anyhow::bail!("unsupported NRD descriptor pool type {other:?}");
+                    }
+                }
+            }
+        }
+
+        let mut pool_sizes = Vec::new();
+        if sampled_image_count > 0 {
+            pool_sizes.push(VptNrdDescriptorPoolSizePlan {
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: sampled_image_count,
+            });
+        }
+        if storage_image_count > 0 {
+            pool_sizes.push(VptNrdDescriptorPoolSizePlan {
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: storage_image_count,
+            });
+        }
+
+        Ok(Self {
+            max_sets,
+            pool_sizes,
+        })
     }
 }
 
@@ -1035,6 +1107,74 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_pool_plan_sums_pipeline_binding_descriptor_counts() {
+        let binding_plans = vec![
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 6,
+                    },
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 2,
+                    },
+                ],
+            },
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 3,
+                    },
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 4,
+                    },
+                ],
+            },
+        ];
+
+        let pool_plan = VptNrdDescriptorPoolPlan::from_binding_plans(&binding_plans).unwrap();
+
+        assert_eq!(
+            pool_plan,
+            VptNrdDescriptorPoolPlan {
+                max_sets: 2,
+                pool_sizes: vec![
+                    VptNrdDescriptorPoolSizePlan {
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 9,
+                    },
+                    VptNrdDescriptorPoolSizePlan {
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 6,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn descriptor_pool_plan_rejects_empty_pipeline_bindings() {
+        let binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: Vec::new(),
+        }];
+
+        let error = VptNrdDescriptorPoolPlan::from_binding_plans(&binding_plans).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline descriptor binding plan is empty")
+        );
+    }
+
+    #[test]
     fn dispatch_resource_plan_maps_relax_diffuse_resources_to_adapter_bindings() {
         let dispatch = dispatch_snapshot(&[
             resource(NrdDescriptorType::Texture, NrdResourceType::InMv, 0),
@@ -1232,6 +1372,7 @@ mod tests {
         assert_eq!(metadata.dispatch_resource_plan_count, 2);
         assert_eq!(metadata.pipeline_layout_plan_count, 1);
         assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 1);
+        assert_eq!(metadata.descriptor_pool_size_count, 1);
     }
 
     #[test]
@@ -1280,7 +1421,7 @@ mod tests {
             samplers: vec![NrdSamplerDesc { mode: 0 }],
             pipelines: vec![NrdPipelineSnapshot {
                 spirv_bytecode: vec![0x0723_0203],
-                resource_ranges: Vec::new(),
+                resource_ranges: vec![resource_range(NrdDescriptorType::Texture, 1)],
                 has_constant_data: false,
                 shader_identifier: "test".to_owned(),
             }],
