@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
+use crate::render::descriptor::DescriptorBindingSpec;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
@@ -529,6 +530,18 @@ impl VptNrdPipelineLayoutPlan {
 impl VptNrdPipelineDescriptorBindingPlan {
     pub fn from_layout_plans(layout_plans: &[VptNrdPipelineLayoutPlan]) -> Result<Vec<Self>> {
         layout_plans.iter().map(Self::from_layout_plan).collect()
+    }
+
+    pub fn descriptor_binding_specs(&self) -> Vec<DescriptorBindingSpec> {
+        self.bindings
+            .iter()
+            .map(|binding| DescriptorBindingSpec {
+                binding: binding.binding,
+                descriptor_type: binding.descriptor_type,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                count: binding.descriptor_count,
+            })
+            .collect()
     }
 
     fn from_layout_plan(layout_plan: &VptNrdPipelineLayoutPlan) -> Result<Self> {
@@ -1103,6 +1116,44 @@ mod tests {
             error
                 .to_string()
                 .contains("NRD pipeline resource range has zero descriptors")
+        );
+    }
+
+    #[test]
+    fn pipeline_descriptor_binding_plan_exports_descriptor_binding_specs() {
+        let binding_plan = VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![
+                VptNrdPipelineDescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 3,
+                },
+                VptNrdPipelineDescriptorBinding {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 2,
+                },
+            ],
+        };
+
+        let specs = binding_plan.descriptor_binding_specs();
+
+        assert_eq!(
+            specs,
+            vec![
+                crate::render::descriptor::DescriptorBindingSpec {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    stage_flags: vk::ShaderStageFlags::COMPUTE,
+                    count: 3,
+                },
+                crate::render::descriptor::DescriptorBindingSpec {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    stage_flags: vk::ShaderStageFlags::COMPUTE,
+                    count: 2,
+                },
+            ]
         );
     }
 
