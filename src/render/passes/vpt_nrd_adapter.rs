@@ -10,9 +10,9 @@ use crate::render::nrd_adapter::{
     NrdDescriptorType, NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc,
     NrdResourceType, NrdTextureImageDesc,
 };
-use crate::render::passes::vpt_nrd_confidence::VptNrdConfidenceResources;
-use crate::render::passes::vpt_nrd_frontend::VptNrdPackedResources;
-use crate::render::passes::vpt_surface::VptCurrentSurfaceResources;
+use crate::render::passes::vpt_nrd_confidence::{VptNrdConfidencePass, VptNrdConfidenceResources};
+use crate::render::passes::vpt_nrd_frontend::{VptNrdFrontendPass, VptNrdPackedResources};
+use crate::render::passes::vpt_surface::{VptCurrentSurfaceResources, VptSurfacePass};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::SceneUniformBuffer;
@@ -166,6 +166,12 @@ pub struct VptNrdAdapterImageInputs<'a> {
     pub transient_pool: &'a [GpuImage],
 }
 
+pub struct VptNrdAdapterPassImageRefs<'a> {
+    pub frontend: &'a VptNrdFrontendPass,
+    pub confidence: &'a VptNrdConfidencePass,
+    pub surface: &'a VptSurfacePass,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VptNrdResolvedDispatchDescriptorWritePlan {
     pub pipeline_index: usize,
@@ -174,6 +180,27 @@ pub struct VptNrdResolvedDispatchDescriptorWritePlan {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VptNrdResolvedDescriptorImageWrite {
+    pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub image_view: vk::ImageView,
+    pub image_layout: vk::ImageLayout,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdDescriptorUpdatePlan {
+    pub dispatches: Vec<VptNrdDispatchDescriptorUpdatePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdDispatchDescriptorUpdatePlan {
+    pub pipeline_index: usize,
+    pub descriptor_set: vk::DescriptorSet,
+    pub writes: Vec<VptNrdDescriptorImageUpdate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdDescriptorImageUpdate {
     pub binding: u32,
     pub array_element: u32,
     pub descriptor_type: vk::DescriptorType,
@@ -252,12 +279,14 @@ pub struct VptNrdAdapterPassCreateInfo<'a> {
     pub width: u32,
     pub height: u32,
     pub scene_ubo: &'a SceneUniformBuffer,
+    pub image_refs: VptNrdAdapterPassImageRefs<'a>,
 }
 
 pub struct VptNrdAdapterPassResizeInfo<'a> {
     pub width: u32,
     pub height: u32,
     pub scene_ubo: &'a SceneUniformBuffer,
+    pub image_refs: VptNrdAdapterPassImageRefs<'a>,
 }
 
 impl VptNrdAdapterPass {
@@ -312,6 +341,25 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
+        if let Err(error) = build_descriptor_update_plan(
+            &backend,
+            descriptor_resources.as_ref(),
+            texture_pools.as_ref(),
+            &images,
+            info.image_refs,
+        ) {
+            images.destroy(device, allocator);
+            if let Some(pipeline_resources) = pipeline_resources {
+                pipeline_resources.destroy(device);
+            }
+            if let Some(descriptor_resources) = descriptor_resources {
+                descriptor_resources.destroy(device);
+            }
+            if let Some(texture_pools) = texture_pools {
+                texture_pools.destroy(device, allocator);
+            }
+            return Err(error).context("failed to build VPT NRD descriptor update plan");
+        }
         Ok(Self {
             nrd_diff_radiance_hitdist: images.nrd_diff_radiance_hitdist,
             nrd_validation: images.nrd_validation,
@@ -371,6 +419,25 @@ impl VptNrdAdapterPass {
                 return Err(error);
             }
         };
+        if let Err(error) = build_descriptor_update_plan(
+            &new_backend,
+            new_descriptor_resources.as_ref(),
+            new_texture_pools.as_ref(),
+            &new_images,
+            info.image_refs,
+        ) {
+            if let Some(new_pipeline_resources) = new_pipeline_resources {
+                new_pipeline_resources.destroy(device);
+            }
+            if let Some(new_descriptor_resources) = new_descriptor_resources {
+                new_descriptor_resources.destroy(device);
+            }
+            if let Some(new_texture_pools) = new_texture_pools {
+                new_texture_pools.destroy(device, allocator);
+            }
+            new_images.destroy(device, allocator);
+            return Err(error).context("failed to rebuild VPT NRD descriptor update plan");
+        }
         let old_images = VptNrdAdapterImages {
             nrd_diff_radiance_hitdist: std::mem::replace(
                 &mut self.nrd_diff_radiance_hitdist,
@@ -558,6 +625,34 @@ impl VptNrdAdapterBackend {
             Self::Unavailable(reason) => Some(reason.as_str()),
         }
     }
+}
+
+fn build_descriptor_update_plan(
+    backend: &VptNrdAdapterBackend,
+    descriptor_resources: Option<&VptNrdDescriptorResources>,
+    texture_pools: Option<&VptNrdTexturePools>,
+    adapter_images: &VptNrdAdapterImages,
+    image_refs: VptNrdAdapterPassImageRefs<'_>,
+) -> Result<Option<VptNrdDescriptorUpdatePlan>> {
+    let VptNrdAdapterBackend::Ready(backend) = backend else {
+        return Ok(None);
+    };
+    let Some(descriptor_resources) = descriptor_resources else {
+        anyhow::bail!("VPT NRD descriptor resources are missing for ready backend");
+    };
+    let Some(texture_pools) = texture_pools else {
+        anyhow::bail!("VPT NRD texture pools are missing for ready backend");
+    };
+
+    let inputs =
+        VptNrdAdapterImageInputs::from_pass_refs(image_refs, texture_pools, adapter_images);
+    let resolved_plans = backend
+        .state
+        .dispatch_descriptor_write_plans
+        .iter()
+        .map(|plan| VptNrdResolvedDispatchDescriptorWritePlan::from_write_plan(plan, &inputs))
+        .collect::<Result<Vec<_>>>()?;
+    VptNrdDescriptorUpdatePlan::from_resolved_plans(&resolved_plans, descriptor_resources).map(Some)
 }
 
 impl VptNrdReadyBackend {
@@ -1072,6 +1167,41 @@ impl VptNrdResolvedDispatchDescriptorWritePlan {
     }
 }
 
+impl VptNrdDescriptorUpdatePlan {
+    fn from_resolved_plans(
+        resolved_plans: &[VptNrdResolvedDispatchDescriptorWritePlan],
+        descriptor_resources: &VptNrdDescriptorResources,
+    ) -> Result<Self> {
+        let dispatches = resolved_plans
+            .iter()
+            .map(|resolved_plan| {
+                let descriptor_set = descriptor_resources
+                    .descriptor_sets
+                    .get(resolved_plan.pipeline_index)
+                    .copied()
+                    .with_context(|| {
+                        format!(
+                            "NRD descriptor update pipeline index {} is out of bounds",
+                            resolved_plan.pipeline_index
+                        )
+                    })?;
+                Ok(VptNrdDispatchDescriptorUpdatePlan {
+                    pipeline_index: resolved_plan.pipeline_index,
+                    descriptor_set,
+                    writes: resolved_plan
+                        .writes
+                        .iter()
+                        .copied()
+                        .map(VptNrdDescriptorImageUpdate::from)
+                        .collect(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self { dispatches })
+    }
+}
+
 impl VptNrdDispatchDescriptorWrite {
     fn resolve_image(
         &self,
@@ -1089,6 +1219,25 @@ impl VptNrdDispatchDescriptorWrite {
 }
 
 impl<'a> VptNrdAdapterImageInputs<'a> {
+    fn from_pass_refs(
+        image_refs: VptNrdAdapterPassImageRefs<'a>,
+        texture_pools: &'a VptNrdTexturePools,
+        adapter_images: &'a VptNrdAdapterImages,
+    ) -> Self {
+        Self {
+            motion: &image_refs.surface.motion_history,
+            normal_roughness: &image_refs.surface.surface_normal_roughness,
+            view_z: &image_refs.surface.surface_view_z,
+            diff_confidence: &image_refs.confidence.diff_confidence,
+            spec_confidence: &image_refs.confidence.spec_confidence,
+            diff_radiance_hitdist: &image_refs.frontend.packed_diff_radiance_hitdist,
+            output_diff_radiance_hitdist: &adapter_images.nrd_diff_radiance_hitdist,
+            validation: &adapter_images.nrd_validation,
+            permanent_pool: &texture_pools.permanent_pool,
+            transient_pool: &texture_pools.transient_pool,
+        }
+    }
+
     fn image_for_resource(&self, resource: VptNrdDispatchResource) -> Result<&'a GpuImage> {
         match resource {
             VptNrdDispatchResource::Motion => Ok(self.motion),
@@ -1111,6 +1260,27 @@ impl<'a> VptNrdAdapterImageInputs<'a> {
                     format!("NRD transient texture pool image index {index} is out of bounds")
                 })
             }
+        }
+    }
+}
+
+impl VptNrdDescriptorImageUpdate {
+    #[cfg(test)]
+    fn descriptor_image_info(&self) -> vk::DescriptorImageInfo {
+        vk::DescriptorImageInfo::default()
+            .image_view(self.image_view)
+            .image_layout(self.image_layout)
+    }
+}
+
+impl From<VptNrdResolvedDescriptorImageWrite> for VptNrdDescriptorImageUpdate {
+    fn from(value: VptNrdResolvedDescriptorImageWrite) -> Self {
+        Self {
+            binding: value.binding,
+            array_element: value.array_element,
+            descriptor_type: value.descriptor_type,
+            image_view: value.image_view,
+            image_layout: value.image_layout,
         }
     }
 }
@@ -2777,6 +2947,88 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_update_plan_pairs_resolved_image_writes_with_descriptor_sets() {
+        let descriptor_resources = descriptor_resources_for_test(2);
+        let resolved_plans = vec![
+            VptNrdResolvedDispatchDescriptorWritePlan {
+                pipeline_index: 1,
+                writes: vec![
+                    resolved_image_write(2, 0, vk::DescriptorType::SAMPLED_IMAGE, 41),
+                    resolved_image_write(3, 1, vk::DescriptorType::STORAGE_IMAGE, 42),
+                ],
+            },
+            VptNrdResolvedDispatchDescriptorWritePlan {
+                pipeline_index: 0,
+                writes: vec![resolved_image_write(
+                    4,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    43,
+                )],
+            },
+        ];
+
+        let update_plan =
+            VptNrdDescriptorUpdatePlan::from_resolved_plans(&resolved_plans, &descriptor_resources)
+                .unwrap();
+
+        assert_eq!(
+            update_plan.dispatches,
+            vec![
+                VptNrdDispatchDescriptorUpdatePlan {
+                    pipeline_index: 1,
+                    descriptor_set: vk::DescriptorSet::from_raw(202),
+                    writes: vec![
+                        descriptor_image_update(2, 0, vk::DescriptorType::SAMPLED_IMAGE, 41),
+                        descriptor_image_update(3, 1, vk::DescriptorType::STORAGE_IMAGE, 42),
+                    ],
+                },
+                VptNrdDispatchDescriptorUpdatePlan {
+                    pipeline_index: 0,
+                    descriptor_set: vk::DescriptorSet::from_raw(201),
+                    writes: vec![descriptor_image_update(
+                        4,
+                        0,
+                        vk::DescriptorType::SAMPLED_IMAGE,
+                        43,
+                    )],
+                },
+            ]
+        );
+
+        let image_info = update_plan.dispatches[0].writes[0].descriptor_image_info();
+        assert_eq!(image_info.image_view, vk::ImageView::from_raw(41));
+        assert_eq!(
+            image_info.image_layout,
+            AccessKind::ComputeShaderRead.image_layout()
+        );
+    }
+
+    #[test]
+    fn descriptor_update_plan_rejects_pipeline_indices_without_descriptor_sets() {
+        let descriptor_resources = descriptor_resources_for_test(1);
+        let resolved_plans = vec![VptNrdResolvedDispatchDescriptorWritePlan {
+            pipeline_index: 2,
+            writes: vec![resolved_image_write(
+                0,
+                0,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                41,
+            )],
+        }];
+
+        let error =
+            VptNrdDescriptorUpdatePlan::from_resolved_plans(&resolved_plans, &descriptor_resources)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD descriptor update pipeline index 2 is out of bounds")
+        );
+    }
+
+    #[test]
     fn dispatch_descriptor_write_plan_rejects_out_of_bounds_pipeline_index() {
         let dispatch = NrdDispatchSnapshot {
             pipeline_index: 4,
@@ -3275,6 +3527,26 @@ mod tests {
             _ => unreachable!("test helper only resolves image descriptors"),
         };
         VptNrdResolvedDescriptorImageWrite {
+            binding,
+            array_element,
+            descriptor_type,
+            image_view: vk::ImageView::from_raw(image_view),
+            image_layout,
+        }
+    }
+
+    fn descriptor_image_update(
+        binding: u32,
+        array_element: u32,
+        descriptor_type: vk::DescriptorType,
+        image_view: u64,
+    ) -> VptNrdDescriptorImageUpdate {
+        let image_layout = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => AccessKind::ComputeShaderRead.image_layout(),
+            vk::DescriptorType::STORAGE_IMAGE => AccessKind::ComputeShaderWrite.image_layout(),
+            _ => unreachable!("test helper only resolves image descriptors"),
+        };
+        VptNrdDescriptorImageUpdate {
             binding,
             array_element,
             descriptor_type,

@@ -19,7 +19,7 @@ use crate::render::passes::vpt_atrous::{
 };
 use crate::render::passes::vpt_nrd_adapter::{
     VptNrdAdapterGraphInputs, VptNrdAdapterPass, VptNrdAdapterPassCreateInfo,
-    VptNrdAdapterPassResizeInfo,
+    VptNrdAdapterPassImageRefs, VptNrdAdapterPassResizeInfo,
 };
 use crate::render::passes::vpt_nrd_confidence::{
     VptNrdConfidenceGraphInputs, VptNrdConfidencePass, VptNrdConfidencePassCreateInfo,
@@ -430,6 +430,13 @@ impl VptRuntimePipeline {
         {
             return;
         }
+        let (Some(vpt_surface), Some(vpt_nrd_confidence), Some(vpt_nrd_frontend)) = (
+            self.vpt_surface_pass.as_ref(),
+            self.vpt_nrd_confidence_pass.as_ref(),
+            self.vpt_nrd_frontend_pass.as_ref(),
+        ) else {
+            return;
+        };
 
         let extent = renderer.swapchain_extent();
         match VptNrdAdapterPass::new(
@@ -439,6 +446,11 @@ impl VptRuntimePipeline {
                 width: extent.width,
                 height: extent.height,
                 scene_ubo,
+                image_refs: VptNrdAdapterPassImageRefs {
+                    frontend: vpt_nrd_frontend,
+                    confidence: vpt_nrd_confidence,
+                    surface: vpt_surface,
+                },
             },
         ) {
             Ok(pass) => {
@@ -1284,19 +1296,6 @@ impl VptRuntimePipeline {
                 )
                 .context("failed to resize VPT NRD frontend images")?;
         }
-        if let Some(vpt_nrd_adapter) = &mut self.vpt_nrd_adapter_pass {
-            vpt_nrd_adapter
-                .resize_images(
-                    &device,
-                    allocator,
-                    VptNrdAdapterPassResizeInfo {
-                        width,
-                        height,
-                        scene_ubo,
-                    },
-                )
-                .context("failed to resize VPT NRD adapter images")?;
-        }
         if let Some(vpt_surface) = &mut self.vpt_surface_pass {
             vpt_surface
                 .resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
@@ -1323,6 +1322,34 @@ impl VptRuntimePipeline {
                     },
                 )
                 .context("failed to resize VPT NRD confidence images")?;
+        }
+        if let (
+            Some(vpt_nrd_adapter),
+            Some(vpt_nrd_frontend),
+            Some(vpt_nrd_confidence),
+            Some(vpt_surface),
+        ) = (
+            &mut self.vpt_nrd_adapter_pass,
+            &self.vpt_nrd_frontend_pass,
+            &self.vpt_nrd_confidence_pass,
+            &self.vpt_surface_pass,
+        ) {
+            vpt_nrd_adapter
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdAdapterPassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        image_refs: VptNrdAdapterPassImageRefs {
+                            frontend: vpt_nrd_frontend,
+                            confidence: vpt_nrd_confidence,
+                            surface: vpt_surface,
+                        },
+                    },
+                )
+                .context("failed to resize VPT NRD adapter images")?;
         }
         if restir_di_enabled && let Some(restir_di) = &mut self.restir_di_pass {
             restir_di
