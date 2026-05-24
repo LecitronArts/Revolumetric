@@ -41,6 +41,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub dispatch_resource_plan_count: usize,
     pub pipeline_layout_plan_count: usize,
     pub pipeline_shader_plan_count: usize,
+    pub pipeline_create_plan_count: usize,
     pub pipeline_descriptor_binding_plan_count: usize,
     pub descriptor_pool_size_count: usize,
     pub dispatch_descriptor_write_plan_count: usize,
@@ -78,6 +79,17 @@ pub struct VptNrdPipelineShaderPlan {
     pub spirv_words: Vec<u32>,
     pub shader_identifier: String,
     pub has_constant_data: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineCreatePlan {
+    pub pipeline_index: usize,
+    pub shader_plan_index: usize,
+    pub descriptor_set_layout_index: usize,
+    pub descriptor_set_index: usize,
+    pub shader_identifier: String,
+    pub has_constant_data: bool,
+    pub descriptor_binding_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -155,6 +167,7 @@ struct VptNrdReadyBackendState {
     texture_pool_plan: VptNrdTexturePoolPlan,
     pipeline_layout_plans: Vec<VptNrdPipelineLayoutPlan>,
     pipeline_shader_plans: Vec<VptNrdPipelineShaderPlan>,
+    pipeline_create_plans: Vec<VptNrdPipelineCreatePlan>,
     pipeline_descriptor_binding_plans: Vec<VptNrdPipelineDescriptorBindingPlan>,
     descriptor_pool_plan: VptNrdDescriptorPoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
@@ -523,6 +536,12 @@ impl VptNrdReadyBackendState {
         let pipeline_descriptor_binding_plans =
             VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&pipeline_layout_plans)
                 .context("failed to build VPT NRD pipeline descriptor binding plans")?;
+        let pipeline_create_plans = VptNrdPipelineCreatePlan::from_plans(
+            &pipeline_layout_plans,
+            &pipeline_shader_plans,
+            &pipeline_descriptor_binding_plans,
+        )
+        .context("failed to build VPT NRD pipeline create plans")?;
         let descriptor_pool_plan =
             VptNrdDescriptorPoolPlan::from_binding_plans(&pipeline_descriptor_binding_plans)
                 .context("failed to build VPT NRD descriptor pool plan")?;
@@ -541,6 +560,7 @@ impl VptNrdReadyBackendState {
             texture_pool_plan,
             pipeline_layout_plans,
             pipeline_shader_plans,
+            pipeline_create_plans,
             pipeline_descriptor_binding_plans,
             descriptor_pool_plan,
             dispatches,
@@ -561,6 +581,7 @@ impl VptNrdReadyBackendState {
             dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
             pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
             pipeline_shader_plan_count: self.pipeline_shader_plans.len(),
+            pipeline_create_plan_count: self.pipeline_create_plans.len(),
             pipeline_descriptor_binding_plan_count: self.pipeline_descriptor_binding_plans.len(),
             descriptor_pool_size_count: self.descriptor_pool_plan.pool_sizes.len(),
             dispatch_descriptor_write_plan_count: self.dispatch_descriptor_write_plans.len(),
@@ -633,6 +654,48 @@ impl VptNrdPipelineShaderPlan {
             shader_identifier: pipeline.shader_identifier.clone(),
             has_constant_data: pipeline.has_constant_data,
         })
+    }
+}
+
+impl VptNrdPipelineCreatePlan {
+    pub fn from_plans(
+        layout_plans: &[VptNrdPipelineLayoutPlan],
+        shader_plans: &[VptNrdPipelineShaderPlan],
+        binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+    ) -> Result<Vec<Self>> {
+        anyhow::ensure!(
+            layout_plans.len() == shader_plans.len(),
+            "NRD pipeline layout plan count does not match shader plan count"
+        );
+        anyhow::ensure!(
+            layout_plans.len() == binding_plans.len(),
+            "NRD pipeline layout plan count does not match descriptor binding plan count"
+        );
+
+        layout_plans
+            .iter()
+            .zip(shader_plans)
+            .zip(binding_plans)
+            .enumerate()
+            .map(
+                |(pipeline_index, ((layout_plan, shader_plan), binding_plan))| {
+                    anyhow::ensure!(
+                        layout_plan.shader_identifier == shader_plan.shader_identifier
+                            && layout_plan.has_constant_data == shader_plan.has_constant_data,
+                        "NRD pipeline shader plan does not match layout plan"
+                    );
+                    Ok(Self {
+                        pipeline_index,
+                        shader_plan_index: pipeline_index,
+                        descriptor_set_layout_index: pipeline_index,
+                        descriptor_set_index: pipeline_index,
+                        shader_identifier: shader_plan.shader_identifier.clone(),
+                        has_constant_data: shader_plan.has_constant_data,
+                        descriptor_binding_count: binding_plan.bindings.len(),
+                    })
+                },
+            )
+            .collect()
     }
 }
 
@@ -1373,6 +1436,137 @@ mod tests {
                 .to_string()
                 .contains("NRD pipeline shader bytecode is empty")
         );
+    }
+
+    #[test]
+    fn pipeline_create_plan_pairs_shader_layout_and_descriptor_slots() {
+        let layout_plans = vec![
+            VptNrdPipelineLayoutPlan {
+                resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    descriptors_num: 2,
+                }],
+                has_constant_data: false,
+                shader_identifier: "relax_prepass".to_owned(),
+            },
+            VptNrdPipelineLayoutPlan {
+                resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    descriptors_num: 1,
+                }],
+                has_constant_data: true,
+                shader_identifier: "relax_temporal".to_owned(),
+            },
+        ];
+        let shader_plans = vec![
+            VptNrdPipelineShaderPlan {
+                spirv_words: vec![0x0723_0203],
+                shader_identifier: "relax_prepass".to_owned(),
+                has_constant_data: false,
+            },
+            VptNrdPipelineShaderPlan {
+                spirv_words: vec![0x0723_0203, 0x0001_0000],
+                shader_identifier: "relax_temporal".to_owned(),
+                has_constant_data: true,
+            },
+        ];
+        let binding_plans =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&layout_plans).unwrap();
+
+        let plans =
+            VptNrdPipelineCreatePlan::from_plans(&layout_plans, &shader_plans, &binding_plans)
+                .unwrap();
+
+        assert_eq!(
+            plans,
+            vec![
+                VptNrdPipelineCreatePlan {
+                    pipeline_index: 0,
+                    shader_plan_index: 0,
+                    descriptor_set_layout_index: 0,
+                    descriptor_set_index: 0,
+                    shader_identifier: "relax_prepass".to_owned(),
+                    has_constant_data: false,
+                    descriptor_binding_count: 1,
+                },
+                VptNrdPipelineCreatePlan {
+                    pipeline_index: 1,
+                    shader_plan_index: 1,
+                    descriptor_set_layout_index: 1,
+                    descriptor_set_index: 1,
+                    shader_identifier: "relax_temporal".to_owned(),
+                    has_constant_data: true,
+                    descriptor_binding_count: 1,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_create_plan_rejects_mismatched_shader_metadata() {
+        let layout_plans = vec![VptNrdPipelineLayoutPlan {
+            resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                descriptors_num: 1,
+            }],
+            has_constant_data: false,
+            shader_identifier: "relax_prepass".to_owned(),
+        }];
+        let shader_plans = vec![VptNrdPipelineShaderPlan {
+            spirv_words: vec![0x0723_0203],
+            shader_identifier: "relax_temporal".to_owned(),
+            has_constant_data: false,
+        }];
+        let binding_plans =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&layout_plans).unwrap();
+
+        let error =
+            VptNrdPipelineCreatePlan::from_plans(&layout_plans, &shader_plans, &binding_plans)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline shader plan does not match layout plan")
+        );
+    }
+
+    #[test]
+    fn pipeline_create_plan_rejects_mismatched_plan_counts() {
+        let layout_plans = vec![VptNrdPipelineLayoutPlan {
+            resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                descriptors_num: 1,
+            }],
+            has_constant_data: false,
+            shader_identifier: "relax_prepass".to_owned(),
+        }];
+        let shader_plans = Vec::new();
+        let binding_plans =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&layout_plans).unwrap();
+
+        let error =
+            VptNrdPipelineCreatePlan::from_plans(&layout_plans, &shader_plans, &binding_plans)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline layout plan count does not match shader plan count")
+        );
+
+        let shader_plans = vec![VptNrdPipelineShaderPlan {
+            spirv_words: vec![0x0723_0203],
+            shader_identifier: "relax_prepass".to_owned(),
+            has_constant_data: false,
+        }];
+
+        let error =
+            VptNrdPipelineCreatePlan::from_plans(&layout_plans, &shader_plans, &[]).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "NRD pipeline layout plan count does not match descriptor binding plan count"
+        ));
     }
 
     #[test]
@@ -2283,6 +2477,7 @@ mod tests {
         assert_eq!(metadata.pipeline_count, 2);
         assert_eq!(metadata.pipeline_layout_plan_count, 2);
         assert_eq!(metadata.pipeline_shader_plan_count, 2);
+        assert_eq!(metadata.pipeline_create_plan_count, 2);
         assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 2);
     }
 
