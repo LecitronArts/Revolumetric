@@ -42,6 +42,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub pipeline_layout_plan_count: usize,
     pub pipeline_descriptor_binding_plan_count: usize,
     pub descriptor_pool_size_count: usize,
+    pub dispatch_descriptor_write_plan_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -148,6 +149,7 @@ struct VptNrdReadyBackendState {
     descriptor_pool_plan: VptNrdDescriptorPoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
     dispatch_resource_plans: Vec<VptNrdDispatchResourcePlan>,
+    dispatch_descriptor_write_plans: Vec<VptNrdDispatchDescriptorWritePlan>,
 }
 
 struct VptNrdTexturePools {
@@ -514,6 +516,12 @@ impl VptNrdReadyBackendState {
         let dispatch_resource_plans =
             VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
                 .context("failed to build VPT NRD dispatch resource plans")?;
+        let dispatch_descriptor_write_plans = VptNrdDispatchDescriptorWritePlan::from_dispatches(
+            &dispatches,
+            &dispatch_resource_plans,
+            &pipeline_descriptor_binding_plans,
+        )
+        .context("failed to build VPT NRD dispatch descriptor write plans")?;
         Ok(Self {
             library_desc,
             instance_snapshot,
@@ -523,6 +531,7 @@ impl VptNrdReadyBackendState {
             descriptor_pool_plan,
             dispatches,
             dispatch_resource_plans,
+            dispatch_descriptor_write_plans,
         })
     }
 
@@ -539,6 +548,7 @@ impl VptNrdReadyBackendState {
             pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
             pipeline_descriptor_binding_plan_count: self.pipeline_descriptor_binding_plans.len(),
             descriptor_pool_size_count: self.descriptor_pool_plan.pool_sizes.len(),
+            dispatch_descriptor_write_plan_count: self.dispatch_descriptor_write_plans.len(),
         }
     }
 }
@@ -736,6 +746,24 @@ impl VptNrdDispatchResourcePlan {
 }
 
 impl VptNrdDispatchDescriptorWritePlan {
+    pub fn from_dispatches(
+        dispatches: &[NrdDispatchSnapshot],
+        dispatch_plans: &[VptNrdDispatchResourcePlan],
+        pipeline_binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+    ) -> Result<Vec<Self>> {
+        anyhow::ensure!(
+            dispatches.len() == dispatch_plans.len(),
+            "NRD dispatch count does not match dispatch resource plan count"
+        );
+        dispatches
+            .iter()
+            .zip(dispatch_plans.iter())
+            .map(|(dispatch, dispatch_plan)| {
+                Self::from_dispatch_plan(dispatch, dispatch_plan, pipeline_binding_plans)
+            })
+            .collect()
+    }
+
     pub fn from_dispatch_plan(
         dispatch: &NrdDispatchSnapshot,
         dispatch_plan: &VptNrdDispatchResourcePlan,
@@ -1930,6 +1958,35 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_descriptor_write_plans_reject_mismatched_dispatch_plan_count() {
+        let dispatches = vec![dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::InViewZ,
+            0,
+        )])];
+        let pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![VptNrdPipelineDescriptorBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            }],
+        }];
+
+        let error = VptNrdDispatchDescriptorWritePlan::from_dispatches(
+            &dispatches,
+            &[],
+            &pipeline_binding_plans,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD dispatch count does not match dispatch resource plan count")
+        );
+    }
+
+    #[test]
     fn ready_backend_metadata_counts_dispatch_snapshots_and_resource_plans() {
         let library_desc = NrdLibraryDesc {
             texture_offset: 10,
@@ -1948,7 +2005,7 @@ mod tests {
                 0,
             )]),
             dispatch_snapshot(&[resource(
-                NrdDescriptorType::StorageTexture,
+                NrdDescriptorType::Texture,
                 NrdResourceType::TransientPool,
                 0,
             )]),
@@ -1970,6 +2027,7 @@ mod tests {
         assert_eq!(metadata.pipeline_layout_plan_count, 1);
         assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 1);
         assert_eq!(metadata.descriptor_pool_size_count, 1);
+        assert_eq!(metadata.dispatch_descriptor_write_plan_count, 2);
     }
 
     #[test]
