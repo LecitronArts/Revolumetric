@@ -37,6 +37,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub transient_pool_size: usize,
     pub dispatch_count: usize,
     pub dispatch_resource_plan_count: usize,
+    pub pipeline_layout_plan_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -57,6 +58,19 @@ pub struct VptNrdTexturePoolImagePlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VptNrdDispatchResourcePlan {
     pub bindings: Vec<VptNrdDispatchResourceBindingPlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineLayoutPlan {
+    pub resource_ranges: Vec<VptNrdPipelineResourceRangePlan>,
+    pub has_constant_data: bool,
+    pub shader_identifier: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineResourceRangePlan {
+    pub descriptor_type: NrdDescriptorType,
+    pub descriptors_num: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,6 +102,7 @@ struct VptNrdReadyBackendState {
     library_desc: NrdLibraryDesc,
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
+    pipeline_layout_plans: Vec<VptNrdPipelineLayoutPlan>,
     dispatches: Vec<NrdDispatchSnapshot>,
     dispatch_resource_plans: Vec<VptNrdDispatchResourcePlan>,
 }
@@ -392,6 +407,9 @@ impl VptNrdReadyBackendState {
         let texture_pool_plan =
             VptNrdTexturePoolPlan::from_instance_snapshot(width, height, &instance_snapshot)
                 .context("failed to build VPT NRD texture pool plan")?;
+        let pipeline_layout_plans =
+            VptNrdPipelineLayoutPlan::from_instance_snapshot(&instance_snapshot)
+                .context("failed to build VPT NRD pipeline layout plans")?;
         let dispatch_resource_plans =
             VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
                 .context("failed to build VPT NRD dispatch resource plans")?;
@@ -399,6 +417,7 @@ impl VptNrdReadyBackendState {
             library_desc,
             instance_snapshot,
             texture_pool_plan,
+            pipeline_layout_plans,
             dispatches,
             dispatch_resource_plans,
         })
@@ -414,6 +433,7 @@ impl VptNrdReadyBackendState {
             transient_pool_size: self.instance_snapshot.transient_pool.len(),
             dispatch_count: self.dispatches.len(),
             dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
+            pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
         }
     }
 }
@@ -437,6 +457,33 @@ impl VptNrdTexturePoolPlan {
                 height,
                 &snapshot.transient_pool,
             )?,
+        })
+    }
+}
+
+impl VptNrdPipelineLayoutPlan {
+    pub fn from_instance_snapshot(snapshot: &NrdInstanceSnapshot) -> Result<Vec<Self>> {
+        snapshot.pipelines.iter().map(Self::from_pipeline).collect()
+    }
+
+    fn from_pipeline(pipeline: &crate::render::nrd_adapter::NrdPipelineSnapshot) -> Result<Self> {
+        let resource_ranges = pipeline
+            .resource_ranges
+            .iter()
+            .map(|range| {
+                let binding = range
+                    .binding_desc()
+                    .context("failed to map NRD pipeline resource range")?;
+                Ok(VptNrdPipelineResourceRangePlan {
+                    descriptor_type: binding.descriptor_type,
+                    descriptors_num: binding.descriptors_num,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            resource_ranges,
+            has_constant_data: pipeline.has_constant_data,
+            shader_identifier: pipeline.shader_identifier.clone(),
         })
     }
 }
@@ -790,6 +837,75 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_layout_plan_maps_resource_ranges_for_each_nrd_pipeline() {
+        let snapshot = instance_snapshot_with_pipelines(vec![
+            pipeline(
+                "relax_prepass",
+                &[
+                    resource_range(NrdDescriptorType::Texture, 6),
+                    resource_range(NrdDescriptorType::StorageTexture, 2),
+                ],
+                true,
+            ),
+            pipeline(
+                "relax_temporal",
+                &[resource_range(NrdDescriptorType::Texture, 4)],
+                false,
+            ),
+        ]);
+
+        let plans = VptNrdPipelineLayoutPlan::from_instance_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            plans,
+            vec![
+                VptNrdPipelineLayoutPlan {
+                    resource_ranges: vec![
+                        VptNrdPipelineResourceRangePlan {
+                            descriptor_type: NrdDescriptorType::Texture,
+                            descriptors_num: 6,
+                        },
+                        VptNrdPipelineResourceRangePlan {
+                            descriptor_type: NrdDescriptorType::StorageTexture,
+                            descriptors_num: 2,
+                        },
+                    ],
+                    has_constant_data: true,
+                    shader_identifier: "relax_prepass".to_owned(),
+                },
+                VptNrdPipelineLayoutPlan {
+                    resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                        descriptor_type: NrdDescriptorType::Texture,
+                        descriptors_num: 4,
+                    },],
+                    has_constant_data: false,
+                    shader_identifier: "relax_temporal".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_layout_plan_rejects_unknown_resource_range_descriptor_type() {
+        let snapshot = instance_snapshot_with_pipelines(vec![pipeline_with_raw_range(
+            "bad_descriptor",
+            &[crate::render::nrd_adapter::NrdResourceRangeDesc {
+                descriptor_type: NrdDescriptorType::Unsupported as u32,
+                descriptors_num: 1,
+            }],
+            false,
+        )]);
+
+        let error = VptNrdPipelineLayoutPlan::from_instance_snapshot(&snapshot).unwrap_err();
+
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("unsupported NRD descriptor type")
+        }));
+    }
+
+    #[test]
     fn dispatch_resource_plan_maps_relax_diffuse_resources_to_adapter_bindings() {
         let dispatch = dispatch_snapshot(&[
             resource(NrdDescriptorType::Texture, NrdResourceType::InMv, 0),
@@ -985,6 +1101,7 @@ mod tests {
         assert_eq!(metadata.library_desc, library_desc);
         assert_eq!(metadata.dispatch_count, 2);
         assert_eq!(metadata.dispatch_resource_plan_count, 2);
+        assert_eq!(metadata.pipeline_layout_plan_count, 1);
     }
 
     #[test]
@@ -1039,6 +1156,54 @@ mod tests {
             }],
             permanent_pool: permanent_pool.to_vec(),
             transient_pool: transient_pool.to_vec(),
+        }
+    }
+
+    fn instance_snapshot_with_pipelines(
+        pipelines: Vec<NrdPipelineSnapshot>,
+    ) -> NrdInstanceSnapshot {
+        NrdInstanceSnapshot {
+            constant_buffer_and_samplers_space_index: 0,
+            resources_space_index: 0,
+            constant_buffer_register_index: 0,
+            samplers_base_register_index: 0,
+            resources_base_register_index: 0,
+            constant_buffer_max_data_size: 0,
+            samplers: vec![NrdSamplerDesc { mode: 0 }],
+            pipelines,
+            permanent_pool: Vec::new(),
+            transient_pool: Vec::new(),
+        }
+    }
+
+    fn pipeline(
+        shader_identifier: &str,
+        resource_ranges: &[crate::render::nrd_adapter::NrdResourceRangeDesc],
+        has_constant_data: bool,
+    ) -> NrdPipelineSnapshot {
+        pipeline_with_raw_range(shader_identifier, resource_ranges, has_constant_data)
+    }
+
+    fn pipeline_with_raw_range(
+        shader_identifier: &str,
+        resource_ranges: &[crate::render::nrd_adapter::NrdResourceRangeDesc],
+        has_constant_data: bool,
+    ) -> NrdPipelineSnapshot {
+        NrdPipelineSnapshot {
+            spirv_bytecode: vec![0x0723_0203],
+            resource_ranges: resource_ranges.to_vec(),
+            has_constant_data,
+            shader_identifier: shader_identifier.to_owned(),
+        }
+    }
+
+    fn resource_range(
+        descriptor_type: NrdDescriptorType,
+        descriptors_num: u32,
+    ) -> crate::render::nrd_adapter::NrdResourceRangeDesc {
+        crate::render::nrd_adapter::NrdResourceRangeDesc {
+            descriptor_type: descriptor_type as u32,
+            descriptors_num,
         }
     }
 
