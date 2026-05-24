@@ -6,7 +6,8 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::nrd_adapter::{
-    NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc, NrdTextureImageDesc,
+    NrdDescriptorType, NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc,
+    NrdResourceType, NrdTextureImageDesc,
 };
 use crate::render::passes::vpt_nrd_confidence::VptNrdConfidenceResources;
 use crate::render::passes::vpt_nrd_frontend::VptNrdPackedResources;
@@ -22,7 +23,7 @@ pub struct VptNrdAdapterPass {
 }
 
 pub enum VptNrdAdapterBackend {
-    Ready(VptNrdReadyBackend),
+    Ready(Box<VptNrdReadyBackend>),
     Unavailable(String),
 }
 
@@ -35,6 +36,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub permanent_pool_size: usize,
     pub transient_pool_size: usize,
     pub dispatch_count: usize,
+    pub dispatch_resource_plan_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,12 +54,38 @@ pub struct VptNrdTexturePoolImagePlan {
     pub downsample_factor: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdDispatchResourcePlan {
+    pub bindings: Vec<VptNrdDispatchResourceBindingPlan>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdDispatchResourceBindingPlan {
+    pub descriptor_type: NrdDescriptorType,
+    pub resource: VptNrdDispatchResource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VptNrdDispatchResource {
+    Motion,
+    NormalRoughness,
+    ViewZ,
+    DiffConfidence,
+    SpecConfidence,
+    DiffRadianceHitdist,
+    OutputDiffRadianceHitdist,
+    Validation,
+    PermanentPool { index: usize },
+    TransientPool { index: usize },
+}
+
 pub struct VptNrdReadyBackend {
     _instance: NrdInstance,
     library_desc: NrdLibraryDesc,
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
+    dispatch_resource_plans: Vec<VptNrdDispatchResourcePlan>,
 }
 
 struct VptNrdTexturePools {
@@ -269,7 +297,7 @@ impl VptNrdAdapterPass {
 impl VptNrdAdapterBackend {
     pub fn initialize_relax(width: u32, height: u32) -> Self {
         match VptNrdReadyBackend::initialize_relax(width, height) {
-            Ok(backend) => Self::Ready(backend),
+            Ok(backend) => Self::Ready(Box::new(backend)),
             Err(error) => Self::Unavailable(error.to_string()),
         }
     }
@@ -315,12 +343,17 @@ impl VptNrdReadyBackend {
         let texture_pool_plan =
             VptNrdTexturePoolPlan::from_instance_snapshot(width, height, &instance_snapshot)
                 .context("failed to build VPT NRD texture pool plan")?;
+        let dispatches = Vec::new();
+        let dispatch_resource_plans =
+            VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
+                .context("failed to build VPT NRD dispatch resource plans")?;
         Ok(Self {
             _instance: instance,
             library_desc,
             instance_snapshot,
             texture_pool_plan,
-            dispatches: Vec::new(),
+            dispatches,
+            dispatch_resource_plans,
         })
     }
 
@@ -333,6 +366,7 @@ impl VptNrdReadyBackend {
             permanent_pool_size: self.instance_snapshot.permanent_pool.len(),
             transient_pool_size: self.instance_snapshot.transient_pool.len(),
             dispatch_count: self.dispatches.len(),
+            dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
         }
     }
 }
@@ -358,6 +392,79 @@ impl VptNrdTexturePoolPlan {
             )?,
         })
     }
+}
+
+impl VptNrdDispatchResourcePlan {
+    pub fn from_dispatches(
+        dispatches: &[NrdDispatchSnapshot],
+        pool_plan: &VptNrdTexturePoolPlan,
+    ) -> Result<Vec<Self>> {
+        dispatches
+            .iter()
+            .map(|dispatch| Self::from_dispatch(dispatch, pool_plan))
+            .collect()
+    }
+
+    pub fn from_dispatch(
+        dispatch: &NrdDispatchSnapshot,
+        pool_plan: &VptNrdTexturePoolPlan,
+    ) -> Result<Self> {
+        let bindings = dispatch
+            .resources
+            .iter()
+            .map(|resource| {
+                let binding = resource
+                    .binding_desc()
+                    .context("failed to map NRD dispatch resource binding")?;
+                Ok(VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: binding.descriptor_type,
+                    resource: map_dispatch_resource(
+                        binding.resource_type,
+                        binding.index_in_pool,
+                        pool_plan,
+                    )?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { bindings })
+    }
+}
+
+fn map_dispatch_resource(
+    resource_type: NrdResourceType,
+    index_in_pool: u16,
+    pool_plan: &VptNrdTexturePoolPlan,
+) -> Result<VptNrdDispatchResource> {
+    let resource = match resource_type {
+        NrdResourceType::InMv => VptNrdDispatchResource::Motion,
+        NrdResourceType::InNormalRoughness => VptNrdDispatchResource::NormalRoughness,
+        NrdResourceType::InViewZ => VptNrdDispatchResource::ViewZ,
+        NrdResourceType::InDiffConfidence => VptNrdDispatchResource::DiffConfidence,
+        NrdResourceType::InSpecConfidence => VptNrdDispatchResource::SpecConfidence,
+        NrdResourceType::InDiffRadianceHitdist => VptNrdDispatchResource::DiffRadianceHitdist,
+        NrdResourceType::OutDiffRadianceHitdist => {
+            VptNrdDispatchResource::OutputDiffRadianceHitdist
+        }
+        NrdResourceType::OutValidation => VptNrdDispatchResource::Validation,
+        NrdResourceType::PermanentPool => {
+            let index = usize::from(index_in_pool);
+            anyhow::ensure!(
+                index < pool_plan.permanent.len(),
+                "NRD permanent texture pool index {index} is out of bounds"
+            );
+            VptNrdDispatchResource::PermanentPool { index }
+        }
+        NrdResourceType::TransientPool => {
+            let index = usize::from(index_in_pool);
+            anyhow::ensure!(
+                index < pool_plan.transient.len(),
+                "NRD transient texture pool index {index} is out of bounds"
+            );
+            VptNrdDispatchResource::TransientPool { index }
+        }
+        other => anyhow::bail!("unsupported NRD RELAX_DIFFUSE resource {other:?}"),
+    };
+    Ok(resource)
 }
 
 impl VptNrdTexturePools {
@@ -635,6 +742,164 @@ mod tests {
         assert_eq!(plan.permanent[0].height, 540);
     }
 
+    #[test]
+    fn dispatch_resource_plan_maps_relax_diffuse_resources_to_adapter_bindings() {
+        let dispatch = dispatch_snapshot(&[
+            resource(NrdDescriptorType::Texture, NrdResourceType::InMv, 0),
+            resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InNormalRoughness,
+                0,
+            ),
+            resource(NrdDescriptorType::Texture, NrdResourceType::InViewZ, 0),
+            resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InDiffRadianceHitdist,
+                0,
+            ),
+            resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InDiffConfidence,
+                0,
+            ),
+            resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::OutDiffRadianceHitdist,
+                0,
+            ),
+            resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::OutValidation,
+                0,
+            ),
+            resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::PermanentPool,
+                1,
+            ),
+            resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::TransientPool,
+                2,
+            ),
+        ]);
+        let pool_plan = VptNrdTexturePoolPlan {
+            permanent: vec![pool_image("permanent_0"), pool_image("permanent_1")],
+            transient: vec![
+                pool_image("transient_0"),
+                pool_image("transient_1"),
+                pool_image("transient_2"),
+            ],
+        };
+
+        let plan = VptNrdDispatchResourcePlan::from_dispatch(&dispatch, &pool_plan).unwrap();
+
+        assert_eq!(
+            plan.bindings,
+            vec![
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::Motion,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::NormalRoughness,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::ViewZ,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::DiffRadianceHitdist,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::DiffConfidence,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::OutputDiffRadianceHitdist,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::Validation,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::PermanentPool { index: 1 },
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::TransientPool { index: 2 },
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dispatch_resource_plan_rejects_unsupported_and_out_of_bounds_pool_resources() {
+        let pool_plan = VptNrdTexturePoolPlan {
+            permanent: vec![],
+            transient: vec![],
+        };
+        let unsupported = dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::InSpecRadianceHitdist,
+            0,
+        )]);
+        let out_of_bounds = dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::PermanentPool,
+            0,
+        )]);
+
+        let unsupported_error =
+            VptNrdDispatchResourcePlan::from_dispatch(&unsupported, &pool_plan).unwrap_err();
+        let out_of_bounds_error =
+            VptNrdDispatchResourcePlan::from_dispatch(&out_of_bounds, &pool_plan).unwrap_err();
+
+        assert!(
+            unsupported_error
+                .to_string()
+                .contains("unsupported NRD RELAX_DIFFUSE resource")
+        );
+        assert!(
+            out_of_bounds_error
+                .to_string()
+                .contains("NRD permanent texture pool index 0 is out of bounds")
+        );
+    }
+
+    #[test]
+    fn dispatch_resource_plans_are_built_for_each_snapshot_dispatch() {
+        let dispatches = vec![
+            dispatch_snapshot(&[resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InViewZ,
+                0,
+            )]),
+            dispatch_snapshot(&[resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::OutValidation,
+                0,
+            )]),
+        ];
+        let pool_plan = VptNrdTexturePoolPlan {
+            permanent: Vec::new(),
+            transient: Vec::new(),
+        };
+
+        let plans = VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &pool_plan).unwrap();
+
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].bindings[0].resource, VptNrdDispatchResource::ViewZ);
+        assert_eq!(
+            plans[1].bindings[0].resource,
+            VptNrdDispatchResource::Validation
+        );
+    }
+
     fn texture(
         format: NrdTextureFormat,
         downsample_factor: u16,
@@ -666,6 +931,44 @@ mod tests {
             }],
             permanent_pool: permanent_pool.to_vec(),
             transient_pool: transient_pool.to_vec(),
+        }
+    }
+
+    fn pool_image(name: &str) -> VptNrdTexturePoolImagePlan {
+        VptNrdTexturePoolImagePlan {
+            name: name.to_owned(),
+            width: 16,
+            height: 16,
+            format: vk::Format::R16_SFLOAT,
+            downsample_factor: 1,
+        }
+    }
+
+    fn resource(
+        descriptor_type: NrdDescriptorType,
+        resource_type: NrdResourceType,
+        index_in_pool: u16,
+    ) -> crate::render::nrd_adapter::NrdResourceDesc {
+        crate::render::nrd_adapter::NrdResourceDesc {
+            descriptor_type: descriptor_type as u32,
+            resource_type: resource_type as u32,
+            index_in_pool,
+            reserved0: 0,
+        }
+    }
+
+    fn dispatch_snapshot(
+        resources: &[crate::render::nrd_adapter::NrdResourceDesc],
+    ) -> NrdDispatchSnapshot {
+        NrdDispatchSnapshot {
+            name: "Relax Diffuse".to_owned(),
+            identifier: 0,
+            resources: resources.to_vec(),
+            constant_buffer_data: Vec::new(),
+            constant_buffer_data_matches_previous_dispatch: false,
+            pipeline_index: 0,
+            grid_width: 16,
+            grid_height: 16,
         }
     }
 }
