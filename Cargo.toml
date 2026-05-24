@@ -27,6 +27,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Feature used to gate the desktop/native binary so Android builds only the library
 desktop = []
+nrd = []
 default = []
 
 [[bin]]
@@ -47,6 +48,7 @@ path = "android-release.pfx"
 keystore_password = "Revolumetric_Release_2026"
 
 [build-dependencies]
+cc = "1"
 walkdir = "2"
 
 [profile.release]

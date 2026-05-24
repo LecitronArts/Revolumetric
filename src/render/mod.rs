@@ -10,6 +10,7 @@ pub mod frame;
 pub mod gpu_profiler;
 pub mod graph;
 pub mod image;
+pub mod nrd_adapter;
 pub mod pass_context;
 pub mod passes;
 pub mod pipeline;

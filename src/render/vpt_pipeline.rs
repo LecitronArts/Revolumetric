@@ -17,6 +17,10 @@ use crate::render::passes::vpt::VptPass;
 use crate::render::passes::vpt_atrous::{
     VptAtrousGraphInputs, VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
 };
+use crate::render::passes::vpt_nrd_adapter::{
+    VptNrdAdapterGraphInputs, VptNrdAdapterPass, VptNrdAdapterPassCreateInfo,
+    VptNrdAdapterPassResizeInfo,
+};
 use crate::render::passes::vpt_nrd_confidence::{
     VptNrdConfidenceGraphInputs, VptNrdConfidencePass, VptNrdConfidencePassCreateInfo,
     VptNrdConfidencePassResizeInfo,
@@ -160,6 +164,7 @@ pub struct VptRuntimePipeline {
     pub vpt_nrd_confidence_pass: Option<VptNrdConfidencePass>,
     pub vpt_pass: Option<VptPass>,
     pub vpt_nrd_frontend_pass: Option<VptNrdFrontendPass>,
+    pub vpt_nrd_adapter_pass: Option<VptNrdAdapterPass>,
     pub vpt_temporal_pass: Option<VptTemporalPass>,
     pub vpt_atrous_pass: Option<VptAtrousPass>,
     pub area_restir_pass: Option<AreaRestirPass>,
@@ -206,6 +211,7 @@ impl VptRuntimePipeline {
             vpt_nrd_confidence_pass: None,
             vpt_pass: None,
             vpt_nrd_frontend_pass: None,
+            vpt_nrd_adapter_pass: None,
             vpt_temporal_pass: None,
             vpt_atrous_pass: None,
             area_restir_pass: None,
@@ -227,6 +233,7 @@ impl VptRuntimePipeline {
         self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_nrd_frontend_pass(renderer, scene_ubo);
+        self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo);
         self.ensure_restir_di_pass(renderer, scene_ubo, ucvh, restir_di_enabled);
         self.ensure_area_restir_pass(renderer, scene_ubo, ucvh_gpu, area_restir_enabled);
         self.ensure_vpt_temporal_pass(renderer, scene_ubo);
@@ -405,6 +412,45 @@ impl VptRuntimePipeline {
             }
             Err(error) => {
                 tracing::error!(%error, "failed to create VPT NRD frontend pass");
+            }
+        }
+    }
+
+    fn ensure_vpt_nrd_adapter_pass(
+        &mut self,
+        renderer: &RenderDevice,
+        scene_ubo: &SceneUniformBuffer,
+    ) {
+        if self.vpt_nrd_adapter_pass.is_some() {
+            return;
+        }
+        if self.vpt_surface_pass.is_none()
+            || self.vpt_nrd_confidence_pass.is_none()
+            || self.vpt_nrd_frontend_pass.is_none()
+        {
+            return;
+        }
+
+        let extent = renderer.swapchain_extent();
+        match VptNrdAdapterPass::new(
+            renderer.device(),
+            renderer.allocator(),
+            VptNrdAdapterPassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                scene_ubo,
+            },
+        ) {
+            Ok(pass) => {
+                tracing::info!(
+                    width = extent.width,
+                    height = extent.height,
+                    "initialized VPT NRD adapter pass"
+                );
+                self.vpt_nrd_adapter_pass = Some(pass);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to create VPT NRD adapter pass");
             }
         }
     }
@@ -888,7 +934,7 @@ impl VptRuntimePipeline {
                     restir_di_selected_written = true;
                 }
 
-                let _nrd_confidence_outputs = if matches!(
+                let nrd_confidence_outputs = if matches!(
                     inputs.lighting_settings.denoiser_mode,
                     VptDenoiserMode::Relax | VptDenoiserMode::Reblur
                 ) {
@@ -922,7 +968,7 @@ impl VptRuntimePipeline {
                 );
                 let noisy_radiance_dep = vpt_outputs.noisy_radiance;
                 let noisy_moments_dep = vpt_outputs.noisy_moments;
-                let _nrd_frontend_outputs = if matches!(
+                let nrd_frontend_outputs = if matches!(
                     inputs.lighting_settings.denoiser_mode,
                     VptDenoiserMode::Relax | VptDenoiserMode::Reblur
                 ) {
@@ -939,6 +985,40 @@ impl VptRuntimePipeline {
                 } else {
                     None
                 };
+                let nrd_adapter_outputs = if matches!(
+                    inputs.lighting_settings.denoiser_mode,
+                    VptDenoiserMode::Relax
+                ) {
+                    match (
+                        self.vpt_nrd_adapter_pass.as_ref(),
+                        nrd_frontend_outputs,
+                        nrd_confidence_outputs,
+                    ) {
+                        (
+                            Some(vpt_nrd_adapter),
+                            Some(nrd_frontend_outputs),
+                            Some(nrd_confidence_outputs),
+                        ) => Some(vpt_nrd_adapter.register_graph(
+                            &mut graph,
+                            VptNrdAdapterGraphInputs {
+                                frame_slot: slot,
+                                packed: nrd_frontend_outputs.packed,
+                                confidence: nrd_confidence_outputs.confidence,
+                                surface_inputs: final_surface_writes,
+                                profiler,
+                            },
+                        )),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                let _ = nrd_adapter_outputs.as_ref().map(|outputs| {
+                    (
+                        outputs.resources.diff_radiance_hitdist,
+                        outputs.resources.validation,
+                    )
+                });
 
                 let temporal_outputs = vpt_temporal.register_graph(
                     &mut graph,
@@ -1119,6 +1199,7 @@ impl VptRuntimePipeline {
                     vpt_ready = self.vpt_pass.is_some(),
                     vpt_nrd_confidence_ready = self.vpt_nrd_confidence_pass.is_some(),
                     vpt_nrd_frontend_ready = self.vpt_nrd_frontend_pass.is_some(),
+                    vpt_nrd_adapter_ready = self.vpt_nrd_adapter_pass.is_some(),
                     vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
                     vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
                     postprocess_ready = self.postprocess_pass.is_some(),
@@ -1202,6 +1283,19 @@ impl VptRuntimePipeline {
                     },
                 )
                 .context("failed to resize VPT NRD frontend images")?;
+        }
+        if let Some(vpt_nrd_adapter) = &mut self.vpt_nrd_adapter_pass {
+            vpt_nrd_adapter
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdAdapterPassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                    },
+                )
+                .context("failed to resize VPT NRD adapter images")?;
         }
         if let Some(vpt_surface) = &mut self.vpt_surface_pass {
             vpt_surface
@@ -1322,6 +1416,9 @@ impl VptRuntimePipeline {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_nrd_frontend_pass {
+            pass.destroy(device, allocator);
+        }
+        if let Some(pass) = self.vpt_nrd_adapter_pass {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_temporal_pass {

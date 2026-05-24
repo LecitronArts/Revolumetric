@@ -900,7 +900,7 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
     }
     assert!(
         compact_pipeline.contains(
-            "let_nrd_frontend_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
+            "letnrd_frontend_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
         ),
         "pipeline must record NRD frontend only for requested NRD modes"
     );
@@ -910,8 +910,8 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         "pipeline must register frontend graph"
     );
     assert!(
-        compact_pipeline.contains("let_nrd_frontend_outputs="),
-        "pipeline must make the unused NRD frontend output explicit until resolve/backend wiring"
+        compact_pipeline.contains("letnrd_frontend_outputs="),
+        "pipeline must keep the NRD frontend output explicit for adapter wiring"
     );
     assert!(
         compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
@@ -1063,7 +1063,7 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
     }
     assert!(
         compact_pipeline.contains(
-            "let_nrd_confidence_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
+            "letnrd_confidence_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
         ),
         "pipeline must record NRD confidence only for requested NRD modes"
     );
@@ -1081,8 +1081,8 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
         "confidence pass must compare against previous surface resources"
     );
     assert!(
-        compact_pipeline.contains("let_nrd_confidence_outputs="),
-        "pipeline must make the unused confidence output explicit until NRD adapter wiring"
+        compact_pipeline.contains("letnrd_confidence_outputs="),
+        "pipeline must keep the confidence output explicit for NRD adapter wiring"
     );
     assert!(
         compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
@@ -1103,6 +1103,180 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
     assert!(surface_idx < confidence_idx);
     assert!(confidence_idx < frontend_idx);
     assert!(confidence_idx < temporal_idx);
+}
+
+#[test]
+fn vpt_nrd_adapter_declares_relax_integration_contract() {
+    let adapter = source("src/render/passes/vpt_nrd_adapter.rs");
+    let ffi = source("src/render/nrd_adapter.rs");
+    let native_header = source("native/nrd_adapter.h");
+    let native_cpp = source("native/nrd_adapter.cpp");
+    let build_rs = source("build.rs");
+    let render_mod = source("src/render/mod.rs");
+    let pass_mod = source("src/render/passes/mod.rs");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let profiler = source("src/render/gpu_profiler.rs");
+    let compact_adapter = adapter.split_whitespace().collect::<String>();
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+
+    for token in [
+        "pub struct NrdLibraryDesc",
+        "pub struct NrdInstanceDesc",
+        "pub struct NrdTextureDesc",
+        "pub struct NrdResourceDesc",
+        "pub struct NrdResourceRangeDesc",
+        "pub struct NrdPipelineDesc",
+        "pub struct NrdDispatchDesc",
+        "pub struct NrdCommonSettings",
+        "pub struct NrdRelaxDiffuseSettings",
+        "pub struct NrdUnavailableError",
+        "pub type NrdResult<T> = Result<T, NrdUnavailableError>",
+        "#[cfg(feature = \"nrd\")]",
+        "#[cfg(not(feature = \"nrd\"))]",
+        "relax_diffuse",
+    ] {
+        assert!(ffi.contains(token), "NRD FFI missing {token}");
+    }
+    for token in [
+        "fn nrd_library_dir(root: &Path) -> PathBuf",
+        "NRD_STATIC_LIBRARY=ON",
+        "NRD_EMBEDS_SPIRV_SHADERS=ON",
+        "NRD_SUPPORTS_HISTORY_CONFIDENCE=ON",
+        "cargo:rustc-link-lib=static=NRD",
+    ] {
+        assert!(build_rs.contains(token), "NRD build gate missing {token}");
+    }
+    for token in [
+        "struct NrdLibraryDesc",
+        "struct NrdInstanceDesc",
+        "struct NrdTextureDesc",
+        "struct NrdResourceDesc",
+        "struct NrdResourceRangeDesc",
+        "struct NrdPipelineDesc",
+        "struct NrdDispatchDesc",
+        "struct NrdCommonSettings",
+        "struct NrdRelaxDiffuseSettings",
+        "revolumetric_nrd_create_relax_diffuse",
+        "revolumetric_nrd_destroy",
+        "revolumetric_nrd_get_library_desc",
+        "revolumetric_nrd_get_instance_desc",
+        "revolumetric_nrd_get_dispatches",
+        "revolumetric_nrd_set_common_settings",
+        "revolumetric_nrd_set_relax_diffuse_settings",
+    ] {
+        assert!(
+            native_header.contains(token) || native_cpp.contains(token),
+            "native NRD wrapper missing {token}"
+        );
+    }
+
+    for token in [
+        "pub struct VptNrdAdapterPass",
+        "pub struct VptNrdAdapterGraphInputs",
+        "pub struct VptNrdAdapterGraphOutputs",
+        "pub struct VptNrdAdapterResources",
+        "pub packed: VptNrdPackedResources",
+        "pub confidence: VptNrdConfidenceResources",
+        "pub surface_inputs: VptCurrentSurfaceResources",
+        "pub diff_radiance_hitdist: ResourceHandle",
+        "pub validation: ResourceHandle",
+        "pub nrd_diff_radiance_hitdist: GpuImage",
+        "pub nrd_validation: GpuImage",
+        "vpt_nrd_adapter_diff_radiance_hitdist",
+        "vpt_nrd_adapter_validation",
+        "graph.add_pass(\"vpt_nrd_adapter\"",
+        "GpuProfileScope::VptNrdAdapter",
+    ] {
+        assert!(adapter.contains(token), "NRD adapter pass missing {token}");
+    }
+    for token in [
+        "builder.read_as(packed.diff_radiance_hitdist,AccessKind::ComputeShaderRead);",
+        "builder.read_as(packed.spec_radiance_hitdist,AccessKind::ComputeShaderRead);",
+        "builder.read_as(packed.residual_radiance,AccessKind::ComputeShaderRead);",
+        "builder.read_as(packed.material_factors,AccessKind::ComputeShaderRead);",
+        "builder.read_as(confidence.diff_confidence,AccessKind::ComputeShaderRead);",
+        "builder.read_as(confidence.spec_confidence,AccessKind::ComputeShaderRead);",
+        "builder.read_as(surface_inputs.normal_roughness,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(surface_inputs.material_roughness,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(surface_inputs.view_z,AccessKind::ComputeShaderRead);",
+        "builder.read_as(surface_inputs.motion_history,AccessKind::ComputeShaderRead);",
+    ] {
+        assert!(
+            compact_adapter.contains(token),
+            "NRD adapter graph missing compact token {token}"
+        );
+    }
+    for forbidden in [
+        "[ResourceHandle; 4]",
+        "[ResourceHandle; 6]",
+        "[ResourceHandle; 8]",
+        "packed[",
+        "confidence[",
+        "surface_inputs[",
+    ] {
+        assert!(
+            !adapter.contains(forbidden),
+            "NRD adapter pass must use named resources, found {forbidden}"
+        );
+    }
+
+    assert!(render_mod.contains("pub mod nrd_adapter;"));
+    assert!(pass_mod.contains("pub mod vpt_nrd_adapter;"));
+    assert!(profiler.contains("VptNrdAdapter"));
+    assert!(profiler.contains("vpt_nrd_adapter_ms"));
+
+    for token in [
+        "use crate::render::passes::vpt_nrd_adapter::{",
+        "pub vpt_nrd_adapter_pass: Option<VptNrdAdapterPass>",
+        "vpt_nrd_adapter_pass: None",
+        "self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo);",
+        "fn ensure_vpt_nrd_adapter_pass(",
+        "VptNrdAdapterPass::new(",
+        "failed to resize VPT NRD adapter images",
+        "vpt_nrd_adapter_ready = self.vpt_nrd_adapter_pass.is_some()",
+        "pass.destroy(device, allocator);",
+    ] {
+        assert!(pipeline.contains(token), "pipeline missing {token}");
+    }
+    assert!(
+        compact_pipeline.contains(
+            "letnrd_adapter_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax){"
+        ),
+        "pipeline must record NRD adapter only for requested RELAX mode"
+    );
+    assert!(
+        compact_pipeline
+            .contains("vpt_nrd_adapter.register_graph(&mutgraph,VptNrdAdapterGraphInputs{"),
+        "pipeline must register adapter graph"
+    );
+    assert!(
+        compact_pipeline.contains("packed:nrd_frontend_outputs.packed,"),
+        "adapter must consume packed NRD frontend resources"
+    );
+    assert!(
+        compact_pipeline.contains("confidence:nrd_confidence_outputs.confidence,"),
+        "adapter must consume history confidence resources"
+    );
+    assert!(
+        compact_pipeline.contains("surface_inputs:final_surface_writes,"),
+        "adapter must consume the selected current surface guides"
+    );
+    assert!(
+        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
+        "Phase 5 must keep SVGF A-trous output feeding postprocess"
+    );
+
+    let frontend_idx = pipeline
+        .find("vpt_nrd_frontend.register_graph(")
+        .expect("NRD frontend graph registration should exist");
+    let adapter_idx = pipeline
+        .find("vpt_nrd_adapter.register_graph(")
+        .expect("NRD adapter graph registration should exist");
+    let temporal_idx = pipeline
+        .find("vpt_temporal.register_graph(")
+        .expect("SVGF temporal graph registration should exist");
+    assert!(frontend_idx < adapter_idx);
+    assert!(adapter_idx < temporal_idx);
 }
 
 #[test]
