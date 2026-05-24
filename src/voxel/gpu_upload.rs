@@ -90,6 +90,14 @@ impl From<UcvhMotionEvent> for GpuUcvhMotionEvent {
 }
 
 impl UcvhGpuResources {
+    pub(crate) fn config_buffer_usage() -> vk::BufferUsageFlags {
+        vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+    }
+
+    pub(crate) fn device_storage_buffer_usage() -> vk::BufferUsageFlags {
+        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST
+    }
+
     pub fn new(device: &ash::Device, allocator: &GpuAllocator, ucvh: &Ucvh) -> Result<Self> {
         let cap = ucvh.pool.capacity() as usize;
         let occ_size = cap * std::mem::size_of::<BrickOccupancy>();
@@ -98,7 +106,6 @@ impl UcvhGpuResources {
         let motion_event_size =
             UCVH_MOTION_EVENT_CAPACITY * std::mem::size_of::<GpuUcvhMotionEvent>();
 
-        let ssbo_usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
         let staging_usage = vk::BufferUsageFlags::TRANSFER_SRC;
 
         // Device-local SSBOs
@@ -106,10 +113,11 @@ impl UcvhGpuResources {
             device,
             allocator,
             std::mem::size_of::<UcvhGpuConfig>() as u64,
-            ssbo_usage,
+            Self::config_buffer_usage(),
             MemoryLocation::GpuOnly,
             "ucvh_config",
         )?;
+        let ssbo_usage = Self::device_storage_buffer_usage();
         let occupancy_buffer = GpuBuffer::new(
             device,
             allocator,
@@ -618,6 +626,26 @@ mod tests {
         .expect("offset staging copy should succeed");
 
         assert_eq!(storage, [9, 1, 2, 3, 9]);
+    }
+
+    #[test]
+    fn ucvh_config_buffer_usage_matches_constant_buffer_descriptors() {
+        let vpt_shader =
+            crate::render::source_checks::read_source("assets/shaders/passes/vpt.slang");
+        let surface_shader =
+            crate::render::source_checks::read_source("assets/shaders/passes/vpt_surface.slang");
+
+        assert!(vpt_shader.contains("ConstantBuffer<UcvhConfig> ucvh_config"));
+        assert!(surface_shader.contains("ConstantBuffer<UcvhConfig> ucvh_config"));
+        let config_usage = UcvhGpuResources::config_buffer_usage();
+        let storage_usage = UcvhGpuResources::device_storage_buffer_usage();
+
+        assert!(config_usage.contains(vk::BufferUsageFlags::UNIFORM_BUFFER));
+        assert!(config_usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
+        assert!(!config_usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+        assert!(storage_usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
+        assert!(storage_usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
+        assert!(!storage_usage.contains(vk::BufferUsageFlags::UNIFORM_BUFFER));
     }
 
     #[test]
