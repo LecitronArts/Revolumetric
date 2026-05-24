@@ -81,6 +81,10 @@ pub enum VptNrdDispatchResource {
 
 pub struct VptNrdReadyBackend {
     _instance: NrdInstance,
+    state: VptNrdReadyBackendState,
+}
+
+struct VptNrdReadyBackendState {
     library_desc: NrdLibraryDesc,
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
@@ -308,7 +312,7 @@ impl VptNrdAdapterBackend {
 
     pub fn dispatch_count(&self) -> usize {
         match self {
-            Self::Ready(backend) => backend.dispatches.len(),
+            Self::Ready(backend) => backend.state.dispatches.len(),
             Self::Unavailable(_) => 0,
         }
     }
@@ -322,7 +326,7 @@ impl VptNrdAdapterBackend {
 
     pub fn texture_pool_plan(&self) -> Option<&VptNrdTexturePoolPlan> {
         match self {
-            Self::Ready(backend) => Some(&backend.texture_pool_plan),
+            Self::Ready(backend) => Some(&backend.state.texture_pool_plan),
             Self::Unavailable(_) => None,
         }
     }
@@ -337,18 +341,61 @@ impl VptNrdAdapterBackend {
 
 impl VptNrdReadyBackend {
     fn initialize_relax(width: u32, height: u32) -> Result<Self> {
-        let instance = NrdInstance::relax_diffuse(width, height)?;
+        let mut instance = NrdInstance::relax_diffuse(width, height)?;
         let library_desc = NrdInstance::library_desc()?;
         let instance_snapshot = instance.instance_snapshot()?;
+        let dispatches = instance.dispatch_snapshot()?;
+        Self::from_instance(
+            instance,
+            library_desc,
+            instance_snapshot,
+            dispatches,
+            width,
+            height,
+        )
+    }
+
+    fn from_instance(
+        instance: NrdInstance,
+        library_desc: NrdLibraryDesc,
+        instance_snapshot: NrdInstanceSnapshot,
+        dispatches: Vec<NrdDispatchSnapshot>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
+        let state = VptNrdReadyBackendState::from_snapshots(
+            library_desc,
+            instance_snapshot,
+            dispatches,
+            width,
+            height,
+        )?;
+        Ok(Self {
+            _instance: instance,
+            state,
+        })
+    }
+
+    fn metadata(&self) -> VptNrdAdapterBackendMetadata {
+        self.state.metadata()
+    }
+}
+
+impl VptNrdReadyBackendState {
+    fn from_snapshots(
+        library_desc: NrdLibraryDesc,
+        instance_snapshot: NrdInstanceSnapshot,
+        dispatches: Vec<NrdDispatchSnapshot>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self> {
         let texture_pool_plan =
             VptNrdTexturePoolPlan::from_instance_snapshot(width, height, &instance_snapshot)
                 .context("failed to build VPT NRD texture pool plan")?;
-        let dispatches = Vec::new();
         let dispatch_resource_plans =
             VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
                 .context("failed to build VPT NRD dispatch resource plans")?;
         Ok(Self {
-            _instance: instance,
             library_desc,
             instance_snapshot,
             texture_pool_plan,
@@ -897,6 +944,67 @@ mod tests {
         assert_eq!(
             plans[1].bindings[0].resource,
             VptNrdDispatchResource::Validation
+        );
+    }
+
+    #[test]
+    fn ready_backend_metadata_counts_dispatch_snapshots_and_resource_plans() {
+        let library_desc = NrdLibraryDesc {
+            texture_offset: 10,
+            sampler_offset: 20,
+            constant_buffer_offset: 30,
+            storage_texture_and_buffer_offset: 40,
+        };
+        let instance_snapshot = instance_snapshot_with_pools(
+            &[texture(NrdTextureFormat::R16Sfloat, 1)],
+            &[texture(NrdTextureFormat::R16Sfloat, 1)],
+        );
+        let dispatches = vec![
+            dispatch_snapshot(&[resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::PermanentPool,
+                0,
+            )]),
+            dispatch_snapshot(&[resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::TransientPool,
+                0,
+            )]),
+        ];
+
+        let state = VptNrdReadyBackendState::from_snapshots(
+            library_desc,
+            instance_snapshot,
+            dispatches,
+            32,
+            16,
+        )
+        .unwrap();
+        let metadata = state.metadata();
+
+        assert_eq!(metadata.library_desc, library_desc);
+        assert_eq!(metadata.dispatch_count, 2);
+        assert_eq!(metadata.dispatch_resource_plan_count, 2);
+    }
+
+    #[test]
+    fn dispatch_resource_plan_rejects_out_of_bounds_transient_pool_resources() {
+        let dispatch = dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::TransientPool,
+            0,
+        )]);
+        let pool_plan = VptNrdTexturePoolPlan {
+            permanent: Vec::new(),
+            transient: Vec::new(),
+        };
+
+        let error = VptNrdDispatchResourcePlan::from_dispatch(&dispatch, &pool_plan).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD transient texture pool index 0 is out of bounds")
         );
     }
 
