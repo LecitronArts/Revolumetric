@@ -1321,13 +1321,18 @@ fn create_surface_image(
             height,
             depth: 1,
             format,
-            usage: vk::ImageUsageFlags::STORAGE
-                | vk::ImageUsageFlags::TRANSFER_SRC
-                | vk::ImageUsageFlags::TRANSFER_DST,
+            usage: surface_image_usage(),
             aspect: vk::ImageAspectFlags::COLOR,
             name,
         },
     )
+}
+
+fn surface_image_usage() -> vk::ImageUsageFlags {
+    vk::ImageUsageFlags::STORAGE
+        | vk::ImageUsageFlags::SAMPLED
+        | vk::ImageUsageFlags::TRANSFER_SRC
+        | vk::ImageUsageFlags::TRANSFER_DST
 }
 
 fn write_descriptor_sets(
@@ -1665,6 +1670,16 @@ mod shader_source_tests {
             result.is_err(),
             "missing surface graph writes must be rejected"
         );
+    }
+
+    #[test]
+    fn surface_images_are_sampleable_for_nrd_adapter_descriptors() {
+        let usage = surface_image_usage();
+
+        assert!(usage.contains(vk::ImageUsageFlags::STORAGE));
+        assert!(usage.contains(vk::ImageUsageFlags::SAMPLED));
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_SRC));
+        assert!(usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
     }
 
     #[test]

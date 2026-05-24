@@ -153,6 +153,34 @@ pub struct VptNrdDispatchDescriptorWrite {
     pub resource: VptNrdDispatchResource,
 }
 
+pub struct VptNrdAdapterImageInputs<'a> {
+    pub motion: &'a GpuImage,
+    pub normal_roughness: &'a GpuImage,
+    pub view_z: &'a GpuImage,
+    pub diff_confidence: &'a GpuImage,
+    pub spec_confidence: &'a GpuImage,
+    pub diff_radiance_hitdist: &'a GpuImage,
+    pub output_diff_radiance_hitdist: &'a GpuImage,
+    pub validation: &'a GpuImage,
+    pub permanent_pool: &'a [GpuImage],
+    pub transient_pool: &'a [GpuImage],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdResolvedDispatchDescriptorWritePlan {
+    pub pipeline_index: usize,
+    pub writes: Vec<VptNrdResolvedDescriptorImageWrite>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdResolvedDescriptorImageWrite {
+    pub binding: u32,
+    pub array_element: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub image_view: vk::ImageView,
+    pub image_layout: vk::ImageLayout,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VptNrdDispatchResource {
     Motion,
@@ -1024,6 +1052,76 @@ impl VptNrdDispatchDescriptorWritePlan {
             pipeline_index,
             writes,
         })
+    }
+}
+
+impl VptNrdResolvedDispatchDescriptorWritePlan {
+    pub fn from_write_plan(
+        plan: &VptNrdDispatchDescriptorWritePlan,
+        inputs: &VptNrdAdapterImageInputs<'_>,
+    ) -> Result<Self> {
+        let writes = plan
+            .writes
+            .iter()
+            .map(|write| write.resolve_image(inputs))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            pipeline_index: plan.pipeline_index,
+            writes,
+        })
+    }
+}
+
+impl VptNrdDispatchDescriptorWrite {
+    fn resolve_image(
+        &self,
+        inputs: &VptNrdAdapterImageInputs<'_>,
+    ) -> Result<VptNrdResolvedDescriptorImageWrite> {
+        let image = inputs.image_for_resource(self.resource)?;
+        Ok(VptNrdResolvedDescriptorImageWrite {
+            binding: self.binding,
+            array_element: self.array_element,
+            descriptor_type: self.descriptor_type,
+            image_view: image.view,
+            image_layout: descriptor_image_layout(self.descriptor_type)?,
+        })
+    }
+}
+
+impl<'a> VptNrdAdapterImageInputs<'a> {
+    fn image_for_resource(&self, resource: VptNrdDispatchResource) -> Result<&'a GpuImage> {
+        match resource {
+            VptNrdDispatchResource::Motion => Ok(self.motion),
+            VptNrdDispatchResource::NormalRoughness => Ok(self.normal_roughness),
+            VptNrdDispatchResource::ViewZ => Ok(self.view_z),
+            VptNrdDispatchResource::DiffConfidence => Ok(self.diff_confidence),
+            VptNrdDispatchResource::SpecConfidence => Ok(self.spec_confidence),
+            VptNrdDispatchResource::DiffRadianceHitdist => Ok(self.diff_radiance_hitdist),
+            VptNrdDispatchResource::OutputDiffRadianceHitdist => {
+                Ok(self.output_diff_radiance_hitdist)
+            }
+            VptNrdDispatchResource::Validation => Ok(self.validation),
+            VptNrdDispatchResource::PermanentPool { index } => {
+                self.permanent_pool.get(index).with_context(|| {
+                    format!("NRD permanent texture pool image index {index} is out of bounds")
+                })
+            }
+            VptNrdDispatchResource::TransientPool { index } => {
+                self.transient_pool.get(index).with_context(|| {
+                    format!("NRD transient texture pool image index {index} is out of bounds")
+                })
+            }
+        }
+    }
+}
+
+fn descriptor_image_layout(descriptor_type: vk::DescriptorType) -> Result<vk::ImageLayout> {
+    match descriptor_type {
+        vk::DescriptorType::SAMPLED_IMAGE => Ok(AccessKind::ComputeShaderRead.image_layout()),
+        vk::DescriptorType::STORAGE_IMAGE => Ok(AccessKind::ComputeShaderWrite.image_layout()),
+        other => anyhow::bail!(
+            "NRD dispatch descriptor image write uses unsupported descriptor type {other:?}"
+        ),
     }
 }
 
@@ -2516,6 +2614,169 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_descriptor_image_write_plan_resolves_named_resources_to_views_and_layouts() {
+        let images = AdapterImageInputFixture::new();
+        let inputs = images.inputs();
+        let plan = VptNrdDispatchDescriptorWritePlan {
+            pipeline_index: 3,
+            writes: vec![
+                descriptor_write(
+                    0,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::Motion,
+                ),
+                descriptor_write(
+                    1,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::NormalRoughness,
+                ),
+                descriptor_write(
+                    2,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::ViewZ,
+                ),
+                descriptor_write(
+                    3,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::DiffConfidence,
+                ),
+                descriptor_write(
+                    4,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::SpecConfidence,
+                ),
+                descriptor_write(
+                    5,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::DiffRadianceHitdist,
+                ),
+                descriptor_write(
+                    6,
+                    0,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    VptNrdDispatchResource::OutputDiffRadianceHitdist,
+                ),
+                descriptor_write(
+                    7,
+                    0,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    VptNrdDispatchResource::Validation,
+                ),
+                descriptor_write(
+                    8,
+                    0,
+                    vk::DescriptorType::SAMPLED_IMAGE,
+                    VptNrdDispatchResource::PermanentPool { index: 0 },
+                ),
+                descriptor_write(
+                    9,
+                    1,
+                    vk::DescriptorType::STORAGE_IMAGE,
+                    VptNrdDispatchResource::TransientPool { index: 0 },
+                ),
+            ],
+        };
+
+        let resolved =
+            VptNrdResolvedDispatchDescriptorWritePlan::from_write_plan(&plan, &inputs).unwrap();
+
+        assert_eq!(resolved.pipeline_index, 3);
+        assert_eq!(
+            resolved.writes,
+            vec![
+                resolved_image_write(0, 0, vk::DescriptorType::SAMPLED_IMAGE, 11),
+                resolved_image_write(1, 0, vk::DescriptorType::SAMPLED_IMAGE, 12),
+                resolved_image_write(2, 0, vk::DescriptorType::SAMPLED_IMAGE, 13),
+                resolved_image_write(3, 0, vk::DescriptorType::SAMPLED_IMAGE, 14),
+                resolved_image_write(4, 0, vk::DescriptorType::SAMPLED_IMAGE, 15),
+                resolved_image_write(5, 0, vk::DescriptorType::SAMPLED_IMAGE, 16),
+                resolved_image_write(6, 0, vk::DescriptorType::STORAGE_IMAGE, 17),
+                resolved_image_write(7, 0, vk::DescriptorType::STORAGE_IMAGE, 18),
+                resolved_image_write(8, 0, vk::DescriptorType::SAMPLED_IMAGE, 21),
+                resolved_image_write(9, 1, vk::DescriptorType::STORAGE_IMAGE, 31),
+            ]
+        );
+        assert_eq!(
+            AccessKind::ComputeShaderRead.image_layout(),
+            vk::ImageLayout::GENERAL,
+            "descriptor layouts must match the current RenderGraph compute image-read layout"
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_image_write_plan_rejects_runtime_pool_index_mismatches() {
+        let images = AdapterImageInputFixture::new();
+        let inputs = images.inputs();
+        let permanent_plan = VptNrdDispatchDescriptorWritePlan {
+            pipeline_index: 0,
+            writes: vec![descriptor_write(
+                0,
+                0,
+                vk::DescriptorType::SAMPLED_IMAGE,
+                VptNrdDispatchResource::PermanentPool { index: 1 },
+            )],
+        };
+
+        let error =
+            VptNrdResolvedDispatchDescriptorWritePlan::from_write_plan(&permanent_plan, &inputs)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD permanent texture pool image index 1 is out of bounds")
+        );
+
+        let transient_plan = VptNrdDispatchDescriptorWritePlan {
+            pipeline_index: 0,
+            writes: vec![descriptor_write(
+                0,
+                0,
+                vk::DescriptorType::STORAGE_IMAGE,
+                VptNrdDispatchResource::TransientPool { index: 1 },
+            )],
+        };
+
+        let error =
+            VptNrdResolvedDispatchDescriptorWritePlan::from_write_plan(&transient_plan, &inputs)
+                .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD transient texture pool image index 1 is out of bounds")
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_image_write_plan_rejects_non_image_descriptor_types() {
+        let images = AdapterImageInputFixture::new();
+        let inputs = images.inputs();
+        let plan = VptNrdDispatchDescriptorWritePlan {
+            pipeline_index: 0,
+            writes: vec![descriptor_write(
+                0,
+                0,
+                vk::DescriptorType::UNIFORM_BUFFER,
+                VptNrdDispatchResource::Motion,
+            )],
+        };
+
+        let error =
+            VptNrdResolvedDispatchDescriptorWritePlan::from_write_plan(&plan, &inputs).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "NRD dispatch descriptor image write uses unsupported descriptor type UNIFORM_BUFFER"
+        ));
+    }
+
+    #[test]
     fn dispatch_descriptor_write_plan_rejects_out_of_bounds_pipeline_index() {
         let dispatch = NrdDispatchSnapshot {
             pipeline_index: 4,
@@ -2925,6 +3186,100 @@ mod tests {
             height: 16,
             format: vk::Format::R16_SFLOAT,
             downsample_factor: 1,
+        }
+    }
+
+    struct AdapterImageInputFixture {
+        motion: GpuImage,
+        normal_roughness: GpuImage,
+        view_z: GpuImage,
+        diff_confidence: GpuImage,
+        spec_confidence: GpuImage,
+        diff_radiance_hitdist: GpuImage,
+        output_diff_radiance_hitdist: GpuImage,
+        validation: GpuImage,
+        permanent_pool: Vec<GpuImage>,
+        transient_pool: Vec<GpuImage>,
+    }
+
+    impl AdapterImageInputFixture {
+        fn new() -> Self {
+            Self {
+                motion: fake_image_with_view(11),
+                normal_roughness: fake_image_with_view(12),
+                view_z: fake_image_with_view(13),
+                diff_confidence: fake_image_with_view(14),
+                spec_confidence: fake_image_with_view(15),
+                diff_radiance_hitdist: fake_image_with_view(16),
+                output_diff_radiance_hitdist: fake_image_with_view(17),
+                validation: fake_image_with_view(18),
+                permanent_pool: vec![fake_image_with_view(21)],
+                transient_pool: vec![fake_image_with_view(31)],
+            }
+        }
+
+        fn inputs(&self) -> VptNrdAdapterImageInputs<'_> {
+            VptNrdAdapterImageInputs {
+                motion: &self.motion,
+                normal_roughness: &self.normal_roughness,
+                view_z: &self.view_z,
+                diff_confidence: &self.diff_confidence,
+                spec_confidence: &self.spec_confidence,
+                diff_radiance_hitdist: &self.diff_radiance_hitdist,
+                output_diff_radiance_hitdist: &self.output_diff_radiance_hitdist,
+                validation: &self.validation,
+                permanent_pool: &self.permanent_pool,
+                transient_pool: &self.transient_pool,
+            }
+        }
+    }
+
+    fn fake_image_with_view(id: u64) -> GpuImage {
+        GpuImage {
+            handle: vk::Image::from_raw(1000 + id),
+            view: vk::ImageView::from_raw(id),
+            extent: vk::Extent3D {
+                width: 16,
+                height: 16,
+                depth: 1,
+            },
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            allocation: None,
+            current_layout: vk::ImageLayout::UNDEFINED,
+        }
+    }
+
+    fn descriptor_write(
+        binding: u32,
+        array_element: u32,
+        descriptor_type: vk::DescriptorType,
+        resource: VptNrdDispatchResource,
+    ) -> VptNrdDispatchDescriptorWrite {
+        VptNrdDispatchDescriptorWrite {
+            binding,
+            array_element,
+            descriptor_type,
+            resource,
+        }
+    }
+
+    fn resolved_image_write(
+        binding: u32,
+        array_element: u32,
+        descriptor_type: vk::DescriptorType,
+        image_view: u64,
+    ) -> VptNrdResolvedDescriptorImageWrite {
+        let image_layout = match descriptor_type {
+            vk::DescriptorType::SAMPLED_IMAGE => AccessKind::ComputeShaderRead.image_layout(),
+            vk::DescriptorType::STORAGE_IMAGE => AccessKind::ComputeShaderWrite.image_layout(),
+            _ => unreachable!("test helper only resolves image descriptors"),
+        };
+        VptNrdResolvedDescriptorImageWrite {
+            binding,
+            array_element,
+            descriptor_type,
+            image_view: vk::ImageView::from_raw(image_view),
+            image_layout,
         }
     }
 
