@@ -574,15 +574,15 @@ impl VptNrdDescriptorPoolPlan {
     pub fn from_binding_plans(
         binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
     ) -> Result<Self> {
+        anyhow::ensure!(
+            !binding_plans.is_empty(),
+            "NRD pipeline descriptor binding plans are empty"
+        );
         let max_sets = u32::try_from(binding_plans.len())
             .context("NRD pipeline descriptor set count exceeds u32")?;
         let mut sampled_image_count = 0u32;
         let mut storage_image_count = 0u32;
         for plan in binding_plans {
-            anyhow::ensure!(
-                !plan.bindings.is_empty(),
-                "NRD pipeline descriptor binding plan is empty"
-            );
             for binding in &plan.bindings {
                 match binding.descriptor_type {
                     vk::DescriptorType::SAMPLED_IMAGE => {
@@ -1246,17 +1246,59 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_pool_plan_rejects_empty_pipeline_bindings() {
-        let binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
-            bindings: Vec::new(),
-        }];
-
-        let error = VptNrdDescriptorPoolPlan::from_binding_plans(&binding_plans).unwrap_err();
+    fn descriptor_pool_plan_rejects_empty_pipeline_binding_plans() {
+        let error = VptNrdDescriptorPoolPlan::from_binding_plans(&[]).unwrap_err();
 
         assert!(
             error
                 .to_string()
-                .contains("NRD pipeline descriptor binding plan is empty")
+                .contains("NRD pipeline descriptor binding plans are empty")
+        );
+    }
+
+    #[test]
+    fn descriptor_pool_plan_allows_pipelines_without_resource_bindings() {
+        let binding_plans = vec![
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: Vec::new(),
+            },
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![VptNrdPipelineDescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 2,
+                }],
+            },
+        ];
+
+        let pool_plan = VptNrdDescriptorPoolPlan::from_binding_plans(&binding_plans).unwrap();
+
+        assert_eq!(
+            pool_plan,
+            VptNrdDescriptorPoolPlan {
+                max_sets: 2,
+                pool_sizes: vec![VptNrdDescriptorPoolSizePlan {
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 2,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn descriptor_pool_plan_allows_all_pipelines_without_resource_bindings() {
+        let binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: Vec::new(),
+        }];
+
+        let pool_plan = VptNrdDescriptorPoolPlan::from_binding_plans(&binding_plans).unwrap();
+
+        assert_eq!(
+            pool_plan,
+            VptNrdDescriptorPoolPlan {
+                max_sets: 1,
+                pool_sizes: Vec::new(),
+            }
         );
     }
 
