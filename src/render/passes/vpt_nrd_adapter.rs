@@ -107,6 +107,19 @@ pub struct VptNrdDispatchResourceBindingPlan {
     pub resource: VptNrdDispatchResource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdDispatchDescriptorWritePlan {
+    pub pipeline_index: usize,
+    pub writes: Vec<VptNrdDispatchDescriptorWrite>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdDispatchDescriptorWrite {
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub resource: VptNrdDispatchResource,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VptNrdDispatchResource {
     Motion,
@@ -719,6 +732,58 @@ impl VptNrdDispatchResourcePlan {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self { bindings })
+    }
+}
+
+impl VptNrdDispatchDescriptorWritePlan {
+    pub fn from_dispatch_plan(
+        dispatch: &NrdDispatchSnapshot,
+        dispatch_plan: &VptNrdDispatchResourcePlan,
+        pipeline_binding_plans: &[VptNrdPipelineDescriptorBindingPlan],
+    ) -> Result<Self> {
+        let pipeline_index = usize::from(dispatch.pipeline_index);
+        let pipeline_binding_plan =
+            pipeline_binding_plans
+                .get(pipeline_index)
+                .with_context(|| {
+                    format!("NRD dispatch pipeline index {pipeline_index} is out of bounds")
+                })?;
+        anyhow::ensure!(
+            dispatch_plan.bindings.len() == pipeline_binding_plan.bindings.len(),
+            "NRD dispatch resource count does not match pipeline descriptor binding count"
+        );
+
+        let writes = pipeline_binding_plan
+            .bindings
+            .iter()
+            .zip(dispatch_plan.bindings.iter())
+            .map(|(pipeline_binding, dispatch_binding)| {
+                let expected_descriptor_type =
+                    nrd_descriptor_type_to_vk(dispatch_binding.descriptor_type)?;
+                anyhow::ensure!(
+                    pipeline_binding.descriptor_type == expected_descriptor_type,
+                    "NRD dispatch descriptor type does not match pipeline binding"
+                );
+                Ok(VptNrdDispatchDescriptorWrite {
+                    binding: pipeline_binding.binding,
+                    descriptor_type: pipeline_binding.descriptor_type,
+                    resource: dispatch_binding.resource,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            pipeline_index,
+            writes,
+        })
+    }
+}
+
+fn nrd_descriptor_type_to_vk(descriptor_type: NrdDescriptorType) -> Result<vk::DescriptorType> {
+    match descriptor_type {
+        NrdDescriptorType::Texture => Ok(vk::DescriptorType::SAMPLED_IMAGE),
+        NrdDescriptorType::StorageTexture => Ok(vk::DescriptorType::STORAGE_IMAGE),
+        other => anyhow::bail!("unsupported NRD descriptor type {other:?}"),
     }
 }
 
@@ -1642,6 +1707,226 @@ mod tests {
             plans[1].bindings[0].resource,
             VptNrdDispatchResource::Validation
         );
+    }
+
+    #[test]
+    fn dispatch_descriptor_write_plan_pairs_dispatch_resources_with_pipeline_bindings() {
+        let dispatch = NrdDispatchSnapshot {
+            pipeline_index: 1,
+            ..dispatch_snapshot(&[
+                resource(NrdDescriptorType::Texture, NrdResourceType::InViewZ, 0),
+                resource(
+                    NrdDescriptorType::StorageTexture,
+                    NrdResourceType::OutValidation,
+                    0,
+                ),
+            ])
+        };
+        let dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::ViewZ,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::Validation,
+                },
+            ],
+        };
+        let pipeline_binding_plans = vec![
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![VptNrdPipelineDescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                }],
+            },
+            VptNrdPipelineDescriptorBindingPlan {
+                bindings: vec![
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 3,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                    },
+                    VptNrdPipelineDescriptorBinding {
+                        binding: 4,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                    },
+                ],
+            },
+        ];
+
+        let write_plan = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &dispatch_plan,
+            &pipeline_binding_plans,
+        )
+        .unwrap();
+
+        assert_eq!(
+            write_plan,
+            VptNrdDispatchDescriptorWritePlan {
+                pipeline_index: 1,
+                writes: vec![
+                    VptNrdDispatchDescriptorWrite {
+                        binding: 3,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        resource: VptNrdDispatchResource::ViewZ,
+                    },
+                    VptNrdDispatchDescriptorWrite {
+                        binding: 4,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        resource: VptNrdDispatchResource::Validation,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_write_plan_rejects_out_of_bounds_pipeline_index() {
+        let dispatch = NrdDispatchSnapshot {
+            pipeline_index: 4,
+            ..dispatch_snapshot(&[resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InViewZ,
+                0,
+            )])
+        };
+        let dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![VptNrdDispatchResourceBindingPlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                resource: VptNrdDispatchResource::ViewZ,
+            }],
+        };
+        let pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![VptNrdPipelineDescriptorBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            }],
+        }];
+
+        let error = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &dispatch_plan,
+            &pipeline_binding_plans,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD dispatch pipeline index 4 is out of bounds")
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_write_plan_rejects_descriptor_type_mismatch() {
+        let dispatch = dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::InViewZ,
+            0,
+        )]);
+        let dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![VptNrdDispatchResourceBindingPlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                resource: VptNrdDispatchResource::ViewZ,
+            }],
+        };
+        let pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![VptNrdPipelineDescriptorBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+            }],
+        }];
+
+        let error = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &dispatch_plan,
+            &pipeline_binding_plans,
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD dispatch descriptor type does not match pipeline binding")
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_write_plan_rejects_mismatched_resource_count() {
+        let dispatch = dispatch_snapshot(&[resource(
+            NrdDescriptorType::Texture,
+            NrdResourceType::InViewZ,
+            0,
+        )]);
+        let dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![VptNrdDispatchResourceBindingPlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                resource: VptNrdDispatchResource::ViewZ,
+            }],
+        };
+        let pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![
+                VptNrdPipelineDescriptorBinding {
+                    binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                },
+                VptNrdPipelineDescriptorBinding {
+                    binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                },
+            ],
+        }];
+
+        let error = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &dispatch_plan,
+            &pipeline_binding_plans,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "NRD dispatch resource count does not match pipeline descriptor binding count"
+        ));
+
+        let extra_dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::ViewZ,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::Validation,
+                },
+            ],
+        };
+        let shorter_pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![VptNrdPipelineDescriptorBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+            }],
+        }];
+
+        let error = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &extra_dispatch_plan,
+            &shorter_pipeline_binding_plans,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains(
+            "NRD dispatch resource count does not match pipeline descriptor binding count"
+        ));
     }
 
     #[test]
