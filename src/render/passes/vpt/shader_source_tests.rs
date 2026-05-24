@@ -1315,6 +1315,49 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
 }
 
 #[test]
+fn vpt_nrd_adapter_owns_backend_texture_pools() {
+    let adapter = source("src/render/passes/vpt_nrd_adapter.rs");
+    let compact_adapter = adapter.split_whitespace().collect::<String>();
+
+    for token in [
+        "texture_pools: Option<VptNrdTexturePools>",
+        "struct VptNrdTexturePools",
+        "permanent_pool: Vec<GpuImage>",
+        "transient_pool: Vec<GpuImage>",
+        "fn create(",
+        "plan: &VptNrdTexturePoolPlan",
+        ") -> Result<Self>",
+        "fn create_texture_pools(",
+        "fn create_texture_pool_images(",
+        "fn create_texture_pool_image(",
+        "\"vpt_nrd_permanent_texture_pool\"",
+        "\"vpt_nrd_transient_texture_pool\"",
+    ] {
+        assert!(
+            adapter.contains(token),
+            "NRD adapter pool owner missing {token}"
+        );
+    }
+
+    for token in [
+        "lettexture_pools=create_texture_pools(device,allocator,&backend)?;",
+        "letnew_backend=VptNrdAdapterBackend::initialize_relax(info.width,info.height);",
+        "letnew_texture_pools=matchcreate_texture_pools(device,allocator,&new_backend)",
+        "new_images.destroy(device,allocator);",
+        "std::mem::replace(&mutself.texture_pools,new_texture_pools)",
+        "old_texture_pools.destroy(device,allocator);",
+        "texture_pools.destroy(device,allocator);",
+        "pool.destroy(device,allocator);",
+        "usage:vk::ImageUsageFlags::STORAGE|vk::ImageUsageFlags::SAMPLED,",
+    ] {
+        assert!(
+            compact_adapter.contains(token),
+            "NRD adapter pool lifecycle missing compact token {token}"
+        );
+    }
+}
+
+#[test]
 fn vpt_phase4_writes_noisy_radiance_and_moments_not_progressive_accumulation() {
     let shader = normalized_source(include_str!("../../../../assets/shaders/passes/vpt.slang"));
     let rust = std::fs::read_to_string("src/render/passes/vpt.rs").expect("vpt source is readable");

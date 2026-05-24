@@ -18,6 +18,7 @@ pub struct VptNrdAdapterPass {
     pub nrd_diff_radiance_hitdist: GpuImage,
     pub nrd_validation: GpuImage,
     backend: VptNrdAdapterBackend,
+    texture_pools: Option<VptNrdTexturePools>,
 }
 
 pub enum VptNrdAdapterBackend {
@@ -57,6 +58,11 @@ pub struct VptNrdReadyBackend {
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
+}
+
+struct VptNrdTexturePools {
+    permanent_pool: Vec<GpuImage>,
+    transient_pool: Vec<GpuImage>,
 }
 
 pub struct VptNrdAdapterGraphInputs<'a> {
@@ -104,11 +110,21 @@ impl VptNrdAdapterPass {
                 "VPT NRD adapter backend unavailable; RELAX dispatch remains disabled"
             );
         }
-        let images = create_adapter_images(device, allocator, info.width, info.height)?;
+        let texture_pools = create_texture_pools(device, allocator, &backend)?;
+        let images = match create_adapter_images(device, allocator, info.width, info.height) {
+            Ok(images) => images,
+            Err(error) => {
+                if let Some(texture_pools) = texture_pools {
+                    texture_pools.destroy(device, allocator);
+                }
+                return Err(error);
+            }
+        };
         Ok(Self {
             nrd_diff_radiance_hitdist: images.nrd_diff_radiance_hitdist,
             nrd_validation: images.nrd_validation,
             backend,
+            texture_pools,
         })
     }
 
@@ -119,7 +135,21 @@ impl VptNrdAdapterPass {
         info: VptNrdAdapterPassResizeInfo<'_>,
     ) -> Result<()> {
         let _ = info.scene_ubo.frame_count();
+        let new_backend = VptNrdAdapterBackend::initialize_relax(info.width, info.height);
+        if let Some(reason) = new_backend.unavailable_reason() {
+            tracing::warn!(
+                reason,
+                "VPT NRD adapter backend unavailable after resize; RELAX dispatch remains disabled"
+            );
+        }
         let new_images = create_adapter_images(device, allocator, info.width, info.height)?;
+        let new_texture_pools = match create_texture_pools(device, allocator, &new_backend) {
+            Ok(texture_pools) => texture_pools,
+            Err(error) => {
+                new_images.destroy(device, allocator);
+                return Err(error);
+            }
+        };
         let old_images = VptNrdAdapterImages {
             nrd_diff_radiance_hitdist: std::mem::replace(
                 &mut self.nrd_diff_radiance_hitdist,
@@ -127,7 +157,13 @@ impl VptNrdAdapterPass {
             ),
             nrd_validation: std::mem::replace(&mut self.nrd_validation, new_images.nrd_validation),
         };
+        let old_texture_pools = std::mem::replace(&mut self.texture_pools, new_texture_pools);
+        let old_backend = std::mem::replace(&mut self.backend, new_backend);
         old_images.destroy(device, allocator);
+        if let Some(old_texture_pools) = old_texture_pools {
+            old_texture_pools.destroy(device, allocator);
+        }
+        drop(old_backend);
         Ok(())
     }
 
@@ -222,6 +258,9 @@ impl VptNrdAdapterPass {
     }
 
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
+        if let Some(texture_pools) = self.texture_pools {
+            texture_pools.destroy(device, allocator);
+        }
         self.nrd_diff_radiance_hitdist.destroy(device, allocator);
         self.nrd_validation.destroy(device, allocator);
     }
@@ -318,6 +357,105 @@ impl VptNrdTexturePoolPlan {
                 &snapshot.transient_pool,
             )?,
         })
+    }
+}
+
+impl VptNrdTexturePools {
+    fn create(
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+        plan: &VptNrdTexturePoolPlan,
+    ) -> Result<Self> {
+        let permanent_pool = create_texture_pool_images(
+            device,
+            allocator,
+            &plan.permanent,
+            "vpt_nrd_permanent_texture_pool",
+        )?;
+        let transient_pool = match create_texture_pool_images(
+            device,
+            allocator,
+            &plan.transient,
+            "vpt_nrd_transient_texture_pool",
+        ) {
+            Ok(pool) => pool,
+            Err(error) => {
+                destroy_texture_pool_images(permanent_pool, device, allocator);
+                return Err(error);
+            }
+        };
+
+        Ok(Self {
+            permanent_pool,
+            transient_pool,
+        })
+    }
+
+    fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
+        destroy_texture_pool_images(self.transient_pool, device, allocator);
+        destroy_texture_pool_images(self.permanent_pool, device, allocator);
+    }
+}
+
+fn create_texture_pools(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    backend: &VptNrdAdapterBackend,
+) -> Result<Option<VptNrdTexturePools>> {
+    backend
+        .texture_pool_plan()
+        .map(|plan| VptNrdTexturePools::create(device, allocator, plan))
+        .transpose()
+}
+
+fn create_texture_pool_images(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    plans: &[VptNrdTexturePoolImagePlan],
+    name: &'static str,
+) -> Result<Vec<GpuImage>> {
+    let mut images = Vec::with_capacity(plans.len());
+    for plan in plans {
+        match create_texture_pool_image(device, allocator, plan, name) {
+            Ok(image) => images.push(image),
+            Err(error) => {
+                destroy_texture_pool_images(images, device, allocator);
+                return Err(error);
+            }
+        }
+    }
+    Ok(images)
+}
+
+fn create_texture_pool_image(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    plan: &VptNrdTexturePoolImagePlan,
+    name: &'static str,
+) -> Result<GpuImage> {
+    GpuImage::new(
+        device,
+        allocator,
+        &GpuImageDesc {
+            width: plan.width,
+            height: plan.height,
+            depth: 1,
+            format: plan.format,
+            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+            aspect: vk::ImageAspectFlags::COLOR,
+            name,
+        },
+    )
+    .with_context(|| format!("failed to create NRD texture pool image {}", plan.name))
+}
+
+fn destroy_texture_pool_images(
+    images: Vec<GpuImage>,
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+) {
+    for pool in images {
+        pool.destroy(device, allocator);
     }
 }
 
