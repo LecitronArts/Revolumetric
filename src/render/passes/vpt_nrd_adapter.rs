@@ -38,6 +38,7 @@ pub struct VptNrdAdapterBackendMetadata {
     pub dispatch_count: usize,
     pub dispatch_resource_plan_count: usize,
     pub pipeline_layout_plan_count: usize,
+    pub pipeline_descriptor_binding_plan_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,6 +74,18 @@ pub struct VptNrdPipelineResourceRangePlan {
     pub descriptors_num: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineDescriptorBindingPlan {
+    pub bindings: Vec<VptNrdPipelineDescriptorBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineDescriptorBinding {
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub descriptor_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VptNrdDispatchResourceBindingPlan {
     pub descriptor_type: NrdDescriptorType,
@@ -103,6 +116,7 @@ struct VptNrdReadyBackendState {
     instance_snapshot: NrdInstanceSnapshot,
     texture_pool_plan: VptNrdTexturePoolPlan,
     pipeline_layout_plans: Vec<VptNrdPipelineLayoutPlan>,
+    pipeline_descriptor_binding_plans: Vec<VptNrdPipelineDescriptorBindingPlan>,
     dispatches: Vec<NrdDispatchSnapshot>,
     dispatch_resource_plans: Vec<VptNrdDispatchResourcePlan>,
 }
@@ -410,6 +424,9 @@ impl VptNrdReadyBackendState {
         let pipeline_layout_plans =
             VptNrdPipelineLayoutPlan::from_instance_snapshot(&instance_snapshot)
                 .context("failed to build VPT NRD pipeline layout plans")?;
+        let pipeline_descriptor_binding_plans =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&pipeline_layout_plans)
+                .context("failed to build VPT NRD pipeline descriptor binding plans")?;
         let dispatch_resource_plans =
             VptNrdDispatchResourcePlan::from_dispatches(&dispatches, &texture_pool_plan)
                 .context("failed to build VPT NRD dispatch resource plans")?;
@@ -418,6 +435,7 @@ impl VptNrdReadyBackendState {
             instance_snapshot,
             texture_pool_plan,
             pipeline_layout_plans,
+            pipeline_descriptor_binding_plans,
             dispatches,
             dispatch_resource_plans,
         })
@@ -434,6 +452,7 @@ impl VptNrdReadyBackendState {
             dispatch_count: self.dispatches.len(),
             dispatch_resource_plan_count: self.dispatch_resource_plans.len(),
             pipeline_layout_plan_count: self.pipeline_layout_plans.len(),
+            pipeline_descriptor_binding_plan_count: self.pipeline_descriptor_binding_plans.len(),
         }
     }
 }
@@ -485,6 +504,37 @@ impl VptNrdPipelineLayoutPlan {
             has_constant_data: pipeline.has_constant_data,
             shader_identifier: pipeline.shader_identifier.clone(),
         })
+    }
+}
+
+impl VptNrdPipelineDescriptorBindingPlan {
+    pub fn from_layout_plans(layout_plans: &[VptNrdPipelineLayoutPlan]) -> Result<Vec<Self>> {
+        layout_plans.iter().map(Self::from_layout_plan).collect()
+    }
+
+    fn from_layout_plan(layout_plan: &VptNrdPipelineLayoutPlan) -> Result<Self> {
+        let bindings = layout_plan
+            .resource_ranges
+            .iter()
+            .enumerate()
+            .map(|(binding, range)| {
+                anyhow::ensure!(
+                    range.descriptors_num > 0,
+                    "NRD pipeline resource range has zero descriptors"
+                );
+                let descriptor_type = match range.descriptor_type {
+                    NrdDescriptorType::Texture => vk::DescriptorType::SAMPLED_IMAGE,
+                    NrdDescriptorType::StorageTexture => vk::DescriptorType::STORAGE_IMAGE,
+                    other => anyhow::bail!("unsupported NRD pipeline descriptor type {other:?}"),
+                };
+                Ok(VptNrdPipelineDescriptorBinding {
+                    binding: binding as u32,
+                    descriptor_type,
+                    descriptor_count: range.descriptors_num,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { bindings })
     }
 }
 
@@ -906,6 +956,85 @@ mod tests {
     }
 
     #[test]
+    fn pipeline_descriptor_binding_plan_expands_layout_ranges_to_vulkan_bindings() {
+        let layout_plans = vec![
+            VptNrdPipelineLayoutPlan {
+                resource_ranges: vec![
+                    VptNrdPipelineResourceRangePlan {
+                        descriptor_type: NrdDescriptorType::Texture,
+                        descriptors_num: 6,
+                    },
+                    VptNrdPipelineResourceRangePlan {
+                        descriptor_type: NrdDescriptorType::StorageTexture,
+                        descriptors_num: 2,
+                    },
+                ],
+                has_constant_data: true,
+                shader_identifier: "relax_prepass".to_owned(),
+            },
+            VptNrdPipelineLayoutPlan {
+                resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    descriptors_num: 1,
+                }],
+                has_constant_data: false,
+                shader_identifier: "relax_temporal".to_owned(),
+            },
+        ];
+
+        let binding_plans =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&layout_plans).unwrap();
+
+        assert_eq!(
+            binding_plans,
+            vec![
+                VptNrdPipelineDescriptorBindingPlan {
+                    bindings: vec![
+                        VptNrdPipelineDescriptorBinding {
+                            binding: 0,
+                            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                            descriptor_count: 6,
+                        },
+                        VptNrdPipelineDescriptorBinding {
+                            binding: 1,
+                            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                            descriptor_count: 2,
+                        },
+                    ],
+                },
+                VptNrdPipelineDescriptorBindingPlan {
+                    bindings: vec![VptNrdPipelineDescriptorBinding {
+                        binding: 0,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                    },],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_descriptor_binding_plan_rejects_zero_descriptor_ranges() {
+        let layout_plans = vec![VptNrdPipelineLayoutPlan {
+            resource_ranges: vec![VptNrdPipelineResourceRangePlan {
+                descriptor_type: NrdDescriptorType::Texture,
+                descriptors_num: 0,
+            }],
+            has_constant_data: false,
+            shader_identifier: "empty_range".to_owned(),
+        }];
+
+        let error =
+            VptNrdPipelineDescriptorBindingPlan::from_layout_plans(&layout_plans).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline resource range has zero descriptors")
+        );
+    }
+
+    #[test]
     fn dispatch_resource_plan_maps_relax_diffuse_resources_to_adapter_bindings() {
         let dispatch = dispatch_snapshot(&[
             resource(NrdDescriptorType::Texture, NrdResourceType::InMv, 0),
@@ -1102,6 +1231,7 @@ mod tests {
         assert_eq!(metadata.dispatch_count, 2);
         assert_eq!(metadata.dispatch_resource_plan_count, 2);
         assert_eq!(metadata.pipeline_layout_plan_count, 1);
+        assert_eq!(metadata.pipeline_descriptor_binding_plan_count, 1);
     }
 
     #[test]
