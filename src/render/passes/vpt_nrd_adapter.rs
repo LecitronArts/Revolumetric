@@ -72,6 +72,13 @@ pub struct VptNrdPipelineLayoutPlan {
     pub shader_identifier: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdPipelineShaderPlan {
+    pub spirv_words: Vec<u32>,
+    pub shader_identifier: String,
+    pub has_constant_data: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VptNrdPipelineResourceRangePlan {
     pub descriptor_type: NrdDescriptorType,
@@ -117,6 +124,7 @@ pub struct VptNrdDispatchDescriptorWritePlan {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VptNrdDispatchDescriptorWrite {
     pub binding: u32,
+    pub array_element: u32,
     pub descriptor_type: vk::DescriptorType,
     pub resource: VptNrdDispatchResource,
 }
@@ -603,6 +611,24 @@ impl VptNrdPipelineLayoutPlan {
     }
 }
 
+impl VptNrdPipelineShaderPlan {
+    pub fn from_instance_snapshot(snapshot: &NrdInstanceSnapshot) -> Result<Vec<Self>> {
+        snapshot.pipelines.iter().map(Self::from_pipeline).collect()
+    }
+
+    fn from_pipeline(pipeline: &crate::render::nrd_adapter::NrdPipelineSnapshot) -> Result<Self> {
+        anyhow::ensure!(
+            !pipeline.spirv_bytecode.is_empty(),
+            "NRD pipeline shader bytecode is empty"
+        );
+        Ok(Self {
+            spirv_words: pipeline.spirv_bytecode.clone(),
+            shader_identifier: pipeline.shader_identifier.clone(),
+            has_constant_data: pipeline.has_constant_data,
+        })
+    }
+}
+
 impl VptNrdPipelineDescriptorBindingPlan {
     pub fn from_layout_plans(layout_plans: &[VptNrdPipelineLayoutPlan]) -> Result<Vec<Self>> {
         layout_plans.iter().map(Self::from_layout_plan).collect()
@@ -776,29 +802,36 @@ impl VptNrdDispatchDescriptorWritePlan {
                 .with_context(|| {
                     format!("NRD dispatch pipeline index {pipeline_index} is out of bounds")
                 })?;
+        let expected_resource_count: usize = pipeline_binding_plan
+            .bindings
+            .iter()
+            .map(|binding| binding.descriptor_count as usize)
+            .sum();
         anyhow::ensure!(
-            dispatch_plan.bindings.len() == pipeline_binding_plan.bindings.len(),
+            dispatch_plan.bindings.len() == expected_resource_count,
             "NRD dispatch resource count does not match pipeline descriptor binding count"
         );
 
-        let writes = pipeline_binding_plan
-            .bindings
-            .iter()
-            .zip(dispatch_plan.bindings.iter())
-            .map(|(pipeline_binding, dispatch_binding)| {
+        let mut resource_index = 0usize;
+        let mut writes = Vec::with_capacity(dispatch_plan.bindings.len());
+        for pipeline_binding in &pipeline_binding_plan.bindings {
+            for array_element in 0..pipeline_binding.descriptor_count {
+                let dispatch_binding = &dispatch_plan.bindings[resource_index];
                 let expected_descriptor_type =
                     nrd_descriptor_type_to_vk(dispatch_binding.descriptor_type)?;
                 anyhow::ensure!(
                     pipeline_binding.descriptor_type == expected_descriptor_type,
                     "NRD dispatch descriptor type does not match pipeline binding"
                 );
-                Ok(VptNrdDispatchDescriptorWrite {
+                writes.push(VptNrdDispatchDescriptorWrite {
                     binding: pipeline_binding.binding,
+                    array_element,
                     descriptor_type: pipeline_binding.descriptor_type,
                     resource: dispatch_binding.resource,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                });
+                resource_index += 1;
+            }
+        }
 
         Ok(Self {
             pipeline_index,
@@ -1279,6 +1312,60 @@ mod tests {
                 .to_string()
                 .contains("unsupported NRD descriptor type")
         }));
+    }
+
+    #[test]
+    fn pipeline_shader_plan_copies_spirv_and_pipeline_metadata() {
+        let snapshot = instance_snapshot_with_pipelines(vec![
+            NrdPipelineSnapshot {
+                spirv_bytecode: vec![0x0723_0203, 0x0001_0000],
+                resource_ranges: vec![resource_range(NrdDescriptorType::Texture, 1)],
+                has_constant_data: true,
+                shader_identifier: "relax_prepass".to_owned(),
+            },
+            NrdPipelineSnapshot {
+                spirv_bytecode: vec![0x0723_0203],
+                resource_ranges: Vec::new(),
+                has_constant_data: false,
+                shader_identifier: "relax_postpass".to_owned(),
+            },
+        ]);
+
+        let plans = VptNrdPipelineShaderPlan::from_instance_snapshot(&snapshot).unwrap();
+
+        assert_eq!(
+            plans,
+            vec![
+                VptNrdPipelineShaderPlan {
+                    spirv_words: vec![0x0723_0203, 0x0001_0000],
+                    shader_identifier: "relax_prepass".to_owned(),
+                    has_constant_data: true,
+                },
+                VptNrdPipelineShaderPlan {
+                    spirv_words: vec![0x0723_0203],
+                    shader_identifier: "relax_postpass".to_owned(),
+                    has_constant_data: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn pipeline_shader_plan_rejects_empty_spirv() {
+        let snapshot = instance_snapshot_with_pipelines(vec![NrdPipelineSnapshot {
+            spirv_bytecode: Vec::new(),
+            resource_ranges: Vec::new(),
+            has_constant_data: false,
+            shader_identifier: "empty_shader".to_owned(),
+        }]);
+
+        let error = VptNrdPipelineShaderPlan::from_instance_snapshot(&snapshot).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("NRD pipeline shader bytecode is empty")
+        );
     }
 
     #[test]
@@ -1800,16 +1887,96 @@ mod tests {
                 writes: vec![
                     VptNrdDispatchDescriptorWrite {
                         binding: 3,
+                        array_element: 0,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         resource: VptNrdDispatchResource::ViewZ,
                     },
                     VptNrdDispatchDescriptorWrite {
                         binding: 4,
+                        array_element: 0,
                         descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
                         resource: VptNrdDispatchResource::Validation,
                     },
                 ],
             }
+        );
+    }
+
+    #[test]
+    fn dispatch_descriptor_write_plan_expands_descriptor_arrays() {
+        let dispatch = dispatch_snapshot(&[
+            resource(NrdDescriptorType::Texture, NrdResourceType::InViewZ, 0),
+            resource(
+                NrdDescriptorType::Texture,
+                NrdResourceType::InDiffConfidence,
+                0,
+            ),
+            resource(
+                NrdDescriptorType::StorageTexture,
+                NrdResourceType::OutValidation,
+                0,
+            ),
+        ]);
+        let dispatch_plan = VptNrdDispatchResourcePlan {
+            bindings: vec![
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::ViewZ,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::Texture,
+                    resource: VptNrdDispatchResource::DiffConfidence,
+                },
+                VptNrdDispatchResourceBindingPlan {
+                    descriptor_type: NrdDescriptorType::StorageTexture,
+                    resource: VptNrdDispatchResource::Validation,
+                },
+            ],
+        };
+        let pipeline_binding_plans = vec![VptNrdPipelineDescriptorBindingPlan {
+            bindings: vec![
+                VptNrdPipelineDescriptorBinding {
+                    binding: 2,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 2,
+                },
+                VptNrdPipelineDescriptorBinding {
+                    binding: 3,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                },
+            ],
+        }];
+
+        let write_plan = VptNrdDispatchDescriptorWritePlan::from_dispatch_plan(
+            &dispatch,
+            &dispatch_plan,
+            &pipeline_binding_plans,
+        )
+        .unwrap();
+
+        assert_eq!(
+            write_plan.writes,
+            vec![
+                VptNrdDispatchDescriptorWrite {
+                    binding: 2,
+                    array_element: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    resource: VptNrdDispatchResource::ViewZ,
+                },
+                VptNrdDispatchDescriptorWrite {
+                    binding: 2,
+                    array_element: 1,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    resource: VptNrdDispatchResource::DiffConfidence,
+                },
+                VptNrdDispatchDescriptorWrite {
+                    binding: 3,
+                    array_element: 0,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    resource: VptNrdDispatchResource::Validation,
+                },
+            ]
         );
     }
 
