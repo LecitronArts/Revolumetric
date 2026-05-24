@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use ash::vk;
 
 use crate::render::allocator::GpuAllocator;
@@ -6,7 +6,7 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::nrd_adapter::{
-    NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc, NrdResult,
+    NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc, NrdTextureImageDesc,
 };
 use crate::render::passes::vpt_nrd_confidence::VptNrdConfidenceResources;
 use crate::render::passes::vpt_nrd_frontend::VptNrdPackedResources;
@@ -36,10 +36,26 @@ pub struct VptNrdAdapterBackendMetadata {
     pub dispatch_count: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdTexturePoolPlan {
+    pub permanent: Vec<VptNrdTexturePoolImagePlan>,
+    pub transient: Vec<VptNrdTexturePoolImagePlan>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VptNrdTexturePoolImagePlan {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub format: vk::Format,
+    pub downsample_factor: u16,
+}
+
 pub struct VptNrdReadyBackend {
     _instance: NrdInstance,
     library_desc: NrdLibraryDesc,
     instance_snapshot: NrdInstanceSnapshot,
+    texture_pool_plan: VptNrdTexturePoolPlan,
     dispatches: Vec<NrdDispatchSnapshot>,
 }
 
@@ -121,6 +137,7 @@ impl VptNrdAdapterPass {
             self.backend.dispatch_count(),
             self.backend.unavailable_reason(),
             self.backend.ready_metadata(),
+            self.backend.texture_pool_plan(),
         );
     }
 
@@ -236,6 +253,13 @@ impl VptNrdAdapterBackend {
         }
     }
 
+    pub fn texture_pool_plan(&self) -> Option<&VptNrdTexturePoolPlan> {
+        match self {
+            Self::Ready(backend) => Some(&backend.texture_pool_plan),
+            Self::Unavailable(_) => None,
+        }
+    }
+
     pub fn unavailable_reason(&self) -> Option<&str> {
         match self {
             Self::Ready(_) => None,
@@ -245,14 +269,18 @@ impl VptNrdAdapterBackend {
 }
 
 impl VptNrdReadyBackend {
-    fn initialize_relax(width: u32, height: u32) -> NrdResult<Self> {
+    fn initialize_relax(width: u32, height: u32) -> Result<Self> {
         let instance = NrdInstance::relax_diffuse(width, height)?;
         let library_desc = NrdInstance::library_desc()?;
         let instance_snapshot = instance.instance_snapshot()?;
+        let texture_pool_plan =
+            VptNrdTexturePoolPlan::from_instance_snapshot(width, height, &instance_snapshot)
+                .context("failed to build VPT NRD texture pool plan")?;
         Ok(Self {
             _instance: instance,
             library_desc,
             instance_snapshot,
+            texture_pool_plan,
             dispatches: Vec::new(),
         })
     }
@@ -268,6 +296,70 @@ impl VptNrdReadyBackend {
             dispatch_count: self.dispatches.len(),
         }
     }
+}
+
+impl VptNrdTexturePoolPlan {
+    pub fn from_instance_snapshot(
+        width: u32,
+        height: u32,
+        snapshot: &NrdInstanceSnapshot,
+    ) -> Result<Self> {
+        Ok(Self {
+            permanent: build_pool_plan(
+                "vpt_nrd_permanent",
+                width,
+                height,
+                &snapshot.permanent_pool,
+            )?,
+            transient: build_pool_plan(
+                "vpt_nrd_transient",
+                width,
+                height,
+                &snapshot.transient_pool,
+            )?,
+        })
+    }
+}
+
+fn build_pool_plan(
+    prefix: &str,
+    width: u32,
+    height: u32,
+    textures: &[crate::render::nrd_adapter::NrdTextureDesc],
+) -> Result<Vec<VptNrdTexturePoolImagePlan>> {
+    textures
+        .iter()
+        .enumerate()
+        .map(|(index, texture)| {
+            let image_desc = texture
+                .image_desc()
+                .with_context(|| format!("failed to map {prefix}_{index} texture format"))?;
+            Ok(texture_pool_image_plan(
+                prefix, index, width, height, image_desc,
+            ))
+        })
+        .collect()
+}
+
+fn texture_pool_image_plan(
+    prefix: &str,
+    index: usize,
+    width: u32,
+    height: u32,
+    image_desc: NrdTextureImageDesc,
+) -> VptNrdTexturePoolImagePlan {
+    let downsample_factor = image_desc.downsample_factor.max(1);
+    VptNrdTexturePoolImagePlan {
+        name: format!("{prefix}_{index}"),
+        width: divide_round_up(width, downsample_factor),
+        height: divide_round_up(height, downsample_factor),
+        format: image_desc.format,
+        downsample_factor,
+    }
+}
+
+fn divide_round_up(value: u32, divisor: u16) -> u32 {
+    value.div_ceil(u32::from(divisor))
 }
 
 struct VptNrdAdapterImages {
@@ -341,6 +433,7 @@ fn create_adapter_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::nrd_adapter::{NrdPipelineSnapshot, NrdSamplerDesc, NrdTextureFormat};
 
     #[cfg(not(feature = "nrd"))]
     #[test]
@@ -356,5 +449,85 @@ mod tests {
                 .expect("default build should report why NRD is unavailable")
                 .contains("nrd Cargo feature is disabled")
         );
+    }
+
+    #[test]
+    fn texture_pool_plan_maps_nrd_pool_descriptors_to_image_extents() {
+        let snapshot = instance_snapshot_with_pools(
+            &[
+                texture(NrdTextureFormat::Rgba16Sfloat, 1),
+                texture(NrdTextureFormat::R16Sfloat, 2),
+            ],
+            &[texture(NrdTextureFormat::Rg16Sfloat, 4)],
+        );
+
+        let plan = VptNrdTexturePoolPlan::from_instance_snapshot(1920, 1080, &snapshot).unwrap();
+
+        assert_eq!(plan.permanent[0].width, 1920);
+        assert_eq!(plan.permanent[0].height, 1080);
+        assert_eq!(plan.permanent[0].format, vk::Format::R16G16B16A16_SFLOAT);
+        assert_eq!(plan.permanent[1].width, 960);
+        assert_eq!(plan.permanent[1].height, 540);
+        assert_eq!(plan.permanent[1].format, vk::Format::R16_SFLOAT);
+        assert_eq!(plan.transient[0].width, 480);
+        assert_eq!(plan.transient[0].height, 270);
+        assert_eq!(plan.transient[0].format, vk::Format::R16G16_SFLOAT);
+    }
+
+    #[test]
+    fn texture_pool_plan_ceil_divides_downsampled_extents_and_rejects_unknown_formats() {
+        let snapshot = instance_snapshot_with_pools(
+            &[texture(NrdTextureFormat::R16Sfloat, 2)],
+            &[texture(NrdTextureFormat::Unknown, 1)],
+        );
+
+        let error =
+            VptNrdTexturePoolPlan::from_instance_snapshot(1919, 1079, &snapshot).unwrap_err();
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("unsupported NRD texture format"))
+        );
+
+        let snapshot =
+            instance_snapshot_with_pools(&[texture(NrdTextureFormat::R16Sfloat, 2)], &[]);
+        let plan = VptNrdTexturePoolPlan::from_instance_snapshot(1919, 1079, &snapshot).unwrap();
+        assert_eq!(plan.permanent[0].width, 960);
+        assert_eq!(plan.permanent[0].height, 540);
+    }
+
+    fn texture(
+        format: NrdTextureFormat,
+        downsample_factor: u16,
+    ) -> crate::render::nrd_adapter::NrdTextureDesc {
+        crate::render::nrd_adapter::NrdTextureDesc {
+            format: format as u32,
+            downsample_factor,
+            reserved0: 0,
+        }
+    }
+
+    fn instance_snapshot_with_pools(
+        permanent_pool: &[crate::render::nrd_adapter::NrdTextureDesc],
+        transient_pool: &[crate::render::nrd_adapter::NrdTextureDesc],
+    ) -> NrdInstanceSnapshot {
+        NrdInstanceSnapshot {
+            constant_buffer_and_samplers_space_index: 0,
+            resources_space_index: 0,
+            constant_buffer_register_index: 0,
+            samplers_base_register_index: 0,
+            resources_base_register_index: 0,
+            constant_buffer_max_data_size: 0,
+            samplers: vec![NrdSamplerDesc { mode: 0 }],
+            pipelines: vec![NrdPipelineSnapshot {
+                spirv_bytecode: vec![0x0723_0203],
+                resource_ranges: Vec::new(),
+                has_constant_data: false,
+                shader_identifier: "test".to_owned(),
+            }],
+            permanent_pool: permanent_pool.to_vec(),
+            transient_pool: transient_pool.to_vec(),
+        }
     }
 }
