@@ -19,7 +19,7 @@ ConstantBuffer<SceneUniforms> scene_ubo;
 RWTexture2D<float4> noisy_radiance_image;
 
 [[vk::binding(2, 0)]]
-StructuredBuffer<UcvhConfig> ucvh_config;
+ConstantBuffer<UcvhConfig> ucvh_config;
 
 [[vk::binding(3, 0)]]
 StructuredBuffer<NodeL0> hierarchy_l0;

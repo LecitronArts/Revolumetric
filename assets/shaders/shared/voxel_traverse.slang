@@ -111,10 +111,6 @@ void dda_step_brick_with_t(
     dda_step_voxel(brick_coord, t_max, t_delta, step_dir, current_t, hit_normal);
 }
 
-bool dda_t_exceeds_target(float next_t, float target_t) {
-    return next_t > target_t + DDA_TIE_EPSILON * max(abs(target_t), 1.0);
-}
-
 uint ucvh_flat_index(uint3 pos, uint3 dim) {
     return pos.x + pos.y * dim.x + pos.z * dim.x * dim.y;
 }
@@ -149,25 +145,24 @@ bool hierarchy_level_empty_at_brick(
     return node_ln_child_mask(parent) == 0u;
 }
 
-void advance_brick_dda_to_t(
+void reset_brick_dda_at_t(
+    Ray ray,
     inout int3 brick_coord,
     inout float3 t_max,
-    float3 t_delta,
     int3 step_dir,
+    int3 igrid,
     inout float current_t,
     float target_t
 ) {
-    while (current_t < target_t) {
-        float next_t = dda_next_t(t_max);
-        if (dda_t_exceeds_target(next_t, target_t)) {
-            break;
-        }
-        float previous_t = current_t;
-        dda_step_brick_with_t(brick_coord, t_max, t_delta, step_dir, current_t);
-        if (current_t <= previous_t) {
-            break;
-        }
-    }
+    float reset_t = target_t + DDA_GRID_BOUNDARY_EPSILON;
+    current_t = reset_t;
+    float3 reset_pos = ray.origin + ray.direction * reset_t;
+    brick_coord = dda_start_coord3(reset_pos / 8.0, step_dir, igrid - int3(1));
+    t_max = float3(
+        ray_axis_t_max(ray.origin.x, ray.direction.x, ray.inv_dir.x, (brick_coord.x + 1) * 8.0, brick_coord.x * 8.0),
+        ray_axis_t_max(ray.origin.y, ray.direction.y, ray.inv_dir.y, (brick_coord.y + 1) * 8.0, brick_coord.y * 8.0),
+        ray_axis_t_max(ray.origin.z, ray.direction.z, ray.inv_dir.z, (brick_coord.z + 1) * 8.0, brick_coord.z * 8.0)
+    );
 }
 
 bool try_skip_empty_hierarchy_block(
@@ -179,7 +174,6 @@ bool try_skip_empty_hierarchy_block(
     StructuredBuffer<NodeLN> hierarchy_l3,
     StructuredBuffer<NodeLN> hierarchy_l4,
     inout float3 t_max,
-    float3 t_delta,
     int3 step_dir,
     inout float current_t,
     out int3 skipped_brick_coord
@@ -218,11 +212,13 @@ bool try_skip_empty_hierarchy_block(
     }
 
     int3 original_brick_coord = skipped_brick_coord;
-    advance_brick_dda_to_t(
+    int3 igrid = int3(grid_dim);
+    reset_brick_dda_at_t(
+        ray,
         skipped_brick_coord,
         t_max,
-        t_delta,
         step_dir,
+        igrid,
         current_t,
         block_t.y
     );
@@ -281,15 +277,12 @@ bool brick_dda(
         ray_axis_t_max(ray_origin.z, ray_dir.z, inv_dir.z, coord.z + 1, coord.z)
     );
 
-    // Load the full BrickOccupancy once (80 bytes, fits in registers)
-    BrickOccupancy occ = occupancy_buf[brick_id];
-
     // Max steps: 8+8+8 = 24 (diagonal through 8^3)
     for (int i = 0; i < 24; i++) {
         if (any(coord < int3(0)) || any(coord >= int3(8))) break;
 
         // Morton-order bit read (matches Rust BrickOccupancy storage)
-        if (read_occupancy_bit(occ, uint3(coord))) {
+        if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {
             hit_local = uint3(coord);
             hit_t = current_t;
             return true;
@@ -310,7 +303,7 @@ bool voxel_traversal_should_skip_shadow_hit(
 }
 
 bool brick_any_hit(
-    BrickOccupancy occ,
+    StructuredBuffer<BrickOccupancy> occupancy_buf,
     uint brick_id,
     uint skip_brick_id,
     uint3 skip_local,
@@ -348,7 +341,7 @@ bool brick_any_hit(
     for (int i = 0; i < 24 && current_t < max_t; i++) {
         if (any(coord < int3(0)) || any(coord >= int3(8))) break;
 
-        if (read_occupancy_bit(occ, uint3(coord))) {
+        if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {
             uint3 local = uint3(coord);
             if (!voxel_traversal_should_skip_shadow_hit(brick_id, local, skip_brick_id, skip_local)) {
                 return true;
@@ -365,7 +358,7 @@ bool brick_any_hit(
 // DDA through brick grid, descending into occupied bricks.
 HitResult trace_primary_ray(
     Ray ray,
-    StructuredBuffer<UcvhConfig> config_buf,
+    ConstantBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<NodeLN> hierarchy_l1,
     StructuredBuffer<NodeLN> hierarchy_l2,
@@ -374,7 +367,7 @@ HitResult trace_primary_ray(
     StructuredBuffer<BrickOccupancy> occupancy_buf,
     StructuredBuffer<VoxelCell> material_buf
 ) {
-    UcvhConfig config = config_buf[0];
+    UcvhConfig config = config_buf;
     float3 grid_size = float3(config.brick_grid_size.xyz);
     float3 world_size = grid_size * 8.0; // each brick = 8 voxels
 
@@ -419,7 +412,6 @@ HitResult trace_primary_ray(
             hierarchy_l3,
             hierarchy_l4,
             t_max,
-            t_delta,
             step_dir,
             current_t,
             skipped_brick_coord
@@ -436,8 +428,7 @@ HitResult trace_primary_ray(
 
         if (!node_l0_is_empty(node)) {
             // Quick check: is brick occupied at all?
-            BrickOccupancy occ = occupancy_buf[node.brick_id];
-            if (occ.count > 0u) {
+            if (occupancy_buf[node.brick_id].count > 0u) {
                 // Compute ray in brick-local space
                 float3 brick_origin = float3(brick_coord) * 8.0;
                 float3 local_origin = ray.origin - brick_origin;
@@ -473,7 +464,7 @@ bool trace_any_hit_ray_skip_voxel(
     float max_t,
     uint skip_brick_id,
     uint3 skip_local,
-    StructuredBuffer<UcvhConfig> config_buf,
+    ConstantBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<NodeLN> hierarchy_l1,
     StructuredBuffer<NodeLN> hierarchy_l2,
@@ -485,7 +476,7 @@ bool trace_any_hit_ray_skip_voxel(
         return false;
     }
 
-    UcvhConfig config = config_buf[0];
+    UcvhConfig config = config_buf;
     float3 grid_size = float3(config.brick_grid_size.xyz);
     float3 world_size = grid_size * 8.0;
 
@@ -532,7 +523,6 @@ bool trace_any_hit_ray_skip_voxel(
             hierarchy_l3,
             hierarchy_l4,
             t_max,
-            t_delta,
             step_dir,
             current_t,
             skipped_brick_coord
@@ -547,12 +537,11 @@ bool trace_any_hit_ray_skip_voxel(
         NodeL0 node = hierarchy_l0[l0_idx];
 
         if (!node_l0_is_empty(node)) {
-            BrickOccupancy occ = occupancy_buf[node.brick_id];
-            if (occ.count > 0u) {
+            if (occupancy_buf[node.brick_id].count > 0u) {
                 float3 brick_origin = float3(brick_coord) * 8.0;
                 float3 local_origin = ray.origin - brick_origin;
                 if (brick_any_hit(
-                    occ,
+                    occupancy_buf,
                     node.brick_id,
                     skip_brick_id,
                     skip_local,
@@ -574,7 +563,7 @@ bool trace_any_hit_ray_skip_voxel(
 bool trace_any_hit_ray(
     Ray ray,
     float max_t,
-    StructuredBuffer<UcvhConfig> config_buf,
+    ConstantBuffer<UcvhConfig> config_buf,
     StructuredBuffer<NodeL0> hierarchy_l0,
     StructuredBuffer<NodeLN> hierarchy_l1,
     StructuredBuffer<NodeLN> hierarchy_l2,

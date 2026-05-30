@@ -38,7 +38,7 @@ RWTexture2D<uint> surface_motion_id;
 RWTexture2D<float4> motion_history;
 
 [[vk::binding(8, 0)]]
-StructuredBuffer<UcvhConfig> ucvh_config;
+ConstantBuffer<UcvhConfig> ucvh_config;
 
 [[vk::binding(9, 0)]]
 StructuredBuffer<NodeL0> hierarchy_l0;

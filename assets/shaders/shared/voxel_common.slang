@@ -71,13 +71,13 @@ uint morton_encode(uint3 p) {
     return m;
 }
 
-// Read a single voxel's occupancy bit from a BrickOccupancy.
-// Uses Morton-order bit indexing.
-bool read_occupancy_bit(BrickOccupancy brick, uint3 local) {
+// Read a single voxel's occupancy bit from a BrickOccupancy storage buffer.
+// Uses Morton-order bit indexing and loads only the needed 32-bit word.
+bool read_occupancy_bit(StructuredBuffer<BrickOccupancy> occupancy_buf, uint brick_id, uint3 local) {
     uint m = morton_encode(local);
     uint word = m / 32u;
     uint bit = m % 32u;
-    return (brick.bits[word] & (1u << bit)) != 0u;
+    return (occupancy_buf[brick_id].bits[word] & (1u << bit)) != 0u;
 }
 
 // Encodes an axis-aligned normal to a 0-5 ID.

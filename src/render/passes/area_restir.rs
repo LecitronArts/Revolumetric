@@ -97,7 +97,7 @@ impl AreaRestirPass {
             DescriptorBindingSpec::compute(4, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(6, vk::DescriptorType::UNIFORM_BUFFER),
-            DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(7, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
@@ -714,11 +714,12 @@ impl AreaRestirPass {
     }
 
     fn write_ucvh_descriptors(&self, device: &ash::Device, ucvh_gpu: &UcvhGpuResources) {
+        self.initial_stage
+            .write_uniform_buffer_descriptors(device, 7, &[&ucvh_gpu.config_buffer]);
         self.initial_stage.write_storage_buffer_descriptors(
             device,
-            7,
+            8,
             &[
-                &ucvh_gpu.config_buffer,
                 &ucvh_gpu.hierarchy_l0_buffer,
                 &ucvh_gpu.hierarchy_ln_buffers[0],
                 &ucvh_gpu.hierarchy_ln_buffers[1],
@@ -1060,6 +1061,38 @@ impl AreaRestirStage {
                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                 .buffer_info(std::slice::from_ref(&info));
             unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        }
+    }
+
+    fn write_uniform_buffer_descriptors(
+        &self,
+        device: &ash::Device,
+        first_binding: u32,
+        buffers: &[&GpuBuffer],
+    ) {
+        let buffer_infos: Vec<_> = buffers
+            .iter()
+            .map(|buffer| {
+                vk::DescriptorBufferInfo::default()
+                    .buffer(buffer.handle)
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)
+            })
+            .collect();
+
+        for &ds in &self.descriptor_sets {
+            let writes: Vec<_> = buffer_infos
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| {
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(ds)
+                        .dst_binding(first_binding + idx as u32)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .buffer_info(std::slice::from_ref(info))
+                })
+                .collect();
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
         }
     }
 

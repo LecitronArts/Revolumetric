@@ -14,6 +14,13 @@ node_modules/
 Thumbs.db
 *.log
 
+# Local Android signing and machine-specific Cargo configuration
+*.jks
+*.keystore
+*.p12
+*.pfx
+/.cargo/config.toml
+
 # Large local research checkouts. Keep small curated reference files tracked.
 /reference/HashDAG/
 /reference/Q2RTX/

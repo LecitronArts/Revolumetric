@@ -30,7 +30,7 @@ RWTexture2D<float4> area_restir_debug;
 ConstantBuffer<SceneUniforms> scene_ubo;
 
 [[vk::binding(7, 0)]]
-StructuredBuffer<UcvhConfig> ucvh_config;
+ConstantBuffer<UcvhConfig> ucvh_config;
 
 [[vk::binding(8, 0)]]
 StructuredBuffer<NodeL0> hierarchy_l0;

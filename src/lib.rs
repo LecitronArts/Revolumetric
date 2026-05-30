@@ -14,7 +14,7 @@ pub mod voxel;
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 pub extern "C" fn android_main(app: AndroidApp) {
-	if let Err(error) = app::run_android(app) {
-		eprintln!("{error}");
-	}
+    if let Err(error) = app::run_android(app) {
+        eprintln!("{error}");
+    }
 }

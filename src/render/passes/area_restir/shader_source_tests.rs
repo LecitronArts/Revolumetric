@@ -60,7 +60,7 @@ fn area_restir_initial_shader_binding_manifest_matches_expected_resources() {
             binding(4, DescriptorKind::StorageImage, "surface_albedo_material"),
             binding(5, DescriptorKind::StorageImage, "area_restir_debug"),
             binding(6, DescriptorKind::UniformBuffer, "scene_ubo"),
-            binding(7, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(7, DescriptorKind::UniformBuffer, "ucvh_config"),
             binding(8, DescriptorKind::StorageBuffer, "hierarchy_l0"),
             binding(9, DescriptorKind::StorageBuffer, "hierarchy_l1"),
             binding(10, DescriptorKind::StorageBuffer, "hierarchy_l2"),
@@ -327,7 +327,7 @@ fn area_restir_shaders_declare_expected_entry_points_and_resources() {
     for token in [
         "RWStructuredBuffer<AreaRestirReservoir> output_reservoirs",
         "ConstantBuffer<SceneUniforms> scene_ubo",
-        "StructuredBuffer<UcvhConfig> ucvh_config",
+        "ConstantBuffer<UcvhConfig> ucvh_config",
         "StructuredBuffer<NodeL0> hierarchy_l0",
         "StructuredBuffer<NodeLN> hierarchy_l1",
         "StructuredBuffer<NodeLN> hierarchy_l2",
@@ -441,7 +441,7 @@ fn area_restir_shaders_cache_per_pixel_surface_reads() {
     assert!(
         initial.contains("#include \"voxel_traverse.slang\"")
             && initial.contains("#include \"material_common.slang\"")
-            && initial.contains("StructuredBuffer<UcvhConfig> ucvh_config")
+            && initial.contains("ConstantBuffer<UcvhConfig> ucvh_config")
             && initial.contains("StructuredBuffer<NodeL0> hierarchy_l0")
             && initial.contains("StructuredBuffer<NodeLN> hierarchy_l1")
             && initial.contains("StructuredBuffer<NodeLN> hierarchy_l2")

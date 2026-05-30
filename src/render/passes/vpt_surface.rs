@@ -149,7 +149,7 @@ impl VptSurfacePass {
             DescriptorBindingSpec::compute(5, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
-            DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(8, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_BUFFER),
@@ -184,7 +184,7 @@ impl VptSurfacePass {
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 6 * frame_count as u32,
+                descriptor_count: 8 * frame_count as u32,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
@@ -192,7 +192,7 @@ impl VptSurfacePass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 22 * frame_count as u32,
+                descriptor_count: 20 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, 2 * frame_count as u32, &pool_sizes)
@@ -1385,7 +1385,6 @@ fn write_descriptor_sets_from_refs(
     ];
     let motion_guide_images = [images.motion_flags, images.surface_brick_generation];
     let ucvh_buffers = [
-        &ucvh_gpu.config_buffer,
         &ucvh_gpu.hierarchy_l0_buffer,
         &ucvh_gpu.hierarchy_ln_buffers[0],
         &ucvh_gpu.hierarchy_ln_buffers[1],
@@ -1394,6 +1393,10 @@ fn write_descriptor_sets_from_refs(
         &ucvh_gpu.occupancy_buffer,
         &ucvh_gpu.material_buffer,
     ];
+    let ucvh_config_info = vk::DescriptorBufferInfo::default()
+        .buffer(ucvh_gpu.config_buffer.handle)
+        .offset(0)
+        .range(vk::WHOLE_SIZE);
     let motion_guide_buffers = [
         &ucvh_gpu.brick_generation_buffer,
         &ucvh_gpu.motion_event_buffer,
@@ -1440,10 +1443,17 @@ fn write_descriptor_sets_from_refs(
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(std::slice::from_ref(info))
         }));
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(8)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .buffer_info(std::slice::from_ref(&ucvh_config_info)),
+        );
         writes.extend(buffer_infos.iter().enumerate().map(|(idx, info)| {
             vk::WriteDescriptorSet::default()
                 .dst_set(ds)
-                .dst_binding((idx + 8) as u32)
+                .dst_binding((idx + 9) as u32)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                 .buffer_info(std::slice::from_ref(info))
         }));

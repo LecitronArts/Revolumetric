@@ -41,18 +41,9 @@ pub fn update_fly_camera(rig: &mut CameraRig, input: InputState, dt: f32) {
         ctrl.move_speed = ctrl.move_speed.clamp(ctrl.min_speed, ctrl.max_speed);
     }
 
-    let deadzone = 0.2;
-    let left_x = apply_deadzone(input.gamepad_left_x, deadzone);
-    let left_y = apply_deadzone(input.gamepad_left_y, deadzone);
-    let right_x = apply_deadzone(input.gamepad_right_x, deadzone);
-    let right_y = apply_deadzone(input.gamepad_right_y, deadzone);
-
-    let look_dx = input.mouse_dx + right_x * ctrl.gamepad_look_speed * dt;
-    let look_dy = input.mouse_dy + right_y * ctrl.gamepad_look_speed * dt;
-
     let sens_rad = ctrl.mouse_sensitivity * std::f32::consts::PI / 180.0;
-    ctrl.yaw += look_dx * sens_rad;
-    ctrl.pitch -= look_dy * sens_rad;
+    ctrl.yaw += input.mouse_dx * sens_rad;
+    ctrl.pitch -= input.mouse_dy * sens_rad;
     ctrl.pitch = ctrl.pitch.clamp(-1.553, 1.553);
 
     cam.forward = Vec3::new(
@@ -64,11 +55,9 @@ pub fn update_fly_camera(rig: &mut CameraRig, input: InputState, dt: f32) {
     let hz_forward = Vec3::new(ctrl.yaw.sin(), 0.0, ctrl.yaw.cos());
     let hz_right = Vec3::Y.cross(hz_forward);
 
-    let move_forward = (input.move_forward - left_y).clamp(-1.0, 1.0);
-    let move_right = (input.move_right + left_x).clamp(-1.0, 1.0);
-    let move_up = (input.move_up
-        + (input.gamepad_right_trigger - input.gamepad_left_trigger))
-        .clamp(-1.0, 1.0);
+    let move_forward = input.move_forward.clamp(-1.0, 1.0);
+    let move_right = input.move_right.clamp(-1.0, 1.0);
+    let move_up = input.move_up.clamp(-1.0, 1.0);
 
     let mut velocity = hz_forward * move_forward + hz_right * move_right + Vec3::Y * move_up;
     if velocity.length_squared() > 0.0 {
@@ -76,14 +65,6 @@ pub fn update_fly_camera(rig: &mut CameraRig, input: InputState, dt: f32) {
     }
 
     cam.position += velocity * ctrl.move_speed * dt;
-}
-
-fn apply_deadzone(value: f32, deadzone: f32) -> f32 {
-    if value.abs() < deadzone {
-        0.0
-    } else {
-        value
-    }
 }
 
 #[cfg(test)]

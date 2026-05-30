@@ -1,7 +1,7 @@
 use anyhow::Result;
 use tracing_subscriber::{EnvFilter, fmt};
 use winit::application::ApplicationHandler;
-use winit::event::{AxisId, ButtonId, DeviceEvent, DeviceId, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
@@ -96,10 +96,48 @@ struct RevolumetricApp {
     window: Option<Window>,
     window_id: Option<WindowId>,
     initialized: bool,
-    last_cursor_pos: Option<(f64, f64)>,
+    touch_look: TouchLookState,
     last_frame_time: Option<std::time::Instant>,
     rendered_frames: u64,
     exit_after_frames: Option<u64>,
+}
+
+#[derive(Debug, Default)]
+struct TouchLookState {
+    active_touch_id: Option<u64>,
+    last_position: Option<(f64, f64)>,
+}
+
+impl TouchLookState {
+    fn clear(&mut self) {
+        self.active_touch_id = None;
+        self.last_position = None;
+    }
+
+    fn handle_touch(&mut self, input: &mut InputState, touch: Touch) {
+        match touch.phase {
+            TouchPhase::Started => {
+                if self.active_touch_id.is_none() {
+                    self.active_touch_id = Some(touch.id);
+                    self.last_position = Some((touch.location.x, touch.location.y));
+                }
+            }
+            TouchPhase::Moved => {
+                if self.active_touch_id == Some(touch.id) {
+                    if let Some((last_x, last_y)) = self.last_position {
+                        input.mouse_dx += (touch.location.x - last_x) as f32;
+                        input.mouse_dy += (touch.location.y - last_y) as f32;
+                    }
+                    self.last_position = Some((touch.location.x, touch.location.y));
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if self.active_touch_id == Some(touch.id) {
+                    self.clear();
+                }
+            }
+        }
+    }
 }
 
 impl RevolumetricApp {
@@ -136,7 +174,7 @@ impl RevolumetricApp {
             window: None,
             window_id: None,
             initialized: false,
-            last_cursor_pos: None,
+            touch_look: TouchLookState::default(),
             last_frame_time: None,
             rendered_frames: 0,
             exit_after_frames: parse_exit_after_frames(),
@@ -188,7 +226,7 @@ impl RevolumetricApp {
         match self.world.resource::<CameraRig>() {
             Some(rig) => VptCameraFrame {
                 position: rig.camera.position,
-                                                                                                                                                           forward: rig.camera.forward,
+                forward: rig.camera.forward,
                 up: rig.camera.up,
                 fov_y_radians: rig.camera.fov_y_radians,
                 aperture_radius: rig.camera.aperture_radius,
@@ -660,28 +698,14 @@ impl ApplicationHandler for RevolumetricApp {
                         } else {
                             let _ = window.set_cursor_grab(CursorGrabMode::None);
                             window.set_cursor_visible(true);
-                            self.last_cursor_pos = None;
                         }
                     }
-                    if !pressed {
-                        self.last_cursor_pos = None;
-                    }
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if let Some(input) = self.world.resource_mut::<InputState>()
-                    && input.right_mouse_held
-                {
-                    if let Some((last_x, last_y)) = self.last_cursor_pos {
-                        input.mouse_dx += (position.x - last_x) as f32;
-                        input.mouse_dy += (position.y - last_y) as f32;
-                    }
-                }
-                self.last_cursor_pos = Some((position.x, position.y));
-            }
-            WindowEvent::AxisMotion { axis, value, .. } => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    apply_gamepad_axis(input, axis, value as f32);
+            WindowEvent::Touch(touch) => {
+                let (world, touch_look) = (&mut self.world, &mut self.touch_look);
+                if let Some(input) = world.resource_mut::<InputState>() {
+                    touch_look.handle_touch(input, touch);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -698,7 +722,7 @@ impl ApplicationHandler for RevolumetricApp {
                     input.reset_axes();
                     input.right_mouse_held = false;
                 }
-                self.last_cursor_pos = None;
+                self.touch_look.clear();
                 if let Some(window) = &self.window {
                     let _ = window.set_cursor_grab(CursorGrabMode::None);
                     window.set_cursor_visible(true);
@@ -714,26 +738,12 @@ impl ApplicationHandler for RevolumetricApp {
         _device_id: DeviceId,
         event: DeviceEvent,
     ) {
-        match event {
-            DeviceEvent::MouseMotion { delta } => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    if input.right_mouse_held {
-                        input.mouse_dx += delta.0 as f32;
-                        input.mouse_dy += delta.1 as f32;
-                    }
-                }
-            }
-            DeviceEvent::Motion { axis, value } => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    apply_gamepad_axis(input, axis, value as f32);
-                }
-            }
-            DeviceEvent::Button { button, state } => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    apply_gamepad_button(input, button, state);
-                }
-            }
-            _ => {}
+        if let DeviceEvent::MouseMotion { delta } = event
+            && let Some(input) = self.world.resource_mut::<InputState>()
+            && input.right_mouse_held
+        {
+            input.mouse_dx += delta.0 as f32;
+            input.mouse_dy += delta.1 as f32;
         }
     }
 
@@ -742,33 +752,6 @@ impl ApplicationHandler for RevolumetricApp {
             window.request_redraw();
         }
     }
-}
-
-const GAMEPAD_AXIS_LEFT_X: AxisId = 0;
-const GAMEPAD_AXIS_LEFT_Y: AxisId = 1;
-const GAMEPAD_AXIS_RIGHT_X: AxisId = 2;
-const GAMEPAD_AXIS_RIGHT_Y: AxisId = 3;
-const GAMEPAD_AXIS_LEFT_TRIGGER: AxisId = 4;
-const GAMEPAD_AXIS_RIGHT_TRIGGER: AxisId = 5;
-
-fn apply_gamepad_axis(input: &mut InputState, axis: AxisId, value: f32) {
-    match axis {
-        GAMEPAD_AXIS_LEFT_X => input.gamepad_left_x = value,
-        GAMEPAD_AXIS_LEFT_Y => input.gamepad_left_y = value,
-        GAMEPAD_AXIS_RIGHT_X => input.gamepad_right_x = value,
-        GAMEPAD_AXIS_RIGHT_Y => input.gamepad_right_y = value,
-        GAMEPAD_AXIS_LEFT_TRIGGER => input.gamepad_left_trigger = normalize_trigger(value),
-        GAMEPAD_AXIS_RIGHT_TRIGGER => input.gamepad_right_trigger = normalize_trigger(value),
-        _ => {}
-    }
-}
-
-fn apply_gamepad_button(_input: &mut InputState, _button: ButtonId, _state: winit::event::ElementState) {
-    // Reserved for future button bindings (e.g. camera reset, speed boost).
-}
-
-fn normalize_trigger(value: f32) -> f32 {
-    ((value + 1.0) * 0.5).clamp(0.0, 1.0)
 }
 
 fn init_tracing() {
@@ -787,6 +770,17 @@ mod tests {
     use crate::scene::light::DirectionalLight;
     use crate::voxel::brick::VoxelCell;
     use crate::voxel::ucvh::UcvhMotionEvent;
+    use winit::event::{DeviceId, Touch, TouchPhase};
+
+    fn touch_event(id: u64, phase: TouchPhase, x: f64, y: f64) -> Touch {
+        Touch {
+            device_id: DeviceId::dummy(),
+            phase,
+            location: winit::dpi::PhysicalPosition::new(x, y),
+            force: None,
+            id,
+        }
+    }
 
     #[test]
     fn view_projection_round_trips_pixel_to_ray_center_coordinates() {
@@ -897,6 +891,29 @@ mod tests {
     fn current_elapsed_seconds_defaults_to_zero_without_time_resource() {
         let app = RevolumetricApp::new();
         assert_eq!(app.current_elapsed_seconds(), 0.0);
+    }
+
+    #[test]
+    fn touch_look_tracks_one_finger_drag_and_ignores_secondary_touch() {
+        let mut touch_look = TouchLookState::default();
+        let mut input = InputState::default();
+
+        touch_look.handle_touch(&mut input, touch_event(7, TouchPhase::Started, 10.0, 20.0));
+        touch_look.handle_touch(&mut input, touch_event(7, TouchPhase::Moved, 14.0, 17.0));
+        touch_look.handle_touch(
+            &mut input,
+            touch_event(8, TouchPhase::Started, 100.0, 100.0),
+        );
+        touch_look.handle_touch(&mut input, touch_event(8, TouchPhase::Moved, 150.0, 120.0));
+
+        assert_eq!(input.mouse_dx, 4.0);
+        assert_eq!(input.mouse_dy, -3.0);
+        assert_eq!(touch_look.active_touch_id, Some(7));
+
+        touch_look.handle_touch(&mut input, touch_event(7, TouchPhase::Ended, 14.0, 17.0));
+
+        assert!(touch_look.active_touch_id.is_none());
+        assert!(touch_look.last_position.is_none());
     }
 
     #[test]

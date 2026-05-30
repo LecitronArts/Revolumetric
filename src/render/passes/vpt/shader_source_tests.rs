@@ -68,7 +68,7 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
         vec![
             binding(0, DescriptorKind::UniformBuffer, "scene_ubo"),
             binding(1, DescriptorKind::StorageImage, "noisy_radiance_image"),
-            binding(2, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(2, DescriptorKind::UniformBuffer, "ucvh_config"),
             binding(3, DescriptorKind::StorageBuffer, "hierarchy_l0"),
             binding(4, DescriptorKind::StorageBuffer, "hierarchy_l1"),
             binding(5, DescriptorKind::StorageBuffer, "hierarchy_l2"),
@@ -439,7 +439,7 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
             binding(5, DescriptorKind::StorageImage, "surface_view_z"),
             binding(6, DescriptorKind::StorageImage, "surface_motion_id"),
             binding(7, DescriptorKind::StorageImage, "motion_history"),
-            binding(8, DescriptorKind::StorageBuffer, "ucvh_config"),
+            binding(8, DescriptorKind::UniformBuffer, "ucvh_config"),
             binding(9, DescriptorKind::StorageBuffer, "hierarchy_l0"),
             binding(10, DescriptorKind::StorageBuffer, "hierarchy_l1"),
             binding(11, DescriptorKind::StorageBuffer, "hierarchy_l2"),
@@ -2522,11 +2522,10 @@ fn vpt_restir_di_visibility_uses_any_hit_shadow_traversal() {
         "bool trace_any_hit_ray_skip_voxel(",
         "bool brick_any_hit(",
         "float max_t",
-        "BrickOccupancy occ",
+        "StructuredBuffer<BrickOccupancy> occupancy_buf",
         "ray_axis_t_max(ray.origin.x, ray.direction.x, inv_dir.x",
         "ray_axis_t_max(ray.origin.y, ray.direction.y, inv_dir.y",
         "ray_axis_t_max(ray.origin.z, ray.direction.z, inv_dir.z",
-        "StructuredBuffer<BrickOccupancy> occupancy_buf",
     ] {
         assert!(
             traverse.contains(token),
@@ -2535,7 +2534,7 @@ fn vpt_restir_di_visibility_uses_any_hit_shadow_traversal() {
     }
     assert!(
         !traverse.contains(
-            "bool trace_any_hit_ray(\n    Ray ray,\n    float max_t,\n    StructuredBuffer<UcvhConfig> config_buf,\n    StructuredBuffer<NodeL0> hierarchy_l0,\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    StructuredBuffer<VoxelCell> material_buf"
+            "bool trace_any_hit_ray(\n    Ray ray,\n    float max_t,\n    ConstantBuffer<UcvhConfig> config_buf,\n    StructuredBuffer<NodeL0> hierarchy_l0,\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    StructuredBuffer<VoxelCell> material_buf"
         ),
         "any-hit shadow traversal must not bind or read material cells"
     );
@@ -2548,6 +2547,43 @@ fn vpt_restir_di_visibility_uses_any_hit_shadow_traversal() {
     assert!(
         !vpt.contains("HitResult occluder = trace_primary_ray(shadow_ray"),
         "VPT ReSTIR-DI visibility must not run full material-returning primary traversal for shadow rays"
+    );
+}
+
+#[test]
+fn voxel_primary_traversal_reads_occupancy_bits_on_demand() {
+    let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+        .expect("voxel traversal shader should be readable");
+    let common = std::fs::read_to_string("assets/shaders/shared/voxel_common.slang")
+        .expect("voxel common shader should be readable");
+
+    for token in [
+        "bool brick_dda(\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    uint brick_id,",
+        "if (occupancy_buf[node.brick_id].count > 0u) {",
+        "if (brick_dda(occupancy_buf, node.brick_id, local_origin, ray.direction,",
+        "bool brick_any_hit(\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    uint brick_id,",
+        "if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {",
+    ] {
+        assert!(
+            traverse.contains(token),
+            "primary brick traversal should read occupancy bits on demand token {token}"
+        );
+    }
+
+    for token in [
+        "bool read_occupancy_bit(StructuredBuffer<BrickOccupancy> occupancy_buf, uint brick_id, uint3 local)",
+        "return (occupancy_buf[brick_id].bits[word] & (1u << bit)) != 0u;",
+    ] {
+        assert!(
+            common.contains(token),
+            "occupancy helper should load only the required word token {token}"
+        );
+    }
+
+    assert!(
+        !traverse.contains("BrickOccupancy occ = occupancy_buf[node.brick_id];")
+            && !traverse.contains("BrickOccupancy occ = occupancy_buf[brick_id];"),
+        "primary brick traversal must not materialize the whole BrickOccupancy struct before the DDA"
     );
 }
 
@@ -2770,7 +2806,7 @@ fn voxel_traversal_uses_uploaded_l1_l4_hierarchy_for_empty_space_skipping() {
         "StructuredBuffer<NodeLN> hierarchy_l4",
         "bool hierarchy_level_empty_at_brick(",
         "bool try_skip_empty_hierarchy_block(",
-        "void advance_brick_dda_to_t(",
+        "void reset_brick_dda_at_t(",
         "node_ln_child_mask(parent)",
         "try_skip_empty_hierarchy_block(",
     ] {
@@ -2791,23 +2827,30 @@ fn voxel_traversal_uses_uploaded_l1_l4_hierarchy_for_empty_space_skipping() {
 }
 
 #[test]
-fn voxel_hierarchy_skip_does_not_advance_past_block_exit_boundary() {
+fn voxel_hierarchy_skip_reinitializes_dda_state_in_constant_time() {
     let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
         .expect("voxel traversal shader should be readable");
 
     for token in [
-        "bool dda_t_exceeds_target(",
-        "float next_t = dda_next_t(t_max);",
-        "if (dda_t_exceeds_target(next_t, target_t))",
-        "break;",
+        "void reset_brick_dda_at_t(",
+        "float reset_t = target_t + DDA_GRID_BOUNDARY_EPSILON",
+        "float3 reset_pos = ray.origin + ray.direction * reset_t;",
+        "brick_coord = dda_start_coord3(reset_pos / 8.0, step_dir, igrid - int3(1));",
+        "ray_axis_t_max(ray.origin.x, ray.direction.x, ray.inv_dir.x",
         "int3 original_brick_coord = skipped_brick_coord;",
         "return any(skipped_brick_coord != original_brick_coord);",
     ] {
         assert!(
             traverse.contains(token),
-            "hierarchy skip DDA advance missing boundary guard token {token}"
+            "hierarchy skip DDA reset missing constant-time token {token}"
         );
     }
+
+    assert!(
+        !traverse.contains("void advance_brick_dda_to_t(")
+            && !traverse.contains("while (current_t < target_t)"),
+        "hierarchy empty-space skipping must not walk brick DDA one boundary at a time"
+    );
 }
 
 #[test]

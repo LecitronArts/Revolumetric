@@ -22,7 +22,6 @@ pub struct FlyCameraController {
     pub max_speed: f32,
     pub scroll_multiplier: f32,
     pub mouse_sensitivity: f32,
-    pub gamepad_look_speed: f32,
     pub pitch: f32,
     pub yaw: f32,
 }
@@ -35,7 +34,6 @@ impl Default for FlyCameraController {
             max_speed: 500.0,
             scroll_multiplier: 1.2,
             mouse_sensitivity: 0.3,
-            gamepad_look_speed: 180.0,
             pitch: -0.03,
             yaw: 0.0,
         }
@@ -61,7 +59,6 @@ mod tests {
         assert_eq!(ctrl.max_speed, 500.0);
         assert!((ctrl.scroll_multiplier - 1.2).abs() < 1e-5);
         assert!((ctrl.mouse_sensitivity - 0.3).abs() < 1e-5);
-        assert!((ctrl.gamepad_look_speed - 180.0).abs() < 1e-5);
         assert!((ctrl.pitch - (-0.03)).abs() < 0.01);
         assert_eq!(ctrl.yaw, 0.0);
     }
