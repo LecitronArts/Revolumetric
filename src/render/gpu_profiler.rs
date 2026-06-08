@@ -85,12 +85,13 @@ pub enum GpuProfileScope {
     VptNrdConfidence = 11,
     VptNrdFrontend = 12,
     VptNrdAdapter = 13,
-    Postprocess = 14,
-    BlitToSwapchain = 15,
+    VptNrdResolve = 14,
+    Postprocess = 15,
+    BlitToSwapchain = 16,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 16;
+    pub const COUNT: usize = 17;
     pub const ALL: [Self; Self::COUNT] = [
         Self::VptSurfaceBootstrap,
         Self::VptSurfaceSelected,
@@ -106,6 +107,7 @@ impl GpuProfileScope {
         Self::VptNrdConfidence,
         Self::VptNrdFrontend,
         Self::VptNrdAdapter,
+        Self::VptNrdResolve,
         Self::Postprocess,
         Self::BlitToSwapchain,
     ];
@@ -126,6 +128,7 @@ impl GpuProfileScope {
             Self::VptNrdConfidence => "VptNrdConfidence",
             Self::VptNrdFrontend => "VptNrdFrontend",
             Self::VptNrdAdapter => "VptNrdAdapter",
+            Self::VptNrdResolve => "VptNrdResolve",
             Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
         }
@@ -147,6 +150,7 @@ impl GpuProfileScope {
             Self::VptNrdConfidence => "vpt_nrd_confidence_ms",
             Self::VptNrdFrontend => "vpt_nrd_frontend_ms",
             Self::VptNrdAdapter => "vpt_nrd_adapter_ms",
+            Self::VptNrdResolve => "vpt_nrd_resolve_ms",
             Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
         }
@@ -168,6 +172,7 @@ impl GpuProfileScope {
             | Self::VptNrdConfidence
             | Self::VptNrdFrontend
             | Self::VptNrdAdapter
+            | Self::VptNrdResolve
             | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
             Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
         }
@@ -683,7 +688,7 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 16);
+        assert_eq!(GpuProfileScope::COUNT, 17);
         assert_eq!(names[0], "VptSurfaceBootstrap");
         assert_eq!(names[1], "VptSurfaceSelected");
         assert_eq!(names[2], "Vpt");
@@ -698,8 +703,9 @@ mod tests {
         assert_eq!(names[11], "VptNrdConfidence");
         assert_eq!(names[12], "VptNrdFrontend");
         assert_eq!(names[13], "VptNrdAdapter");
-        assert_eq!(names[14], "Postprocess");
-        assert_eq!(names[15], "Blit");
+        assert_eq!(names[14], "VptNrdResolve");
+        assert_eq!(names[15], "Postprocess");
+        assert_eq!(names[16], "Blit");
         assert_eq!(columns[0], "vpt_surface_bootstrap_ms");
         assert_eq!(columns[1], "vpt_surface_selected_ms");
         assert_eq!(columns[2], "vpt_ms");
@@ -714,8 +720,9 @@ mod tests {
         assert_eq!(columns[11], "vpt_nrd_confidence_ms");
         assert_eq!(columns[12], "vpt_nrd_frontend_ms");
         assert_eq!(columns[13], "vpt_nrd_adapter_ms");
-        assert_eq!(columns[14], "postprocess_ms");
-        assert_eq!(columns[15], "blit_to_swapchain_ms");
+        assert_eq!(columns[14], "vpt_nrd_resolve_ms");
+        assert_eq!(columns[15], "postprocess_ms");
+        assert_eq!(columns[16], "blit_to_swapchain_ms");
     }
 
     #[test]
@@ -735,6 +742,7 @@ mod tests {
             GpuProfileScope::VptNrdConfidence,
             GpuProfileScope::VptNrdFrontend,
             GpuProfileScope::VptNrdAdapter,
+            GpuProfileScope::VptNrdResolve,
             GpuProfileScope::Postprocess,
         ] {
             assert_eq!(
@@ -880,11 +888,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
+            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,vpt_nrd_resolve_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
+            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
         );
     }
 }

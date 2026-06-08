@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::render::pass_context::{PassBuilder, PassContext};
 use crate::render::resource::{
     AccessKind, PassDecl, QueueType, ResourceAccess, ResourceDesc, ResourceHandle,
+    ResourceLifetime, ResourceOrigin, TransientAliasCandidate, TransientResourceSlot,
 };
 
 type ExecuteFn<'a> = Box<dyn FnOnce(&mut PassContext) + 'a>;
@@ -18,6 +19,10 @@ pub struct RenderGraph<'a> {
     passes: Vec<PassNode<'a>>,
     sorted_order: Vec<usize>,
     resources: BTreeMap<u32, ResourceDesc>,
+    resource_origins: BTreeMap<u32, ResourceOrigin>,
+    resource_lifetimes: Vec<ResourceLifetime>,
+    transient_alias_candidates: Vec<TransientAliasCandidate>,
+    transient_resource_slots: Vec<TransientResourceSlot>,
     image_handles: BTreeMap<u32, vk::Image>,
     buffer_handles: BTreeMap<u32, vk::Buffer>,
     imported_accesses: BTreeMap<u32, AccessKind>,
@@ -47,6 +52,10 @@ impl<'a> RenderGraph<'a> {
             passes: Vec::new(),
             sorted_order: Vec::new(),
             resources: BTreeMap::new(),
+            resource_origins: BTreeMap::new(),
+            resource_lifetimes: Vec::new(),
+            transient_alias_candidates: Vec::new(),
+            transient_resource_slots: Vec::new(),
             image_handles: BTreeMap::new(),
             buffer_handles: BTreeMap::new(),
             imported_accesses: BTreeMap::new(),
@@ -54,6 +63,15 @@ impl<'a> RenderGraph<'a> {
             next_resource_id: 0,
             compiled: false,
         }
+    }
+
+    fn invalidate_compile_products(&mut self) {
+        self.sorted_order.clear();
+        self.barrier_plan.clear();
+        self.resource_lifetimes.clear();
+        self.transient_alias_candidates.clear();
+        self.transient_resource_slots.clear();
+        self.compiled = false;
     }
 
     pub fn import_image(
@@ -77,7 +95,9 @@ impl<'a> RenderGraph<'a> {
                 usage,
             },
         );
-        self.compiled = false;
+        self.resource_origins
+            .insert(handle.id, ResourceOrigin::Imported);
+        self.invalidate_compile_products();
         handle
     }
 
@@ -108,7 +128,9 @@ impl<'a> RenderGraph<'a> {
         self.next_resource_id += 1;
         self.resources
             .insert(handle.id, ResourceDesc::Buffer { size, usage });
-        self.compiled = false;
+        self.resource_origins
+            .insert(handle.id, ResourceOrigin::Imported);
+        self.invalidate_compile_products();
         handle
     }
 
@@ -139,6 +161,8 @@ impl<'a> RenderGraph<'a> {
         let writes = builder.writes.clone();
         for (handle, desc) in &builder.resource_descs {
             self.resources.insert(handle.id, desc.clone());
+            self.resource_origins
+                .insert(handle.id, ResourceOrigin::Transient);
         }
         let decl = PassDecl {
             name: builder.name,
@@ -149,7 +173,7 @@ impl<'a> RenderGraph<'a> {
             final_accesses: builder.final_accesses,
         };
         self.passes.push(PassNode { decl, execute });
-        self.compiled = false;
+        self.invalidate_compile_products();
         writes
     }
 
@@ -157,17 +181,24 @@ impl<'a> RenderGraph<'a> {
         self.resources.get(&handle.id)
     }
 
+    pub fn resource_origin(&self, handle: ResourceHandle) -> Option<ResourceOrigin> {
+        self.resource_origins.get(&handle.id).copied()
+    }
+
     pub fn bind_image(&mut self, handle: ResourceHandle, image: vk::Image) {
         self.image_handles.insert(handle.id, image);
-        self.compiled = false;
+        self.invalidate_compile_products();
     }
 
     pub fn bind_buffer(&mut self, handle: ResourceHandle, buffer: vk::Buffer) {
         self.buffer_handles.insert(handle.id, buffer);
-        self.compiled = false;
+        self.invalidate_compile_products();
     }
 
     pub fn compile(&mut self) -> Result<()> {
+        self.resource_lifetimes.clear();
+        self.transient_alias_candidates.clear();
+        self.transient_resource_slots.clear();
         self.validate_resource_references()?;
         self.validate_resource_timeline()?;
         self.barrier_plan.clear();
@@ -229,6 +260,9 @@ impl<'a> RenderGraph<'a> {
         }
 
         self.sorted_order = order;
+        self.resource_lifetimes = self.compute_resource_lifetimes();
+        self.transient_resource_slots = self.compute_transient_resource_slots();
+        self.transient_alias_candidates = self.compute_transient_alias_candidates();
         let barrier_plan = self.plan_barriers();
         self.validate_barrier_resource_bindings(&barrier_plan)?;
         self.barrier_plan = barrier_plan;
@@ -242,6 +276,118 @@ impl<'a> RenderGraph<'a> {
         }
         adj[from].push(to);
         in_degree[to] += 1;
+    }
+
+    fn compute_resource_lifetimes(&self) -> Vec<ResourceLifetime> {
+        let mut steps_by_resource: BTreeMap<u32, (usize, usize)> = BTreeMap::new();
+
+        for (step, &pass_idx) in self.sorted_order.iter().enumerate() {
+            let pass = &self.passes[pass_idx].decl;
+            let mut touched_ids: Vec<u32> = pass
+                .reads
+                .iter()
+                .chain(pass.writes.iter())
+                .chain(pass.accesses.iter().map(|access| &access.handle))
+                .chain(pass.final_accesses.iter().map(|access| &access.handle))
+                .map(|handle| handle.id)
+                .collect();
+            touched_ids.sort_unstable();
+            touched_ids.dedup();
+
+            for id in touched_ids {
+                steps_by_resource
+                    .entry(id)
+                    .and_modify(|(_, last_step)| *last_step = step)
+                    .or_insert((step, step));
+            }
+        }
+
+        steps_by_resource
+            .into_iter()
+            .filter_map(|(resource_id, (first_step, last_step))| {
+                Some(ResourceLifetime {
+                    resource_id,
+                    origin: *self.resource_origins.get(&resource_id)?,
+                    first_step,
+                    last_step,
+                })
+            })
+            .collect()
+    }
+
+    fn compute_transient_alias_candidates(&self) -> Vec<TransientAliasCandidate> {
+        let mut candidates = Vec::new();
+        for (first_index, first) in self.resource_lifetimes.iter().enumerate() {
+            if first.origin != ResourceOrigin::Transient {
+                continue;
+            }
+            let Some(first_desc) = self.resources.get(&first.resource_id) else {
+                continue;
+            };
+            for second in self.resource_lifetimes.iter().skip(first_index + 1) {
+                if second.origin != ResourceOrigin::Transient {
+                    continue;
+                }
+                let Some(second_desc) = self.resources.get(&second.resource_id) else {
+                    continue;
+                };
+                if first_desc != second_desc {
+                    continue;
+                }
+                let lifetimes_do_not_overlap =
+                    first.last_step < second.first_step || second.last_step < first.first_step;
+                if lifetimes_do_not_overlap {
+                    candidates.push(TransientAliasCandidate {
+                        first_resource_id: first.resource_id,
+                        second_resource_id: second.resource_id,
+                    });
+                }
+            }
+        }
+        candidates
+    }
+
+    fn compute_transient_resource_slots(&self) -> Vec<TransientResourceSlot> {
+        let mut transient_resources: Vec<_> = self
+            .resource_lifetimes
+            .iter()
+            .filter(|lifetime| lifetime.origin == ResourceOrigin::Transient)
+            .filter_map(|lifetime| {
+                let desc = self.resources.get(&lifetime.resource_id)?.clone();
+                Some((
+                    lifetime.resource_id,
+                    lifetime.first_step,
+                    lifetime.last_step,
+                    desc,
+                ))
+            })
+            .collect();
+        transient_resources.sort_by_key(|(resource_id, first_step, last_step, _desc)| {
+            (*first_step, *last_step, *resource_id)
+        });
+
+        let mut slots: Vec<(TransientResourceSlot, usize)> = Vec::new();
+        for (resource_id, first_step, last_step, desc) in transient_resources {
+            if let Some((slot, slot_last_step)) = slots
+                .iter_mut()
+                .find(|(slot, slot_last_step)| slot.desc == desc && *slot_last_step < first_step)
+            {
+                slot.resource_ids.push(resource_id);
+                *slot_last_step = last_step;
+            } else {
+                let slot_index = slots.len();
+                slots.push((
+                    TransientResourceSlot {
+                        slot_index,
+                        desc,
+                        resource_ids: vec![resource_id],
+                    },
+                    last_step,
+                ));
+            }
+        }
+
+        slots.into_iter().map(|(slot, _last_step)| slot).collect()
     }
 
     fn producer_map(&self) -> Result<BTreeMap<(u32, u32), usize>> {
@@ -435,6 +581,7 @@ impl<'a> RenderGraph<'a> {
             | AccessKind::ComputeShaderWrite => vk::ImageUsageFlags::STORAGE,
             AccessKind::TransferRead => vk::ImageUsageFlags::TRANSFER_SRC,
             AccessKind::TransferWrite => vk::ImageUsageFlags::TRANSFER_DST,
+            AccessKind::ColorAttachmentWrite => vk::ImageUsageFlags::COLOR_ATTACHMENT,
         };
 
         if !required.is_empty() && !usage.contains(required) {
@@ -469,6 +616,7 @@ impl<'a> RenderGraph<'a> {
             }
             AccessKind::TransferRead => vk::BufferUsageFlags::TRANSFER_SRC,
             AccessKind::TransferWrite => vk::BufferUsageFlags::TRANSFER_DST,
+            AccessKind::ColorAttachmentWrite => vk::BufferUsageFlags::empty(),
         };
 
         if !required.is_empty() && !usage.intersects(required) {
@@ -581,11 +729,14 @@ impl<'a> RenderGraph<'a> {
                 if final_access.kind == AccessKind::Present
                     && !pass.decl.accesses.iter().any(|access| {
                         access.handle.id == final_access.handle.id
-                            && access.kind == AccessKind::TransferWrite
+                            && matches!(
+                                access.kind,
+                                AccessKind::TransferWrite | AccessKind::ColorAttachmentWrite
+                            )
                     })
                 {
                     return Err(anyhow!(
-                        "pass '{}' presents resource id {} without a transfer write access",
+                        "pass '{}' presents resource id {} without a swapchain write access",
                         pass.decl.name,
                         final_access.handle.id
                     ));
@@ -762,6 +913,18 @@ impl<'a> RenderGraph<'a> {
     pub fn planned_barriers(&self) -> &[PlannedBarrier] {
         &self.barrier_plan
     }
+
+    pub fn resource_lifetimes(&self) -> &[ResourceLifetime] {
+        &self.resource_lifetimes
+    }
+
+    pub fn transient_alias_candidates(&self) -> &[TransientAliasCandidate] {
+        &self.transient_alias_candidates
+    }
+
+    pub fn transient_resource_slots(&self) -> &[TransientResourceSlot] {
+        &self.transient_resource_slots
+    }
 }
 
 impl Default for RenderGraph<'_> {
@@ -773,7 +936,9 @@ impl Default for RenderGraph<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::render::resource::{AccessKind, QueueType, ResourceDesc};
+    use crate::render::resource::{
+        AccessKind, QueueType, ResourceDesc, ResourceOrigin, TransientAliasCandidate,
+    };
     use ash::vk::Handle;
 
     fn fake_image(raw: u64) -> vk::Image {
@@ -874,6 +1039,334 @@ mod tests {
                 usage: vk::BufferUsageFlags::STORAGE_BUFFER,
             })
         );
+    }
+
+    #[test]
+    fn rendergraph_resource_lifecycle_records_imported_and_transient_origins() {
+        let mut graph = RenderGraph::new();
+        let imported = graph.import_image(
+            64,
+            64,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE,
+        );
+        let transient = graph.add_pass("producer", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+
+        assert_eq!(
+            graph.resource_origin(imported),
+            Some(ResourceOrigin::Imported)
+        );
+        assert_eq!(
+            graph.resource_origin(transient),
+            Some(ResourceOrigin::Transient)
+        );
+    }
+
+    #[test]
+    fn rendergraph_resource_lifecycle_records_sorted_execution_lifetimes() {
+        let mut graph = RenderGraph::new();
+        let imported = graph.import_image_with_access(
+            fake_image(201),
+            64,
+            64,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::ComputeShaderRead,
+        );
+        let transient = graph.add_pass("producer", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(transient, fake_image(202));
+
+        graph.add_pass("consumer", QueueType::Compute, |builder| {
+            builder.read_as(transient, AccessKind::ComputeShaderRead);
+            builder.read_as(imported, AccessKind::ComputeShaderRead);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile().unwrap();
+
+        let imported_lifetime = graph
+            .resource_lifetimes()
+            .iter()
+            .find(|lifetime| lifetime.resource_id == imported.id)
+            .unwrap();
+        let transient_lifetime = graph
+            .resource_lifetimes()
+            .iter()
+            .find(|lifetime| lifetime.resource_id == transient.id)
+            .unwrap();
+
+        assert_eq!(imported_lifetime.origin, ResourceOrigin::Imported);
+        assert_eq!(imported_lifetime.first_step, 1);
+        assert_eq!(imported_lifetime.last_step, 1);
+        assert_eq!(transient_lifetime.origin, ResourceOrigin::Transient);
+        assert_eq!(transient_lifetime.first_step, 0);
+        assert_eq!(transient_lifetime.last_step, 1);
+    }
+
+    #[test]
+    fn rendergraph_resource_lifecycle_plans_alias_candidates_for_non_overlapping_transients() {
+        let mut graph = RenderGraph::new();
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(301));
+        let first_read_marker = graph.add_pass("first_read", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.create_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER);
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_buffer(first_read_marker, fake_buffer(303));
+        let second = graph.add_pass("second_write", QueueType::Compute, |builder| {
+            builder.depend_on(first_read_marker);
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(second, fake_image(302));
+
+        graph.compile().unwrap();
+
+        assert!(
+            graph
+                .transient_alias_candidates()
+                .contains(&TransientAliasCandidate {
+                    first_resource_id: first.id,
+                    second_resource_id: second.id,
+                }),
+            "compatible non-overlapping transient images should be alias candidates"
+        );
+    }
+
+    #[test]
+    fn rendergraph_resource_lifecycle_excludes_imported_and_overlapping_alias_candidates() {
+        let mut graph = RenderGraph::new();
+        let imported = graph.import_image_with_access(
+            fake_image(401),
+            64,
+            64,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::ComputeShaderRead,
+        );
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(402));
+        let overlapping = graph.add_pass("overlapping_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(overlapping, fake_image(403));
+        graph.add_pass("read_both", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.read_as(overlapping, AccessKind::ComputeShaderRead);
+            builder.read_as(imported, AccessKind::ComputeShaderRead);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile().unwrap();
+
+        assert!(
+            graph
+                .transient_alias_candidates()
+                .iter()
+                .all(|candidate| candidate.first_resource_id != imported.id
+                    && candidate.second_resource_id != imported.id),
+            "imported resources must not be transient alias candidates"
+        );
+        assert!(
+            !graph
+                .transient_alias_candidates()
+                .contains(&TransientAliasCandidate {
+                    first_resource_id: first.id,
+                    second_resource_id: overlapping.id,
+                }),
+            "overlapping transient lifetimes must not alias"
+        );
+    }
+
+    #[test]
+    fn rendergraph_resource_lifecycle_clears_compile_products_after_graph_mutation() {
+        let mut graph = RenderGraph::new();
+        let image = graph.add_pass("write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(image, fake_image(501));
+
+        graph.compile().unwrap();
+        assert!(!graph.resource_lifetimes().is_empty());
+
+        graph.add_pass("later", QueueType::Compute, |_builder| Box::new(|_ctx| {}));
+
+        assert!(graph.resource_lifetimes().is_empty());
+        assert!(graph.transient_alias_candidates().is_empty());
+        assert!(graph.transient_resource_slots().is_empty());
+        assert!(graph.barrier_plan().is_empty());
+    }
+
+    #[test]
+    fn rendergraph_transient_slot_plan_packs_non_overlapping_transients() {
+        let mut graph = RenderGraph::new();
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(601));
+        let marker = graph.add_pass("first_read", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.create_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER);
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_buffer(marker, fake_buffer(602));
+        let second = graph.add_pass("second_write", QueueType::Compute, |builder| {
+            builder.depend_on(marker);
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(second, fake_image(603));
+
+        graph.compile().unwrap();
+
+        let image_slots: Vec<_> = graph
+            .transient_resource_slots()
+            .iter()
+            .filter(|slot| matches!(slot.desc, ResourceDesc::Image { .. }))
+            .collect();
+        assert_eq!(image_slots.len(), 1);
+        assert_eq!(image_slots[0].resource_ids, vec![first.id, second.id]);
+    }
+
+    #[test]
+    fn rendergraph_transient_slot_plan_separates_overlapping_transients() {
+        let mut graph = RenderGraph::new();
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(701));
+        let second = graph.add_pass("second_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(second, fake_image(702));
+        graph.add_pass("read_both", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.read_as(second, AccessKind::ComputeShaderRead);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile().unwrap();
+
+        let image_slots: Vec<_> = graph
+            .transient_resource_slots()
+            .iter()
+            .filter(|slot| matches!(slot.desc, ResourceDesc::Image { .. }))
+            .collect();
+        assert_eq!(image_slots.len(), 2);
+    }
+
+    #[test]
+    fn rendergraph_transient_slot_plan_separates_different_descriptors() {
+        let mut graph = RenderGraph::new();
+        let small = graph.add_pass("small_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(small, fake_image(801));
+        let marker = graph.add_pass("small_read", QueueType::Compute, |builder| {
+            builder.read_as(small, AccessKind::ComputeShaderRead);
+            builder.create_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER);
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_buffer(marker, fake_buffer(802));
+        let large = graph.add_pass("large_write", QueueType::Compute, |builder| {
+            builder.depend_on(marker);
+            builder.create_image(
+                128,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(large, fake_image(803));
+
+        graph.compile().unwrap();
+
+        let image_slots: Vec<_> = graph
+            .transient_resource_slots()
+            .iter()
+            .filter(|slot| matches!(slot.desc, ResourceDesc::Image { .. }))
+            .collect();
+        assert_eq!(image_slots.len(), 2);
     }
 
     #[test]
@@ -1311,6 +1804,12 @@ mod tests {
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             ),
             (
+                AccessKind::ColorAttachmentWrite,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            ),
+            (
                 AccessKind::Present,
                 vk::PipelineStageFlags::BOTTOM_OF_PIPE,
                 vk::AccessFlags::empty(),
@@ -1332,7 +1831,7 @@ mod tests {
         );
         assert_eq!(
             AccessKind::from_swapchain_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-            None
+            Some(AccessKind::ColorAttachmentWrite)
         );
     }
 
@@ -1642,6 +2141,37 @@ mod tests {
         assert_eq!(barriers[2].resource.id, swapchain.id);
         assert_eq!(barriers[2].from, AccessKind::TransferWrite);
         assert_eq!(barriers[2].to, AccessKind::Present);
+    }
+
+    #[test]
+    fn compile_plans_swapchain_color_attachment_overlay_before_present() {
+        let mut graph = RenderGraph::new();
+        let swapchain = graph.import_image_with_access(
+            fake_image(42),
+            320,
+            180,
+            vk::Format::B8G8R8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+            AccessKind::TransferWrite,
+        );
+
+        graph.add_pass("egui_overlay", QueueType::Graphics, |builder| {
+            builder.write_as(swapchain, AccessKind::ColorAttachmentWrite);
+            builder.finish_as(swapchain, AccessKind::Present);
+            Box::new(|_ctx| {})
+        });
+
+        graph.compile().unwrap();
+        let barriers = graph.barrier_plan();
+        assert_eq!(barriers.len(), 2);
+        assert_eq!(barriers[0].timing, BarrierTiming::BeforePass);
+        assert_eq!(barriers[0].resource.id, swapchain.id);
+        assert_eq!(barriers[0].from, AccessKind::TransferWrite);
+        assert_eq!(barriers[0].to, AccessKind::ColorAttachmentWrite);
+        assert_eq!(barriers[1].timing, BarrierTiming::AfterPass);
+        assert_eq!(barriers[1].resource.id, swapchain.id);
+        assert_eq!(barriers[1].from, AccessKind::ColorAttachmentWrite);
+        assert_eq!(barriers[1].to, AccessKind::Present);
     }
 
     #[test]

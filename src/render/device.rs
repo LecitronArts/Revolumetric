@@ -6,8 +6,13 @@ use std::ffi::{CStr, CString, c_char};
 use winit::window::Window;
 
 use crate::render::allocator::GpuAllocator;
-use crate::render::frame::FrameContext;
+use crate::render::frame::{FrameCompletion, FrameContext};
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
+
+// ash 0.38 is generated from Vulkan 1.3.281 and only exposes the older NV
+// Rust names, but current Vulkan headers alias the NV feature struct/sType to
+// VK_KHR_compute_shader_derivatives. Request the vendor-neutral extension name.
+const KHR_COMPUTE_SHADER_DERIVATIVES_NAME: &CStr = c"VK_KHR_compute_shader_derivatives";
 
 struct FrameResources {
     command_pool: vk::CommandPool,
@@ -157,7 +162,10 @@ impl RenderDevice {
             }
         };
 
-        let device_extension_names = [ash::khr::swapchain::NAME.as_ptr()];
+        let device_extension_names = [
+            ash::khr::swapchain::NAME.as_ptr(),
+            KHR_COMPUTE_SHADER_DERIVATIVES_NAME.as_ptr(),
+        ];
         let selection =
             pick_physical_device(&instance, &surface_loader, surface, &device_extension_names)?;
 
@@ -183,6 +191,11 @@ impl RenderDevice {
 
         let mut bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let mut compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let mut dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
         let physical_features =
             vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
@@ -191,6 +204,8 @@ impl RenderDevice {
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&device_extension_names)
             .enabled_features(&physical_features)
+            .push_next(&mut dynamic_rendering_features)
+            .push_next(&mut compute_derivatives_features)
             .push_next(&mut bda_features);
 
         let device =
@@ -329,7 +344,9 @@ impl RenderDevice {
             Ok(result) => result,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 self.recreate_swapchain()?;
-                return Ok(FrameContext::skip(self.frame_index));
+                return Ok(FrameContext::skip_after_swapchain_recreate(
+                    self.frame_index,
+                ));
             }
             Err(error) => {
                 return Err(anyhow!(
@@ -375,6 +392,7 @@ impl RenderDevice {
             should_render: true,
             command_buffer,
             swapchain_image: self.swapchain.images[image_index],
+            swapchain_image_view: self.swapchain.image_views[image_index],
             swapchain_image_index: image_index,
             swapchain_image_layout: self.swapchain.image_layouts[image_index],
             swapchain_extent: self.swapchain.extent,
@@ -383,13 +401,15 @@ impl RenderDevice {
             render_finished_semaphore,
             in_flight_fence,
             suboptimal,
+            swapchain_recreated: false,
         })
     }
 
-    pub fn end_frame(&mut self, ctx: FrameContext) -> Result<()> {
+    pub fn end_frame(&mut self, ctx: FrameContext) -> Result<FrameCompletion> {
         if !ctx.should_render {
-            return Ok(());
+            return Ok(FrameCompletion::default());
         }
+        let mut completion = FrameCompletion::default();
 
         unsafe {
             self.device
@@ -425,10 +445,12 @@ impl RenderDevice {
                 Ok(is_suboptimal) => {
                     if is_suboptimal || ctx.suboptimal {
                         self.recreate_swapchain()?;
+                        completion.swapchain_recreated = true;
                     }
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.recreate_swapchain()?;
+                    completion.swapchain_recreated = true;
                 }
                 Err(error) => {
                     return Err(anyhow!(
@@ -438,7 +460,10 @@ impl RenderDevice {
             }
         }
 
-        self.swapchain.image_layouts[ctx.swapchain_image_index] = vk::ImageLayout::PRESENT_SRC_KHR;
+        if !completion.swapchain_recreated {
+            self.swapchain.image_layouts[ctx.swapchain_image_index] =
+                vk::ImageLayout::PRESENT_SRC_KHR;
+        }
 
         tracing::trace!(
             frame_index = ctx.frame_index,
@@ -446,7 +471,7 @@ impl RenderDevice {
             "completed frame"
         );
 
-        Ok(())
+        Ok(completion)
     }
 
     pub fn wait_for_fence(&self, fence: vk::Fence) -> Result<()> {
@@ -610,9 +635,18 @@ fn pick_physical_device(
                         physical_device,
                         required_extensions,
                     )?;
-                    let (features, bda_features) =
-                        query_required_device_features(instance, physical_device);
-                    ensure_required_device_features(&features, &bda_features)?;
+                    let (
+                        features,
+                        bda_features,
+                        compute_derivatives_features,
+                        dynamic_rendering_features,
+                    ) = query_required_device_features(instance, physical_device);
+                    ensure_required_device_features(
+                        &features,
+                        &bda_features,
+                        &compute_derivatives_features,
+                        &dynamic_rendering_features,
+                    )?;
                     Ok(PhysicalDeviceSelection {
                         physical_device,
                         graphics_queue_family_index: queue_families.graphics_queue_family_index,
@@ -741,18 +775,33 @@ fn query_required_device_features(
 ) -> (
     vk::PhysicalDeviceFeatures,
     vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>,
+    vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV<'static>,
+    vk::PhysicalDeviceDynamicRenderingFeatures<'static>,
 ) {
     let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
-    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut bda_features);
+    let mut compute_derivatives_features =
+        vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default();
+    let mut dynamic_rendering_features = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::default()
+        .push_next(&mut dynamic_rendering_features)
+        .push_next(&mut compute_derivatives_features)
+        .push_next(&mut bda_features);
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features2);
     }
-    (features2.features, bda_features)
+    (
+        features2.features,
+        bda_features,
+        compute_derivatives_features,
+        dynamic_rendering_features,
+    )
 }
 
 fn ensure_required_device_features(
     features: &vk::PhysicalDeviceFeatures,
     bda_features: &vk::PhysicalDeviceBufferDeviceAddressFeatures<'_>,
+    compute_derivatives_features: &vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV<'_>,
+    dynamic_rendering_features: &vk::PhysicalDeviceDynamicRenderingFeatures<'_>,
 ) -> Result<()> {
     if bda_features.buffer_device_address == vk::FALSE {
         return Err(anyhow!(
@@ -763,6 +812,14 @@ fn ensure_required_device_features(
         return Err(anyhow!(
             "missing required Vulkan feature: shaderStorageImageExtendedFormats"
         ));
+    }
+    if compute_derivatives_features.compute_derivative_group_quads == vk::FALSE {
+        return Err(anyhow!(
+            "missing required Vulkan feature: computeDerivativeGroupQuads"
+        ));
+    }
+    if dynamic_rendering_features.dynamic_rendering == vk::FALSE {
+        return Err(anyhow!("missing required Vulkan feature: dynamicRendering"));
     }
     Ok(())
 }
@@ -808,13 +865,58 @@ mod tests {
     }
 
     #[test]
+    fn device_reports_swapchain_recreation_from_frame_completion() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let end_frame = source
+            .split("pub fn end_frame")
+            .nth(1)
+            .expect("RenderDevice::end_frame should exist")
+            .split("pub fn wait_for_fence")
+            .next()
+            .expect("end_frame should end before wait_for_fence");
+
+        assert!(end_frame.contains("Result<FrameCompletion>"));
+        assert!(end_frame.contains("let mut completion = FrameCompletion::default();"));
+        assert!(end_frame.contains("completion.swapchain_recreated = true;"));
+        assert!(end_frame.contains("Ok(completion)"));
+    }
+
+    #[test]
+    fn end_frame_does_not_write_old_image_layout_after_present_recreate() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let end_frame = source
+            .split("pub fn end_frame")
+            .nth(1)
+            .expect("RenderDevice::end_frame should exist")
+            .split("pub fn wait_for_fence")
+            .next()
+            .expect("end_frame should end before wait_for_fence");
+
+        let compact = crate::render::source_checks::compact(end_frame);
+        assert!(compact.contains(
+            "if!completion.swapchain_recreated{self.swapchain.image_layouts[ctx.swapchain_image_index]=vk::ImageLayout::PRESENT_SRC_KHR;"
+        ));
+    }
+
+    #[test]
     fn required_device_features_accept_supported_features() {
         let features =
             vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
         let bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
-        ensure_required_device_features(&features, &bda_features).unwrap();
+        ensure_required_device_features(
+            &features,
+            &bda_features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -823,8 +925,19 @@ mod tests {
             vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
         let bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(false);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
-        let error = ensure_required_device_features(&features, &bda_features).unwrap_err();
+        let error = ensure_required_device_features(
+            &features,
+            &bda_features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+        )
+        .unwrap_err();
 
         assert!(error.to_string().contains("bufferDeviceAddress"));
     }
@@ -835,13 +948,100 @@ mod tests {
             vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(false);
         let bda_features =
             vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
 
-        let error = ensure_required_device_features(&features, &bda_features).unwrap_err();
+        let error = ensure_required_device_features(
+            &features,
+            &bda_features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+        )
+        .unwrap_err();
 
         assert!(
             error
                 .to_string()
                 .contains("shaderStorageImageExtendedFormats")
         );
+    }
+
+    #[test]
+    fn required_device_features_report_missing_compute_derivative_quads() {
+        let features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+        let bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(false);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
+        let error = ensure_required_device_features(
+            &features,
+            &bda_features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("computeDerivativeGroupQuads"));
+    }
+
+    #[test]
+    fn required_device_features_report_missing_dynamic_rendering() {
+        let features =
+            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+        let bda_features =
+            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(false);
+
+        let error = ensure_required_device_features(
+            &features,
+            &bda_features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("dynamicRendering"));
+    }
+
+    #[test]
+    fn required_device_extensions_include_khr_compute_shader_derivatives_for_nrd_spirv() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let device_extensions = source
+            .split("let device_extension_names")
+            .nth(1)
+            .expect("device extension list should exist")
+            .split("let selection")
+            .next()
+            .expect("device extension list should be before physical-device selection");
+
+        assert!(device_extensions.contains("KHR_COMPUTE_SHADER_DERIVATIVES_NAME"));
+        assert!(source.contains("VK_KHR_compute_shader_derivatives"));
+    }
+
+    #[test]
+    fn device_creation_enables_dynamic_rendering_for_graphics_overlay_passes() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let constructor = source
+            .split("pub fn new(window: &Window) -> Result<Self>")
+            .nth(1)
+            .expect("RenderDevice::new should exist")
+            .split("let allocator = GpuAllocator::new")
+            .next()
+            .expect("device creation should precede allocator creation");
+
+        assert!(constructor.contains("PhysicalDeviceDynamicRenderingFeatures"));
+        assert!(constructor.contains(".dynamic_rendering(true)"));
     }
 }
