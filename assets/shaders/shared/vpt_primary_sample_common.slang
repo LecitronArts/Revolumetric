@@ -18,11 +18,12 @@ float vpt_primary_rand01(inout uint state) {
 }
 
 uint vpt_primary_rng_seed(uint2 pixel, SceneUniforms scene) {
+    // Keep sampling deterministic across wall-clock time; temporal state should be driven by the
+    // VPT sample index and explicit history reset logic, not elapsed seconds.
     return vpt_primary_hash_u32(
         pixel.x * 1973u ^
         pixel.y * 9277u ^
-        scene.vpt_sample_index * 26699u ^
-        uint(scene.time * 1000.0)
+        scene.vpt_sample_index * 26699u
     );
 }
 

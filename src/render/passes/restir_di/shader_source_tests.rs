@@ -457,7 +457,7 @@ fn restir_di_temporal_uses_explicit_history_surface_and_selected_frame_ring() {
 
 #[test]
 fn app_restir_di_dispatches_only_enabled_reuse_stages() {
-    let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let compact_pipeline = pipeline.split_whitespace().collect::<String>();
     let pass = source("src/render/passes/restir_di.rs");
@@ -487,7 +487,7 @@ fn app_restir_di_dispatches_only_enabled_reuse_stages() {
             && pass.contains("self.initial_stage.write_storage_descriptors_for_frame(\n            device,\n            frame_slot,\n            2,\n            &[initial_output],\n        );"),
         "when temporal reuse is disabled, ReSTIR-DI initial must write the selected current slot that VPT reads"
     );
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(
         compact_pipeline.contains("restir_di.register_graph(")
             && compact_pipeline.contains(
@@ -506,6 +506,7 @@ fn app_restir_di_dispatches_only_enabled_reuse_stages() {
 #[test]
 fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() {
     let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
 
     assert!(!app.contains("restir_di.update_surface_descriptors(&device,vpt_surface);"));
@@ -513,7 +514,7 @@ fn restir_di_surface_descriptors_are_refreshed_only_on_resize_not_every_frame() 
         pipeline.contains("restir_di.update_surface_descriptors(&device, vpt_surface);")
             || pipeline.contains("restir_di.update_surface_descriptors(&device,vpt_surface);")
     );
-    assert!(app.contains("self.vpt_pipeline.resize("));
+    assert!(runtime.contains("self.vpt_pipeline.resize("));
 }
 
 #[test]
@@ -690,7 +691,7 @@ fn vpt_restir_direct_resolve_tests_visibility_before_applying_selected_weight() 
         vpt.find("restir_di_light_visible_from_hit")
             .expect("VPT ReSTIR resolve should test visibility")
             < vpt
-                .find("sample.radiance = albedo * reservoir.sample_radiance.rgb")
+                .find("sample.radiance = albedo * LIGHTING_INV_PI * reservoir.sample_radiance.rgb")
                 .expect("VPT ReSTIR resolve should assign radiance"),
         "visibility must be tested before applying reservoir.selected_weight"
     );
@@ -888,6 +889,23 @@ fn restir_di_spatial_samples_multiple_neighbor_offsets_instead_of_one_right_neig
     assert!(
         !spatial.contains("uint neighbor_index = index + 1u;"),
         "spatial reuse should not propagate only to the right-hand neighbor"
+    );
+}
+
+#[test]
+fn restir_di_spatial_neighbor_rotation_is_stable_across_stationary_frames() {
+    let spatial = source("assets/shaders/passes/restir_di_spatial.slang");
+    let compact = spatial.split_whitespace().collect::<String>();
+
+    assert!(
+        compact.contains("uintoffset_rotation=hash_u32(index)&7u;"),
+        "spatial reuse tap rotation should be deterministic for a pixel across stationary accumulated VPT frames"
+    );
+    assert!(
+        !compact.contains("offset_rotation=hash_u32(rng_state)&7u")
+            && !compact
+                .contains("offset_rotation=hash_u32(index*1973u^restir.frame_index*9277u)&7u"),
+        "using the display frame index in spatial tap rotation makes ReSTIR-DI neighbors flow during stationary accumulation"
     );
 }
 

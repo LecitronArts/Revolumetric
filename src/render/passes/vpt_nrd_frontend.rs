@@ -7,6 +7,7 @@ use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::passes::vpt::{VptNrdNoisyResources, VptPass};
+use crate::render::passes::vpt_surface::{VptCurrentSurfaceResources, VptSurfacePass};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
@@ -20,23 +21,28 @@ pub struct VptNrdFrontendPass {
     pub packed_spec_radiance_hitdist: GpuImage,
     pub residual_radiance: GpuImage,
     pub material_factors: GpuImage,
+    pub packed_normal_roughness: GpuImage,
 }
 
 pub struct VptNrdFrontendGraphInputs<'a> {
     pub frame_slot: usize,
     pub raw_noisy: VptNrdNoisyResources,
+    pub surface_inputs: VptCurrentSurfaceResources,
     pub profiler: Option<&'a GpuProfiler>,
 }
 
+#[derive(Clone, Copy)]
 pub struct VptNrdFrontendGraphOutputs {
     pub packed: VptNrdPackedResources,
 }
 
+#[derive(Clone, Copy)]
 pub struct VptNrdPackedResources {
     pub diff_radiance_hitdist: ResourceHandle,
     pub spec_radiance_hitdist: ResourceHandle,
     pub residual_radiance: ResourceHandle,
     pub material_factors: ResourceHandle,
+    pub normal_roughness: ResourceHandle,
 }
 
 pub struct VptNrdFrontendPassCreateInfo<'a> {
@@ -45,6 +51,7 @@ pub struct VptNrdFrontendPassCreateInfo<'a> {
     pub spirv_bytes: &'a [u8],
     pub scene_ubo: &'a SceneUniformBuffer,
     pub vpt: &'a VptPass,
+    pub vpt_surface: &'a VptSurfacePass,
 }
 
 pub struct VptNrdFrontendPassResizeInfo<'a> {
@@ -52,10 +59,11 @@ pub struct VptNrdFrontendPassResizeInfo<'a> {
     pub height: u32,
     pub scene_ubo: &'a SceneUniformBuffer,
     pub vpt: &'a VptPass,
+    pub vpt_surface: &'a VptSurfacePass,
 }
 
 impl VptNrdFrontendPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 9] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 13] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -66,6 +74,10 @@ impl VptNrdFrontendPass {
             DescriptorBindingSpec::compute(6, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(7, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(8, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(9, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(10, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(11, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_IMAGE),
         ]
     }
 
@@ -83,7 +95,7 @@ impl VptNrdFrontendPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 8 * frame_count as u32,
+                descriptor_count: 12 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -116,11 +128,13 @@ impl VptNrdFrontendPass {
             &descriptor_sets,
             info.scene_ubo,
             info.vpt,
+            info.vpt_surface,
             &VptNrdFrontendImageRefs {
                 packed_diff_radiance_hitdist: &images.packed_diff_radiance_hitdist,
                 packed_spec_radiance_hitdist: &images.packed_spec_radiance_hitdist,
                 residual_radiance: &images.residual_radiance,
                 material_factors: &images.material_factors,
+                packed_normal_roughness: &images.packed_normal_roughness,
             },
         );
 
@@ -160,6 +174,7 @@ impl VptNrdFrontendPass {
             packed_spec_radiance_hitdist: images.packed_spec_radiance_hitdist,
             residual_radiance: images.residual_radiance,
             material_factors: images.material_factors,
+            packed_normal_roughness: images.packed_normal_roughness,
         })
     }
 
@@ -187,9 +202,13 @@ impl VptNrdFrontendPass {
                 &mut self.material_factors,
                 new_images.material_factors,
             ),
+            packed_normal_roughness: std::mem::replace(
+                &mut self.packed_normal_roughness,
+                new_images.packed_normal_roughness,
+            ),
         };
         old_images.destroy(device, allocator);
-        self.update_input_images(device, info.scene_ubo, info.vpt);
+        self.update_input_images(device, info.scene_ubo, info.vpt, info.vpt_surface);
         Ok(())
     }
 
@@ -198,17 +217,20 @@ impl VptNrdFrontendPass {
         device: &ash::Device,
         scene_ubo: &SceneUniformBuffer,
         vpt: &VptPass,
+        vpt_surface: &VptSurfacePass,
     ) {
         write_descriptor_sets(
             device,
             &self.descriptor_sets,
             scene_ubo,
             vpt,
+            vpt_surface,
             &VptNrdFrontendImageRefs {
                 packed_diff_radiance_hitdist: &self.packed_diff_radiance_hitdist,
                 packed_spec_radiance_hitdist: &self.packed_spec_radiance_hitdist,
                 residual_radiance: &self.residual_radiance,
                 material_factors: &self.material_factors,
+                packed_normal_roughness: &self.packed_normal_roughness,
             },
         );
     }
@@ -238,6 +260,7 @@ impl VptNrdFrontendPass {
         let VptNrdFrontendGraphInputs {
             frame_slot,
             raw_noisy,
+            surface_inputs,
             profiler,
         } = inputs;
         let usage = vk::ImageUsageFlags::STORAGE
@@ -275,6 +298,14 @@ impl VptNrdFrontendPass {
             usage,
             AccessKind::Undefined,
         );
+        let packed_normal_resource = graph.import_image_with_access(
+            self.packed_normal_roughness.handle,
+            self.packed_normal_roughness.extent.width,
+            self.packed_normal_roughness.extent.height,
+            vk::Format::R16G16B16A16_SFLOAT,
+            usage,
+            AccessKind::Undefined,
+        );
 
         let packed_writes = graph.add_pass("vpt_nrd_frontend", QueueType::Compute, |builder| {
             builder.read_as(
@@ -287,10 +318,20 @@ impl VptNrdFrontendPass {
             );
             builder.read_as(raw_noisy.residual_radiance, AccessKind::ComputeShaderRead);
             builder.read_as(raw_noisy.material_factors, AccessKind::ComputeShaderRead);
+            builder.read_as(
+                surface_inputs.normal_roughness,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(
+                surface_inputs.material_roughness,
+                AccessKind::ComputeShaderRead,
+            );
+            builder.read_as(surface_inputs.view_z, AccessKind::ComputeShaderRead);
             builder.write_as(packed_diff_resource, AccessKind::ComputeShaderWrite);
             builder.write_as(packed_spec_resource, AccessKind::ComputeShaderWrite);
             builder.write_as(residual_resource, AccessKind::ComputeShaderWrite);
             builder.write_as(material_resource, AccessKind::ComputeShaderWrite);
+            builder.write_as(packed_normal_resource, AccessKind::ComputeShaderWrite);
             Box::new(move |ctx| {
                 if let Some(profiler) = profiler {
                     profiler.begin_scope(
@@ -318,6 +359,7 @@ impl VptNrdFrontendPass {
                 spec_radiance_hitdist: packed_writes[1],
                 residual_radiance: packed_writes[2],
                 material_factors: packed_writes[3],
+                normal_roughness: packed_writes[4],
             },
         }
     }
@@ -330,6 +372,7 @@ impl VptNrdFrontendPass {
         self.packed_spec_radiance_hitdist.destroy(device, allocator);
         self.residual_radiance.destroy(device, allocator);
         self.material_factors.destroy(device, allocator);
+        self.packed_normal_roughness.destroy(device, allocator);
     }
 }
 
@@ -344,6 +387,7 @@ struct VptNrdFrontendImages {
     packed_spec_radiance_hitdist: GpuImage,
     residual_radiance: GpuImage,
     material_factors: GpuImage,
+    packed_normal_roughness: GpuImage,
 }
 
 struct VptNrdFrontendImageRefs<'a> {
@@ -351,6 +395,7 @@ struct VptNrdFrontendImageRefs<'a> {
     packed_spec_radiance_hitdist: &'a GpuImage,
     residual_radiance: &'a GpuImage,
     material_factors: &'a GpuImage,
+    packed_normal_roughness: &'a GpuImage,
 }
 
 impl VptNrdFrontendImages {
@@ -359,6 +404,7 @@ impl VptNrdFrontendImages {
         self.packed_spec_radiance_hitdist.destroy(device, allocator);
         self.residual_radiance.destroy(device, allocator);
         self.material_factors.destroy(device, allocator);
+        self.packed_normal_roughness.destroy(device, allocator);
     }
 }
 
@@ -417,12 +463,29 @@ fn create_frontend_images(
             return Err(error);
         }
     };
+    let packed_normal_roughness = match create_frontend_image(
+        device,
+        allocator,
+        width,
+        height,
+        "vpt_nrd_packed_normal_roughness",
+    ) {
+        Ok(image) => image,
+        Err(error) => {
+            material_factors.destroy(device, allocator);
+            residual_radiance.destroy(device, allocator);
+            packed_spec_radiance_hitdist.destroy(device, allocator);
+            packed_diff_radiance_hitdist.destroy(device, allocator);
+            return Err(error);
+        }
+    };
 
     Ok(VptNrdFrontendImages {
         packed_diff_radiance_hitdist,
         packed_spec_radiance_hitdist,
         residual_radiance,
         material_factors,
+        packed_normal_roughness,
     })
 }
 
@@ -455,6 +518,7 @@ fn write_descriptor_sets(
     descriptor_sets: &[vk::DescriptorSet],
     scene_ubo: &SceneUniformBuffer,
     vpt: &VptPass,
+    vpt_surface: &VptSurfacePass,
     images: &VptNrdFrontendImageRefs<'_>,
 ) {
     for (set_idx, &ds) in descriptor_sets.iter().enumerate() {
@@ -467,10 +531,14 @@ fn write_descriptor_sets(
             &vpt.nrd_spec_radiance_hitdist,
             &vpt.nrd_residual_radiance,
             &vpt.nrd_material_factors,
+            &vpt_surface.surface_normal_roughness,
+            &vpt_surface.surface_material_roughness,
+            &vpt_surface.surface_view_z,
             images.packed_diff_radiance_hitdist,
             images.packed_spec_radiance_hitdist,
             images.residual_radiance,
             images.material_factors,
+            images.packed_normal_roughness,
         ];
         let image_infos: Vec<_> = image_refs
             .iter()

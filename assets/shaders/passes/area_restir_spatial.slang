@@ -88,7 +88,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     );
 
     uint sample_count = min(area_restir.spatial_sample_count, 8u);
-    uint rotation = rng % 8u;
+    uint rotation = area_restir_spatial_hash(index) % 8u;
     for (uint tap = 0u; tap < sample_count; tap++) {
         uint rotated_tap = (tap + rotation) & 7u;
         int2 offset = neighbor_offsets[rotated_tap] * int(max(area_restir.spatial_radius / 24.0, 1.0));

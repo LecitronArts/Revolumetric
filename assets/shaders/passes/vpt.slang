@@ -124,8 +124,6 @@ struct VptTraceSample {
     float3 radiance;
     float3 direct_radiance;
     float3 indirect_radiance;
-    float3 nrd_diffuse_radiance;
-    float3 nrd_residual_signal;
     float reservoir_weight;
     float first_indirect_hit_distance;
     HitResult first_hit;
@@ -165,13 +163,17 @@ bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 su
 }
 
 float3 analytic_sun_direct(HitResult hit, SceneUniforms scene, inout uint rng_state) {
+    float sun_pdf = sun_direction_pdf(scene);
+    if (sun_pdf <= 0.0) {
+        return float3(0.0);
+    }
     float3 sun_dir = sample_sun_direction(scene, rng_state);
     float sun_term = max(dot(hit.normal, sun_dir), 0.0);
     if (sun_term <= 0.0 || !analytic_sun_visible_from_hit(hit, scene, sun_dir)) {
         return float3(0.0);
     }
     float3 albedo = material_cell_albedo(hit.cell);
-    return albedo * scene.sun_intensity * sun_term * 0.2;
+    return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term / sun_pdf;
 }
 
 VptTraceSample empty_vpt_trace_sample() {
@@ -179,8 +181,6 @@ VptTraceSample empty_vpt_trace_sample() {
     sample.radiance = float3(0.0);
     sample.direct_radiance = float3(0.0);
     sample.indirect_radiance = float3(0.0);
-    sample.nrd_diffuse_radiance = float3(0.0);
-    sample.nrd_residual_signal = float3(0.0);
     sample.reservoir_weight = 0.0;
     sample.first_indirect_hit_distance = VPT_NRD_INVALID_HIT_DISTANCE;
     sample.first_hit = NO_HIT;
@@ -364,12 +364,12 @@ RestirDirectLightSample resolve_restir_di_direct_light(uint2 pixel, HitResult hi
     float3 albedo = material_cell_albedo(hit.cell);
     if (reservoir.sample_flags == 0u) {
         float sun_term = max(dot(hit.normal, scene.sun_direction), 0.0);
-        sample.radiance = albedo * reservoir.sample_radiance.rgb * sun_term * selected_weight * 0.2;
+        sample.radiance = albedo * LIGHTING_INV_PI * reservoir.sample_radiance.rgb * sun_term * selected_weight;
         return sample;
     }
 
     float geometry_term = restir_di_emissive_geometry_term(hit.position, hit.normal, reservoir.sample_position_pdf.xyz);
-    sample.radiance = albedo * reservoir.sample_radiance.rgb * geometry_term * selected_weight;
+    sample.radiance = albedo * LIGHTING_INV_PI * reservoir.sample_radiance.rgb * geometry_term * selected_weight;
     return sample;
 }
 
@@ -400,10 +400,8 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
             sample.radiance += contribution;
             if (bounce == 0u) {
                 sample.direct_radiance += contribution;
-                sample.nrd_residual_signal += contribution;
             } else {
                 sample.indirect_radiance += contribution;
-                sample.nrd_residual_signal += contribution;
             }
             break;
         }
@@ -414,10 +412,8 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
             sample.radiance += contribution;
             if (bounce == 0u) {
                 sample.direct_radiance += contribution;
-                sample.nrd_residual_signal += contribution;
             } else {
                 sample.indirect_radiance += contribution;
-                sample.nrd_diffuse_radiance += contribution;
             }
             break;
         }
@@ -429,17 +425,14 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
             float3 contribution = throughput * direct_radiance;
             sample.radiance += contribution;
             sample.direct_radiance += contribution;
-            sample.nrd_residual_signal += contribution;
             sample.reservoir_weight = direct.selected_weight;
         } else {
             float3 contribution = throughput * analytic_sun_direct(hit, scene, rng_state);
             sample.radiance += contribution;
             if (bounce == 0u) {
                 sample.direct_radiance += contribution;
-                sample.nrd_residual_signal += contribution;
             } else {
                 sample.indirect_radiance += contribution;
-                sample.nrd_diffuse_radiance += contribution;
             }
         }
         throughput *= material_cell_albedo(hit.cell);
@@ -485,20 +478,21 @@ void main(uint3 tid : SV_DispatchThreadID) {
     noisy_radiance_image[tid.xy] = float4(sample_radiance, 1.0);
     noisy_moments_image[tid.xy] = float4(luminance, luminance * luminance, 1.0, 1.0);
 
-    float3 nrd_residual = sample.nrd_residual_signal;
-    float3 nrd_diffuse_indirect = demodulate_by_primary_albedo(sample.nrd_diffuse_radiance, sample.first_hit);
+    float3 nrd_residual = sample.direct_radiance;
+    float3 nrd_diffuse_signal = demodulate_by_primary_albedo(sample.indirect_radiance, sample.first_hit);
     float nrd_diffuse_hitdist = sample.first_indirect_hit_distance;
     if (!sample.first_hit.hit) {
         nrd_residual = sample_radiance;
-        nrd_diffuse_indirect = float3(0.0);
+        nrd_diffuse_signal = float3(0.0);
         nrd_diffuse_hitdist = VPT_NRD_INVALID_HIT_DISTANCE;
     } else if (scene.vpt_debug_view != VPT_DEBUG_VIEW_FINAL) {
         nrd_residual = sample_radiance;
-        nrd_diffuse_indirect = float3(0.0);
+        nrd_diffuse_signal = float3(0.0);
         nrd_diffuse_hitdist = VPT_NRD_INVALID_HIT_DISTANCE;
     }
-    nrd_diff_radiance_hitdist[tid.xy] = float4(nrd_diffuse_indirect, nrd_diffuse_hitdist);
+    nrd_diff_radiance_hitdist[tid.xy] = float4(nrd_diffuse_signal, nrd_diffuse_hitdist);
     nrd_spec_radiance_hitdist[tid.xy] = float4(0.0, 0.0, 0.0, VPT_NRD_INVALID_HIT_DISTANCE);
     nrd_residual_radiance[tid.xy] = float4(nrd_residual, 1.0);
-    nrd_material_factors[tid.xy] = float4(primary_albedo_or_one(sample.first_hit), primary_roughness_or_one(sample.first_hit));
+    float nrd_material_id = sample.first_hit.hit ? float(voxel_material(sample.first_hit.cell)) : 0.0;
+    nrd_material_factors[tid.xy] = float4(primary_albedo_or_one(sample.first_hit), nrd_material_id);
 }

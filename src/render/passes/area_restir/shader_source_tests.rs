@@ -210,7 +210,7 @@ fn area_restir_resize_cleans_up_failed_resource_creation() {
 
 #[test]
 fn app_area_restir_dispatches_only_enabled_reuse_stages() {
-    let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let compact_pipeline = pipeline.split_whitespace().collect::<String>();
     let pass = source("src/render/passes/area_restir.rs");
@@ -250,7 +250,7 @@ fn app_area_restir_dispatches_only_enabled_reuse_stages() {
                 .contains("letspatial_active=temporal_active&&settings.spatial_enabled;"),
         "effective settings must disable spatial reuse until temporal history is usable"
     );
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(
         compact_pipeline.contains("area_restir.register_graph(")
             && compact_pipeline.contains(
@@ -263,7 +263,7 @@ fn app_area_restir_dispatches_only_enabled_reuse_stages() {
 
 #[test]
 fn app_uses_area_restir_selected_frame_ring_for_history_and_vpt_reads() {
-    let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pass = source("src/render/passes/area_restir.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let pass_impl = pass
@@ -291,7 +291,7 @@ fn app_uses_area_restir_selected_frame_ring_for_history_and_vpt_reads() {
     }
     assert!(pipeline.contains("pub area_restir_pass: Option<AreaRestirPass>"));
     assert!(pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();"));
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(
         compact_pipeline.contains(
             "vpt_area_restir_reads=Some((area_graph.uniform_resource,area_graph.selected_current_resource,));"
@@ -723,5 +723,21 @@ fn area_restir_spatial_reuses_neighbors_in_current_pixel_measure() {
     assert!(
         !spatial.contains("area_restir_replay_target_pdf(center, center_reservoir.sample_state"),
         "valid center reservoirs can reuse cached center target luma instead of repeating replay-domain checks"
+    );
+}
+
+#[test]
+fn area_restir_spatial_neighbor_rotation_is_stable_across_stationary_frames() {
+    let spatial = source("assets/shaders/passes/area_restir_spatial.slang");
+    let compact = spatial.split_whitespace().collect::<String>();
+
+    assert!(
+        compact.contains("uintrotation=area_restir_spatial_hash(index)%8u;"),
+        "Area ReSTIR spatial tap rotation should be deterministic for a pixel across stationary accumulated VPT frames"
+    );
+    assert!(
+        !compact.contains("uintrotation=rng%8u")
+            && !compact.contains("uintrotation=area_restir_spatial_hash(index^(area_restir.frame_index*3266489917u))%8u"),
+        "using the display frame index in Area ReSTIR spatial tap rotation makes selected sample areas flow during stationary accumulation"
     );
 }

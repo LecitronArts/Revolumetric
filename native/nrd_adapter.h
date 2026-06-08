@@ -67,6 +67,49 @@ typedef enum RevolumetricNrdDescriptorType {
     REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_STORAGE_TEXTURE = 2,
 } RevolumetricNrdDescriptorType;
 
+typedef enum RevolumetricNrdSamplerMode {
+    REVOLUMETRIC_NRD_SAMPLER_MODE_NEAREST_CLAMP = 0,
+    REVOLUMETRIC_NRD_SAMPLER_MODE_LINEAR_CLAMP = 1,
+    REVOLUMETRIC_NRD_SAMPLER_MODE_UNSUPPORTED = 0xFFFFFFFFu,
+} RevolumetricNrdSamplerMode;
+
+typedef enum RevolumetricNrdAccumulationMode {
+    REVOLUMETRIC_NRD_ACCUMULATION_MODE_CONTINUE = 0,
+    REVOLUMETRIC_NRD_ACCUMULATION_MODE_RESTART = 1,
+    REVOLUMETRIC_NRD_ACCUMULATION_MODE_CLEAR_AND_RESTART = 2,
+    REVOLUMETRIC_NRD_ACCUMULATION_MODE_UNSUPPORTED = 0xFFFFFFFFu,
+} RevolumetricNrdAccumulationMode;
+
+typedef enum RevolumetricNrdCheckerboardMode {
+    REVOLUMETRIC_NRD_CHECKERBOARD_MODE_OFF = 0,
+    REVOLUMETRIC_NRD_CHECKERBOARD_MODE_BLACK = 1,
+    REVOLUMETRIC_NRD_CHECKERBOARD_MODE_WHITE = 2,
+    REVOLUMETRIC_NRD_CHECKERBOARD_MODE_UNSUPPORTED = 0xFFFFFFFFu,
+} RevolumetricNrdCheckerboardMode;
+
+typedef enum RevolumetricNrdNormalEncoding {
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_RGBA8_UNORM = 0,
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_RGBA8_SNORM = 1,
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_R10_G10_B10_A2_UNORM = 2,
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_RGBA16_UNORM = 3,
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_RGBA16_SNORM = 4,
+    REVOLUMETRIC_NRD_NORMAL_ENCODING_MAX_NUM = 5,
+} RevolumetricNrdNormalEncoding;
+
+typedef enum RevolumetricNrdRoughnessEncoding {
+    REVOLUMETRIC_NRD_ROUGHNESS_ENCODING_SQ_LINEAR = 0,
+    REVOLUMETRIC_NRD_ROUGHNESS_ENCODING_LINEAR = 1,
+    REVOLUMETRIC_NRD_ROUGHNESS_ENCODING_SQRT_LINEAR = 2,
+    REVOLUMETRIC_NRD_ROUGHNESS_ENCODING_MAX_NUM = 3,
+} RevolumetricNrdRoughnessEncoding;
+
+typedef enum RevolumetricNrdHitDistanceReconstructionMode {
+    REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_OFF = 0,
+    REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_3X3 = 1,
+    REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_5X5 = 2,
+    REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_UNSUPPORTED = 0xFFFFFFFFu,
+} RevolumetricNrdHitDistanceReconstructionMode;
+
 typedef enum RevolumetricNrdResourceType {
     REVOLUMETRIC_NRD_RESOURCE_TYPE_UNSUPPORTED = 0,
     REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_MV = 1,
@@ -108,6 +151,9 @@ typedef struct NrdLibraryDesc {
     uint32_t samplerOffset;
     uint32_t constantBufferOffset;
     uint32_t storageTextureAndBufferOffset;
+    uint8_t normalEncoding;
+    uint8_t roughnessEncoding;
+    uint16_t reserved0;
 } NrdLibraryDesc;
 
 typedef struct NrdTextureDesc {
@@ -230,7 +276,52 @@ typedef struct NrdRelaxDiffuseSettings {
     uint32_t enableRoughnessEdgeStopping;
 } NrdRelaxDiffuseSettings;
 
+typedef struct NrdReblurHitDistanceParameters {
+    float a;
+    float b;
+    float c;
+} NrdReblurHitDistanceParameters;
+
+typedef struct NrdReblurDiffuseSettings {
+    NrdReblurHitDistanceParameters hitDistanceParameters;
+    float antilagLuminanceSigmaScale;
+    float antilagLuminanceSensitivity;
+    float responsiveAccumulationRoughnessThreshold;
+    uint32_t responsiveAccumulationMinAccumulatedFrameNum;
+    float convergenceS;
+    float convergenceB;
+    float convergenceP;
+    uint32_t maxAccumulatedFrameNum;
+    uint32_t maxFastAccumulatedFrameNum;
+    uint32_t maxStabilizedFrameNum;
+    uint32_t historyFixFrameNum;
+    uint32_t historyFixBasePixelStride;
+    uint32_t historyFixAlternatePixelStride;
+    float fastHistoryClampingSigmaScale;
+    float diffusePrepassBlurRadius;
+    float specularPrepassBlurRadius;
+    float minHitDistanceWeight;
+    float minBlurRadius;
+    float maxBlurRadius;
+    float lobeAngleFraction;
+    float roughnessFraction;
+    float planeDistanceSensitivity;
+    float specularProbabilityThresholdsForMvModification[2];
+    float fireflySuppressorMinRelativeScale;
+    float minMaterialForDiffuse;
+    float minMaterialForSpecular;
+    uint32_t checkerboardMode;
+    uint32_t hitDistanceReconstructionMode;
+    uint32_t enableAntiFirefly;
+    uint32_t usePrepassOnlyForSpecularMotionEstimation;
+    uint32_t returnHistoryLengthInsteadOfOcclusion;
+} NrdReblurDiffuseSettings;
+
 RevolumetricNrdStatus revolumetric_nrd_create_relax_diffuse(
+    uint32_t width,
+    uint32_t height,
+    RevolumetricNrdInstance** out_instance);
+RevolumetricNrdStatus revolumetric_nrd_create_reblur_diffuse(
     uint32_t width,
     uint32_t height,
     RevolumetricNrdInstance** out_instance);
@@ -245,6 +336,9 @@ RevolumetricNrdStatus revolumetric_nrd_set_common_settings(
 RevolumetricNrdStatus revolumetric_nrd_set_relax_diffuse_settings(
     RevolumetricNrdInstance* instance,
     const NrdRelaxDiffuseSettings* settings);
+RevolumetricNrdStatus revolumetric_nrd_set_reblur_diffuse_settings(
+    RevolumetricNrdInstance* instance,
+    const NrdReblurDiffuseSettings* settings);
 RevolumetricNrdStatus revolumetric_nrd_get_dispatches(
     RevolumetricNrdInstance* instance,
     const NrdDispatchDesc** out_dispatches,

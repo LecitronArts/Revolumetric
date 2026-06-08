@@ -15,6 +15,11 @@ pub const LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE: u32 = 1;
 pub const LIGHTING_DEBUG_VIEW_NORMAL: u32 = 2;
 pub const RENDER_MODE_VPT: u32 = 1;
 pub const DENOISER_FLAG_ENABLED: u32 = 1 << 0;
+pub const DENOISER_MODE_SHIFT: u32 = 28;
+pub const DENOISER_MODE_MASK: u32 = 0x3 << DENOISER_MODE_SHIFT;
+pub const DENOISER_MODE_SVGF: u32 = 0 << DENOISER_MODE_SHIFT;
+pub const DENOISER_MODE_RELAX: u32 = 1 << DENOISER_MODE_SHIFT;
+pub const DENOISER_MODE_REBLUR: u32 = 2 << DENOISER_MODE_SHIFT;
 pub const VPT_DEBUG_VIEW_FINAL: u32 = 0;
 pub const VPT_DEBUG_VIEW_RAW: u32 = 1;
 pub const VPT_DEBUG_VIEW_TEMPORAL: u32 = 2;
@@ -39,6 +44,7 @@ pub const VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS: u32 = 20;
 pub const VPT_DEBUG_VIEW_NRD_VIEWZ: u32 = 21;
 pub const VPT_DEBUG_VIEW_NRD_MOTION: u32 = 22;
 pub const VPT_DEBUG_VIEW_NRD_MOTION_Z: u32 = 23;
+pub const VPT_DEBUG_VIEW_NRD_VALIDATION: u32 = 24;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LightingDebugView {
@@ -78,6 +84,7 @@ pub enum VptDebugView {
     NrdViewZ,
     NrdMotion,
     NrdMotionZ,
+    NrdValidation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +140,7 @@ impl VptDebugView {
             Self::NrdViewZ => VPT_DEBUG_VIEW_NRD_VIEWZ,
             Self::NrdMotion => VPT_DEBUG_VIEW_NRD_MOTION,
             Self::NrdMotionZ => VPT_DEBUG_VIEW_NRD_MOTION_Z,
+            Self::NrdValidation => VPT_DEBUG_VIEW_NRD_VALIDATION,
         }
     }
 }
@@ -357,7 +365,7 @@ impl LightingSettings {
             &mut settings.vpt_debug_view,
             vpt_debug_view,
             "REVOLUMETRIC_VPT_DEBUG_VIEW",
-            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z",
+            "final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z|nrd_validation",
             parse_vpt_debug_view,
             &mut warnings,
         );
@@ -365,7 +373,7 @@ impl LightingSettings {
             &mut settings.sun_angular_radius,
             sun_angular_radius,
             "REVOLUMETRIC_SUN_ANGULAR_RADIUS",
-            "finite float in 0.0..=0.25 radians",
+            "finite positive float in (0.0, 0.25] radians",
             parse_sun_angular_radius,
             &mut warnings,
         );
@@ -387,12 +395,7 @@ impl LightingSettings {
     }
 
     pub fn effective_denoiser_mode(self) -> VptDenoiserMode {
-        match self.denoiser_mode {
-            VptDenoiserMode::Off => VptDenoiserMode::Off,
-            VptDenoiserMode::Svgf | VptDenoiserMode::Relax | VptDenoiserMode::Reblur => {
-                VptDenoiserMode::Svgf
-            }
-        }
+        self.denoiser_mode
     }
 
     pub fn denoiser_enabled(self) -> bool {
@@ -408,10 +411,11 @@ impl LightingSettings {
     }
 
     pub fn denoiser_flags(self) -> u32 {
-        if self.denoiser_enabled() {
-            DENOISER_FLAG_ENABLED
-        } else {
-            0
+        match self.effective_denoiser_mode() {
+            VptDenoiserMode::Off => 0,
+            VptDenoiserMode::Svgf => DENOISER_FLAG_ENABLED | DENOISER_MODE_SVGF,
+            VptDenoiserMode::Relax => DENOISER_FLAG_ENABLED | DENOISER_MODE_RELAX,
+            VptDenoiserMode::Reblur => DENOISER_FLAG_ENABLED | DENOISER_MODE_REBLUR,
         }
     }
 }
@@ -512,6 +516,8 @@ fn parse_vpt_debug_view(value: &str) -> Option<VptDebugView> {
         Some(VptDebugView::NrdMotion)
     } else if value.eq_ignore_ascii_case("nrd_motion_z") {
         Some(VptDebugView::NrdMotionZ)
+    } else if value.eq_ignore_ascii_case("nrd_validation") {
+        Some(VptDebugView::NrdValidation)
     } else {
         None
     }
@@ -538,7 +544,7 @@ fn parse_vpt_max_bounces(value: &str) -> Option<u32> {
 
 fn parse_sun_angular_radius(value: &str) -> Option<f32> {
     let parsed = value.trim().parse::<f32>().ok()?;
-    (parsed.is_finite() && (0.0..=0.25).contains(&parsed)).then_some(parsed)
+    (parsed.is_finite() && parsed > 0.0 && parsed <= 0.25).then_some(parsed)
 }
 
 fn parse_exposure(value: &str) -> Option<f32> {
@@ -578,7 +584,7 @@ pub struct GpuSceneUniforms {
     pub _pad0: [u32; 2],             // 8B
     pub sun_direction: [f32; 3],     // 12B — normalized, world space, points TOWARD sun
     pub sun_angular_radius: f32,     // 4B
-    pub sun_intensity: [f32; 3],     // 12B — HDR color * intensity
+    pub sun_intensity: [f32; 3],     // 12B - solar-disk radiance for VPT finite sun estimator
     pub _pad2: f32,                  // 4B
     pub sky_color: [f32; 3],         // 12B — hemisphere ambient upper
     pub _pad3: f32,                  // 4B
@@ -1024,36 +1030,44 @@ mod tests {
     }
 
     #[test]
-    fn nrd_requested_modes_fall_back_to_svgf_until_backend_exists() {
-        for requested in [VptDenoiserMode::Relax, VptDenoiserMode::Reblur] {
+    fn requested_nrd_modes_remain_effective_when_backend_exists() {
+        for requested in [
+            VptDenoiserMode::Svgf,
+            VptDenoiserMode::Relax,
+            VptDenoiserMode::Reblur,
+        ] {
             let settings = LightingSettings {
                 denoiser_mode: requested,
                 ..LightingSettings::default()
             };
 
-            assert_eq!(settings.effective_denoiser_mode(), VptDenoiserMode::Svgf);
+            assert_eq!(settings.effective_denoiser_mode(), requested);
             assert!(settings.denoiser_enabled());
-            assert_eq!(settings.denoiser_flags(), DENOISER_FLAG_ENABLED);
         }
     }
 
     #[test]
-    fn denoiser_flags_follow_effective_mode_without_growing_scene_ubo() {
-        let off = LightingSettings {
-            denoiser_mode: VptDenoiserMode::Off,
-            ..LightingSettings::default()
-        };
-        let svgf = LightingSettings {
-            denoiser_mode: VptDenoiserMode::Svgf,
-            ..LightingSettings::default()
-        };
+    fn denoiser_flags_encode_requested_mode_without_growing_scene_ubo() {
+        let cases = [
+            (VptDenoiserMode::Off, 0),
+            (VptDenoiserMode::Svgf, DENOISER_FLAG_ENABLED),
+            (VptDenoiserMode::Relax, DENOISER_FLAG_ENABLED | (1 << 28)),
+            (VptDenoiserMode::Reblur, DENOISER_FLAG_ENABLED | (2 << 28)),
+        ];
 
         assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 224);
-        assert_eq!(off.denoiser_flags() & DENOISER_FLAG_ENABLED, 0);
-        assert_eq!(
-            svgf.denoiser_flags() & DENOISER_FLAG_ENABLED,
-            DENOISER_FLAG_ENABLED
-        );
+        for (denoiser_mode, expected_flags) in cases {
+            let settings = LightingSettings {
+                denoiser_mode,
+                ..LightingSettings::default()
+            };
+
+            assert_eq!(settings.denoiser_flags(), expected_flags);
+            assert_eq!(
+                settings.denoiser_flags() & (0x3 << 28),
+                expected_flags & (0x3 << 28)
+            );
+        }
     }
 
     #[test]
@@ -1220,6 +1234,7 @@ mod tests {
             ("nrd_viewz", 21),
             ("nrd_motion", 22),
             ("nrd_motion_z", 23),
+            ("nrd_validation", 24),
         ];
 
         for (raw, expected_gpu_value) in cases {
@@ -1284,25 +1299,28 @@ mod tests {
 
     #[test]
     fn lighting_settings_warn_invalid_sun_angular_radius() {
-        let result = LightingSettings::from_values_report_with_denoiser(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("0.5"),
-        );
+        for invalid in ["0", "-0.01", "0.5"] {
+            let result = LightingSettings::from_values_report_with_denoiser(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(invalid),
+            );
 
-        assert_eq!(result.settings.sun_angular_radius, 0.02);
-        assert!(
-            result
-                .warnings
-                .iter()
-                .any(|warning| warning.variable == "REVOLUMETRIC_SUN_ANGULAR_RADIUS")
-        );
+            assert_eq!(result.settings.sun_angular_radius, 0.02);
+            assert!(
+                result.warnings.iter().any(|warning| {
+                    warning.variable == "REVOLUMETRIC_SUN_ANGULAR_RADIUS"
+                        && warning.expected == "finite positive float in (0.0, 0.25] radians"
+                }),
+                "invalid sun angular radius {invalid} should report the strict finite-disk range"
+            );
+        }
     }
 }

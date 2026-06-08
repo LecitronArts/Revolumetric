@@ -36,6 +36,65 @@ static uint32_t to_descriptor_type(nrd::DescriptorType value) {
     }
 }
 
+static uint32_t to_sampler_mode(nrd::Sampler value) {
+    switch (value) {
+        case nrd::Sampler::NEAREST_CLAMP:
+            return REVOLUMETRIC_NRD_SAMPLER_MODE_NEAREST_CLAMP;
+        case nrd::Sampler::LINEAR_CLAMP:
+            return REVOLUMETRIC_NRD_SAMPLER_MODE_LINEAR_CLAMP;
+        default:
+            return REVOLUMETRIC_NRD_SAMPLER_MODE_UNSUPPORTED;
+    }
+}
+
+static bool to_accumulation_mode(uint32_t value, nrd::AccumulationMode& out) {
+    switch (value) {
+        case REVOLUMETRIC_NRD_ACCUMULATION_MODE_CONTINUE:
+            out = nrd::AccumulationMode::CONTINUE;
+            return true;
+        case REVOLUMETRIC_NRD_ACCUMULATION_MODE_RESTART:
+            out = nrd::AccumulationMode::RESTART;
+            return true;
+        case REVOLUMETRIC_NRD_ACCUMULATION_MODE_CLEAR_AND_RESTART:
+            out = nrd::AccumulationMode::CLEAR_AND_RESTART;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool to_checkerboard_mode(uint32_t value, nrd::CheckerboardMode& out) {
+    switch (value) {
+        case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_OFF:
+            out = nrd::CheckerboardMode::OFF;
+            return true;
+        case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_BLACK:
+            out = nrd::CheckerboardMode::BLACK;
+            return true;
+        case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_WHITE:
+            out = nrd::CheckerboardMode::WHITE;
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool to_hit_distance_reconstruction_mode(uint32_t value, nrd::HitDistanceReconstructionMode& out) {
+    switch (value) {
+        case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_OFF:
+            out = nrd::HitDistanceReconstructionMode::OFF;
+            return true;
+        case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_3X3:
+            out = nrd::HitDistanceReconstructionMode::AREA_3X3;
+            return true;
+        case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_5X5:
+            out = nrd::HitDistanceReconstructionMode::AREA_5X5;
+            return true;
+        default:
+            return false;
+    }
+}
+
 static uint32_t to_resource_type(nrd::ResourceType value) {
     switch (value) {
         case nrd::ResourceType::IN_MV:
@@ -202,9 +261,14 @@ static void copy_matrix(float* dst, const float* src) {
     std::memcpy(dst, src, sizeof(float) * 16);
 }
 
-static void copy_common_settings(
+static RevolumetricNrdStatus copy_common_settings(
     nrd::CommonSettings& dst,
     const NrdCommonSettings& src) {
+    nrd::AccumulationMode accumulationMode = {};
+    if (!to_accumulation_mode(src.accumulationMode, accumulationMode)) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+
     copy_matrix(dst.viewToClipMatrix, src.viewToClipMatrix);
     copy_matrix(dst.viewToClipMatrixPrev, src.viewToClipMatrixPrev);
     copy_matrix(dst.worldToViewMatrix, src.worldToViewMatrix);
@@ -223,17 +287,29 @@ static void copy_common_settings(
     dst.timeDeltaBetweenFrames = src.timeDeltaBetweenFrames;
     dst.viewZScale = src.viewZScale;
     dst.frameIndex = src.frameIndex;
-    dst.accumulationMode = static_cast<nrd::AccumulationMode>(src.accumulationMode);
+    dst.accumulationMode = accumulationMode;
     dst.isMotionVectorInWorldSpace = src.isMotionVectorInWorldSpace != 0;
     dst.isHistoryConfidenceAvailable = src.isHistoryConfidenceAvailable != 0;
     dst.isDisocclusionThresholdMixAvailable =
         src.isDisocclusionThresholdMixAvailable != 0;
     dst.enableValidation = src.enableValidation != 0;
+    return REVOLUMETRIC_NRD_STATUS_OK;
 }
 
-static void copy_relax_diffuse_settings(
+static RevolumetricNrdStatus copy_relax_diffuse_settings(
     nrd::RelaxSettings& dst,
     const NrdRelaxDiffuseSettings& src) {
+    nrd::CheckerboardMode checkerboardMode = {};
+    if (!to_checkerboard_mode(src.checkerboardMode, checkerboardMode)) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+    nrd::HitDistanceReconstructionMode hitDistanceReconstructionMode = {};
+    if (!to_hit_distance_reconstruction_mode(
+            src.hitDistanceReconstructionMode,
+            hitDistanceReconstructionMode)) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+
     dst.antilagSettings.accelerationAmount = src.antilagAccelerationAmount;
     dst.antilagSettings.spatialSigmaScale = src.antilagSpatialSigmaScale;
     dst.antilagSettings.temporalSigmaScale = src.antilagTemporalSigmaScale;
@@ -271,15 +347,78 @@ static void copy_relax_diffuse_settings(
     dst.luminanceEdgeStoppingRelaxation = src.luminanceEdgeStoppingRelaxation;
     dst.normalEdgeStoppingRelaxation = src.normalEdgeStoppingRelaxation;
     dst.roughnessEdgeStoppingRelaxation = src.roughnessEdgeStoppingRelaxation;
-    dst.checkerboardMode =
-        static_cast<nrd::CheckerboardMode>(src.checkerboardMode);
-    dst.hitDistanceReconstructionMode =
-        static_cast<nrd::HitDistanceReconstructionMode>(
-            src.hitDistanceReconstructionMode);
+    dst.checkerboardMode = checkerboardMode;
+    dst.hitDistanceReconstructionMode = hitDistanceReconstructionMode;
     dst.minMaterialForDiffuse = src.minMaterialForDiffuse;
     dst.minMaterialForSpecular = 0;
     dst.enableAntiFirefly = src.enableAntiFirefly != 0;
     dst.enableRoughnessEdgeStopping = src.enableRoughnessEdgeStopping != 0;
+    return REVOLUMETRIC_NRD_STATUS_OK;
+}
+
+static void copy_hit_distance_parameters(
+    nrd::ReblurHitDistanceParameters& dst,
+    const NrdReblurHitDistanceParameters& src) {
+    static_assert(
+        sizeof(nrd::ReblurHitDistanceParameters) == sizeof(NrdReblurHitDistanceParameters),
+        "NrdReblurHitDistanceParameters must match nrd::ReblurHitDistanceParameters layout");
+    std::memcpy(&dst, &src, sizeof(dst));
+}
+
+static RevolumetricNrdStatus copy_reblur_diffuse_settings(
+    nrd::ReblurSettings& dst,
+    const NrdReblurDiffuseSettings& src) {
+    nrd::CheckerboardMode checkerboardMode = {};
+    if (!to_checkerboard_mode(src.checkerboardMode, checkerboardMode)) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+    nrd::HitDistanceReconstructionMode hitDistanceReconstructionMode = {};
+    if (!to_hit_distance_reconstruction_mode(
+            src.hitDistanceReconstructionMode,
+            hitDistanceReconstructionMode)) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+
+    copy_hit_distance_parameters(dst.hitDistanceParameters, src.hitDistanceParameters);
+    dst.antilagSettings.luminanceSigmaScale = src.antilagLuminanceSigmaScale;
+    dst.antilagSettings.luminanceSensitivity = src.antilagLuminanceSensitivity;
+    dst.responsiveAccumulationSettings.roughnessThreshold =
+        src.responsiveAccumulationRoughnessThreshold;
+    dst.responsiveAccumulationSettings.minAccumulatedFrameNum =
+        src.responsiveAccumulationMinAccumulatedFrameNum;
+    dst.convergenceSettings.s = src.convergenceS;
+    dst.convergenceSettings.b = src.convergenceB;
+    dst.convergenceSettings.p = src.convergenceP;
+    dst.maxAccumulatedFrameNum = src.maxAccumulatedFrameNum;
+    dst.maxFastAccumulatedFrameNum = src.maxFastAccumulatedFrameNum;
+    dst.maxStabilizedFrameNum = src.maxStabilizedFrameNum;
+    dst.historyFixFrameNum = src.historyFixFrameNum;
+    dst.historyFixBasePixelStride = src.historyFixBasePixelStride;
+    dst.historyFixAlternatePixelStride = src.historyFixAlternatePixelStride;
+    dst.fastHistoryClampingSigmaScale = src.fastHistoryClampingSigmaScale;
+    dst.diffusePrepassBlurRadius = src.diffusePrepassBlurRadius;
+    dst.specularPrepassBlurRadius = src.specularPrepassBlurRadius;
+    dst.minHitDistanceWeight = src.minHitDistanceWeight;
+    dst.minBlurRadius = src.minBlurRadius;
+    dst.maxBlurRadius = src.maxBlurRadius;
+    dst.lobeAngleFraction = src.lobeAngleFraction;
+    dst.roughnessFraction = src.roughnessFraction;
+    dst.planeDistanceSensitivity = src.planeDistanceSensitivity;
+    dst.specularProbabilityThresholdsForMvModification[0] =
+        src.specularProbabilityThresholdsForMvModification[0];
+    dst.specularProbabilityThresholdsForMvModification[1] =
+        src.specularProbabilityThresholdsForMvModification[1];
+    dst.fireflySuppressorMinRelativeScale = src.fireflySuppressorMinRelativeScale;
+    dst.minMaterialForDiffuse = src.minMaterialForDiffuse;
+    dst.minMaterialForSpecular = src.minMaterialForSpecular;
+    dst.checkerboardMode = checkerboardMode;
+    dst.hitDistanceReconstructionMode = hitDistanceReconstructionMode;
+    dst.enableAntiFirefly = src.enableAntiFirefly != 0;
+    dst.usePrepassOnlyForSpecularMotionEstimation =
+        src.usePrepassOnlyForSpecularMotionEstimation != 0;
+    dst.returnHistoryLengthInsteadOfOcclusion =
+        src.returnHistoryLengthInsteadOfOcclusion != 0;
+    return REVOLUMETRIC_NRD_STATUS_OK;
 }
 
 static void cache_instance_desc(RevolumetricNrdInstance& out) {
@@ -300,7 +439,7 @@ static void cache_instance_desc(RevolumetricNrdInstance& out) {
     out.transientPool.reserve(desc.transientPoolSize);
     out.samplers.reserve(desc.samplersNum);
     for (uint32_t i = 0; i < desc.samplersNum; ++i) {
-        out.samplers.push_back({static_cast<uint32_t>(desc.samplers[i])});
+        out.samplers.push_back({to_sampler_mode(desc.samplers[i])});
     }
 
     for (uint32_t i = 0; i < desc.permanentPoolSize; ++i) {
@@ -368,6 +507,32 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_create_relax_diffuse(
     return REVOLUMETRIC_NRD_STATUS_OK;
 }
 
+extern "C" RevolumetricNrdStatus revolumetric_nrd_create_reblur_diffuse(
+    uint32_t width,
+    uint32_t height,
+    RevolumetricNrdInstance** out_instance) {
+    if (out_instance == nullptr || width == 0 || height == 0) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+    *out_instance = nullptr;
+
+    nrd::DenoiserDesc denoiser = {};
+    denoiser.identifier = 0;
+    denoiser.denoiser = nrd::Denoiser::REBLUR_DIFFUSE;
+    nrd::InstanceCreationDesc create_desc = {};
+    create_desc.denoisers = &denoiser;
+    create_desc.denoisersNum = 1;
+    std::unique_ptr<RevolumetricNrdInstance> instance(
+        new RevolumetricNrdInstance());
+    const nrd::Result result = nrd::CreateInstance(create_desc, instance->instance);
+    if (result != nrd::Result::SUCCESS) {
+        return from_result(result);
+    }
+    cache_instance_desc(*instance);
+    *out_instance = instance.release();
+    return REVOLUMETRIC_NRD_STATUS_OK;
+}
+
 extern "C" void revolumetric_nrd_destroy(RevolumetricNrdInstance* instance) {
     if (instance == nullptr) {
         return;
@@ -390,6 +555,9 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_get_library_desc(
         desc.spirvBindingOffsets.constantBufferOffset;
     out_desc->storageTextureAndBufferOffset =
         desc.spirvBindingOffsets.storageTextureAndBufferOffset;
+    out_desc->normalEncoding = static_cast<uint8_t>(desc.normalEncoding);
+    out_desc->roughnessEncoding = static_cast<uint8_t>(desc.roughnessEncoding);
+    out_desc->reserved0 = 0;
     return REVOLUMETRIC_NRD_STATUS_OK;
 }
 
@@ -427,7 +595,11 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_set_common_settings(
         return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
     }
     nrd::CommonSettings native = {};
-    copy_common_settings(native, *settings);
+    const RevolumetricNrdStatus copy_status =
+        copy_common_settings(native, *settings);
+    if (copy_status != REVOLUMETRIC_NRD_STATUS_OK) {
+        return copy_status;
+    }
     return from_result(nrd::SetCommonSettings(*instance->instance, native));
 }
 
@@ -438,7 +610,26 @@ extern "C" RevolumetricNrdStatus revolumetric_nrd_set_relax_diffuse_settings(
         return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
     }
     nrd::RelaxSettings native = {};
-    copy_relax_diffuse_settings(native, *settings);
+    const RevolumetricNrdStatus copy_status =
+        copy_relax_diffuse_settings(native, *settings);
+    if (copy_status != REVOLUMETRIC_NRD_STATUS_OK) {
+        return copy_status;
+    }
+    return from_result(nrd::SetDenoiserSettings(*instance->instance, 0, &native));
+}
+
+extern "C" RevolumetricNrdStatus revolumetric_nrd_set_reblur_diffuse_settings(
+    RevolumetricNrdInstance* instance,
+    const NrdReblurDiffuseSettings* settings) {
+    if (instance == nullptr || instance->instance == nullptr || settings == nullptr) {
+        return REVOLUMETRIC_NRD_STATUS_INVALID_ARGUMENT;
+    }
+    nrd::ReblurSettings native = {};
+    const RevolumetricNrdStatus copy_status =
+        copy_reblur_diffuse_settings(native, *settings);
+    if (copy_status != REVOLUMETRIC_NRD_STATUS_OK) {
+        return copy_status;
+    }
     return from_result(nrd::SetDenoiserSettings(*instance->instance, 0, &native));
 }
 

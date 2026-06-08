@@ -6,6 +6,8 @@ use crate::render::area_restir::AreaRestirSettings;
 use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
 use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
 use crate::render::device::RenderDevice;
+#[cfg(not(target_os = "android"))]
+use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::frame::FrameContext;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
@@ -19,7 +21,8 @@ use crate::render::passes::vpt_atrous::{
 };
 use crate::render::passes::vpt_nrd_adapter::{
     VptNrdAdapterGraphInputs, VptNrdAdapterPass, VptNrdAdapterPassCreateInfo,
-    VptNrdAdapterPassImageRefs, VptNrdAdapterPassResizeInfo,
+    VptNrdAdapterPassImageRefs, VptNrdAdapterPassResizeInfo, VptNrdFrameSettings,
+    VptNrdFrameSettingsInputs,
 };
 use crate::render::passes::vpt_nrd_confidence::{
     VptNrdConfidenceGraphInputs, VptNrdConfidencePass, VptNrdConfidencePassCreateInfo,
@@ -28,6 +31,10 @@ use crate::render::passes::vpt_nrd_confidence::{
 use crate::render::passes::vpt_nrd_frontend::{
     VptNrdFrontendGraphInputs, VptNrdFrontendPass, VptNrdFrontendPassCreateInfo,
     VptNrdFrontendPassResizeInfo,
+};
+use crate::render::passes::vpt_nrd_resolve::{
+    VptNrdResolveGraphInputs, VptNrdResolvePass, VptNrdResolvePassCreateInfo,
+    VptNrdResolvePassResizeInfo,
 };
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::{
@@ -107,10 +114,14 @@ pub struct VptPipelineFrameState {
     pub vpt_accumulation_needs_init: bool,
     pub vpt_temporal_history_initialized: bool,
     pub postprocess_output_initialized: bool,
+    pub vpt_nrd_texture_pools_initialized: bool,
     pub area_restir_history_initialized: bool,
     pub restir_di_history_initialized: bool,
     pub previous_vpt_view_proj: Option<glam::Mat4>,
     pub previous_vpt_resolution: Option<[u32; 2]>,
+    pub previous_nrd_world_to_view: Option<glam::Mat4>,
+    pub previous_nrd_view_to_clip: Option<glam::Mat4>,
+    pub previous_nrd_elapsed_seconds: Option<f32>,
 }
 
 impl Default for VptPipelineFrameState {
@@ -123,10 +134,14 @@ impl Default for VptPipelineFrameState {
             vpt_accumulation_needs_init: true,
             vpt_temporal_history_initialized: false,
             postprocess_output_initialized: false,
+            vpt_nrd_texture_pools_initialized: false,
             area_restir_history_initialized: false,
             restir_di_history_initialized: false,
             previous_vpt_view_proj: None,
             previous_vpt_resolution: None,
+            previous_nrd_world_to_view: None,
+            previous_nrd_view_to_clip: None,
+            previous_nrd_elapsed_seconds: None,
         }
     }
 }
@@ -139,10 +154,14 @@ impl VptPipelineFrameState {
         self.vpt_accumulation_needs_init = true;
         self.vpt_temporal_history_initialized = false;
         self.postprocess_output_initialized = false;
+        self.vpt_nrd_texture_pools_initialized = false;
         self.area_restir_history_initialized = false;
         self.restir_di_history_initialized = false;
         self.previous_vpt_view_proj = None;
         self.previous_vpt_resolution = None;
+        self.previous_nrd_world_to_view = None;
+        self.previous_nrd_view_to_clip = None;
+        self.previous_nrd_elapsed_seconds = None;
     }
 
     pub fn reset_for_scene_change(&mut self) {
@@ -153,9 +172,35 @@ impl VptPipelineFrameState {
         self.vpt_accumulation_needs_init = true;
         self.vpt_temporal_history_initialized = false;
         self.postprocess_output_initialized = false;
+        self.vpt_nrd_texture_pools_initialized = false;
         self.area_restir_history_initialized = false;
         self.restir_di_history_initialized = false;
     }
+}
+
+fn compute_nrd_world_to_view(
+    camera_pos: glam::Vec3,
+    camera_forward: glam::Vec3,
+    camera_up: glam::Vec3,
+) -> glam::Mat4 {
+    let forward = camera_forward.normalize();
+    let right = camera_up.cross(forward).normalize();
+    let up = forward.cross(right);
+    glam::Mat4::from_cols(
+        glam::Vec4::new(right.x, up.x, -forward.x, 0.0),
+        glam::Vec4::new(right.y, up.y, -forward.y, 0.0),
+        glam::Vec4::new(right.z, up.z, -forward.z, 0.0),
+        glam::Vec4::new(
+            -right.dot(camera_pos),
+            -up.dot(camera_pos),
+            forward.dot(camera_pos),
+            1.0,
+        ),
+    )
+}
+
+fn compute_nrd_view_to_clip(fov_y: f32, width: u32, height: u32) -> glam::Mat4 {
+    glam::Mat4::perspective_rh(fov_y, width as f32 / height.max(1) as f32, 0.01, 10_000.0)
 }
 
 pub struct VptRuntimePipeline {
@@ -165,6 +210,7 @@ pub struct VptRuntimePipeline {
     pub vpt_pass: Option<VptPass>,
     pub vpt_nrd_frontend_pass: Option<VptNrdFrontendPass>,
     pub vpt_nrd_adapter_pass: Option<VptNrdAdapterPass>,
+    pub vpt_nrd_resolve_pass: Option<VptNrdResolvePass>,
     pub vpt_temporal_pass: Option<VptTemporalPass>,
     pub vpt_atrous_pass: Option<VptAtrousPass>,
     pub area_restir_pass: Option<AreaRestirPass>,
@@ -212,6 +258,7 @@ impl VptRuntimePipeline {
             vpt_pass: None,
             vpt_nrd_frontend_pass: None,
             vpt_nrd_adapter_pass: None,
+            vpt_nrd_resolve_pass: None,
             vpt_temporal_pass: None,
             vpt_atrous_pass: None,
             area_restir_pass: None,
@@ -220,12 +267,14 @@ impl VptRuntimePipeline {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_passes(
         &mut self,
         renderer: &RenderDevice,
         scene_ubo: &SceneUniformBuffer,
         ucvh: Option<&Ucvh>,
         ucvh_gpu: Option<&UcvhGpuResources>,
+        lighting_settings: LightingSettings,
         restir_di_enabled: bool,
         area_restir_enabled: bool,
     ) {
@@ -233,7 +282,8 @@ impl VptRuntimePipeline {
         self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_nrd_frontend_pass(renderer, scene_ubo);
-        self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo);
+        self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo, lighting_settings);
+        self.ensure_vpt_nrd_resolve_pass(renderer, scene_ubo);
         self.ensure_restir_di_pass(renderer, scene_ubo, ucvh, restir_di_enabled);
         self.ensure_area_restir_pass(renderer, scene_ubo, ucvh_gpu, area_restir_enabled);
         self.ensure_vpt_temporal_pass(renderer, scene_ubo);
@@ -383,6 +433,9 @@ impl VptRuntimePipeline {
         let Some(vpt) = &self.vpt_pass else {
             return;
         };
+        let Some(vpt_surface) = &self.vpt_surface_pass else {
+            return;
+        };
 
         let extent = renderer.swapchain_extent();
         let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vpt_nrd_frontend.spv"));
@@ -400,6 +453,7 @@ impl VptRuntimePipeline {
                 spirv_bytes: spirv,
                 scene_ubo,
                 vpt,
+                vpt_surface,
             },
         ) {
             Ok(pass) => {
@@ -420,9 +474,24 @@ impl VptRuntimePipeline {
         &mut self,
         renderer: &RenderDevice,
         scene_ubo: &SceneUniformBuffer,
+        lighting_settings: LightingSettings,
     ) {
-        if self.vpt_nrd_adapter_pass.is_some() {
+        if !matches!(
+            lighting_settings.denoiser_mode,
+            VptDenoiserMode::Relax | VptDenoiserMode::Reblur
+        ) {
+            if let Some(pass) = self.vpt_nrd_adapter_pass.take() {
+                pass.destroy(renderer.device(), renderer.allocator());
+            }
             return;
+        }
+        if let Some(pass) = self.vpt_nrd_adapter_pass.as_ref() {
+            if pass.denoiser_mode() == lighting_settings.denoiser_mode {
+                return;
+            }
+        }
+        if let Some(pass) = self.vpt_nrd_adapter_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
         }
         if self.vpt_surface_pass.is_none()
             || self.vpt_nrd_confidence_pass.is_none()
@@ -445,6 +514,12 @@ impl VptRuntimePipeline {
             VptNrdAdapterPassCreateInfo {
                 width: extent.width,
                 height: extent.height,
+                denoiser_mode: lighting_settings.denoiser_mode,
+                relax_atrous_iteration_num: lighting_settings.denoiser_atrous_iterations,
+                constant_buffer_alignment: renderer
+                    .physical_device_properties()
+                    .limits
+                    .min_uniform_buffer_offset_alignment,
                 scene_ubo,
                 image_refs: VptNrdAdapterPassImageRefs {
                     frontend: vpt_nrd_frontend,
@@ -463,6 +538,54 @@ impl VptRuntimePipeline {
             }
             Err(error) => {
                 tracing::error!(%error, "failed to create VPT NRD adapter pass");
+            }
+        }
+    }
+
+    fn ensure_vpt_nrd_resolve_pass(
+        &mut self,
+        renderer: &RenderDevice,
+        scene_ubo: &SceneUniformBuffer,
+    ) {
+        if self.vpt_nrd_resolve_pass.is_some() {
+            return;
+        }
+        let (Some(vpt_nrd_adapter), Some(vpt_nrd_frontend)) = (
+            self.vpt_nrd_adapter_pass.as_ref(),
+            self.vpt_nrd_frontend_pass.as_ref(),
+        ) else {
+            return;
+        };
+
+        let extent = renderer.swapchain_extent();
+        let spirv = include_bytes!(concat!(env!("OUT_DIR"), "/shaders/vpt_nrd_resolve.spv"));
+        if spirv.is_empty() {
+            tracing::warn!("vpt_nrd_resolve.spv is empty; slangc may not be installed");
+            return;
+        }
+
+        match VptNrdResolvePass::new(
+            renderer.device(),
+            renderer.allocator(),
+            VptNrdResolvePassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                spirv_bytes: spirv,
+                scene_ubo,
+                denoised_diff_radiance_hitdist: &vpt_nrd_adapter.nrd_diff_radiance_hitdist,
+                frontend: vpt_nrd_frontend,
+            },
+        ) {
+            Ok(pass) => {
+                tracing::info!(
+                    width = extent.width,
+                    height = extent.height,
+                    "initialized VPT NRD resolve pass"
+                );
+                self.vpt_nrd_resolve_pass = Some(pass);
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to create VPT NRD resolve pass");
             }
         }
     }
@@ -744,6 +867,8 @@ impl VptRuntimePipeline {
         &mut self,
         renderer: &RenderDevice,
         frame: &FrameContext,
+        #[cfg(not(target_os = "android"))] egui_renderer: Option<&mut EguiRenderer>,
+        #[cfg(not(target_os = "android"))] egui_frame: Option<&EguiFrame>,
         mut inputs: VptFrameInputs<'_>,
     ) -> Result<VptFrameRecordResult> {
         let mut graph = RenderGraph::new();
@@ -753,6 +878,8 @@ impl VptRuntimePipeline {
         let mut restir_di_selected_written = false;
         let mut area_restir_selected_written = false;
         let mut current_vpt_view_proj = None;
+        let mut current_nrd_frame_state = None;
+        let mut nrd_adapter_pass_recorded = false;
         let scene_key = Self::make_scene_key(
             inputs.sun_direction,
             inputs.sun_intensity,
@@ -873,6 +1000,67 @@ impl VptRuntimePipeline {
                 vpt_surface
                     .update_motion_guide_state(frame.frame_slot, inputs.ucvh_motion_event_count);
             }
+            let current_nrd_world_to_view =
+                compute_nrd_world_to_view(camera.position, camera.forward, camera.up);
+            let current_nrd_view_to_clip = compute_nrd_view_to_clip(
+                camera.fov_y_radians,
+                frame.swapchain_extent.width,
+                frame.swapchain_extent.height,
+            );
+            let nrd_reset_history = self.frame_state.vpt_accumulation_needs_init
+                || history_flags != 0
+                || scene_history_flags != 0;
+            let previous_nrd_world_to_view = if nrd_reset_history {
+                current_nrd_world_to_view
+            } else {
+                self.frame_state
+                    .previous_nrd_world_to_view
+                    .unwrap_or(current_nrd_world_to_view)
+            };
+            let previous_nrd_view_to_clip = if nrd_reset_history {
+                current_nrd_view_to_clip
+            } else {
+                self.frame_state
+                    .previous_nrd_view_to_clip
+                    .unwrap_or(current_nrd_view_to_clip)
+            };
+            let previous_nrd_elapsed_seconds = self.frame_state.previous_nrd_elapsed_seconds;
+            let nrd_time_delta_seconds = previous_nrd_elapsed_seconds
+                .map(|previous| inputs.elapsed_seconds - previous)
+                .unwrap_or(0.0);
+            let nrd_frame_settings = if matches!(
+                inputs.lighting_settings.denoiser_mode,
+                VptDenoiserMode::Relax | VptDenoiserMode::Reblur
+            ) {
+                let settings = VptNrdFrameSettings::from_inputs(VptNrdFrameSettingsInputs {
+                    current_world_to_view: current_nrd_world_to_view,
+                    previous_world_to_view: previous_nrd_world_to_view,
+                    current_view_to_clip: current_nrd_view_to_clip,
+                    previous_view_to_clip: previous_nrd_view_to_clip,
+                    current_resolution: [
+                        frame.swapchain_extent.width,
+                        frame.swapchain_extent.height,
+                    ],
+                    previous_resolution,
+                    frame_index: frame.frame_index as u32,
+                    time_delta_seconds: nrd_time_delta_seconds,
+                    reset_history: nrd_reset_history,
+                    history_confidence_available: true,
+                    relax_atrous_iteration_num: inputs.lighting_settings.denoiser_atrous_iterations,
+                    enable_validation: matches!(
+                        inputs.lighting_settings.vpt_debug_view,
+                        VptDebugView::NrdValidation
+                    ),
+                })?;
+                current_nrd_frame_state = Some((
+                    current_nrd_world_to_view,
+                    current_nrd_view_to_clip,
+                    inputs.elapsed_seconds,
+                ));
+                Some(settings)
+            } else {
+                None
+            };
 
             if let (
                 Some(vpt_surface),
@@ -990,6 +1178,7 @@ impl VptRuntimePipeline {
                             VptNrdFrontendGraphInputs {
                                 frame_slot: slot,
                                 raw_noisy: vpt_outputs.nrd_noisy,
+                                surface_inputs: final_surface_writes,
                                 profiler,
                             },
                         )
@@ -999,38 +1188,99 @@ impl VptRuntimePipeline {
                 };
                 let nrd_adapter_outputs = if matches!(
                     inputs.lighting_settings.denoiser_mode,
-                    VptDenoiserMode::Relax
+                    VptDenoiserMode::Relax | VptDenoiserMode::Reblur
                 ) {
-                    match (
-                        self.vpt_nrd_adapter_pass.as_ref(),
+                    if let (
+                        Some(vpt_nrd_adapter),
+                        Some(vpt_nrd_frontend),
+                        Some(vpt_nrd_confidence),
+                        Some(nrd_frame_settings),
+                        Some(nrd_frontend_outputs),
+                        Some(nrd_confidence_outputs),
+                    ) = (
+                        self.vpt_nrd_adapter_pass.as_mut(),
+                        self.vpt_nrd_frontend_pass.as_ref(),
+                        self.vpt_nrd_confidence_pass.as_ref(),
+                        nrd_frame_settings,
                         nrd_frontend_outputs,
                         nrd_confidence_outputs,
                     ) {
-                        (
-                            Some(vpt_nrd_adapter),
-                            Some(nrd_frontend_outputs),
-                            Some(nrd_confidence_outputs),
-                        ) => Some(vpt_nrd_adapter.register_graph(
-                            &mut graph,
-                            VptNrdAdapterGraphInputs {
-                                frame_slot: slot,
-                                packed: nrd_frontend_outputs.packed,
-                                confidence: nrd_confidence_outputs.confidence,
-                                surface_inputs: final_surface_writes,
-                                profiler,
-                            },
-                        )),
-                        _ => None,
+                        if vpt_nrd_adapter.is_ready() {
+                            match vpt_nrd_adapter.update_frame_settings(
+                                renderer.device(),
+                                renderer.allocator(),
+                                nrd_frame_settings,
+                                VptNrdAdapterPassImageRefs {
+                                    frontend: vpt_nrd_frontend,
+                                    confidence: vpt_nrd_confidence,
+                                    surface: vpt_surface,
+                                },
+                                slot,
+                            ) {
+                                Ok(()) => Some(vpt_nrd_adapter.register_graph(
+                                    &mut graph,
+                                    VptNrdAdapterGraphInputs {
+                                        frame_slot: slot,
+                                        packed: nrd_frontend_outputs.packed,
+                                        confidence: nrd_confidence_outputs.confidence,
+                                        surface_inputs: final_surface_writes,
+                                        texture_pools_initialized:
+                                            self.frame_state.vpt_nrd_texture_pools_initialized,
+                                        profiler,
+                                    },
+                                )),
+                                Err(error) => {
+                                    tracing::error!(%error, "failed to update VPT NRD frame settings");
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
                     }
                 } else {
                     None
                 };
-                let _ = nrd_adapter_outputs.as_ref().map(|outputs| {
-                    (
-                        outputs.resources.diff_radiance_hitdist,
-                        outputs.resources.validation,
-                    )
-                });
+                nrd_adapter_pass_recorded = nrd_adapter_outputs.is_some();
+                let nrd_resolve_outputs = if matches!(
+                    inputs.lighting_settings.denoiser_mode,
+                    VptDenoiserMode::Relax | VptDenoiserMode::Reblur
+                ) {
+                    if let (
+                        Some(vpt_nrd_resolve),
+                        Some(nrd_adapter_outputs),
+                        Some(nrd_frontend_outputs),
+                    ) = (
+                        self.vpt_nrd_resolve_pass.as_ref(),
+                        nrd_adapter_outputs,
+                        nrd_frontend_outputs,
+                    ) {
+                        let _ = nrd_adapter_outputs.resources.validation;
+                        Some(vpt_nrd_resolve.register_graph(
+                            &mut graph,
+                            VptNrdResolveGraphInputs {
+                                frame_slot: slot,
+                                denoised_diff_radiance_hitdist:
+                                    nrd_adapter_outputs.resources.diff_radiance_hitdist,
+                                packed: nrd_frontend_outputs.packed,
+                                profiler,
+                            },
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let use_nrd_resolve_for_postprocess = inputs.lighting_settings.vpt_debug_view
+                    == VptDebugView::Final
+                    && nrd_resolve_outputs.is_some();
+                let actual_effective_denoiser_mode_name = capture_effective_denoiser_mode_name(
+                    inputs.lighting_settings,
+                    use_nrd_resolve_for_postprocess,
+                );
 
                 let temporal_outputs = vpt_temporal.register_graph(
                     &mut graph,
@@ -1069,13 +1319,41 @@ impl VptRuntimePipeline {
 
                 let postprocess_output = postprocess.output_image.handle;
                 let postprocess_extent = postprocess.output_image.extent;
+                let (postprocess_input_radiance, postprocess_hdr_image) = if matches!(
+                    inputs.lighting_settings.vpt_debug_view,
+                    VptDebugView::NrdValidation
+                ) {
+                    if let Some(nrd_adapter_outputs) = nrd_adapter_outputs {
+                        (
+                            nrd_adapter_outputs.resources.validation,
+                            nrd_adapter_outputs.validation_image,
+                        )
+                    } else {
+                        (atrous_filtered_dep, vpt_atrous.output_image())
+                    }
+                } else if inputs.lighting_settings.vpt_debug_view == VptDebugView::Final {
+                    if let Some(nrd_resolve_outputs) = nrd_resolve_outputs {
+                        if let Some(vpt_nrd_resolve) = self.vpt_nrd_resolve_pass.as_ref() {
+                            (
+                                nrd_resolve_outputs.resolved_radiance,
+                                vpt_nrd_resolve.output_image(),
+                            )
+                        } else {
+                            (atrous_filtered_dep, vpt_atrous.output_image())
+                        }
+                    } else {
+                        (atrous_filtered_dep, vpt_atrous.output_image())
+                    }
+                } else {
+                    (atrous_filtered_dep, vpt_atrous.output_image())
+                };
                 let postprocess_outputs = postprocess.register_graph(
                     &mut graph,
                     PostprocessGraphInputs {
                         device: renderer.device(),
                         frame_slot: frame.frame_slot,
-                        input_radiance: atrous_filtered_dep,
-                        hdr_image: vpt_atrous.output_image(),
+                        input_radiance: postprocess_input_radiance,
+                        hdr_image: postprocess_hdr_image,
                         output_initialized: self.frame_state.postprocess_output_initialized,
                         profiler,
                     },
@@ -1085,6 +1363,11 @@ impl VptRuntimePipeline {
                 let dst_image = frame.swapchain_image;
                 let dst_extent = frame.swapchain_extent;
                 let dep_handle = postprocess_outputs.output;
+                #[cfg(not(target_os = "android"))]
+                let has_egui_overlay =
+                    egui_renderer.is_some() && egui_frame.is_some_and(|frame| !frame.is_empty());
+                #[cfg(target_os = "android")]
+                let has_egui_overlay = false;
                 let mut capture_dependency = None;
                 let capture_frame = inputs
                     .capture
@@ -1149,9 +1432,7 @@ impl VptRuntimePipeline {
                         ),
                         denoiser_enabled: inputs.lighting_settings.denoiser_enabled(),
                         denoiser_mode: inputs.lighting_settings.denoiser_mode_name(),
-                        effective_denoiser_mode: inputs
-                            .lighting_settings
-                            .effective_denoiser_mode_name(),
+                        effective_denoiser_mode: actual_effective_denoiser_mode_name,
                     });
                     tracing::info!(
                         frame_index = frame.frame_index,
@@ -1167,43 +1448,64 @@ impl VptRuntimePipeline {
                     dst_extent.width,
                     dst_extent.height,
                     frame.swapchain_format,
-                    vk::ImageUsageFlags::TRANSFER_DST,
+                    vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     swapchain_access_from_layout(frame.swapchain_image_layout)?,
                 );
-                graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
-                    builder.read_as(dep_handle, AccessKind::TransferRead);
-                    if let Some(capture_dep) = capture_dependency {
-                        builder.depend_on(capture_dep);
+                let blit_writes =
+                    graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
+                        builder.read_as(dep_handle, AccessKind::TransferRead);
+                        if let Some(capture_dep) = capture_dependency {
+                            builder.depend_on(capture_dep);
+                        }
+                        builder.write_as(swapchain_dep, AccessKind::TransferWrite);
+                        if !has_egui_overlay {
+                            builder.finish_as(swapchain_dep, AccessKind::Present);
+                        }
+                        Box::new(move |ctx| {
+                            if let Some(profiler) = profiler {
+                                profiler.begin_scope(
+                                    ctx.device,
+                                    ctx.command_buffer,
+                                    slot,
+                                    GpuProfileScope::BlitToSwapchain,
+                                );
+                            }
+                            blit_to_swapchain::record_blit_core(
+                                ctx.device,
+                                ctx.command_buffer,
+                                src_image,
+                                src_extent,
+                                dst_image,
+                                dst_extent,
+                            );
+                            if let Some(profiler) = profiler {
+                                profiler.end_scope(
+                                    ctx.device,
+                                    ctx.command_buffer,
+                                    slot,
+                                    GpuProfileScope::BlitToSwapchain,
+                                );
+                            }
+                        })
+                    });
+                #[cfg(not(target_os = "android"))]
+                if has_egui_overlay {
+                    let swapchain_after_blit = blit_writes[0];
+                    if let (Some(egui_renderer), Some(egui_frame)) = (egui_renderer, egui_frame) {
+                        graph.add_pass("egui_overlay", QueueType::Graphics, |builder| {
+                            builder
+                                .write_as(swapchain_after_blit, AccessKind::ColorAttachmentWrite);
+                            builder.finish_as(swapchain_after_blit, AccessKind::Present);
+                            Box::new(move |_ctx| {
+                                if let Err(error) =
+                                    egui_renderer.record(renderer, frame, egui_frame)
+                                {
+                                    tracing::error!(%error, "failed to record egui overlay");
+                                }
+                            })
+                        });
                     }
-                    builder.write_as(swapchain_dep, AccessKind::TransferWrite);
-                    builder.finish_as(swapchain_dep, AccessKind::Present);
-                    Box::new(move |ctx| {
-                        if let Some(profiler) = profiler {
-                            profiler.begin_scope(
-                                ctx.device,
-                                ctx.command_buffer,
-                                slot,
-                                GpuProfileScope::BlitToSwapchain,
-                            );
-                        }
-                        blit_to_swapchain::record_blit_core(
-                            ctx.device,
-                            ctx.command_buffer,
-                            src_image,
-                            src_extent,
-                            dst_image,
-                            dst_extent,
-                        );
-                        if let Some(profiler) = profiler {
-                            profiler.end_scope(
-                                ctx.device,
-                                ctx.command_buffer,
-                                slot,
-                                GpuProfileScope::BlitToSwapchain,
-                            );
-                        }
-                    })
-                });
+                }
             } else {
                 self.frame_state.vpt_sample_index = 0;
                 self.frame_state.last_vpt_camera_key = None;
@@ -1212,6 +1514,7 @@ impl VptRuntimePipeline {
                     vpt_nrd_confidence_ready = self.vpt_nrd_confidence_pass.is_some(),
                     vpt_nrd_frontend_ready = self.vpt_nrd_frontend_pass.is_some(),
                     vpt_nrd_adapter_ready = self.vpt_nrd_adapter_pass.is_some(),
+                    vpt_nrd_resolve_ready = self.vpt_nrd_resolve_pass.is_some(),
                     vpt_temporal_ready = self.vpt_temporal_pass.is_some(),
                     vpt_atrous_ready = self.vpt_atrous_pass.is_some(),
                     postprocess_ready = self.postprocess_pass.is_some(),
@@ -1242,6 +1545,14 @@ impl VptRuntimePipeline {
             self.frame_state.previous_vpt_resolution =
                 Some([frame.swapchain_extent.width, frame.swapchain_extent.height]);
         }
+        if let Some((world_to_view, view_to_clip, elapsed_seconds)) = current_nrd_frame_state {
+            self.frame_state.previous_nrd_world_to_view = Some(world_to_view);
+            self.frame_state.previous_nrd_view_to_clip = Some(view_to_clip);
+            self.frame_state.previous_nrd_elapsed_seconds = Some(elapsed_seconds);
+        }
+        if nrd_adapter_pass_recorded {
+            self.frame_state.vpt_nrd_texture_pools_initialized = true;
+        }
         if vpt_accumulation_written {
             self.frame_state.vpt_accumulation_needs_init = false;
             self.frame_state.vpt_temporal_history_initialized = true;
@@ -1269,6 +1580,7 @@ impl VptRuntimePipeline {
         ucvh_gpu: &UcvhGpuResources,
         width: u32,
         height: u32,
+        lighting_settings: LightingSettings,
         restir_di_enabled: bool,
         area_restir_enabled: bool,
     ) -> Result<()> {
@@ -1280,22 +1592,6 @@ impl VptRuntimePipeline {
             vpt.resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
                 .context("failed to resize VPT images")?;
         }
-        if let (Some(vpt_nrd_frontend), Some(vpt)) =
-            (&mut self.vpt_nrd_frontend_pass, &self.vpt_pass)
-        {
-            vpt_nrd_frontend
-                .resize_images(
-                    &device,
-                    allocator,
-                    VptNrdFrontendPassResizeInfo {
-                        width,
-                        height,
-                        scene_ubo,
-                        vpt,
-                    },
-                )
-                .context("failed to resize VPT NRD frontend images")?;
-        }
         if let Some(vpt_surface) = &mut self.vpt_surface_pass {
             vpt_surface
                 .resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
@@ -1306,6 +1602,25 @@ impl VptRuntimePipeline {
             if area_restir_enabled && let Some(area_restir) = &self.area_restir_pass {
                 area_restir.update_surface_descriptors(&device, vpt_surface);
             }
+        }
+        if let (Some(vpt_nrd_frontend), Some(vpt), Some(vpt_surface)) = (
+            &mut self.vpt_nrd_frontend_pass,
+            &self.vpt_pass,
+            &self.vpt_surface_pass,
+        ) {
+            vpt_nrd_frontend
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdFrontendPassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        vpt,
+                        vpt_surface,
+                    },
+                )
+                .context("failed to resize VPT NRD frontend images")?;
         }
         if let (Some(vpt_nrd_confidence), Some(vpt_surface)) =
             (&mut self.vpt_nrd_confidence_pass, &self.vpt_surface_pass)
@@ -1341,6 +1656,12 @@ impl VptRuntimePipeline {
                     VptNrdAdapterPassResizeInfo {
                         width,
                         height,
+                        denoiser_mode: lighting_settings.denoiser_mode,
+                        relax_atrous_iteration_num: lighting_settings.denoiser_atrous_iterations,
+                        constant_buffer_alignment: renderer
+                            .physical_device_properties()
+                            .limits
+                            .min_uniform_buffer_offset_alignment,
                         scene_ubo,
                         image_refs: VptNrdAdapterPassImageRefs {
                             frontend: vpt_nrd_frontend,
@@ -1350,6 +1671,25 @@ impl VptRuntimePipeline {
                     },
                 )
                 .context("failed to resize VPT NRD adapter images")?;
+        }
+        if let (Some(vpt_nrd_resolve), Some(vpt_nrd_adapter), Some(vpt_nrd_frontend)) = (
+            &mut self.vpt_nrd_resolve_pass,
+            &self.vpt_nrd_adapter_pass,
+            &self.vpt_nrd_frontend_pass,
+        ) {
+            vpt_nrd_resolve
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptNrdResolvePassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        denoised_diff_radiance_hitdist: &vpt_nrd_adapter.nrd_diff_radiance_hitdist,
+                        frontend: vpt_nrd_frontend,
+                    },
+                )
+                .context("failed to resize VPT NRD resolve images")?;
         }
         if restir_di_enabled && let Some(restir_di) = &mut self.restir_di_pass {
             restir_di
@@ -1437,6 +1777,9 @@ impl VptRuntimePipeline {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_atrous_pass {
+            pass.destroy(device, allocator);
+        }
+        if let Some(pass) = self.vpt_nrd_resolve_pass {
             pass.destroy(device, allocator);
         }
         if let Some(pass) = self.vpt_nrd_confidence_pass {
@@ -1539,6 +1882,23 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
         VptDebugView::NrdViewZ => "nrd_viewz",
         VptDebugView::NrdMotion => "nrd_motion",
         VptDebugView::NrdMotionZ => "nrd_motion_z",
+        VptDebugView::NrdValidation => "nrd_validation",
+    }
+}
+
+fn capture_effective_denoiser_mode_name(
+    lighting_settings: LightingSettings,
+    use_nrd_resolve_for_postprocess: bool,
+) -> &'static str {
+    match lighting_settings.denoiser_mode {
+        VptDenoiserMode::Relax | VptDenoiserMode::Reblur => {
+            if use_nrd_resolve_for_postprocess {
+                lighting_settings.denoiser_mode.as_config_value()
+            } else {
+                VptDenoiserMode::Svgf.as_config_value()
+            }
+        }
+        _ => lighting_settings.denoiser_mode_name(),
     }
 }
 
@@ -1550,6 +1910,15 @@ mod tests {
     };
     use crate::voxel::ucvh::{UcvhInvalidationRegion, UcvhMotionEvent};
 
+    fn assert_mat4_near(actual: glam::Mat4, expected: glam::Mat4, epsilon: f32) {
+        for (actual, expected) in actual.to_cols_array().iter().zip(expected.to_cols_array()) {
+            assert!(
+                (*actual - expected).abs() <= epsilon,
+                "matrix element mismatch: actual={actual} expected={expected}"
+            );
+        }
+    }
+
     #[test]
     fn frame_state_reset_clears_history_and_accumulation() {
         let mut state = VptPipelineFrameState {
@@ -1560,10 +1929,14 @@ mod tests {
             vpt_accumulation_needs_init: false,
             vpt_temporal_history_initialized: true,
             postprocess_output_initialized: true,
+            vpt_nrd_texture_pools_initialized: true,
             area_restir_history_initialized: true,
             restir_di_history_initialized: true,
             previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
             previous_vpt_resolution: Some([1280, 720]),
+            previous_nrd_world_to_view: Some(glam::Mat4::from_scale(glam::Vec3::splat(2.0))),
+            previous_nrd_view_to_clip: Some(glam::Mat4::from_scale(glam::Vec3::splat(3.0))),
+            previous_nrd_elapsed_seconds: Some(12.0),
         };
 
         state.reset_for_resize_or_camera_cut();
@@ -1575,10 +1948,14 @@ mod tests {
         assert!(state.vpt_accumulation_needs_init);
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
+        assert!(!state.vpt_nrd_texture_pools_initialized);
         assert!(!state.area_restir_history_initialized);
         assert!(!state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, None);
         assert_eq!(state.previous_vpt_resolution, None);
+        assert_eq!(state.previous_nrd_world_to_view, None);
+        assert_eq!(state.previous_nrd_view_to_clip, None);
+        assert_eq!(state.previous_nrd_elapsed_seconds, None);
     }
 
     #[test]
@@ -1591,10 +1968,14 @@ mod tests {
             vpt_accumulation_needs_init: false,
             vpt_temporal_history_initialized: true,
             postprocess_output_initialized: true,
+            vpt_nrd_texture_pools_initialized: true,
             area_restir_history_initialized: true,
             restir_di_history_initialized: true,
             previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
             previous_vpt_resolution: Some([1280, 720]),
+            previous_nrd_world_to_view: Some(glam::Mat4::from_scale(glam::Vec3::splat(2.0))),
+            previous_nrd_view_to_clip: Some(glam::Mat4::from_scale(glam::Vec3::splat(3.0))),
+            previous_nrd_elapsed_seconds: Some(12.0),
         };
 
         state.reset_for_scene_change();
@@ -1606,10 +1987,65 @@ mod tests {
         assert!(state.vpt_accumulation_needs_init);
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
+        assert!(!state.vpt_nrd_texture_pools_initialized);
         assert!(!state.area_restir_history_initialized);
         assert!(!state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
         assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
+        assert_eq!(
+            state.previous_nrd_world_to_view,
+            Some(glam::Mat4::from_scale(glam::Vec3::splat(2.0)))
+        );
+        assert_eq!(
+            state.previous_nrd_view_to_clip,
+            Some(glam::Mat4::from_scale(glam::Vec3::splat(3.0)))
+        );
+        assert_eq!(state.previous_nrd_elapsed_seconds, Some(12.0));
+    }
+
+    #[test]
+    fn nrd_camera_matrices_match_existing_view_projection_path() {
+        let position = glam::Vec3::new(3.0, 4.0, -5.0);
+        let forward = glam::Vec3::new(0.2, -0.1, 1.0).normalize();
+        let up = glam::Vec3::Y;
+        let fov_y = 1.1;
+        let width = 1920;
+        let height = 1080;
+
+        let world_to_view = compute_nrd_world_to_view(position, forward, up);
+        let view_to_clip = compute_nrd_view_to_clip(fov_y, width, height);
+        let expected = compute_view_proj(position, forward, up, fov_y, width, height);
+
+        assert_mat4_near(view_to_clip * world_to_view, expected, 1.0e-5);
+    }
+
+    #[test]
+    fn capture_effective_denoiser_mode_name_reports_svgf_when_nrd_resolve_is_unused() {
+        for mode in [VptDenoiserMode::Relax, VptDenoiserMode::Reblur] {
+            let settings = LightingSettings {
+                denoiser_mode: mode,
+                ..LightingSettings::default()
+            };
+
+            assert_eq!(
+                capture_effective_denoiser_mode_name(settings, true),
+                mode.as_config_value()
+            );
+            assert_eq!(
+                capture_effective_denoiser_mode_name(settings, false),
+                VptDenoiserMode::Svgf.as_config_value()
+            );
+        }
+
+        let settings = LightingSettings {
+            denoiser_mode: VptDenoiserMode::Off,
+            ..LightingSettings::default()
+        };
+
+        assert_eq!(
+            capture_effective_denoiser_mode_name(settings, false),
+            VptDenoiserMode::Off.as_config_value()
+        );
     }
 
     #[test]

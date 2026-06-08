@@ -2,6 +2,7 @@ use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderRef
 use crate::render::passes::vpt_atrous::VptAtrousPass;
 use crate::render::passes::vpt_nrd_confidence::VptNrdConfidencePass;
 use crate::render::passes::vpt_nrd_frontend::VptNrdFrontendPass;
+use crate::render::passes::vpt_nrd_resolve::VptNrdResolvePass;
 use crate::render::passes::vpt_surface::VptSurfacePass;
 use crate::render::passes::vpt_temporal::VptTemporalPass;
 
@@ -58,6 +59,11 @@ fn vpt_svgf_descriptor_specs_match_shader_manifests() {
         "VPT A-trous",
         &VptAtrousPass::descriptor_binding_specs(),
         &shader_reflection("assets/shaders/passes/vpt_atrous.slang"),
+    );
+    crate::render::descriptor::assert_specs_match_shader_bindings(
+        "VPT NRD resolve",
+        &VptNrdResolvePass::descriptor_binding_specs(),
+        &shader_reflection("assets/shaders/passes/vpt_nrd_resolve.slang"),
     );
 }
 
@@ -681,6 +687,20 @@ fn vpt_shader_declares_stochastic_accumulating_reference_path() {
 }
 
 #[test]
+fn vpt_primary_seed_does_not_depend_on_wall_clock_time() {
+    let primary_sample_common = normalized_source(include_str!(
+        "../../../../assets/shaders/shared/vpt_primary_sample_common.slang"
+    ));
+
+    assert!(primary_sample_common.contains("uint vpt_primary_rng_seed"));
+    assert!(primary_sample_common.contains("scene.vpt_sample_index"));
+    assert!(
+        !primary_sample_common.contains("scene.time"),
+        "primary RNG seed must not depend on wall-clock time"
+    );
+}
+
+#[test]
 fn vpt_nrd_noisy_frontend_contract() {
     let shader = source("assets/shaders/passes/vpt.slang");
     let rust = source("src/render/passes/vpt.rs");
@@ -689,18 +709,16 @@ fn vpt_nrd_noisy_frontend_contract() {
     for token in [
         "struct VptTraceSample",
         "float first_indirect_hit_distance",
-        "float3 nrd_diffuse_radiance",
-        "float3 nrd_residual_signal",
         "RWTexture2D<float4> nrd_diff_radiance_hitdist",
         "RWTexture2D<float4> nrd_spec_radiance_hitdist",
         "RWTexture2D<float4> nrd_residual_radiance",
         "RWTexture2D<float4> nrd_material_factors",
-        "sample.first_indirect_hit_distance",
-        "sample.nrd_diffuse_radiance",
-        "sample.nrd_residual_signal",
+        "sample.first_indirect_hit_distance = VPT_NRD_INVALID_HIT_DISTANCE;",
         "if (hit.hit && bounce > 0u && sample.first_indirect_hit_distance == VPT_NRD_INVALID_HIT_DISTANCE)",
-        "float3 nrd_diffuse_indirect = demodulate_by_primary_albedo(sample.nrd_diffuse_radiance, sample.first_hit);",
-        "float3 nrd_residual = sample.nrd_residual_signal;",
+        "float3 nrd_residual = sample.direct_radiance;",
+        "float3 nrd_diffuse_signal = demodulate_by_primary_albedo(sample.indirect_radiance, sample.first_hit);",
+        "float nrd_diffuse_hitdist = sample.first_indirect_hit_distance;",
+        "float nrd_material_id = sample.first_hit.hit ? float(voxel_material(sample.first_hit.cell)) : 0.0;",
         "nrd_diff_radiance_hitdist[tid.xy]",
         "nrd_spec_radiance_hitdist[tid.xy]",
         "nrd_residual_radiance[tid.xy]",
@@ -713,16 +731,28 @@ fn vpt_nrd_noisy_frontend_contract() {
     }
 
     assert!(
-        compact_shader.contains(
-            "else{sample.indirect_radiance+=contribution;sample.nrd_residual_signal+=contribution;}break;"
-        ),
-        "secondary sky miss must bypass NRD diffuse through residual radiance"
+        !shader.contains("demodulate_by_primary_albedo(sample_radiance, sample.first_hit)"),
+        "RELAX diffuse input must not fold direct, sky, primary emissive, or debug radiance into the indirect diffuse denoising signal"
+    );
+    assert!(
+        !shader.contains("nrd_diffuse_radiance"),
+        "VPT should write the dominant final radiance signal to NRD diffuse instead of a partial side channel"
+    );
+    assert!(
+        !shader.contains("max(sample.first_hit.t, 0.0)"),
+        "RELAX diffuse hit distance must exclude the primary hit distance"
     );
     assert!(
         compact_shader.contains(
-            "else{sample.indirect_radiance+=contribution;sample.nrd_diffuse_radiance+=contribution;}break;"
+            "float3nrd_residual=sample.direct_radiance;float3nrd_diffuse_signal=demodulate_by_primary_albedo(sample.indirect_radiance,sample.first_hit);"
         ),
-        "secondary emissive hit must feed NRD diffuse with a real lobe hit distance"
+        "RELAX should denoise only indirect diffuse and keep primary direct/emissive radiance in the residual channel"
+    );
+    assert!(
+        compact_shader.contains(
+            "if(!sample.first_hit.hit){nrd_residual=sample_radiance;nrd_diffuse_signal=float3(0.0);nrd_diffuse_hitdist=VPT_NRD_INVALID_HIT_DISTANCE;}elseif(scene.vpt_debug_view!=VPT_DEBUG_VIEW_FINAL){nrd_residual=sample_radiance;nrd_diffuse_signal=float3(0.0);nrd_diffuse_hitdist=VPT_NRD_INVALID_HIT_DISTANCE;}"
+        ),
+        "miss/debug paths should bypass RELAX through residual radiance"
     );
 
     for token in [
@@ -781,18 +811,26 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
             ),
             binding(3, DescriptorKind::StorageImage, "input_residual_radiance"),
             binding(4, DescriptorKind::StorageImage, "input_material_factors"),
+            binding(5, DescriptorKind::StorageImage, "surface_normal_roughness"),
             binding(
-                5,
+                6,
+                DescriptorKind::StorageImage,
+                "surface_material_roughness"
+            ),
+            binding(7, DescriptorKind::StorageImage, "surface_view_z"),
+            binding(
+                8,
                 DescriptorKind::StorageImage,
                 "packed_diff_radiance_hitdist"
             ),
             binding(
-                6,
+                9,
                 DescriptorKind::StorageImage,
                 "packed_spec_radiance_hitdist"
             ),
-            binding(7, DescriptorKind::StorageImage, "residual_radiance"),
-            binding(8, DescriptorKind::StorageImage, "material_factors"),
+            binding(10, DescriptorKind::StorageImage, "residual_radiance"),
+            binding(11, DescriptorKind::StorageImage, "material_factors"),
+            binding(12, DescriptorKind::StorageImage, "packed_normal_roughness"),
         ]
     );
 
@@ -805,6 +843,13 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         "float3 sanitize_relax_radiance(float3 radiance)",
         "float sanitize_relax_hit_distance(float hit_distance)",
         "float4 pack_relax_radiance_hitdist(float4 radiance_hitdist)",
+        "float _REBLUR_GetHitDistanceNormalization(float view_z, float roughness, float3 hit_distance_parameters)",
+        "float REBLUR_FrontEnd_GetNormHitDist(float hit_distance, float view_z, float roughness, float3 hit_distance_parameters)",
+        "float4 REBLUR_FrontEnd_PackRadianceAndNormHitDist(float4 radiance_hitdist, float view_z, float roughness)",
+        "float3 sanitize_nrd_normal(float3 normal)",
+        "float2 encode_nrd_unit_vector_oct(float3 normal)",
+        "float4 pack_nrd_normal_roughness(float3 normal, float roughness, float material_id)",
+        "RWTexture2D<float> surface_view_z",
     ] {
         assert!(
             shader.contains(token),
@@ -813,10 +858,17 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
     }
     for token in [
         "returnfloat4(sanitize_relax_radiance(radiance_hitdist.rgb),sanitize_relax_hit_distance(radiance_hitdist.a));",
-        "packed_diff_radiance_hitdist[tid.xy]=pack_relax_radiance_hitdist(input_diff_radiance_hitdist[tid.xy]);",
         "packed_spec_radiance_hitdist[tid.xy]=pack_relax_radiance_hitdist(input_spec_radiance_hitdist[tid.xy]);",
+        "booluse_reblur=(scene.denoiser_flags&DENOISER_MODE_MASK)==DENOISER_MODE_REBLUR;",
+        "floatview_z=surface_view_z[tid.xy];",
+        "floatroughness=surface_material_roughness[tid.xy];",
+        "packed_diff_radiance_hitdist[tid.xy]=use_reblur?REBLUR_FrontEnd_PackRadianceAndNormHitDist(input_diff_radiance_hitdist[tid.xy],view_z,roughness):pack_relax_radiance_hitdist(input_diff_radiance_hitdist[tid.xy]);",
         "residual_radiance[tid.xy]=float4(sanitize_relax_radiance(input_residual_radiance[tid.xy].rgb),1.0);",
-        "material_factors[tid.xy]=float4(saturate(input_material_factors[tid.xy].rgb),saturate(input_material_factors[tid.xy].a));",
+        "material_factors[tid.xy]=float4(saturate(input_material_factors[tid.xy].rgb),input_material_factors[tid.xy].a);",
+        "normal/=max(abs(normal.x)+abs(normal.y)+abs(normal.z),1.0e-8);",
+        "float2encoded_normal=encode_nrd_unit_vector_oct(sanitize_nrd_normal(normal));",
+        "returnfloat4(encoded_normal,saturate(roughness),saturate(material_id/3.0));",
+        "packed_normal_roughness[tid.xy]=pack_nrd_normal_roughness(surface_normal_roughness[tid.xy].xyz,surface_material_roughness[tid.xy],input_material_factors[tid.xy].a);",
     ] {
         assert!(
             compact_shader.contains(token),
@@ -825,15 +877,22 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
     }
     for forbidden in [
         "NRD.hlsli",
-        "REBLUR_FrontEnd",
         "RELAX_FrontEnd",
         "PackRadiance.cs.slang",
+        "encode_nrd_normal_roughness_101010",
+        "return float4(encoded, 0.0);",
     ] {
         assert!(
             !shader.contains(forbidden),
             "local frontend must not copy SDK helper token {forbidden}"
         );
     }
+    assert!(
+        !compact_shader.contains(
+            "REBLUR_FrontEnd_PackRadianceAndNormHitDist(input_diff_radiance_hitdist[tid.xy],view_z,1.0)"
+        ),
+        "ReBLUR hit-distance normalization must use the surface roughness guide, not a hard-coded fully rough material"
+    );
 
     for token in [
         "pub struct VptNrdFrontendPass",
@@ -841,15 +900,19 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         "pub struct VptNrdFrontendGraphOutputs",
         "pub struct VptNrdPackedResources",
         "pub raw_noisy: VptNrdNoisyResources",
+        "pub surface_inputs: VptCurrentSurfaceResources",
         "pub packed: VptNrdPackedResources",
         "pub packed_diff_radiance_hitdist: GpuImage",
         "pub packed_spec_radiance_hitdist: GpuImage",
         "pub residual_radiance: GpuImage",
         "pub material_factors: GpuImage",
-        "pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 9]",
-        "descriptor_count: 8 * frame_count as u32",
+        "pub packed_normal_roughness: GpuImage",
+        "pub normal_roughness: ResourceHandle",
+        "pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 13]",
+        "descriptor_count: 12 * frame_count as u32",
         "vpt_nrd_packed_diff_radiance_hitdist",
         "vpt_nrd_packed_spec_radiance_hitdist",
+        "vpt_nrd_packed_normal_roughness",
         "vpt_nrd_frontend_residual_radiance",
         "vpt_nrd_frontend_material_factors",
         "graph.add_pass(\"vpt_nrd_frontend\"",
@@ -862,6 +925,11 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         "builder.read_as(raw_noisy.spec_radiance_hitdist,AccessKind::ComputeShaderRead,);",
         "builder.read_as(raw_noisy.residual_radiance,AccessKind::ComputeShaderRead);",
         "builder.read_as(raw_noisy.material_factors,AccessKind::ComputeShaderRead);",
+        "builder.read_as(surface_inputs.normal_roughness,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(surface_inputs.material_roughness,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(surface_inputs.view_z,AccessKind::ComputeShaderRead);",
+        "builder.write_as(packed_normal_resource,AccessKind::ComputeShaderWrite);",
+        "&vpt_surface.surface_view_z",
     ] {
         assert!(
             compact_pass.contains(token),
@@ -914,8 +982,12 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         "pipeline must keep the NRD frontend output explicit for adapter wiring"
     );
     assert!(
-        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
-        "SVGF fallback output must remain the postprocess input"
+        compact_pipeline.contains("surface_inputs:final_surface_writes,"),
+        "pipeline must feed selected surface guides into the NRD frontend"
+    );
+    assert!(
+        compact_pipeline.contains("atrous_filtered_dep,vpt_atrous.output_image()"),
+        "SVGF fallback output must remain available for postprocess"
     );
     let vpt_idx = pipeline
         .find("vpt.register_graph(")
@@ -928,6 +1000,31 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
         .expect("SVGF temporal graph registration should exist");
     assert!(vpt_idx < nrd_idx);
     assert!(vpt_idx < temporal_idx);
+}
+
+#[test]
+fn vpt_nrd_reblur_hit_distance_parameters_match_native_settings() {
+    let shader = source("assets/shaders/passes/vpt_nrd_frontend.slang");
+    let sys = source("src/render/nrd_sys.rs");
+    let compact_shader = shader.split_whitespace().collect::<String>();
+    let compact_sys = sys.split_whitespace().collect::<String>();
+
+    assert!(
+        shader.contains(
+            "static const float3 VPT_NRD_REBLUR_HIT_DISTANCE_PARAMETERS = float3(3.0, 0.1, 20.0);"
+        ),
+        "ReBLUR frontend shader must expose the same hit-distance parameters as the native settings default"
+    );
+    assert!(
+        compact_shader.contains(
+            "REBLUR_FrontEnd_GetNormHitDist(radiance_hitdist.a,view_z,roughness,VPT_NRD_REBLUR_HIT_DISTANCE_PARAMETERS)"
+        ),
+        "ReBLUR frontend packing must use the shared named hit-distance parameter constant"
+    );
+    assert!(
+        compact_sys.contains("Self{a:3.0,b:0.1,c:20.0,}"),
+        "Rust NRD ReBLUR hit-distance default must stay aligned with the shader frontend parameters"
+    );
 }
 
 #[test]
@@ -1085,8 +1182,8 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
         "pipeline must keep the confidence output explicit for NRD adapter wiring"
     );
     assert!(
-        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
-        "SVGF fallback output must remain the postprocess input"
+        compact_pipeline.contains("atrous_filtered_dep,vpt_atrous.output_image()"),
+        "SVGF fallback output must remain available for postprocess"
     );
     let surface_idx = pipeline
         .find("vpt_surface.register_bootstrap_graph(")
@@ -1108,7 +1205,8 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
 #[test]
 fn vpt_nrd_adapter_declares_relax_integration_contract() {
     let adapter = source("src/render/passes/vpt_nrd_adapter.rs");
-    let ffi = source("src/render/nrd_adapter.rs");
+    let rust_api = source("src/render/nrd_adapter.rs");
+    let sys = source("src/render/nrd_sys.rs");
     let native_header = source("native/nrd_adapter.h");
     let native_cpp = source("native/nrd_adapter.cpp");
     let build_rs = source("build.rs");
@@ -1129,13 +1227,36 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "pub struct NrdDispatchDesc",
         "pub struct NrdCommonSettings",
         "pub struct NrdRelaxDiffuseSettings",
+        "pub struct NrdReblurHitDistanceParameters",
+        "pub struct NrdReblurDiffuseSettings",
+        "pub struct RevolumetricNrdInstance",
+        "pub type RevolumetricNrdStatus = u32",
+        "REVOLUMETRIC_NRD_STATUS_OK",
+        "#[cfg(feature = \"nrd\")]",
+    ] {
+        assert!(sys.contains(token), "NRD sys layer missing {token}");
+    }
+    for token in [
+        "pub use crate::render::nrd_sys::{",
+        "pub struct NrdTextureImageDesc",
+        "pub struct NrdResourceBindingDesc",
+        "pub struct NrdPipelineSnapshot",
+        "pub struct NrdInstanceSnapshot",
+        "pub struct NrdDispatchSnapshot",
         "pub struct NrdUnavailableError",
         "pub type NrdResult<T> = Result<T, NrdUnavailableError>",
+        "pub struct NrdInstance",
         "#[cfg(feature = \"nrd\")]",
         "#[cfg(not(feature = \"nrd\"))]",
+        "NrdInstanceSnapshot::from_sys(&desc)",
+        "nrd_sys::revolumetric_nrd_create_relax_diffuse",
+        "nrd_sys::revolumetric_nrd_create_reblur_diffuse",
+        "nrd_sys::revolumetric_nrd_destroy",
         "relax_diffuse",
+        "reblur_diffuse",
+        "set_reblur_diffuse_settings",
     ] {
-        assert!(ffi.contains(token), "NRD FFI missing {token}");
+        assert!(rust_api.contains(token), "NRD Rust API missing {token}");
     }
     for token in [
         "fn nrd_library_dir(root: &Path) -> PathBuf",
@@ -1149,11 +1270,21 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     for token in [
         "typedef enum RevolumetricNrdTextureFormat",
         "typedef enum RevolumetricNrdDescriptorType",
+        "typedef enum RevolumetricNrdSamplerMode",
+        "typedef enum RevolumetricNrdAccumulationMode",
+        "typedef enum RevolumetricNrdCheckerboardMode",
+        "typedef enum RevolumetricNrdHitDistanceReconstructionMode",
         "typedef enum RevolumetricNrdResourceType",
         "REVOLUMETRIC_NRD_TEXTURE_FORMAT_R16_SFLOAT",
         "REVOLUMETRIC_NRD_TEXTURE_FORMAT_RGBA16_SFLOAT",
         "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_TEXTURE",
         "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_STORAGE_TEXTURE",
+        "REVOLUMETRIC_NRD_SAMPLER_MODE_NEAREST_CLAMP",
+        "REVOLUMETRIC_NRD_SAMPLER_MODE_LINEAR_CLAMP",
+        "REVOLUMETRIC_NRD_ACCUMULATION_MODE_CONTINUE",
+        "REVOLUMETRIC_NRD_ACCUMULATION_MODE_RESTART",
+        "REVOLUMETRIC_NRD_CHECKERBOARD_MODE_OFF",
+        "REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_OFF",
         "REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_MV",
         "REVOLUMETRIC_NRD_RESOURCE_TYPE_IN_DIFF_RADIANCE_HITDIST",
         "REVOLUMETRIC_NRD_RESOURCE_TYPE_OUT_DIFF_RADIANCE_HITDIST",
@@ -1169,13 +1300,17 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "struct NrdDispatchDesc",
         "struct NrdCommonSettings",
         "struct NrdRelaxDiffuseSettings",
+        "struct NrdReblurHitDistanceParameters",
+        "struct NrdReblurDiffuseSettings",
         "revolumetric_nrd_create_relax_diffuse",
+        "revolumetric_nrd_create_reblur_diffuse",
         "revolumetric_nrd_destroy",
         "revolumetric_nrd_get_library_desc",
         "revolumetric_nrd_get_instance_desc",
         "revolumetric_nrd_get_dispatches",
         "revolumetric_nrd_set_common_settings",
         "revolumetric_nrd_set_relax_diffuse_settings",
+        "revolumetric_nrd_set_reblur_diffuse_settings",
     ] {
         assert!(
             native_header.contains(token) || native_cpp.contains(token),
@@ -1185,6 +1320,12 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     for token in [
         "static uint32_t to_texture_format(nrd::Format value)",
         "static uint32_t to_descriptor_type(nrd::DescriptorType value)",
+        "static uint32_t to_sampler_mode(nrd::Sampler value)",
+        "static bool to_accumulation_mode(uint32_t value, nrd::AccumulationMode& out)",
+        "static bool to_checkerboard_mode(uint32_t value, nrd::CheckerboardMode& out)",
+        "static bool to_hit_distance_reconstruction_mode(uint32_t value, nrd::HitDistanceReconstructionMode& out)",
+        "static void copy_hit_distance_parameters",
+        "static RevolumetricNrdStatus copy_reblur_diffuse_settings",
         "static uint32_t to_resource_type(nrd::ResourceType value)",
         "case nrd::Format::R16_SFLOAT:",
         "case nrd::Format::RGBA16_SFLOAT:",
@@ -1192,6 +1333,18 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "case nrd::DescriptorType::TEXTURE:",
         "case nrd::DescriptorType::STORAGE_TEXTURE:",
         "REVOLUMETRIC_NRD_DESCRIPTOR_TYPE_UNSUPPORTED",
+        "case nrd::Sampler::NEAREST_CLAMP:",
+        "case nrd::Sampler::LINEAR_CLAMP:",
+        "REVOLUMETRIC_NRD_SAMPLER_MODE_UNSUPPORTED",
+        "case REVOLUMETRIC_NRD_ACCUMULATION_MODE_CONTINUE:",
+        "case REVOLUMETRIC_NRD_ACCUMULATION_MODE_RESTART:",
+        "case REVOLUMETRIC_NRD_ACCUMULATION_MODE_CLEAR_AND_RESTART:",
+        "case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_OFF:",
+        "case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_BLACK:",
+        "case REVOLUMETRIC_NRD_CHECKERBOARD_MODE_WHITE:",
+        "case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_OFF:",
+        "case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_3X3:",
+        "case REVOLUMETRIC_NRD_HIT_DISTANCE_RECONSTRUCTION_MODE_AREA_5X5:",
         "case nrd::ResourceType::IN_MV:",
         "case nrd::ResourceType::OUT_VALIDATION:",
         "case nrd::ResourceType::PERMANENT_POOL:",
@@ -1206,6 +1359,34 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
             "native NRD wrapper must reserve vector storage before exposing internal pointers: missing {token}"
         );
     }
+    let reblur_sys_struct = sys
+        .split("pub struct NrdReblurDiffuseSettings")
+        .nth(1)
+        .and_then(|tail| {
+            tail.split("impl Default for NrdReblurDiffuseSettings")
+                .next()
+        })
+        .expect("Rust sys ReBLUR settings struct should be present");
+    let reblur_native_struct = native_header
+        .split("typedef struct NrdReblurDiffuseSettings")
+        .nth(1)
+        .and_then(|tail| tail.split("} NrdReblurDiffuseSettings;").next())
+        .expect("native ReBLUR settings struct should be present");
+    for forbidden in [
+        "historyFixEdgeStoppingNormalPower",
+        "history_fix_edge_stopping_normal_power",
+        "enableRoughnessEdgeStopping",
+        "enable_roughness_edge_stopping",
+    ] {
+        assert!(
+            !reblur_sys_struct.contains(forbidden) && !reblur_native_struct.contains(forbidden),
+            "ReBLUR ABI must not include SDK-absent RELAX field {forbidden}"
+        );
+    }
+    assert!(
+        native_cpp.contains("nrd::ReblurHitDistanceParameters& dst"),
+        "native ReBLUR ABI must copy into the SDK ReblurHitDistanceParameters type"
+    );
     assert!(
         !native_cpp.contains("static uint32_t to_u32(nrd::DescriptorType value)")
             && !native_cpp.contains("static uint32_t to_u32(nrd::ResourceType value)"),
@@ -1227,6 +1408,11 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "Ready(Box<VptNrdReadyBackend>)",
         "Unavailable(String)",
         "pub struct VptNrdReadyBackend",
+        "pub struct VptNrdFrameSettingsInputs",
+        "pub struct VptNrdFrameSettings",
+        "pub enum NrdAccumulationMode",
+        "pub enum NrdCheckerboardMode",
+        "pub enum NrdHitDistanceReconstructionMode",
         "pub struct VptNrdTexturePoolPlan",
         "pub struct VptNrdTexturePoolImagePlan",
         "pub struct VptNrdDispatchResourcePlan",
@@ -1241,7 +1427,16 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "VptNrdTexturePoolPlan::from_instance_snapshot(width, height, &instance_snapshot)",
         "pub fn texture_pool_plan(&self) -> Option<&VptNrdTexturePoolPlan>",
         "NrdInstance::relax_diffuse(width, height)",
+        "NrdInstance::reblur_diffuse(width, height)",
         "instance.instance_snapshot()",
+        "set_common_settings",
+        "set_relax_diffuse_settings",
+        "set_reblur_diffuse_settings",
+        "fn update_frame_settings(",
+        "refresh_dispatches",
+        "refresh_constant_upload_plan",
+        "denoiser_mode: VptDenoiserMode",
+        "reblur_diffuse: NrdReblurDiffuseSettings",
         "pub fn is_ready(&self) -> bool",
         "pub fn dispatch_count(&self) -> usize",
         "pub fn unavailable_reason(&self) -> Option<&str>",
@@ -1259,12 +1454,16 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "builder.read_as(packed.spec_radiance_hitdist,AccessKind::ComputeShaderRead);",
         "builder.read_as(packed.residual_radiance,AccessKind::ComputeShaderRead);",
         "builder.read_as(packed.material_factors,AccessKind::ComputeShaderRead);",
+        "builder.read_as(packed.normal_roughness,AccessKind::ComputeShaderRead);",
         "builder.read_as(confidence.diff_confidence,AccessKind::ComputeShaderRead);",
         "builder.read_as(confidence.spec_confidence,AccessKind::ComputeShaderRead);",
-        "builder.read_as(surface_inputs.normal_roughness,AccessKind::ComputeShaderRead,);",
-        "builder.read_as(surface_inputs.material_roughness,AccessKind::ComputeShaderRead,);",
         "builder.read_as(surface_inputs.view_z,AccessKind::ComputeShaderRead);",
         "builder.read_as(surface_inputs.motion_history,AccessKind::ComputeShaderRead);",
+        "device.update_descriptor_sets(&writes,&[])",
+        "device.cmd_bind_pipeline(cmd,vk::PipelineBindPoint::COMPUTE,pipeline.pipeline.handle,);",
+        "device.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::COMPUTE,pipeline.pipeline.layout,pipeline.shared_set_index,&[shared_descriptor_set],&[],);",
+        "device.cmd_bind_descriptor_sets(cmd,vk::PipelineBindPoint::COMPUTE,pipeline.pipeline.layout,pipeline.resource_set_index,&[update.descriptor_set],&[],);",
+        "device.cmd_dispatch(cmd,u32::from(dispatch.grid_width),u32::from(dispatch.grid_height),1,);",
     ] {
         assert!(
             compact_adapter.contains(token),
@@ -1286,6 +1485,7 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     }
 
     assert!(render_mod.contains("pub mod nrd_adapter;"));
+    assert!(render_mod.contains("pub mod nrd_sys;"));
     assert!(pass_mod.contains("pub mod vpt_nrd_adapter;"));
     assert!(profiler.contains("VptNrdAdapter"));
     assert!(profiler.contains("vpt_nrd_adapter_ms"));
@@ -1294,9 +1494,16 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "use crate::render::passes::vpt_nrd_adapter::{",
         "pub vpt_nrd_adapter_pass: Option<VptNrdAdapterPass>",
         "vpt_nrd_adapter_pass: None",
-        "self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo);",
+        "self.ensure_vpt_nrd_adapter_pass(renderer, scene_ubo, lighting_settings);",
         "fn ensure_vpt_nrd_adapter_pass(",
         "VptNrdAdapterPass::new(",
+        "VptNrdFrameSettings::from_inputs",
+        "VptNrdFrameSettingsInputs",
+        "compute_nrd_world_to_view",
+        "compute_nrd_view_to_clip",
+        "previous_nrd_world_to_view",
+        "previous_nrd_view_to_clip",
+        "previous_nrd_elapsed_seconds",
         "failed to resize VPT NRD adapter images",
         "vpt_nrd_adapter_ready = self.vpt_nrd_adapter_pass.is_some()",
         "pass.destroy(device, allocator);",
@@ -1305,9 +1512,9 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
     }
     assert!(
         compact_pipeline.contains(
-            "letnrd_adapter_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax){"
+            "letnrd_adapter_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
         ),
-        "pipeline must record NRD adapter only for requested RELAX mode"
+        "pipeline must record NRD adapter for requested RELAX or REBLUR mode"
     );
     assert!(
         compact_pipeline
@@ -1323,12 +1530,16 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "adapter must consume history confidence resources"
     );
     assert!(
+        compact_pipeline.contains("vpt_nrd_adapter.update_frame_settings("),
+        "pipeline must refresh NRD settings and dispatches before registering the adapter graph"
+    );
+    assert!(
         compact_pipeline.contains("surface_inputs:final_surface_writes,"),
         "adapter must consume the selected current surface guides"
     );
     assert!(
-        compact_pipeline.contains("input_radiance:atrous_filtered_dep,"),
-        "Phase 5 must keep SVGF A-trous output feeding postprocess"
+        compact_pipeline.contains("atrous_filtered_dep,vpt_atrous.output_image()"),
+        "SVGF fallback must keep A-trous output available for postprocess"
     );
 
     let frontend_idx = pipeline
@@ -1342,6 +1553,184 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         .expect("SVGF temporal graph registration should exist");
     assert!(frontend_idx < adapter_idx);
     assert!(adapter_idx < temporal_idx);
+}
+
+#[test]
+fn vpt_nrd_resolve_remodulates_relax_output_before_postprocess() {
+    let shader = source("assets/shaders/passes/vpt_nrd_resolve.slang");
+    let pass = source("src/render/passes/vpt_nrd_resolve.rs");
+    let pass_mod = source("src/render/passes/mod.rs");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let profiler = source("src/render/gpu_profiler.rs");
+    let compact_shader = shader.split_whitespace().collect::<String>();
+    let compact_pass = pass.split_whitespace().collect::<String>();
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+
+    for token in [
+        "RWTexture2D<float4> denoised_diff_radiance_hitdist",
+        "RWTexture2D<float4> residual_radiance",
+        "RWTexture2D<float4> material_factors",
+        "RWTexture2D<float4> resolved_radiance",
+        "float3 sanitize_nrd_resolve_radiance(float3 radiance)",
+        "float3 nrd_ycocg_to_linear(float3 color)",
+    ] {
+        assert!(shader.contains(token), "NRD resolve shader missing {token}");
+    }
+    for token in [
+        "booluse_reblur=(scene.denoiser_flags&DENOISER_MODE_MASK)==DENOISER_MODE_REBLUR;",
+        "float3denoised_diffuse=sanitize_nrd_resolve_radiance(unpack_nrd_diffuse_radiance(denoised_diff_radiance_hitdist[tid.xy].rgb,use_reblur));",
+        "float3residual=sanitize_nrd_resolve_radiance(residual_radiance[tid.xy].rgb);",
+        "float3albedo=saturate(material_factors[tid.xy].rgb);",
+        "resolved_radiance[tid.xy]=float4(sanitize_nrd_resolve_radiance(residual+denoised_diffuse*albedo),1.0);",
+    ] {
+        assert!(
+            compact_shader.contains(token),
+            "NRD resolve shader missing compact token {token}"
+        );
+    }
+
+    for token in [
+        "pub struct VptNrdResolvePass",
+        "pub struct VptNrdResolveGraphInputs",
+        "pub struct VptNrdResolveGraphOutputs",
+        "pub struct VptNrdResolvePassCreateInfo",
+        "pub struct VptNrdResolvePassResizeInfo",
+        "pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 5]",
+        "descriptor_count: 4 * frame_count as u32",
+        "pub resolved_radiance: GpuImage",
+        "vpt_nrd_resolved_radiance",
+        "graph.add_pass(\"vpt_nrd_resolve\"",
+        "GpuProfileScope::VptNrdResolve",
+    ] {
+        assert!(pass.contains(token), "NRD resolve pass missing {token}");
+    }
+    for token in [
+        "builder.read_as(denoised_diff_radiance_hitdist,AccessKind::ComputeShaderRead,);",
+        "builder.read_as(packed.residual_radiance,AccessKind::ComputeShaderRead);",
+        "builder.read_as(packed.material_factors,AccessKind::ComputeShaderRead);",
+        "builder.write_as(resolved_resource,AccessKind::ComputeShaderWrite);",
+    ] {
+        assert!(
+            compact_pass.contains(token),
+            "NRD resolve graph missing compact token {token}"
+        );
+    }
+
+    assert!(pass_mod.contains("pub mod vpt_nrd_resolve;"));
+    assert!(profiler.contains("VptNrdResolve"));
+    assert!(profiler.contains("vpt_nrd_resolve_ms"));
+
+    for token in [
+        "use crate::render::passes::vpt_nrd_resolve::{",
+        "pub vpt_nrd_resolve_pass: Option<VptNrdResolvePass>",
+        "vpt_nrd_resolve_pass: None",
+        "self.ensure_vpt_nrd_resolve_pass(renderer, scene_ubo);",
+        "fn ensure_vpt_nrd_resolve_pass(",
+        "include_bytes!(concat!(env!(\"OUT_DIR\"), \"/shaders/vpt_nrd_resolve.spv\"))",
+        "VptNrdResolvePass::new(",
+        "failed to resize VPT NRD resolve images",
+        "vpt_nrd_resolve_ready = self.vpt_nrd_resolve_pass.is_some()",
+        "pass.destroy(device, allocator);",
+    ] {
+        assert!(pipeline.contains(token), "pipeline missing {token}");
+    }
+    assert!(
+        compact_pipeline.contains("vpt_nrd_adapter.is_ready()"),
+        "pipeline must only consume adapter output when the native NRD backend is ready"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "letnrd_resolve_outputs=ifmatches!(inputs.lighting_settings.denoiser_mode,VptDenoiserMode::Relax|VptDenoiserMode::Reblur){"
+        ),
+        "pipeline must resolve NRD output for requested RELAX or REBLUR mode"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "denoised_diff_radiance_hitdist:nrd_adapter_outputs.resources.diff_radiance_hitdist,"
+        ),
+        "resolve pass must consume denoised RELAX diffuse output"
+    );
+    assert!(
+        compact_pipeline.contains("packed:nrd_frontend_outputs.packed,"),
+        "resolve pass must consume frontend residual and material factors"
+    );
+    assert!(
+        compact_pipeline.contains("ifletSome(nrd_resolve_outputs)=nrd_resolve_outputs"),
+        "postprocess input must branch between NRD resolve and SVGF fallback"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "elseifinputs.lighting_settings.vpt_debug_view==VptDebugView::Final{ifletSome(nrd_resolve_outputs)=nrd_resolve_outputs"
+        ),
+        "NRD resolve must only override the postprocess input for the final VPT view so guide debug views remain visible"
+    );
+    assert!(
+        compact_pipeline.contains("input_radiance:postprocess_input_radiance,"),
+        "postprocess must use the selected denoiser output dependency"
+    );
+    assert!(
+        compact_pipeline.contains("hdr_image:postprocess_hdr_image,"),
+        "postprocess descriptors must bind the selected HDR source image"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "letactual_effective_denoiser_mode_name=capture_effective_denoiser_mode_name(inputs.lighting_settings,use_nrd_resolve_for_postprocess,);"
+        ),
+        "capture metadata must report the requested NRD mode when the NRD resolve output is selected"
+    );
+    assert!(
+        compact_pipeline.contains("effective_denoiser_mode:actual_effective_denoiser_mode_name,"),
+        "capture metadata must use the actual selected denoiser route"
+    );
+
+    let adapter_idx = pipeline
+        .find("vpt_nrd_adapter.register_graph(")
+        .expect("NRD adapter graph registration should exist");
+    let resolve_idx = pipeline
+        .find("vpt_nrd_resolve.register_graph(")
+        .expect("NRD resolve graph registration should exist");
+    let postprocess_idx = pipeline
+        .find("postprocess.register_graph(")
+        .expect("postprocess graph registration should exist");
+    assert!(adapter_idx < resolve_idx);
+    assert!(resolve_idx < postprocess_idx);
+}
+
+#[test]
+fn vpt_nrd_validation_debug_view_routes_native_overlay_to_postprocess() {
+    let scene_ubo = source("src/render/scene_ubo.rs");
+    let scene_common = source("assets/shaders/shared/scene_common.slang");
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+    let compact_scene_ubo = scene_ubo.split_whitespace().collect::<String>();
+
+    for token in [
+        "VPT_DEBUG_VIEW_NRD_VALIDATION",
+        "NrdValidation",
+        "nrd_validation",
+    ] {
+        assert!(
+            scene_ubo.contains(token) || scene_common.contains(token),
+            "NRD validation debug view plumbing missing {token}"
+        );
+    }
+    assert!(
+        compact_scene_ubo.contains("(\"nrd_validation\",24)"),
+        "NRD validation debug view should parse to GPU value 24"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "enable_validation:matches!(inputs.lighting_settings.vpt_debug_view,VptDebugView::NrdValidation),"
+        ),
+        "NRD frame settings must enable native validation only for the validation debug view"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "ifmatches!(inputs.lighting_settings.vpt_debug_view,VptDebugView::NrdValidation)"
+        ) && compact_pipeline.contains("nrd_adapter_outputs.resources.validation")
+            && compact_pipeline.contains("nrd_adapter_outputs.validation_image"),
+        "pipeline must route native NRD validation output into postprocess when requested"
+    );
 }
 
 #[test]
@@ -1371,7 +1760,7 @@ fn vpt_nrd_adapter_owns_backend_texture_pools() {
 
     for token in [
         "lettexture_pools=create_texture_pools(device,allocator,&backend)?;",
-        "letnew_backend=VptNrdAdapterBackend::initialize_relax(info.width,info.height);",
+        "letbackend=VptNrdAdapterBackend::initialize(info.denoiser_mode,info.width,info.height,info.relax_atrous_iteration_num,);",
         "letnew_texture_pools=matchcreate_texture_pools(device,allocator,&new_backend)",
         "new_images.destroy(device,allocator);",
         "std::mem::replace(&mutself.texture_pools,new_texture_pools)",
@@ -1539,7 +1928,7 @@ fn vpt_atrous_pass_declares_svgf_edge_aware_filter_contract() {
 
 #[test]
 fn app_routes_temporal_radiance_through_vpt_atrous_before_postprocess() {
-    let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let atrous_pass = source("src/render/passes/vpt_atrous.rs");
     let postprocess_pass = source("src/render/passes/postprocess.rs");
@@ -1552,8 +1941,8 @@ fn app_routes_temporal_radiance_through_vpt_atrous_before_postprocess() {
     assert!(pipeline.contains("VptAtrousPass::new"));
     assert!(pipeline.contains("VptAtrousPassCreateInfo"));
     assert!(pipeline.contains("PostprocessPass::new"));
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
-    assert!(app.contains("self.vpt_pipeline.record_and_execute_frame("));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("self.vpt_pipeline.record_and_execute_frame("));
     assert!(pipeline.contains("vpt_temporal.register_graph("));
     assert!(pipeline.contains("vpt_atrous.register_graph("));
     assert!(pipeline.contains("postprocess.register_graph("));
@@ -1705,16 +2094,16 @@ fn vpt_temporal_seeds_valid_history_when_no_previous_history_is_accepted() {
 
 #[test]
 fn app_does_not_rewrite_all_vpt_temporal_descriptors_per_frame() {
-    let app = std::fs::read_to_string("src/app.rs")
+    let runtime = std::fs::read_to_string("src/render/runtime.rs")
         .expect("app source should be readable for VPT temporal descriptor lifetime test");
-    let render_loop_start = app
-        .find("let frame = renderer.begin_frame()?")
+    let render_loop_start = runtime
+        .find("pub fn render_frame(")
         .expect("render loop should begin a Vulkan frame");
-    let render_loop_end = app[render_loop_start..]
-        .find("renderer.end_frame(frame)?")
+    let render_loop_end = runtime[render_loop_start..]
+        .find("fn snapshot_ucvh_frame_changes")
         .map(|offset| render_loop_start + offset)
         .expect("render loop should end the Vulkan frame");
-    let frame_body = &app[render_loop_start..render_loop_end];
+    let frame_body = &runtime[render_loop_start..render_loop_end];
 
     assert!(
         !frame_body.contains("vpt_temporal.update_input_images"),
@@ -1765,16 +2154,18 @@ fn app_declares_persistent_vpt_image_layouts_from_previous_frame_final_access() 
 fn app_resets_vpt_temporal_state_on_resize_and_key_changes() {
     let source = std::fs::read_to_string("src/app.rs")
         .expect("app source should be readable for VPT reset test");
+    let runtime = std::fs::read_to_string("src/render/runtime.rs")
+        .expect("runtime source should be readable for VPT reset test");
     let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
         .expect("VPT pipeline source should be readable for VPT reset test");
     let temporal = std::fs::read_to_string("src/render/passes/vpt_temporal.rs")
         .expect("VPT temporal source should be readable for VPT reset test");
     let compact = pipeline.split_whitespace().collect::<String>();
 
-    assert!(source.contains("self.vpt_pipeline.resize("));
+    assert!(runtime.contains("self.vpt_pipeline.resize("));
     assert!(
         source
-            .contains("fn resize_render_passes(&mut self, width: u32, height: u32) -> Result<()>")
+            .contains("fn resize_render_runtime(&mut self, width: u32, height: u32) -> Result<()>")
     );
     assert!(pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();"));
     assert!(compact.contains("self.frame_state.vpt_temporal_history_initialized"));
@@ -1787,7 +2178,7 @@ fn app_resets_vpt_temporal_state_on_resize_and_key_changes() {
     assert!(pipeline.contains("add_swapchain_clear_present_pass"));
     assert!(
         source
-            .contains("fn resize_render_passes(&mut self, width: u32, height: u32) -> Result<()>")
+            .contains("fn resize_render_runtime(&mut self, width: u32, height: u32) -> Result<()>")
     );
     assert!(!source.contains("graph.add_pass(\"primary_ray\""));
     assert!(!source.contains("primary_ray_writes"));
@@ -1833,12 +2224,29 @@ fn app_supports_frame_limited_runtime_smoke_validation() {
 }
 
 #[test]
+fn desktop_builds_reject_placeholder_shaders_instead_of_opening_black_window() {
+    let build = source("build.rs");
+
+    for token in [
+        "fn desktop_feature_enabled() -> bool",
+        "CARGO_FEATURE_DESKTOP",
+        "REVOLUMETRIC_SLANGC",
+        "fn slangc_command() -> Command",
+        "REVOLUMETRIC_SHADER_COMPILE=skip cannot be used with the desktop feature",
+        "desktop builds require real shaders",
+    ] {
+        assert!(build.contains(token), "build.rs missing {token}");
+    }
+}
+
+#[test]
 fn app_registers_vpt_graph_without_primary_ray_pass() {
     let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let vpt_pass = source("src/render/passes/vpt.rs");
 
-    assert!(app.contains("self.vpt_pipeline.record_and_execute_frame("));
+    assert!(runtime.contains("self.vpt_pipeline.record_and_execute_frame("));
     assert!(!app.contains("graph.add_pass(\"vpt\""));
     assert!(pipeline.contains("vpt.register_graph("));
     assert!(pipeline.contains("postprocess.register_graph("));
@@ -2233,6 +2641,78 @@ fn vpt_temporal_firefly_clamp_sanitizes_history_blended_output() {
 }
 
 #[test]
+fn vpt_temporal_denoiser_disabled_short_circuits_to_raw_passthrough() {
+    let temporal = std::fs::read_to_string("assets/shaders/passes/vpt_temporal.slang")
+        .expect("VPT temporal shader should exist");
+    let compact_temporal = temporal.split_whitespace().collect::<String>();
+
+    let off_idx = compact_temporal
+        .find("if((scene.denoiser_flags&DENOISER_FLAG_ENABLED)==0u){")
+        .expect("VPT temporal shader should short-circuit when denoiser is disabled");
+    let clamp_idx = compact_temporal
+        .find("firefly_stats=gather_firefly_clamp_stats(pixel,scene.resolution);")
+        .expect("VPT temporal shader should still contain the spatial firefly clamp path");
+    let history_idx = compact_temporal
+        .find("ClampedRadianceSamplehistory_clamped_noisy=clamp_noisy_radiance_to_history(")
+        .expect("VPT temporal shader should still contain the history clamp path");
+
+    assert!(
+        compact_temporal.contains(
+            "if((scene.denoiser_flags&DENOISER_FLAG_ENABLED)==0u){accumulated_radiance_image[pixel]=float4(noisy_radiance.rgb,1.0);accumulated_moments_history_image[pixel]=float4(noisy_moments.xy,current_surface_valid?1.0:0.0,current_surface_valid?1.0:0.0);return;}"
+        ),
+        "denoiser-off temporal path must write raw noisy radiance and return before filtering"
+    );
+    assert!(off_idx < clamp_idx);
+    assert!(off_idx < history_idx);
+}
+
+#[test]
+fn app_records_egui_overlay_only_after_postprocess_capture_and_swapchain_blit() {
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let compact_pipeline = pipeline.split_whitespace().collect::<String>();
+
+    for token in [
+        "let postprocess_outputs = postprocess.register_graph(",
+        "graph.add_pass(\"capture_postprocess\"",
+        "graph.add_pass(\"blit_to_swapchain\"",
+        "graph.add_pass(\"egui_overlay\"",
+        "builder.finish_as(swapchain_after_blit, AccessKind::Present);",
+    ] {
+        assert!(pipeline.contains(token), "VPT pipeline missing {token}");
+    }
+
+    assert!(
+        compact_pipeline.contains(
+            "builder.read_as(dep_handle,AccessKind::TransferRead);ifletSome(capture_dep)=capture_dependency{builder.depend_on(capture_dep);}builder.write_as(swapchain_dep,AccessKind::TransferWrite);if!has_egui_overlay{builder.finish_as(swapchain_dep,AccessKind::Present);}"
+        ),
+        "swapchain blit must depend on postprocess capture and present directly only when no UI overlay is recorded"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "letswapchain_after_blit=blit_writes[0];iflet(Some(egui_renderer),Some(egui_frame))=(egui_renderer,egui_frame){graph.add_pass(\"egui_overlay\",QueueType::Graphics,|builder|{builder.write_as(swapchain_after_blit,AccessKind::ColorAttachmentWrite);builder.finish_as(swapchain_after_blit,AccessKind::Present);"
+        ),
+        "egui overlay must draw onto the swapchain after blit and must not feed postprocess or capture"
+    );
+
+    let postprocess_idx = pipeline
+        .find("let postprocess_outputs = postprocess.register_graph(")
+        .expect("postprocess graph should exist");
+    let capture_idx = pipeline
+        .find("graph.add_pass(\"capture_postprocess\"")
+        .expect("capture graph should exist");
+    let blit_idx = pipeline
+        .find("graph.add_pass(\"blit_to_swapchain\"")
+        .expect("blit graph should exist");
+    let egui_idx = pipeline
+        .find("graph.add_pass(\"egui_overlay\"")
+        .expect("egui overlay graph should exist");
+
+    assert!(postprocess_idx < capture_idx);
+    assert!(capture_idx < blit_idx);
+    assert!(blit_idx < egui_idx);
+}
+
+#[test]
 fn vpt_temporal_motion_debug_view_encodes_reprojection_delta() {
     let temporal = std::fs::read_to_string("assets/shaders/passes/vpt_temporal.slang")
         .expect("VPT temporal shader should exist");
@@ -2396,7 +2876,7 @@ fn vpt_trace_shader_exposes_voxel_traversal_debug_views() {
 
 #[test]
 fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
-    let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let surface_pass = source("src/render/passes/vpt_surface.rs");
     let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
@@ -2415,8 +2895,8 @@ fn app_runs_vpt_surface_before_restir_and_vpt_trace() {
         .find("vpt.register_graph(")
         .expect("VPT trace graph pass should exist after surface registration");
 
-    assert!(app.contains("vpt_pipeline: VptRuntimePipeline"));
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("vpt_pipeline: VptRuntimePipeline"));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(pipeline.contains("pub vpt_surface_pass: Option<VptSurfacePass>"));
     assert!(pipeline.contains("VptSurfacePass::new"));
     assert!(surface_pass.contains("\"vpt_surface_bootstrap\""));
@@ -2452,6 +2932,8 @@ fn app_profiles_bootstrap_and_selected_vpt_surface_with_distinct_query_scopes() 
 fn app_keeps_restir_di_behind_vpt_setting() {
     let source = std::fs::read_to_string("src/app.rs")
         .expect("app source should be readable for ReSTIR-DI app wiring test");
+    let runtime = std::fs::read_to_string("src/render/runtime.rs")
+        .expect("runtime source should be readable for ReSTIR-DI app wiring test");
     let pipeline = std::fs::read_to_string("src/render/vpt_pipeline.rs")
         .expect("VPT pipeline source should be readable for ReSTIR-DI app wiring test");
     let compact_source = source.split_whitespace().collect::<String>();
@@ -2461,7 +2943,7 @@ fn app_keeps_restir_di_behind_vpt_setting() {
     assert!(pipeline.contains("pub restir_di_pass: Option<RestirDiPass>"));
     assert!(source.contains("fn restir_di_vpt_enabled(&self) -> bool"));
     assert!(source.contains("let restir_di_enabled = self.restir_di_vpt_enabled();"));
-    assert!(source.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(
         compact_source.contains("self.restir_di_settings.enabled"),
         "ReSTIR-DI must stay disabled unless the explicit setting is enabled"
@@ -2508,6 +2990,22 @@ fn vpt_restir_direct_resolve_uses_area_sample_position_without_pdf_amplification
         !source.contains("reservoir.sample_radiance.rgb / sample_pdf"),
         "cluster color_power already represents total emissive power; dividing final radiance by area PDF causes brightness explosions"
     );
+}
+
+#[test]
+fn vpt_restir_direct_resolve_applies_lambertian_brdf_factor() {
+    let source = normalized_source(include_str!("../../../../assets/shaders/passes/vpt.slang"));
+
+    for token in [
+        "LIGHTING_INV_PI",
+        "sample.radiance = albedo * LIGHTING_INV_PI * reservoir.sample_radiance.rgb * sun_term * selected_weight;",
+        "sample.radiance = albedo * LIGHTING_INV_PI * reservoir.sample_radiance.rgb * geometry_term * selected_weight;",
+    ] {
+        assert!(
+            source.contains(token),
+            "VPT ReSTIR direct resolve must shade reservoirs with Lambertian f=albedo/pi; missing token {token}"
+        );
+    }
 }
 
 #[test]
@@ -2656,6 +3154,74 @@ fn vpt_analytic_sun_samples_solar_disk_for_soft_shadow_edges() {
     assert!(
         !vpt.contains("analytic_sun_direct(hit, scene);"),
         "analytic sun direct lighting must consume rng_state so penumbrae can converge across VPT samples"
+    );
+}
+
+#[test]
+fn vpt_analytic_sun_normalizes_by_solar_disk_solid_angle() {
+    let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
+        .expect("vpt shader should be readable");
+    let lighting_common = std::fs::read_to_string("assets/shaders/shared/lighting_common.slang")
+        .expect("lighting common shader should be readable");
+    let scene_light = std::fs::read_to_string("src/scene/light.rs")
+        .expect("scene light source should be readable");
+    let scene_ubo =
+        std::fs::read_to_string("src/render/scene_ubo.rs").expect("scene UBO should be readable");
+    let readme = std::fs::read_to_string("README.md").expect("README should be readable");
+
+    for token in [
+        "float sun_pdf = sun_direction_pdf(scene);",
+        "if (sun_pdf <= 0.0)",
+        "return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term / sun_pdf;",
+    ] {
+        assert!(
+            vpt.contains(token),
+            "VPT analytic sun must normalize the sampled solar disk with its pdf; missing token {token}"
+        );
+    }
+    for token in [
+        "float sun_disk_solid_angle(SceneUniforms scene)",
+        "float sun_direction_pdf(SceneUniforms scene)",
+        "if (sun_radius <= 0.0)",
+        "return 0.0;",
+        "return max(LIGHTING_TWO_PI * (1.0 - cos(sun_radius)), 1.0e-8);",
+        "return solid_angle > 0.0 ? 1.0 / solid_angle : 0.0;",
+    ] {
+        assert!(
+            lighting_common.contains(token),
+            "shared lighting helpers must expose finite solar disk normalization; missing token {token}"
+        );
+    }
+    assert!(
+        lighting_common.contains(
+            "float3 finite_sun_irradiance = scene.sun_intensity * ground_ndotl * sun_disk_solid_angle(scene);"
+        ) && lighting_common.contains(
+            "float3 sunlit_ground = scene.ground_color * (1.0 + LIGHTING_INV_PI * finite_sun_irradiance);"
+        ),
+        "sky miss ground lighting must use the same finite-disk radiance scale as direct sun instead of treating sun_intensity as directional irradiance"
+    );
+    assert!(
+        !lighting_common
+            .contains("scene.ground_color * (1.0 + scene.sun_intensity * ground_ndotl)"),
+        "sky miss path must not retain the legacy directional-irradiance ground boost"
+    );
+
+    assert!(
+        scene_light.contains("Solar-disk radiance used by the VPT finite sun estimator."),
+        "DirectionalLight::intensity must document that VPT consumes solar-disk radiance, not legacy directional irradiance"
+    );
+    assert!(
+        scene_ubo.contains("solar-disk radiance for VPT finite sun estimator"),
+        "GpuSceneUniforms::sun_intensity must document the finite-disk radiance semantic"
+    );
+    assert!(
+        readme.contains("The default sun intensity is interpreted as solar-disk radiance"),
+        "README must tell users that finite sun disk direct lighting uses radiance/pdf semantics"
+    );
+
+    assert!(
+        !vpt.contains("* 0.2"),
+        "VPT analytic sun must not use a magic constant in place of the solar-disk sampling pdf"
     );
 }
 
@@ -3267,6 +3833,7 @@ fn app_declares_spatial_reservoir_as_vpt_read_dependency() {
 #[test]
 fn app_wires_area_restir_between_surface_and_vpt_with_history_and_vpt_reads() {
     let app = source("src/app.rs");
+    let runtime = source("src/render/runtime.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
     let surface_pass = source("src/render/passes/vpt_surface.rs");
     let area_pass = std::fs::read_to_string("src/render/passes/area_restir.rs")
@@ -3285,12 +3852,16 @@ fn app_wires_area_restir_between_surface_and_vpt_with_history_and_vpt_reads() {
     for app_token in [
         "AreaRestirSettings::from_env",
         "area_restir_settings: AreaRestirSettings",
-        "ucvh_gpu",
-        "self.vpt_pipeline.ensure_passes(",
     ] {
         assert!(
             app.contains(app_token),
             "app missing Area ReSTIR setup token {app_token}"
+        );
+    }
+    for runtime_token in ["ucvh_gpu", "self.vpt_pipeline.ensure_passes("] {
+        assert!(
+            runtime.contains(runtime_token),
+            "runtime missing Area ReSTIR setup token {runtime_token}"
         );
     }
 

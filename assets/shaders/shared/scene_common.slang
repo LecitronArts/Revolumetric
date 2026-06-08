@@ -11,6 +11,11 @@ static const uint LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE = 1u;
 static const uint LIGHTING_DEBUG_VIEW_NORMAL = 2u;
 static const uint RENDER_MODE_VPT = 1u;
 static const uint DENOISER_FLAG_ENABLED = 1u << 0;
+static const uint DENOISER_MODE_SHIFT = 28u;
+static const uint DENOISER_MODE_MASK = 0x3u << DENOISER_MODE_SHIFT;
+static const uint DENOISER_MODE_SVGF = 0u << DENOISER_MODE_SHIFT;
+static const uint DENOISER_MODE_RELAX = 1u << DENOISER_MODE_SHIFT;
+static const uint DENOISER_MODE_REBLUR = 2u << DENOISER_MODE_SHIFT;
 static const uint VPT_DEBUG_VIEW_FINAL = 0u;
 static const uint VPT_DEBUG_VIEW_RAW = 1u;
 static const uint VPT_DEBUG_VIEW_TEMPORAL = 2u;
@@ -35,6 +40,7 @@ static const uint VPT_DEBUG_VIEW_NRD_NORMAL_ROUGHNESS = 20u;
 static const uint VPT_DEBUG_VIEW_NRD_VIEWZ = 21u;
 static const uint VPT_DEBUG_VIEW_NRD_MOTION = 22u;
 static const uint VPT_DEBUG_VIEW_NRD_MOTION_Z = 23u;
+static const uint VPT_DEBUG_VIEW_NRD_VALIDATION = 24u;
 static const float VPT_VIEW_Z_MISS_SENTINEL = 1.0e20;
 
 uint lighting_debug_view(uint flags) {

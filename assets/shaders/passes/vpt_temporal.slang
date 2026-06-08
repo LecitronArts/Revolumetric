@@ -501,6 +501,16 @@ void main(uint3 tid : SV_DispatchThreadID) {
         return;
     }
 
+    if ((scene.denoiser_flags & DENOISER_FLAG_ENABLED) == 0u) {
+        accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, 1.0);
+        accumulated_moments_history_image[pixel] = float4(
+            noisy_moments.xy,
+            current_surface_valid ? 1.0 : 0.0,
+            current_surface_valid ? 1.0 : 0.0
+        );
+        return;
+    }
+
     if (current_surface_valid) {
         firefly_stats = gather_firefly_clamp_stats(pixel, scene.resolution);
         ClampedRadianceSample clamped_noisy = clamp_noisy_radiance_to_spatial_firefly_stats(

@@ -64,9 +64,9 @@ fn postprocess_input_update_is_frame_slot_scoped() {
 
 #[test]
 fn app_wires_vpt_through_postprocess_before_blit() {
-    let app = normalized_source(
-        &std::fs::read_to_string("src/app.rs")
-            .expect("app source should be readable for render-pipeline source test"),
+    let runtime = normalized_source(
+        &std::fs::read_to_string("src/render/runtime.rs")
+            .expect("runtime source should be readable for render-pipeline source test"),
     );
     let pipeline = normalized_source(
         &std::fs::read_to_string("src/render/vpt_pipeline.rs")
@@ -77,8 +77,8 @@ fn app_wires_vpt_through_postprocess_before_blit() {
             .expect("postprocess source should be readable for render-pipeline source test"),
     );
 
-    assert!(app.contains("capture: Option<RenderCapture>"));
-    assert!(app.contains("self.vpt_pipeline.ensure_passes("));
+    assert!(runtime.contains("capture: Option<RenderCapture>"));
+    assert!(runtime.contains("self.vpt_pipeline.ensure_passes("));
     assert!(pipeline.contains("pub postprocess_pass: Option<PostprocessPass>"));
     assert!(pipeline.contains("PostprocessPass::new"));
     assert!(pipeline.contains("postprocess.register_graph("));
@@ -110,5 +110,5 @@ fn app_wires_vpt_through_postprocess_before_blit() {
     assert!(postprocess_idx < capture_idx);
     assert!(capture_idx < blit_idx);
     assert!(pipeline.contains("cmd_copy_image_to_buffer"));
-    assert!(app.contains("renderer.wait_for_fence"));
+    assert!(runtime.contains("self.renderer.wait_for_fence"));
 }

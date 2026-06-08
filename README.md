@@ -8,7 +8,12 @@ The project is currently an engine prototype, not a packaged application. The co
 
 - Rust toolchain with edition 2024 support.
 - Vulkan 1.3 capable driver.
-- `slangc` on `PATH` for real shader compilation.
+- `slangc` on `PATH` for real shader compilation, or set
+  `REVOLUMETRIC_SLANGC` to the absolute `slangc.exe` path.
+- Optional native NRD validation requires an accepted NVIDIA NRD SDK checkout
+  with headers and `NRD.lib`/`libNRD.a`. Static official NRD builds may also
+  need `ShaderMakeBlob.lib` beside `NRD.lib`. Set `REVOLUMETRIC_NRD_ROOT`, or
+  place the SDK under `run/nrd`.
 
 By default, if `slangc` is missing, the build script writes empty placeholder `.spv` files so Rust compilation can still proceed. Runtime render passes that require non-empty shaders will log warnings and skip initialization.
 
@@ -20,7 +25,8 @@ $env:REVOLUMETRIC_SHADER_COMPILE = "skip"; cargo test; Remove-Item Env:\REVOLUME
 $env:REVOLUMETRIC_SHADER_COMPILE = "strict"; cargo test --lib; cargo build --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
 cargo clippy --all-targets -- -D warnings
 cargo build
-cargo run
+cargo run --features desktop --bin revolumetric
+.\run\validate-nrd.ps1 -Frames 3
 ```
 
 ## Runtime And Build Config
@@ -30,6 +36,9 @@ Build-time shader compilation is controlled with `REVOLUMETRIC_SHADER_COMPILE`:
 - `auto` or unset: compile shaders with `slangc` when available. If `slangc` is not found, write empty placeholder `.spv` files and emit a Cargo warning.
 - `strict`: require `slangc`. Missing `slangc` or a shader compiler failure fails the build. Use this mode for CI and release validation so shader ABI and compiler errors cannot be hidden by placeholder SPIR-V.
 - `skip`: do not invoke `slangc`; write empty placeholder `.spv` files. Use this only for CPU-only test environments.
+- `REVOLUMETRIC_SLANGC=<absolute path to slangc.exe>`: optional explicit
+  compiler path for launch environments, such as IDEs, whose `PATH` does not
+  include the Vulkan SDK `Bin` directory.
 
 Invalid values fail the build instead of silently falling back to a default.
 
@@ -39,10 +48,13 @@ Rendering settings can be overridden through environment variables:
 - `REVOLUMETRIC_VPT_MAX_BOUNCES=1..8`: bounds VPT path length. Default is `2`.
 - `REVOLUMETRIC_EXPOSURE=<finite non-negative float>`: postprocess exposure multiplier before tonemap. Default is `1.0`.
 - `REVOLUMETRIC_LIGHTING_SHADOWS=on|off|1|0|true|false`: enables direct-light shadow rays.
-- `REVOLUMETRIC_SUN_ANGULAR_RADIUS=<finite float in 0.0..=0.25>`: analytic sun disk radius in radians for VPT soft shadow edges. Default is `0.02`.
+- `REVOLUMETRIC_SUN_ANGULAR_RADIUS=<finite positive float in (0.0, 0.25]>`: analytic sun disk radius in radians for VPT soft shadow edges. Default is `0.02`.
+  The default sun intensity is interpreted as solar-disk radiance and the VPT direct-light estimator evaluates Lambertian `f * Li * cos / pdf`; changing the angular radius changes the sampled disk solid angle rather than applying a legacy directional-light brightness compensation.
 - `REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS=on|off|1|0|true|false`: skips backface shadow hits when enabled.
 - `REVOLUMETRIC_LIGHTING_DEBUG_VIEW=final|off|diffuse|direct|normal`: selects runtime lighting debug output.
-- `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit`: selects VPT diagnostics. Area ReSTIR and voxel traversal debug views are written through the final postprocess path without temporal smoothing.
+- `REVOLUMETRIC_DENOISER=off|svgf|relax|reblur`: selects VPT denoising. `relax` uses the native NRD path only when the `nrd` Cargo feature and NRD SDK are available; otherwise it falls back to the existing SVGF path.
+- `REVOLUMETRIC_DENOISER_ATROUS_ITERATIONS=0..5`: controls the fallback SVGF/A-trous iteration budget and related denoiser settings.
+- `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z|nrd_validation`: selects VPT diagnostics. Area ReSTIR, voxel traversal, and NRD guide/debug views are written through the final postprocess path without temporal smoothing.
 
 Invalid rendering environment values emit parse warnings and keep the default for the invalid setting.
 
