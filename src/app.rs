@@ -11,6 +11,10 @@ use winit::platform::android::EventLoopBuilderExtAndroid;
 #[cfg(target_os = "android")]
 use winit::platform::android::activity::AndroidApp;
 
+#[cfg(not(target_os = "android"))]
+use crate::editor::fonts::{configure_editor_fonts, configure_editor_style};
+#[cfg(not(target_os = "android"))]
+use crate::editor::ui::{EditorUi, EditorUiFrameState};
 use crate::platform::input::InputState;
 use crate::scene::camera::update_fly_camera;
 use crate::scene::components::CameraRig;
@@ -20,18 +24,15 @@ use crate::ecs::world::World;
 use crate::platform::time::Time;
 use crate::platform::window::WindowDescriptor;
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
-use crate::render::capture::RenderCapture;
-use crate::render::device::RenderDevice;
-use crate::render::gpu_profiler::{GpuProfiler, GpuProfilerConfig};
+#[cfg(not(target_os = "android"))]
+use crate::render::egui_renderer::EguiFrame;
 use crate::render::restir_di::RestirDiSettings;
-use crate::render::scene_ubo::{LightingSettings, SceneUniformBuffer, VptDebugView};
-use crate::render::vpt_pipeline::{
-    UcvhFrameChanges, VptCameraFrame, VptFrameInputs, VptRuntimePipeline,
-};
+use crate::render::runtime::{RenderFrameInput, RenderRuntime, RuntimeSettings};
+use crate::render::scene_ubo::{LightingSettings, VptDebugView};
+use crate::render::vpt_pipeline::VptCameraFrame;
 use crate::scene::light::DirectionalLight;
 use crate::scene::systems;
 use crate::voxel::generator;
-use crate::voxel::gpu_upload::UcvhGpuResources;
 use crate::voxel::ucvh::{Ucvh, UcvhConfig};
 
 pub fn run() -> Result<()> {
@@ -81,20 +82,20 @@ fn parse_exit_after_frames() -> Option<u64> {
 struct RevolumetricApp {
     world: World,
     schedule: Schedule,
-    renderer: Option<RenderDevice>,
-    gpu_profiler: Option<GpuProfiler>,
-    capture: Option<RenderCapture>,
-    vpt_pipeline: VptRuntimePipeline,
+    render_runtime: Option<RenderRuntime>,
     ucvh: Option<Ucvh>,
-    ucvh_gpu: Option<UcvhGpuResources>,
-    ucvh_uploaded: bool,
-    scene_ubo: Option<SceneUniformBuffer>,
     lighting_settings: LightingSettings,
     area_restir_settings: AreaRestirSettings,
     restir_di_settings: RestirDiSettings,
     window_descriptor: WindowDescriptor,
     window: Option<Window>,
     window_id: Option<WindowId>,
+    #[cfg(not(target_os = "android"))]
+    egui_ctx: Option<egui::Context>,
+    #[cfg(not(target_os = "android"))]
+    egui_state: Option<egui_winit::State>,
+    #[cfg(not(target_os = "android"))]
+    editor_ui: Option<EditorUi>,
     initialized: bool,
     touch_look: TouchLookState,
     last_frame_time: Option<std::time::Instant>,
@@ -140,6 +141,28 @@ impl TouchLookState {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct UiInputCapture {
+    consumed: bool,
+    wants_keyboard_input: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CameraInputEventKind {
+    Keyboard,
+    Pointer,
+}
+
+fn camera_should_receive_input(kind: CameraInputEventKind, capture: UiInputCapture) -> bool {
+    if capture.consumed {
+        return false;
+    }
+    match kind {
+        CameraInputEventKind::Keyboard => !capture.wants_keyboard_input,
+        CameraInputEventKind::Pointer => true,
+    }
+}
+
 impl RevolumetricApp {
     fn new() -> Self {
         let mut world = World::new();
@@ -159,20 +182,20 @@ impl RevolumetricApp {
         Self {
             world,
             schedule,
-            renderer: None,
-            gpu_profiler: None,
-            capture: None,
-            vpt_pipeline: VptRuntimePipeline::new(),
+            render_runtime: None,
             ucvh: None,
-            ucvh_gpu: None,
-            ucvh_uploaded: false,
-            scene_ubo: None,
             lighting_settings: LightingSettings::default(),
             area_restir_settings: AreaRestirSettings::default(),
             restir_di_settings: RestirDiSettings::default(),
             window_descriptor: WindowDescriptor::default(),
             window: None,
             window_id: None,
+            #[cfg(not(target_os = "android"))]
+            egui_ctx: None,
+            #[cfg(not(target_os = "android"))]
+            egui_state: None,
+            #[cfg(not(target_os = "android"))]
+            editor_ui: None,
             initialized: false,
             touch_look: TouchLookState::default(),
             last_frame_time: None,
@@ -189,25 +212,29 @@ impl RevolumetricApp {
         self.area_restir_settings.enabled
     }
 
-    fn resize_render_passes(&mut self, width: u32, height: u32) -> Result<()> {
-        let renderer = match self.renderer.as_ref() {
-            Some(renderer) => renderer,
-            None => return Ok(()),
-        };
-        let (scene_ubo, ucvh_gpu) = match (&self.scene_ubo, &self.ucvh_gpu) {
-            (Some(scene_ubo), Some(ucvh_gpu)) => (scene_ubo, ucvh_gpu),
-            _ => return Ok(()),
-        };
+    fn runtime_settings(&self) -> RuntimeSettings {
+        RuntimeSettings {
+            lighting: self.lighting_settings,
+            restir_di: self.restir_di_settings,
+            area_restir: self.area_restir_settings,
+        }
+    }
 
-        self.vpt_pipeline.resize(
-            renderer,
-            scene_ubo,
-            ucvh_gpu,
-            width,
-            height,
-            self.restir_di_vpt_enabled(),
-            self.area_restir_vpt_enabled(),
-        )
+    fn resize_render_runtime(&mut self, width: u32, height: u32) -> Result<()> {
+        let settings = self.runtime_settings();
+        let restir_di_enabled = self.restir_di_vpt_enabled();
+        let area_restir_enabled = self.area_restir_vpt_enabled();
+        if let Some(runtime) = self.render_runtime.as_mut() {
+            runtime.resize(
+                width,
+                height,
+                self.ucvh.as_ref(),
+                settings,
+                restir_di_enabled,
+                area_restir_enabled,
+            )?;
+        }
+        Ok(())
     }
 
     fn update_camera(&mut self, dt: f32) {
@@ -259,16 +286,119 @@ impl RevolumetricApp {
             .map_or(0.0, |time| time.elapsed_seconds)
     }
 
-    fn snapshot_ucvh_frame_changes(ucvh: &Ucvh) -> UcvhFrameChanges {
-        UcvhFrameChanges::new(
-            ucvh.invalidation_regions().to_vec(),
-            ucvh.motion_events().to_vec(),
-        )
+    #[cfg(not(target_os = "android"))]
+    fn initialize_editor_ui(&mut self, window: &Window) {
+        let egui_ctx = egui::Context::default();
+        let font_report = configure_editor_fonts(std::path::Path::new("assets").join("fonts"));
+        for warning in &font_report.warnings {
+            tracing::warn!(
+                font = warning.font_name,
+                searched_paths = ?warning.searched_paths,
+                "optional editor font asset missing; using egui fallback"
+            );
+        }
+        egui_ctx.set_fonts(font_report.fonts);
+        egui_ctx.set_style(configure_editor_style());
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window,
+            Some(window.scale_factor() as f32),
+            window.theme(),
+            None,
+        );
+
+        self.egui_ctx = Some(egui_ctx);
+        self.egui_state = Some(egui_state);
+        self.editor_ui = Some(EditorUi::new());
     }
 
-    fn clear_ucvh_frame_changes(ucvh: &mut Ucvh) {
-        let _ = ucvh.take_invalidation_regions();
-        let _ = ucvh.take_motion_events();
+    #[cfg(not(target_os = "android"))]
+    fn process_egui_window_event(&mut self, event: &WindowEvent) -> UiInputCapture {
+        let Some(window) = self.window.as_ref() else {
+            return UiInputCapture::default();
+        };
+        let Some(egui_state) = self.egui_state.as_mut() else {
+            return UiInputCapture::default();
+        };
+        let response = egui_state.on_window_event(window, event);
+        if response.repaint {
+            window.request_redraw();
+        }
+        let Some(egui_ctx) = self.egui_ctx.as_ref() else {
+            return UiInputCapture {
+                consumed: response.consumed,
+                ..UiInputCapture::default()
+            };
+        };
+        UiInputCapture {
+            consumed: response.consumed,
+            wants_keyboard_input: egui_ctx.wants_keyboard_input(),
+        }
+    }
+
+    #[cfg(target_os = "android")]
+    fn process_egui_window_event(&mut self, _event: &WindowEvent) -> UiInputCapture {
+        UiInputCapture::default()
+    }
+
+    #[cfg(not(target_os = "android"))]
+    fn build_egui_frame(
+        &mut self,
+        camera: VptCameraFrame,
+        viewport_extent: [u32; 2],
+    ) -> Option<EguiFrame> {
+        let window = self.window.as_ref()?;
+        let egui_ctx = self.egui_ctx.as_ref()?;
+        let egui_state = self.egui_state.as_mut()?;
+        let editor_ui = self.editor_ui.as_mut()?;
+        let raw_input = egui_state.take_egui_input(window);
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            editor_ui.show(
+                ctx,
+                EditorUiFrameState {
+                    lighting: &mut self.lighting_settings,
+                    restir_di: &mut self.restir_di_settings,
+                    area_restir: &mut self.area_restir_settings,
+                    camera,
+                    viewport_extent,
+                    rendered_frames: self.rendered_frames,
+                },
+            );
+        });
+        egui_state.handle_platform_output(window, full_output.platform_output);
+        let clipped_primitives =
+            egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        Some(EguiFrame {
+            clipped_primitives,
+            textures_delta: full_output.textures_delta,
+            pixels_per_point: full_output.pixels_per_point,
+        })
+    }
+
+    #[cfg(target_os = "android")]
+    fn build_egui_frame(
+        &mut self,
+        _camera: VptCameraFrame,
+        _viewport_extent: [u32; 2],
+    ) -> Option<()> {
+        None
+    }
+
+    fn set_camera_look(&mut self, pressed: bool) {
+        if let Some(input) = self.world.resource_mut::<InputState>() {
+            input.right_mouse_held = pressed;
+        }
+        if let Some(window) = &self.window {
+            if pressed {
+                let _ = window.set_cursor_grab(CursorGrabMode::Confined);
+                window.set_cursor_visible(false);
+            } else {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+        }
     }
 
     fn tick_frame(&mut self) -> Result<()> {
@@ -297,107 +427,32 @@ impl RevolumetricApp {
         let restir_di_enabled = self.restir_di_vpt_enabled();
         let area_restir_enabled = self.area_restir_vpt_enabled();
         let camera = self.current_vpt_camera_frame();
+        let viewport_extent = self
+            .window
+            .as_ref()
+            .map(|window| {
+                let size = window.inner_size();
+                [size.width, size.height]
+            })
+            .unwrap_or([0, 0]);
+        #[cfg(not(target_os = "android"))]
+        let egui_frame = self.build_egui_frame(camera, viewport_extent);
         let (sun_direction, sun_intensity) = self.current_sun_light();
         let elapsed_seconds = self.current_elapsed_seconds();
-        if let Some(renderer) = self.renderer.as_mut() {
-            let frame = renderer.begin_frame()?;
-            if frame.should_render {
-                if let Some(profiler) = &mut self.gpu_profiler {
-                    profiler.begin_frame(
-                        renderer.device(),
-                        frame.command_buffer,
-                        frame.frame_slot,
-                        frame.frame_index,
-                    );
-                }
-
-                // Upload UCVH data to GPU (first frame only)
-                if !self.ucvh_uploaded {
-                    if let (Some(ucvh), Some(gpu)) = (self.ucvh.as_mut(), &self.ucvh_gpu) {
-                        match gpu.upload_all(renderer.device(), frame.command_buffer, ucvh) {
-                            Ok(()) => {
-                                self.ucvh_uploaded = true;
-                                tracing::info!("uploaded UCVH data to GPU");
-                            }
-                            Err(error) => {
-                                tracing::error!(%error, "failed to upload UCVH data to GPU");
-                            }
-                        }
-                    }
-                }
-
-                let ucvh_frame_changes = if self.ucvh_uploaded {
-                    self.ucvh
-                        .as_ref()
-                        .map(Self::snapshot_ucvh_frame_changes)
-                        .unwrap_or_default()
-                } else {
-                    UcvhFrameChanges::default()
-                };
-                let mut ucvh_motion_event_count = 0u32;
-                if self.ucvh_uploaded
-                    && let (Some(ucvh), Some(gpu)) = (self.ucvh.as_ref(), &self.ucvh_gpu)
-                {
-                    match gpu.upload_motion_guide(
-                        renderer.device(),
-                        frame.command_buffer,
-                        ucvh,
-                        &ucvh_frame_changes.motion_events,
-                    ) {
-                        Ok(count) => {
-                            ucvh_motion_event_count = count;
-                        }
-                        Err(error) => tracing::error!(%error, "failed to upload UCVH motion guide"),
-                    }
-                }
-
-                if let Some(scene_ubo) = &self.scene_ubo {
-                    let record_result = self.vpt_pipeline.record_and_execute_frame(
-                        renderer,
-                        &frame,
-                        VptFrameInputs {
-                            scene_ubo,
-                            camera,
-                            sun_direction,
-                            sun_intensity,
-                            elapsed_seconds,
-                            lighting_settings: self.lighting_settings,
-                            restir_di_settings: self.restir_di_settings,
-                            area_restir_settings: self.area_restir_settings,
-                            restir_di_enabled,
-                            area_restir_enabled,
-                            ucvh_ready: self.ucvh_uploaded,
-                            ucvh_frame_changes,
-                            ucvh_motion_event_count,
-                            capture: self.capture.as_mut(),
-                            profiler: self.gpu_profiler.as_ref(),
-                        },
-                    )?;
-                    let submitted_fence = record_result.submitted_fence;
-                    let mut pending_capture = record_result.pending_capture;
-                    renderer.end_frame(frame)?;
-                    if self.ucvh_uploaded
-                        && let Some(ucvh) = self.ucvh.as_mut()
-                    {
-                        Self::clear_ucvh_frame_changes(ucvh);
-                    }
-                    if let Some(metadata) = pending_capture.take() {
-                        renderer.wait_for_fence(submitted_fence)?;
-                        if let Some(capture) = &self.capture {
-                            capture.write_rgba8_capture(&metadata)?;
-                            tracing::info!(
-                                frame_index = metadata.frame_index,
-                                ppm = %metadata.ppm_path.display(),
-                                json = %metadata.json_path.display(),
-                                "wrote postprocess capture"
-                            );
-                        }
-                    }
-                } else {
-                    tracing::warn!("skipping render frame until scene UBO is initialized");
-                    renderer.end_frame(frame)?;
-                }
-            }
+        let settings = self.runtime_settings();
+        if let Some(runtime) = self.render_runtime.as_mut() {
+            runtime.render_frame(RenderFrameInput {
+                camera,
+                sun_direction,
+                sun_intensity,
+                elapsed_seconds,
+                settings,
+                restir_di_enabled,
+                area_restir_enabled,
+                ucvh: self.ucvh.as_mut(),
+                #[cfg(not(target_os = "android"))]
+                egui_frame,
+            })?;
         }
         if let Some(input) = self.world.resource_mut::<InputState>() {
             input.clear_per_frame();
@@ -406,29 +461,6 @@ impl RevolumetricApp {
         self.schedule
             .run_stage(Stage::ExecuteRender, &mut self.world)?;
         Ok(())
-    }
-}
-
-impl Drop for RevolumetricApp {
-    fn drop(&mut self) {
-        // Destroy GPU passes before the renderer (which owns the device/allocator).
-        if let Some(renderer) = &self.renderer {
-            unsafe { renderer.device().device_wait_idle().ok() };
-            if let Some(profiler) = self.gpu_profiler.take() {
-                profiler.destroy(renderer.device());
-            }
-            if let Some(capture) = self.capture.take() {
-                capture.destroy(renderer.device(), renderer.allocator());
-            }
-            let vpt_pipeline = std::mem::take(&mut self.vpt_pipeline);
-            vpt_pipeline.destroy(renderer.device(), renderer.allocator());
-            if let Some(gpu) = self.ucvh_gpu.take() {
-                gpu.destroy(renderer.device(), renderer.allocator());
-            }
-            if let Some(ubo) = self.scene_ubo.take() {
-                ubo.destroy(renderer.device(), renderer.allocator());
-            }
-        }
     }
 }
 
@@ -446,27 +478,6 @@ impl ApplicationHandler for RevolumetricApp {
                 return;
             }
         };
-
-        let renderer = match RenderDevice::new(&window) {
-            Ok(renderer) => renderer,
-            Err(error) => {
-                tracing::error!(%error, "failed to initialize Vulkan bootstrap");
-                event_loop.exit();
-                return;
-            }
-        };
-
-        tracing::info!(
-            renderer = %renderer.backend_name(),
-            physical_device = %renderer.physical_device_name(),
-            graphics_queue_family = renderer.graphics_queue_family_index(),
-            present_queue_family = renderer.present_queue_family_index(),
-            swapchain_format = ?renderer.swapchain_format(),
-            swapchain_extent = ?renderer.swapchain_extent(),
-            swapchain_images = renderer.swapchain_image_count(),
-            surface = ?renderer.surface(),
-            "initialized renderer bootstrap"
-        );
 
         let window_id = window.id();
         let lighting_settings_result = LightingSettings::from_env_report();
@@ -505,62 +516,6 @@ impl ApplicationHandler for RevolumetricApp {
             self.lighting_settings.vpt_debug_view = vpt_debug_view;
         }
 
-        self.gpu_profiler = match GpuProfiler::new(
-            renderer.device(),
-            renderer
-                .physical_device_properties()
-                .limits
-                .timestamp_period,
-            renderer.graphics_queue_timestamp_valid_bits(),
-            renderer.frame_slot_count(),
-            GpuProfilerConfig::from_env(),
-        ) {
-            Ok(profiler) => profiler,
-            Err(error) => {
-                tracing::warn!(%error, "failed to initialize GPU profiler; continuing without profiling");
-                None
-            }
-        };
-        self.capture = match RenderCapture::from_env() {
-            Ok(capture) => {
-                if let Some(capture) = &capture {
-                    tracing::info!(
-                        target_frame = ?capture.config().target_frame,
-                        output_dir = %capture.config().output_dir.display(),
-                        prefix = %capture.config().prefix,
-                        "enabled postprocess capture"
-                    );
-                }
-                capture
-            }
-            Err(error) => {
-                tracing::warn!(%error, "invalid postprocess capture configuration; capture disabled");
-                None
-            }
-        };
-        self.renderer = Some(renderer);
-        self.window = Some(window);
-        self.window_id = Some(window_id);
-
-        // Create Scene UBO
-        if self.scene_ubo.is_none() {
-            let renderer = self.renderer.as_ref().unwrap();
-            match SceneUniformBuffer::new(
-                renderer.device(),
-                renderer.allocator(),
-                renderer.swapchain_image_count(),
-            ) {
-                Ok(ubo) => {
-                    tracing::info!(
-                        frame_count = renderer.swapchain_image_count(),
-                        "created scene UBO"
-                    );
-                    self.scene_ubo = Some(ubo);
-                }
-                Err(e) => tracing::error!(%e, "failed to create scene UBO"),
-            }
-        }
-
         // Generate UCVH sponza demo scene
         if self.ucvh.is_none() {
             let config = UcvhConfig::new(glam::UVec3::splat(128));
@@ -572,31 +527,24 @@ impl ApplicationHandler for RevolumetricApp {
                 total_voxels = ucvh.pool.allocated_count() as u64 * 512,
                 "generated sponza demo scene"
             );
-
-            let renderer = self.renderer.as_ref().unwrap();
-            match UcvhGpuResources::new(renderer.device(), renderer.allocator(), &ucvh) {
-                Ok(gpu) => {
-                    tracing::info!("created UCVH GPU resources");
-                    self.ucvh_gpu = Some(gpu);
-                }
-                Err(e) => tracing::error!(%e, "failed to create UCVH GPU resources"),
-            }
             self.ucvh = Some(ucvh);
         }
 
-        let restir_di_enabled = self.restir_di_vpt_enabled();
-        let area_restir_enabled = self.area_restir_vpt_enabled();
-        if let (Some(renderer), Some(scene_ubo)) = (self.renderer.as_ref(), self.scene_ubo.as_ref())
-        {
-            self.vpt_pipeline.ensure_passes(
-                renderer,
-                scene_ubo,
-                self.ucvh.as_ref(),
-                self.ucvh_gpu.as_ref(),
-                restir_di_enabled,
-                area_restir_enabled,
-            );
-        }
+        let render_runtime =
+            match RenderRuntime::new(&window, self.runtime_settings(), self.ucvh.as_ref()) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(%error, "failed to initialize render runtime");
+                    event_loop.exit();
+                    return;
+                }
+            };
+        self.render_runtime = Some(render_runtime);
+        #[cfg(not(target_os = "android"))]
+        self.initialize_editor_ui(&window);
+        self.window = Some(window);
+        self.window_id = Some(window_id);
+
         if !self.initialized {
             if let Err(error) = self.schedule.run_stage(Stage::Startup, &mut self.world) {
                 tracing::error!(%error, "startup stage failed");
@@ -618,6 +566,7 @@ impl ApplicationHandler for RevolumetricApp {
         if Some(window_id) != self.window_id {
             return;
         }
+        let ui_capture = self.process_egui_window_event(&event);
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -649,21 +598,17 @@ impl ApplicationHandler for RevolumetricApp {
                 if size.width == 0 || size.height == 0 {
                     return; // minimized, skip resize
                 }
-                if let Some(renderer) = self.renderer.as_mut() {
-                    if let Err(error) = renderer.handle_resize(size.width, size.height) {
-                        tracing::error!(%error, "failed to recreate swapchain after resize");
-                        event_loop.exit();
-                        return;
-                    }
-                }
-                if let Err(error) = self.resize_render_passes(size.width, size.height) {
-                    tracing::error!(%error, "failed to resize render passes");
+                if let Err(error) = self.resize_render_runtime(size.width, size.height) {
+                    tracing::error!(%error, "failed to resize render runtime");
                     event_loop.exit();
                     return;
                 }
                 tracing::debug!(width = size.width, height = size.height, "window resized");
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if !camera_should_receive_input(CameraInputEventKind::Keyboard, ui_capture) {
+                    return;
+                }
                 if event.repeat {
                     return; // ignore key repeat
                 }
@@ -685,30 +630,32 @@ impl ApplicationHandler for RevolumetricApp {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                if !camera_should_receive_input(CameraInputEventKind::Pointer, ui_capture) {
+                    if button == winit::event::MouseButton::Right
+                        && state == winit::event::ElementState::Released
+                    {
+                        self.set_camera_look(false);
+                    }
+                    return;
+                }
                 if button == winit::event::MouseButton::Right {
                     let pressed = state == winit::event::ElementState::Pressed;
-                    if let Some(input) = self.world.resource_mut::<InputState>() {
-                        input.right_mouse_held = pressed;
-                    }
-                    // Grab/release cursor for FPS camera
-                    if let Some(window) = &self.window {
-                        if pressed {
-                            let _ = window.set_cursor_grab(CursorGrabMode::Confined);
-                            window.set_cursor_visible(false);
-                        } else {
-                            let _ = window.set_cursor_grab(CursorGrabMode::None);
-                            window.set_cursor_visible(true);
-                        }
-                    }
+                    self.set_camera_look(pressed);
                 }
             }
             WindowEvent::Touch(touch) => {
+                if !camera_should_receive_input(CameraInputEventKind::Pointer, ui_capture) {
+                    return;
+                }
                 let (world, touch_look) = (&mut self.world, &mut self.touch_look);
                 if let Some(input) = world.resource_mut::<InputState>() {
                     touch_look.handle_touch(input, touch);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                if !camera_should_receive_input(CameraInputEventKind::Pointer, ui_capture) {
+                    return;
+                }
                 let scroll = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 120.0,
@@ -768,8 +715,6 @@ mod tests {
     use crate::scene::camera::Camera;
     use crate::scene::components::CameraRig;
     use crate::scene::light::DirectionalLight;
-    use crate::voxel::brick::VoxelCell;
-    use crate::voxel::ucvh::UcvhMotionEvent;
     use winit::event::{DeviceId, Touch, TouchPhase};
 
     fn touch_event(id: u64, phase: TouchPhase, x: f64, y: f64) -> Touch {
@@ -780,6 +725,46 @@ mod tests {
             force: None,
             id,
         }
+    }
+
+    #[test]
+    fn camera_input_gate_blocks_consumed_ui_events() {
+        let capture = UiInputCapture {
+            consumed: true,
+            wants_keyboard_input: false,
+        };
+
+        assert!(!camera_should_receive_input(
+            CameraInputEventKind::Pointer,
+            capture
+        ));
+        assert!(!camera_should_receive_input(
+            CameraInputEventKind::Keyboard,
+            capture
+        ));
+    }
+
+    #[test]
+    fn camera_input_gate_allows_unconsumed_pointer_events_for_viewport_control() {
+        assert!(camera_should_receive_input(
+            CameraInputEventKind::Pointer,
+            UiInputCapture::default()
+        ));
+        assert!(camera_should_receive_input(
+            CameraInputEventKind::Keyboard,
+            UiInputCapture::default()
+        ));
+    }
+
+    #[test]
+    fn camera_input_gate_blocks_keyboard_focus_independently() {
+        assert!(!camera_should_receive_input(
+            CameraInputEventKind::Keyboard,
+            UiInputCapture {
+                wants_keyboard_input: true,
+                ..UiInputCapture::default()
+            }
+        ));
     }
 
     #[test]
@@ -917,36 +902,6 @@ mod tests {
     }
 
     #[test]
-    fn snapshotting_ucvh_frame_changes_returns_render_visible_change_summary_without_consuming() {
-        let mut ucvh = Ucvh::new(UcvhConfig::new(glam::UVec3::splat(32)));
-        assert!(ucvh.set_voxel(glam::UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
-        assert!(ucvh.push_motion_event(UcvhMotionEvent {
-            region_min: glam::UVec3::new(8, 8, 8),
-            region_max_exclusive: glam::UVec3::new(16, 16, 16),
-            world_delta_current_from_previous: glam::IVec3::new(1, 0, 0),
-            generation: 2,
-        }));
-
-        let changes = RevolumetricApp::snapshot_ucvh_frame_changes(&ucvh);
-
-        assert_eq!(changes.invalidation_regions.len(), 1);
-        assert_eq!(changes.motion_events.len(), 1);
-        assert_eq!(ucvh.invalidation_regions().len(), 1);
-        assert_eq!(ucvh.motion_events().len(), 1);
-    }
-
-    #[test]
-    fn clearing_ucvh_frame_changes_discards_initial_generation_metadata() {
-        let mut ucvh = Ucvh::new(UcvhConfig::new(glam::UVec3::splat(32)));
-        assert!(ucvh.set_voxel(glam::UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
-
-        RevolumetricApp::clear_ucvh_frame_changes(&mut ucvh);
-
-        assert!(ucvh.invalidation_regions().is_empty());
-        assert!(ucvh.motion_events().is_empty());
-    }
-
-    #[test]
     fn app_delegates_vpt_pass_ownership_to_runtime_pipeline() {
         let source = crate::render::source_checks::read_source("src/app.rs");
         let app_struct = source
@@ -957,11 +912,21 @@ mod tests {
             .next()
             .expect("RevolumetricApp struct should end before impl");
 
-        assert!(app_struct.contains("vpt_pipeline: VptRuntimePipeline"));
+        assert!(app_struct.contains("render_runtime: Option<RenderRuntime>"));
+        assert!(!app_struct.contains("vpt_pipeline: VptRuntimePipeline"));
         assert!(!app_struct.contains("vpt_pass: Option<VptPass>"));
         assert!(!app_struct.contains("vpt_surface_pass: Option<VptSurfacePass>"));
         assert!(!app_struct.contains("postprocess_pass: Option<PostprocessPass>"));
-        assert!(source.contains("self.vpt_pipeline.record_and_execute_frame("));
+        let record_call = [
+            "self",
+            ".",
+            "vpt_pipeline",
+            ".",
+            "record_and_execute_frame",
+            "(",
+        ]
+        .concat();
+        assert!(!source.contains(&record_call));
         let add_pass_call = ["graph", ".", "add_pass"].concat();
         for pass_name in [
             "vpt".to_string(),

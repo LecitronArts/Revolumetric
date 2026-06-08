@@ -9,8 +9,17 @@ enum ShaderCompileMode {
     Skip,
 }
 
+#[derive(Clone, Debug)]
+struct ShaderJob {
+    path: PathBuf,
+    stage: &'static str,
+    output_stem: String,
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=REVOLUMETRIC_SHADER_COMPILE");
+    println!("cargo:rerun-if-env-changed=REVOLUMETRIC_SLANGC");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_DESKTOP");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NRD");
     println!("cargo:rerun-if-env-changed=REVOLUMETRIC_NRD_ROOT");
     println!("cargo:rerun-if-changed=assets/shaders");
@@ -24,6 +33,7 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap()).join("shaders");
     std::fs::create_dir_all(&out_dir).unwrap();
     let shader_compile_mode = shader_compile_mode();
+    let desktop_feature = desktop_feature_enabled();
 
     // Track every shader file individually so edits trigger recompilation on
     // Windows NTFS (directory mtime doesn't update when file contents change).
@@ -41,34 +51,50 @@ fn main() {
         return;
     }
 
-    let pass_paths = walkdir::WalkDir::new(passes_dir.as_path())
+    let mut shader_jobs = walkdir::WalkDir::new(passes_dir.as_path())
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "slang"))
-        .map(|entry| entry.path().to_path_buf())
+        .map(|entry| {
+            let path = entry.path().to_path_buf();
+            ShaderJob {
+                output_stem: path.file_stem().unwrap().to_str().unwrap().to_owned(),
+                path,
+                stage: "compute",
+            }
+        })
         .collect::<Vec<_>>();
+    for job in ui_shader_jobs(shader_dir) {
+        shader_jobs.push(job);
+    }
 
     if shader_compile_mode == ShaderCompileMode::Skip {
+        if desktop_feature {
+            panic!(
+                "REVOLUMETRIC_SHADER_COMPILE=skip cannot be used with the desktop feature; \
+                 desktop builds require real shaders, otherwise the app opens a black window. \
+                 Install slangc and use REVOLUMETRIC_SHADER_COMPILE=strict for runtime validation"
+            );
+        }
         println!(
             "cargo:warning=REVOLUMETRIC_SHADER_COMPILE=skip, writing placeholder shader files"
         );
-        write_placeholder_spirv_files(&pass_paths, &out_dir);
+        write_placeholder_spirv_files(&shader_jobs, &out_dir);
         return;
     }
 
-    for path in &pass_paths {
-        let stem = path.file_stem().unwrap().to_str().unwrap();
-        let spv_path = out_dir.join(format!("{stem}.spv"));
-        let reflection_json_path = out_dir.join(format!("{stem}.reflection.json"));
+    for job in &shader_jobs {
+        let spv_path = out_dir.join(format!("{}.spv", job.output_stem));
+        let reflection_json_path = out_dir.join(format!("{}.reflection.json", job.output_stem));
 
-        let status = Command::new("slangc")
-            .arg(path)
+        let status = slangc_command()
+            .arg(&job.path)
             .arg("-target")
             .arg("spirv")
             .arg("-entry")
             .arg("main")
             .arg("-stage")
-            .arg("compute")
+            .arg(job.stage)
             .arg("-o")
             .arg(&spv_path)
             .arg("-reflection-json")
@@ -79,32 +105,79 @@ fn main() {
 
         match status {
             Ok(s) if s.success() => {
-                println!("cargo:warning=Compiled {}", path.display());
+                println!(
+                    "cargo:warning=Compiled {} ({})",
+                    job.path.display(),
+                    job.stage
+                );
             }
             Ok(s) => {
                 panic!(
                     "slangc failed for {} with exit code {:?}; set REVOLUMETRIC_SHADER_COMPILE=skip only for CPU-only test environments",
-                    path.display(),
+                    job.path.display(),
                     s.code()
                 );
             }
             Err(e) => match shader_compile_mode {
                 ShaderCompileMode::Auto => {
+                    if desktop_feature {
+                        panic!(
+                            "slangc not found ({e}); desktop builds require real shaders. \
+                             Put slangc on PATH, or set REVOLUMETRIC_SLANGC to the absolute \
+                             slangc.exe path in your launch environment"
+                        );
+                    }
                     println!(
                         "cargo:warning=slangc not found ({e}), writing placeholder shader files"
                     );
-                    write_placeholder_spirv_files(&pass_paths, &out_dir);
+                    write_placeholder_spirv_files(&shader_jobs, &out_dir);
                     return;
                 }
                 ShaderCompileMode::Strict => {
                     panic!(
-                        "slangc not found ({e}); install slangc or set REVOLUMETRIC_SHADER_COMPILE=skip for CPU-only test environments"
+                        "slangc not found ({e}); install slangc, put it on PATH, set \
+                         REVOLUMETRIC_SLANGC to the absolute slangc.exe path, or set \
+                         REVOLUMETRIC_SHADER_COMPILE=skip for CPU-only test environments"
                     );
                 }
                 ShaderCompileMode::Skip => unreachable!("skip mode returns before invoking slangc"),
             },
         }
     }
+}
+
+fn ui_shader_jobs(shader_dir: &Path) -> Vec<ShaderJob> {
+    [
+        (
+            "egui.vert",
+            "vertex",
+            shader_dir.join("ui").join("egui.vert.slang"),
+        ),
+        (
+            "egui.frag",
+            "fragment",
+            shader_dir.join("ui").join("egui.frag.slang"),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, _, path)| path.exists())
+    .map(|(output_stem, stage, path)| ShaderJob {
+        path,
+        stage,
+        output_stem: output_stem.to_owned(),
+    })
+    .collect()
+}
+
+fn slangc_command() -> Command {
+    match env::var_os("REVOLUMETRIC_SLANGC") {
+        Some(path) => Command::new(path),
+        None => Command::new("slangc"),
+    }
+}
+
+fn desktop_feature_enabled() -> bool {
+    env::var_os("CARGO_FEATURE_DESKTOP").is_some()
 }
 
 fn nrd_feature_enabled() -> bool {
@@ -122,17 +195,15 @@ fn build_nrd_adapter() {
         .compile("revolumetric_nrd_adapter");
     println!("cargo:rustc-link-search=native={}", link_dir.display());
     println!("cargo:rustc-link-lib=static=NRD");
+    if nrd_shader_make_blob_library_exists(&link_dir) {
+        println!("cargo:rustc-link-lib=static=ShaderMakeBlob");
+    }
     println!("cargo:rerun-if-changed=native/nrd_adapter.h");
     println!("cargo:rerun-if-changed=native/nrd_adapter.cpp");
 }
 
 fn validate_nrd_sdk_root() -> PathBuf {
-    let root = PathBuf::from(env::var("REVOLUMETRIC_NRD_ROOT").unwrap_or_else(|_| {
-        panic!(
-            "REVOLUMETRIC_NRD_ROOT is required when the nrd feature is enabled; \
-             point it at an accepted local NVIDIA RTX SDK checkout before building with --features nrd"
-        )
-    }));
+    let root = resolve_nrd_sdk_root();
 
     let required_files = [
         "Include/NRD.h",
@@ -152,6 +223,30 @@ fn validate_nrd_sdk_root() -> PathBuf {
         println!("cargo:rerun-if-changed={}", full_path.display());
     }
     root
+}
+
+fn resolve_nrd_sdk_root() -> PathBuf {
+    match env::var("REVOLUMETRIC_NRD_ROOT") {
+        Ok(value) => PathBuf::from(value),
+        Err(env::VarError::NotPresent) => {
+            let local_root = PathBuf::from("run").join("nrd");
+            println!("cargo:rerun-if-changed={}", local_root.display());
+            if local_root.exists() {
+                local_root
+            } else {
+                panic!(
+                    "REVOLUMETRIC_NRD_ROOT is required when the nrd feature is enabled, \
+                     or place an accepted local NVIDIA NRD SDK checkout under run/nrd"
+                );
+            }
+        }
+        Err(env::VarError::NotUnicode(value)) => {
+            panic!(
+                "invalid REVOLUMETRIC_NRD_ROOT={value:?}; expected a valid Unicode path \
+                 to an accepted local NVIDIA NRD SDK checkout"
+            );
+        }
+    }
 }
 
 fn nrd_library_dir(root: &Path) -> PathBuf {
@@ -176,6 +271,14 @@ fn nrd_library_dir(root: &Path) -> PathBuf {
          Build/Release, build/Release, or build/lib",
         root
     );
+}
+
+fn nrd_shader_make_blob_library_exists(link_dir: &Path) -> bool {
+    let candidates = [
+        link_dir.join("ShaderMakeBlob.lib"),
+        link_dir.join("libShaderMakeBlob.a"),
+    ];
+    candidates.iter().any(|path| path.exists())
 }
 
 fn shader_compile_mode() -> ShaderCompileMode {
@@ -203,11 +306,10 @@ fn parse_shader_compile_mode(value: &str) -> Option<ShaderCompileMode> {
     }
 }
 
-fn write_placeholder_spirv_files(pass_paths: &[PathBuf], out_dir: &Path) {
-    for path in pass_paths {
-        let stem = path.file_stem().unwrap().to_str().unwrap();
-        let spv_path = out_dir.join(format!("{stem}.spv"));
-        let reflection_json_path = out_dir.join(format!("{stem}.reflection.json"));
+fn write_placeholder_spirv_files(shader_jobs: &[ShaderJob], out_dir: &Path) {
+    for job in shader_jobs {
+        let spv_path = out_dir.join(format!("{}.spv", job.output_stem));
+        let reflection_json_path = out_dir.join(format!("{}.reflection.json", job.output_stem));
         std::fs::write(spv_path, []).unwrap();
         let _ = std::fs::remove_file(reflection_json_path);
     }
