@@ -1674,9 +1674,9 @@ fn vpt_nrd_resolve_remodulates_relax_output_before_postprocess() {
     );
     assert!(
         compact_pipeline.contains(
-            "letactual_effective_denoiser_mode_name=capture_effective_denoiser_mode_name(inputs.lighting_settings,use_nrd_resolve_for_postprocess,);"
+            "letactual_effective_denoiser_mode_name=capture_effective_denoiser_mode_name(inputs.lighting_settings,nrd_resolve_available,);"
         ),
-        "capture metadata must report the requested NRD mode when the NRD resolve output is selected"
+        "capture metadata must report the requested NRD mode whenever the native NRD path is available"
     );
     assert!(
         compact_pipeline.contains("effective_denoiser_mode:actual_effective_denoiser_mode_name,"),

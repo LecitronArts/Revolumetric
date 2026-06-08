@@ -4346,6 +4346,33 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "nrd")]
+    fn native_reblur_backend_refreshes_dispatches_after_frame_settings() {
+        let mut backend =
+            VptNrdReadyBackend::initialize(VptDenoiserMode::Reblur, 64, 64, 4).unwrap();
+        assert_eq!(backend.denoiser_mode, VptDenoiserMode::Reblur);
+        assert!(!backend.state.dispatches.is_empty());
+
+        let settings = VptNrdFrameSettings::from_inputs(VptNrdFrameSettingsInputs {
+            current_world_to_view: glam::Mat4::IDENTITY,
+            previous_world_to_view: glam::Mat4::IDENTITY,
+            current_view_to_clip: glam::Mat4::IDENTITY,
+            previous_view_to_clip: glam::Mat4::IDENTITY,
+            current_resolution: [64, 64],
+            previous_resolution: [64, 64],
+            frame_index: 1,
+            time_delta_seconds: 1.0 / 60.0,
+            reset_history: false,
+            history_confidence_available: true,
+            relax_atrous_iteration_num: 4,
+            enable_validation: false,
+        })
+        .unwrap();
+
+        backend.update_frame_settings(&settings).unwrap();
+    }
+
+    #[test]
     fn descriptor_pool_plan_sums_pipeline_binding_descriptor_counts() {
         let binding_plans = vec![
             VptNrdPipelineDescriptorBindingPlan {

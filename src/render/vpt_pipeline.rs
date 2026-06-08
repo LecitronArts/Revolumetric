@@ -1274,12 +1274,10 @@ impl VptRuntimePipeline {
                 } else {
                     None
                 };
-                let use_nrd_resolve_for_postprocess = inputs.lighting_settings.vpt_debug_view
-                    == VptDebugView::Final
-                    && nrd_resolve_outputs.is_some();
+                let nrd_resolve_available = nrd_resolve_outputs.is_some();
                 let actual_effective_denoiser_mode_name = capture_effective_denoiser_mode_name(
                     inputs.lighting_settings,
-                    use_nrd_resolve_for_postprocess,
+                    nrd_resolve_available,
                 );
 
                 let temporal_outputs = vpt_temporal.register_graph(
@@ -1888,11 +1886,11 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
 
 fn capture_effective_denoiser_mode_name(
     lighting_settings: LightingSettings,
-    use_nrd_resolve_for_postprocess: bool,
+    nrd_resolve_available: bool,
 ) -> &'static str {
     match lighting_settings.denoiser_mode {
         VptDenoiserMode::Relax | VptDenoiserMode::Reblur => {
-            if use_nrd_resolve_for_postprocess {
+            if nrd_resolve_available {
                 lighting_settings.denoiser_mode.as_config_value()
             } else {
                 VptDenoiserMode::Svgf.as_config_value()
@@ -2020,7 +2018,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_effective_denoiser_mode_name_reports_svgf_when_nrd_resolve_is_unused() {
+    fn capture_effective_denoiser_mode_name_reports_svgf_when_nrd_path_is_unavailable() {
         for mode in [VptDenoiserMode::Relax, VptDenoiserMode::Reblur] {
             let settings = LightingSettings {
                 denoiser_mode: mode,
