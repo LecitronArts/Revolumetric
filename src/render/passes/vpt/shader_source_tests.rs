@@ -3050,10 +3050,10 @@ fn vpt_restir_di_visibility_uses_any_hit_shadow_traversal() {
 
 #[test]
 fn voxel_primary_traversal_reads_occupancy_bits_on_demand() {
-    let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
-        .expect("voxel traversal shader should be readable");
-    let common = std::fs::read_to_string("assets/shaders/shared/voxel_common.slang")
-        .expect("voxel common shader should be readable");
+    let traverse =
+        crate::render::source_checks::read_source("assets/shaders/shared/voxel_traverse.slang");
+    let common =
+        crate::render::source_checks::read_source("assets/shaders/shared/voxel_common.slang");
 
     for token in [
         "bool brick_dda(\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    uint brick_id,",
