@@ -13,6 +13,7 @@ use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
+use crate::render::traversal_stats::VptTraversalStatsBuffer;
 use crate::render::vpt_history::GpuVptHistoryUniforms;
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
@@ -48,6 +49,7 @@ pub struct VptSurfacePass {
 pub struct VptSurfaceBootstrapGraph {
     pub surface_writes: VptCurrentSurfaceResources,
     pub previous_surface_resources: VptPreviousSurfaceResources,
+    pub traversal_stats_resource: Option<ResourceHandle>,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +119,23 @@ pub struct VptPreviousSurfaceResources {
     pub brick_generation: ResourceHandle,
 }
 
+pub struct VptSurfacePassCreateInfo<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub spirv_bytes: &'a [u8],
+    pub ucvh_gpu: &'a UcvhGpuResources,
+    pub scene_ubo: &'a SceneUniformBuffer,
+    pub traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
+}
+
+pub struct VptSurfacePassResizeInfo<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub scene_ubo: &'a SceneUniformBuffer,
+    pub ucvh_gpu: &'a UcvhGpuResources,
+    pub traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
+}
+
 impl VptPreviousSurfaceResources {
     pub fn for_each(self, mut visit: impl FnMut(ResourceHandle)) {
         visit(self.position_depth);
@@ -139,7 +158,7 @@ struct VptSurfacePushConstants {
 }
 
 impl VptSurfacePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 23] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 24] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -164,23 +183,20 @@ impl VptSurfacePass {
             DescriptorBindingSpec::compute(20, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(21, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(22, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(23, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
-        width: u32,
-        height: u32,
-        spirv_bytes: &[u8],
-        ucvh_gpu: &UcvhGpuResources,
-        scene_ubo: &SceneUniformBuffer,
+        info: VptSurfacePassCreateInfo<'_>,
     ) -> Result<Self> {
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
             .add_binding_specs(&Self::descriptor_binding_specs())
             .build(device)?;
 
-        let frame_count = scene_ubo.frame_count();
+        let frame_count = info.scene_ubo.frame_count();
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -192,7 +208,7 @@ impl VptSurfacePass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 20 * frame_count as u32,
+                descriptor_count: 22 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, 2 * frame_count as u32, &pool_sizes)
@@ -217,7 +233,7 @@ impl VptSurfacePass {
         let selected_descriptor_sets = descriptor_sets.split_off(frame_count);
         let bootstrap_descriptor_sets = descriptor_sets;
 
-        let images = match create_surface_images(device, allocator, width, height) {
+        let images = match create_surface_images(device, allocator, info.width, info.height) {
             Ok(images) => images,
             Err(error) => {
                 descriptor_pool.destroy(device);
@@ -262,29 +278,35 @@ impl VptSurfacePass {
         write_descriptor_sets(
             device,
             &bootstrap_descriptor_sets,
-            scene_ubo,
             &images,
-            ucvh_gpu,
-            &history_uniform_buffers,
-            DisabledAreaRestirRefs {
-                uniform_buffers: &disabled_area_restir_uniform_buffers,
-                reservoir_buffer: &disabled_area_restir_reservoir_buffer,
+            VptSurfaceDescriptorRefs {
+                scene_ubo: info.scene_ubo,
+                ucvh_gpu: info.ucvh_gpu,
+                history_uniform_buffers: &history_uniform_buffers,
+                traversal_stats_buffers: info.traversal_stats_buffers,
+                disabled_area_restir: DisabledAreaRestirRefs {
+                    uniform_buffers: &disabled_area_restir_uniform_buffers,
+                    reservoir_buffer: &disabled_area_restir_reservoir_buffer,
+                },
             },
         );
         write_descriptor_sets(
             device,
             &selected_descriptor_sets,
-            scene_ubo,
             &images,
-            ucvh_gpu,
-            &history_uniform_buffers,
-            DisabledAreaRestirRefs {
-                uniform_buffers: &disabled_area_restir_uniform_buffers,
-                reservoir_buffer: &disabled_area_restir_reservoir_buffer,
+            VptSurfaceDescriptorRefs {
+                scene_ubo: info.scene_ubo,
+                ucvh_gpu: info.ucvh_gpu,
+                history_uniform_buffers: &history_uniform_buffers,
+                traversal_stats_buffers: info.traversal_stats_buffers,
+                disabled_area_restir: DisabledAreaRestirRefs {
+                    uniform_buffers: &disabled_area_restir_uniform_buffers,
+                    reservoir_buffer: &disabled_area_restir_reservoir_buffer,
+                },
             },
         );
 
-        let shader_module = match create_shader_module(device, spirv_bytes) {
+        let shader_module = match create_shader_module(device, info.spirv_bytes) {
             Ok(module) => module,
             Err(error) => {
                 disabled_area_restir_reservoir_buffer.destroy(device, allocator);
@@ -354,12 +376,9 @@ impl VptSurfacePass {
         &mut self,
         device: &ash::Device,
         allocator: &GpuAllocator,
-        width: u32,
-        height: u32,
-        scene_ubo: &SceneUniformBuffer,
-        ucvh_gpu: &UcvhGpuResources,
+        info: VptSurfacePassResizeInfo<'_>,
     ) -> Result<()> {
-        let new_images = create_surface_images(device, allocator, width, height)?;
+        let new_images = create_surface_images(device, allocator, info.width, info.height)?;
         let old_images = VptSurfaceImages {
             surface_position_depth: std::mem::replace(
                 &mut self.surface_position_depth,
@@ -433,25 +452,31 @@ impl VptSurfacePass {
         write_descriptor_sets_from_refs(
             device,
             &self.bootstrap_descriptor_sets,
-            scene_ubo,
             current_images,
-            ucvh_gpu,
-            &self.history_uniform_buffers,
-            DisabledAreaRestirRefs {
-                uniform_buffers: &self.disabled_area_restir_uniform_buffers,
-                reservoir_buffer: &self.disabled_area_restir_reservoir_buffer,
+            VptSurfaceDescriptorRefs {
+                scene_ubo: info.scene_ubo,
+                ucvh_gpu: info.ucvh_gpu,
+                history_uniform_buffers: &self.history_uniform_buffers,
+                traversal_stats_buffers: info.traversal_stats_buffers,
+                disabled_area_restir: DisabledAreaRestirRefs {
+                    uniform_buffers: &self.disabled_area_restir_uniform_buffers,
+                    reservoir_buffer: &self.disabled_area_restir_reservoir_buffer,
+                },
             },
         );
         write_descriptor_sets_from_refs(
             device,
             &self.selected_descriptor_sets,
-            scene_ubo,
             current_images,
-            ucvh_gpu,
-            &self.history_uniform_buffers,
-            DisabledAreaRestirRefs {
-                uniform_buffers: &self.disabled_area_restir_uniform_buffers,
-                reservoir_buffer: &self.disabled_area_restir_reservoir_buffer,
+            VptSurfaceDescriptorRefs {
+                scene_ubo: info.scene_ubo,
+                ucvh_gpu: info.ucvh_gpu,
+                history_uniform_buffers: &self.history_uniform_buffers,
+                traversal_stats_buffers: info.traversal_stats_buffers,
+                disabled_area_restir: DisabledAreaRestirRefs {
+                    uniform_buffers: &self.disabled_area_restir_uniform_buffers,
+                    reservoir_buffer: &self.disabled_area_restir_reservoir_buffer,
+                },
             },
         );
         Ok(())
@@ -487,6 +512,31 @@ impl VptSurfacePass {
         );
     }
 
+    pub fn update_traversal_stats_descriptor(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        traversal_stats: &VptTraversalStatsBuffer,
+    ) {
+        let stats_info = vk::DescriptorBufferInfo::default()
+            .buffer(traversal_stats.handle())
+            .offset(0)
+            .range(traversal_stats.size());
+        let writes = [
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.bootstrap_descriptor_sets[frame_slot])
+                .dst_binding(23)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&stats_info)),
+            vk::WriteDescriptorSet::default()
+                .dst_set(self.selected_descriptor_sets[frame_slot])
+                .dst_binding(23)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&stats_info)),
+        ];
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
+    }
+
     pub fn record_bootstrap(
         &self,
         device: &ash::Device,
@@ -515,6 +565,7 @@ impl VptSurfacePass {
         graph: &mut RenderGraph<'a>,
         history_initialized: bool,
         frame_slot: usize,
+        traversal_stats_resource: Option<ResourceHandle>,
         profiler: Option<&'a GpuProfiler>,
     ) -> VptSurfaceBootstrapGraph {
         let surface_position_resource = graph.import_image_with_access(
@@ -665,6 +716,7 @@ impl VptSurfacePass {
             previous_surface_access,
         );
 
+        let mut traversal_stats_after_bootstrap = traversal_stats_resource;
         let bootstrap_writes =
             graph.add_pass("vpt_surface_bootstrap", QueueType::Compute, |builder| {
                 builder.write_as(surface_position_resource, AccessKind::ComputeShaderWrite);
@@ -682,6 +734,12 @@ impl VptSurfacePass {
                     surface_brick_generation_resource,
                     AccessKind::ComputeShaderWrite,
                 );
+                if let Some(traversal_stats_resource) = traversal_stats_resource {
+                    traversal_stats_after_bootstrap = Some(
+                        builder
+                            .write_as(traversal_stats_resource, AccessKind::ComputeShaderReadWrite),
+                    );
+                }
                 Box::new(move |ctx| {
                     if let Some(profiler) = profiler {
                         profiler.begin_scope(
@@ -702,7 +760,9 @@ impl VptSurfacePass {
                     }
                 })
             });
-        let surface_writes = VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);
+        let surface_writes = VptCurrentSurfaceResources::from_graph_writes(
+            bootstrap_writes.iter().copied().take(9).collect(),
+        );
         graph.bind_image(
             surface_writes.position_depth,
             self.surface_position_depth.handle,
@@ -739,6 +799,7 @@ impl VptSurfacePass {
                 motion_id: previous_surface_motion_id_resource,
                 brick_generation: previous_surface_brick_generation_resource,
             },
+            traversal_stats_resource: traversal_stats_after_bootstrap,
         }
     }
 
@@ -927,6 +988,15 @@ struct VptSurfaceImageRefs<'a> {
 struct DisabledAreaRestirRefs<'a> {
     uniform_buffers: &'a [GpuBuffer],
     reservoir_buffer: &'a GpuBuffer,
+}
+
+#[derive(Clone, Copy)]
+struct VptSurfaceDescriptorRefs<'a> {
+    scene_ubo: &'a SceneUniformBuffer,
+    ucvh_gpu: &'a UcvhGpuResources,
+    history_uniform_buffers: &'a [GpuBuffer],
+    traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
+    disabled_area_restir: DisabledAreaRestirRefs<'a>,
 }
 
 impl VptSurfaceImages {
@@ -1338,16 +1408,12 @@ fn surface_image_usage() -> vk::ImageUsageFlags {
 fn write_descriptor_sets(
     device: &ash::Device,
     descriptor_sets: &[vk::DescriptorSet],
-    scene_ubo: &SceneUniformBuffer,
     images: &VptSurfaceImages,
-    ucvh_gpu: &UcvhGpuResources,
-    history_uniform_buffers: &[GpuBuffer],
-    disabled_area_restir: DisabledAreaRestirRefs<'_>,
+    refs: VptSurfaceDescriptorRefs<'_>,
 ) {
     write_descriptor_sets_from_refs(
         device,
         descriptor_sets,
-        scene_ubo,
         VptSurfaceImageRefs {
             surface_position_depth: &images.surface_position_depth,
             surface_normal_roughness: &images.surface_normal_roughness,
@@ -1359,20 +1425,15 @@ fn write_descriptor_sets(
             motion_flags: &images.motion_flags,
             surface_brick_generation: &images.surface_brick_generation,
         },
-        ucvh_gpu,
-        history_uniform_buffers,
-        disabled_area_restir,
+        VptSurfaceDescriptorRefs { ..refs },
     );
 }
 
 fn write_descriptor_sets_from_refs(
     device: &ash::Device,
     descriptor_sets: &[vk::DescriptorSet],
-    scene_ubo: &SceneUniformBuffer,
     images: VptSurfaceImageRefs<'_>,
-    ucvh_gpu: &UcvhGpuResources,
-    history_uniform_buffers: &[GpuBuffer],
-    disabled_area_restir: DisabledAreaRestirRefs<'_>,
+    refs: VptSurfaceDescriptorRefs<'_>,
 ) {
     let output_images = [
         images.surface_position_depth,
@@ -1385,30 +1446,30 @@ fn write_descriptor_sets_from_refs(
     ];
     let motion_guide_images = [images.motion_flags, images.surface_brick_generation];
     let ucvh_buffers = [
-        &ucvh_gpu.hierarchy_l0_buffer,
-        &ucvh_gpu.hierarchy_ln_buffers[0],
-        &ucvh_gpu.hierarchy_ln_buffers[1],
-        &ucvh_gpu.hierarchy_ln_buffers[2],
-        &ucvh_gpu.hierarchy_ln_buffers[3],
-        &ucvh_gpu.occupancy_buffer,
-        &ucvh_gpu.material_buffer,
+        &refs.ucvh_gpu.hierarchy_l0_buffer,
+        &refs.ucvh_gpu.hierarchy_ln_buffers[0],
+        &refs.ucvh_gpu.hierarchy_ln_buffers[1],
+        &refs.ucvh_gpu.hierarchy_ln_buffers[2],
+        &refs.ucvh_gpu.hierarchy_ln_buffers[3],
+        &refs.ucvh_gpu.occupancy_buffer,
+        &refs.ucvh_gpu.material_buffer,
     ];
     let ucvh_config_info = vk::DescriptorBufferInfo::default()
-        .buffer(ucvh_gpu.config_buffer.handle)
+        .buffer(refs.ucvh_gpu.config_buffer.handle)
         .offset(0)
         .range(vk::WHOLE_SIZE);
     let motion_guide_buffers = [
-        &ucvh_gpu.brick_generation_buffer,
-        &ucvh_gpu.motion_event_buffer,
+        &refs.ucvh_gpu.brick_generation_buffer,
+        &refs.ucvh_gpu.motion_event_buffer,
     ];
 
     for (set_idx, &ds) in descriptor_sets.iter().enumerate() {
         let ubo_info = vk::DescriptorBufferInfo::default()
-            .buffer(scene_ubo.buffer_handle(set_idx))
+            .buffer(refs.scene_ubo.buffer_handle(set_idx))
             .offset(0)
             .range(std::mem::size_of::<GpuSceneUniforms>() as u64);
         let history_ubo_info = vk::DescriptorBufferInfo::default()
-            .buffer(history_uniform_buffers[set_idx].handle)
+            .buffer(refs.history_uniform_buffers[set_idx].handle)
             .offset(0)
             .range(std::mem::size_of::<GpuVptHistoryUniforms>() as u64);
         let image_infos: Vec<vk::DescriptorImageInfo> = output_images
@@ -1505,13 +1566,25 @@ fn write_descriptor_sets_from_refs(
                         .buffer_info(std::slice::from_ref(info))
                 }),
         );
+        let stats_buffer = &refs.traversal_stats_buffers[set_idx];
+        let stats_info = vk::DescriptorBufferInfo::default()
+            .buffer(stats_buffer.handle())
+            .offset(0)
+            .range(stats_buffer.size());
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(23)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&stats_info)),
+        );
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
     write_area_restir_descriptor_sets(
         device,
         descriptor_sets,
-        disabled_area_restir.uniform_buffers,
-        disabled_area_restir.reservoir_buffer,
+        refs.disabled_area_restir.uniform_buffers,
+        refs.disabled_area_restir.reservoir_buffer,
     );
 }
 

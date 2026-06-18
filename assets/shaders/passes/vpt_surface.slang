@@ -84,6 +84,9 @@ StructuredBuffer<uint> brick_generations;
 [[vk::binding(22, 0)]]
 StructuredBuffer<UcvhMotionEvent> ucvh_motion_events;
 
+[[vk::binding(23, 0)]]
+RWStructuredBuffer<uint> traversal_stats;
+
 [[vk::push_constant]]
 VptMotionGuidePushConstants vpt_motion_guide;
 
@@ -177,7 +180,9 @@ void main(uint3 tid : SV_DispatchThreadID) {
         hierarchy_l3,
         hierarchy_l4,
         brick_occupancy,
-        brick_materials
+        brick_materials,
+        traversal_stats,
+        scene_vpt_traversal_stats_enabled(scene)
     );
 
     if (!hit.hit) {

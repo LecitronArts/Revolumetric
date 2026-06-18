@@ -24,6 +24,7 @@ pub mod sampler;
 pub mod scene_ubo;
 pub mod shader;
 pub mod swapchain;
+pub mod traversal_stats;
 pub mod vpt_history;
 pub mod vpt_motion;
 pub mod vpt_pipeline;

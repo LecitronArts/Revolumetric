@@ -68,6 +68,7 @@ fn area_restir_initial_shader_binding_manifest_matches_expected_resources() {
             binding(12, DescriptorKind::StorageBuffer, "hierarchy_l4"),
             binding(13, DescriptorKind::StorageBuffer, "brick_occupancy"),
             binding(14, DescriptorKind::StorageBuffer, "brick_materials"),
+            binding(15, DescriptorKind::StorageBuffer, "traversal_stats"),
         ]
     );
 }

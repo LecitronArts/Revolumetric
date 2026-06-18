@@ -53,6 +53,9 @@ StructuredBuffer<BrickOccupancy> brick_occupancy;
 [[vk::binding(14, 0)]]
 StructuredBuffer<VoxelCell> brick_materials;
 
+[[vk::binding(15, 0)]]
+RWStructuredBuffer<uint> traversal_stats;
+
 struct AreaRestirCandidateSurface {
     float4 position_depth;
     float4 normal_roughness;
@@ -125,7 +128,9 @@ AreaRestirCandidateSurface evaluate_area_restir_candidate_surface(
         hierarchy_l3,
         hierarchy_l4,
         brick_occupancy,
-        brick_materials
+        brick_materials,
+        traversal_stats,
+        scene_vpt_traversal_stats_enabled(scene)
     );
     if (!hit.hit) {
         return invalid_candidate_surface();

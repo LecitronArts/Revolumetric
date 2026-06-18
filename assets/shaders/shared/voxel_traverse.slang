@@ -14,6 +14,28 @@
 static const float DDA_TIE_EPSILON = 1.0e-6;
 static const float DDA_GRID_BOUNDARY_EPSILON = 1.0e-5;
 static const uint VOXEL_TRAVERSAL_NO_SKIP_BRICK = 0xffffffffu;
+static const uint VPT_TRAVERSAL_STAT_PRIMARY_RAYS = 0u;
+static const uint VPT_TRAVERSAL_STAT_SHADOW_RAYS = 1u;
+static const uint VPT_TRAVERSAL_STAT_HIERARCHY_SKIP_TESTS = 2u;
+static const uint VPT_TRAVERSAL_STAT_HIERARCHY_SKIPS_ACCEPTED = 3u;
+static const uint VPT_TRAVERSAL_STAT_BRICK_DDA_CALLS = 4u;
+static const uint VPT_TRAVERSAL_STAT_BRICK_DDA_STEPS = 5u;
+static const uint VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_CALLS = 6u;
+static const uint VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_STEPS = 7u;
+
+void vpt_traversal_stats_add(
+    RWStructuredBuffer<uint> stats,
+    bool enabled,
+    uint counter_index,
+    uint value
+) {
+    if (!enabled || value == 0u) {
+        return;
+    }
+
+    uint previous_value;
+    InterlockedAdd(stats[counter_index], value, previous_value);
+}
 
 float dda_next_t(float3 t_max) {
     return min(t_max.x, min(t_max.y, t_max.z));
@@ -176,9 +198,12 @@ bool try_skip_empty_hierarchy_block(
     inout float3 t_max,
     int3 step_dir,
     inout float current_t,
-    out int3 skipped_brick_coord
+    out int3 skipped_brick_coord,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
     skipped_brick_coord = brick_coord;
+    vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_HIERARCHY_SKIP_TESTS, 1u);
     uint selected_block_size = 0u;
     for (uint level = 4u; level >= 1u; level--) {
         uint block_size = 1u << level;
@@ -222,7 +247,11 @@ bool try_skip_empty_hierarchy_block(
         current_t,
         block_t.y
     );
-    return any(skipped_brick_coord != original_brick_coord);
+    bool skipped = any(skipped_brick_coord != original_brick_coord);
+    if (skipped) {
+        vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_HIERARCHY_SKIPS_ACCEPTED, 1u);
+    }
+    return skipped;
 }
 
 // --- Brick-internal DDA (Level 2) ---
@@ -236,11 +265,14 @@ bool brick_dda(
     float3 ray_dir,
     out uint3 hit_local,
     out float3 hit_normal,
-    out float hit_t
+    out float hit_t,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
     hit_local = uint3(0);
     hit_normal = float3(0);
     hit_t = 0.0;
+    vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_BRICK_DDA_CALLS, 1u);
 
     float3 inv_dir = ray_safe_inv_dir(ray_dir);
 
@@ -280,6 +312,7 @@ bool brick_dda(
     // Max steps: 8+8+8 = 24 (diagonal through 8^3)
     for (int i = 0; i < 24; i++) {
         if (any(coord < int3(0)) || any(coord >= int3(8))) break;
+        vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_BRICK_DDA_STEPS, 1u);
 
         // Morton-order bit read (matches Rust BrickOccupancy storage)
         if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {
@@ -309,11 +342,14 @@ bool brick_any_hit(
     uint3 skip_local,
     float3 ray_origin,
     float3 ray_dir,
-    float max_t
+    float max_t,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
     if (max_t <= 0.0) {
         return false;
     }
+    vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_CALLS, 1u);
 
     float3 inv_dir = ray_safe_inv_dir(ray_dir);
 
@@ -340,6 +376,7 @@ bool brick_any_hit(
 
     for (int i = 0; i < 24 && current_t < max_t; i++) {
         if (any(coord < int3(0)) || any(coord >= int3(8))) break;
+        vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_STEPS, 1u);
 
         if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {
             uint3 local = uint3(coord);
@@ -365,8 +402,11 @@ HitResult trace_primary_ray(
     StructuredBuffer<NodeLN> hierarchy_l3,
     StructuredBuffer<NodeLN> hierarchy_l4,
     StructuredBuffer<BrickOccupancy> occupancy_buf,
-    StructuredBuffer<VoxelCell> material_buf
+    StructuredBuffer<VoxelCell> material_buf,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
+    vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_PRIMARY_RAYS, 1u);
     UcvhConfig config = config_buf;
     float3 grid_size = float3(config.brick_grid_size.xyz);
     float3 world_size = grid_size * 8.0; // each brick = 8 voxels
@@ -414,7 +454,9 @@ HitResult trace_primary_ray(
             t_max,
             step_dir,
             current_t,
-            skipped_brick_coord
+            skipped_brick_coord,
+            stats,
+            stats_enabled
         )) {
             brick_coord = skipped_brick_coord;
             continue;
@@ -436,8 +478,17 @@ HitResult trace_primary_ray(
                 uint3 hit_local;
                 float3 hit_normal;
                 float hit_t;
-                if (brick_dda(occupancy_buf, node.brick_id, local_origin, ray.direction,
-                              hit_local, hit_normal, hit_t)) {
+                if (brick_dda(
+                    occupancy_buf,
+                    node.brick_id,
+                    local_origin,
+                    ray.direction,
+                    hit_local,
+                    hit_normal,
+                    hit_t,
+                    stats,
+                    stats_enabled
+                )) {
                     HitResult result;
                     result.hit = true;
                     result.t = hit_t;
@@ -470,11 +521,14 @@ bool trace_any_hit_ray_skip_voxel(
     StructuredBuffer<NodeLN> hierarchy_l2,
     StructuredBuffer<NodeLN> hierarchy_l3,
     StructuredBuffer<NodeLN> hierarchy_l4,
-    StructuredBuffer<BrickOccupancy> occupancy_buf
+    StructuredBuffer<BrickOccupancy> occupancy_buf,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
     if (max_t <= 0.0) {
         return false;
     }
+    vpt_traversal_stats_add(stats, stats_enabled, VPT_TRAVERSAL_STAT_SHADOW_RAYS, 1u);
 
     UcvhConfig config = config_buf;
     float3 grid_size = float3(config.brick_grid_size.xyz);
@@ -525,7 +579,9 @@ bool trace_any_hit_ray_skip_voxel(
             t_max,
             step_dir,
             current_t,
-            skipped_brick_coord
+            skipped_brick_coord,
+            stats,
+            stats_enabled
         )) {
             brick_coord = skipped_brick_coord;
             continue;
@@ -547,7 +603,9 @@ bool trace_any_hit_ray_skip_voxel(
                     skip_local,
                     local_origin,
                     ray.direction,
-                    max_t
+                    max_t,
+                    stats,
+                    stats_enabled
                 )) {
                     return true;
                 }
@@ -569,7 +627,9 @@ bool trace_any_hit_ray(
     StructuredBuffer<NodeLN> hierarchy_l2,
     StructuredBuffer<NodeLN> hierarchy_l3,
     StructuredBuffer<NodeLN> hierarchy_l4,
-    StructuredBuffer<BrickOccupancy> occupancy_buf
+    StructuredBuffer<BrickOccupancy> occupancy_buf,
+    RWStructuredBuffer<uint> stats,
+    bool stats_enabled
 ) {
     return trace_any_hit_ray_skip_voxel(
         ray,
@@ -582,6 +642,8 @@ bool trace_any_hit_ray(
         hierarchy_l2,
         hierarchy_l3,
         hierarchy_l4,
-        occupancy_buf
+        occupancy_buf,
+        stats,
+        stats_enabled
     );
 }

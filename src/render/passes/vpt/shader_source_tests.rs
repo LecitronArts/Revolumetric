@@ -99,6 +99,7 @@ fn vpt_shader_binding_manifest_matches_expected_resources() {
             ),
             binding(17, DescriptorKind::StorageImage, "nrd_residual_radiance"),
             binding(18, DescriptorKind::StorageImage, "nrd_material_factors"),
+            binding(19, DescriptorKind::StorageBuffer, "traversal_stats"),
         ]
     );
 }
@@ -153,7 +154,7 @@ fn vpt_surface_writes_explicit_material_roughness_guide() {
 
     for token in [
         "letoutput_images=[images.surface_position_depth,images.surface_normal_roughness,images.surface_albedo_material,images.surface_material_roughness,images.surface_view_z,images.surface_motion_id,images.motion_history,];",
-        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
+        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes.iter().copied().take(9).collect(),);",
         "surface_writes.position_depth,self.surface_position_depth.handle,",
         "graph.bind_image(surface_writes.material_roughness,self.surface_material_roughness.handle,);",
         "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
@@ -305,7 +306,7 @@ fn vpt_surface_view_z_resource_graph_contract_is_ordered() {
         "surface_motion_id_resource",
         "previous_surface_view_z_resource",
         "previous_surface_motion_id_resource",
-        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes);",
+        "letsurface_writes=VptCurrentSurfaceResources::from_graph_writes(bootstrap_writes.iter().copied().take(9).collect(),);",
         "surface_writes.position_depth,self.surface_position_depth.handle,",
         "graph.bind_image(surface_writes.view_z,self.surface_view_z.handle);",
         "graph.bind_image(surface_writes.motion_id,self.surface_motion_id.handle);",
@@ -460,6 +461,7 @@ fn vpt_surface_shader_binding_manifest_matches_expected_resources() {
             binding(20, DescriptorKind::StorageImage, "surface_brick_generation"),
             binding(21, DescriptorKind::StorageBuffer, "brick_generations"),
             binding(22, DescriptorKind::StorageBuffer, "ucvh_motion_events"),
+            binding(23, DescriptorKind::StorageBuffer, "traversal_stats"),
         ]
     );
 }
@@ -2202,8 +2204,10 @@ fn app_keeps_vpt_first_use_sample_zero_until_noisy_radiance_is_written() {
         "scene UBO must see sample 0 while the accumulation image is still first-use"
     );
     assert!(
-        compact_pass
-            .contains("letnoisy_initial_access=ifaccumulation_needs_init{AccessKind::Undefined}else{AccessKind::ComputeShaderRead};"),
+        compact_pass.contains("pubstructVptGraphInputs")
+            && compact_pass.contains("pubaccumulation_needs_init:bool")
+            && compact_pass
+                .contains("letnoisy_initial_access=ifinputs.accumulation_needs_init{AccessKind::Undefined}else{AccessKind::ComputeShaderRead};"),
         "first-use VPT noisy images must start from Undefined even if internal sample state was advanced"
     );
     assert!(
@@ -3058,7 +3062,8 @@ fn voxel_primary_traversal_reads_occupancy_bits_on_demand() {
     for token in [
         "bool brick_dda(\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    uint brick_id,",
         "if (occupancy_buf[node.brick_id].count > 0u) {",
-        "if (brick_dda(occupancy_buf, node.brick_id, local_origin, ray.direction,",
+        "if (brick_dda(",
+        "occupancy_buf,\n                    node.brick_id,\n                    local_origin,\n                    ray.direction,",
         "bool brick_any_hit(\n    StructuredBuffer<BrickOccupancy> occupancy_buf,\n    uint brick_id,",
         "if (read_occupancy_bit(occupancy_buf, brick_id, uint3(coord))) {",
     ] {
@@ -3404,7 +3409,8 @@ fn voxel_hierarchy_skip_reinitializes_dda_state_in_constant_time() {
         "brick_coord = dda_start_coord3(reset_pos / 8.0, step_dir, igrid - int3(1));",
         "ray_axis_t_max(ray.origin.x, ray.direction.x, ray.inv_dir.x",
         "int3 original_brick_coord = skipped_brick_coord;",
-        "return any(skipped_brick_coord != original_brick_coord);",
+        "bool skipped = any(skipped_brick_coord != original_brick_coord);",
+        "return skipped;",
     ] {
         assert!(
             traverse.contains(token),

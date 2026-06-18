@@ -8,6 +8,7 @@ use crate::render::buffer::GpuBuffer;
 
 pub const LIGHTING_FLAG_SHADOWS_ENABLED: u32 = 1 << 0;
 pub const LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS: u32 = 1 << 1;
+pub const LIGHTING_FLAG_VPT_TRAVERSAL_STATS: u32 = 1 << 2;
 pub const LIGHTING_DEBUG_VIEW_SHIFT: u32 = 28;
 pub const LIGHTING_DEBUG_VIEW_MASK: u32 = 0xF << LIGHTING_DEBUG_VIEW_SHIFT;
 pub const LIGHTING_DEBUG_VIEW_FINAL: u32 = 0;
@@ -169,6 +170,7 @@ impl VptDenoiserMode {
 pub struct LightingSettings {
     pub shadows_enabled: bool,
     pub skip_backface_shadows: bool,
+    pub vpt_traversal_stats_enabled: bool,
     pub render_mode: RenderMode,
     pub vpt_max_bounces: u32,
     pub sun_angular_radius: f32,
@@ -197,6 +199,7 @@ impl Default for LightingSettings {
         Self {
             shadows_enabled: true,
             skip_backface_shadows: false,
+            vpt_traversal_stats_enabled: false,
             render_mode: RenderMode::Vpt,
             vpt_max_bounces: 2,
             sun_angular_radius: 0.02,
@@ -217,6 +220,7 @@ impl LightingSettings {
     pub fn from_env_report() -> LightingSettingsParseResult {
         let shadows = std::env::var("REVOLUMETRIC_LIGHTING_SHADOWS").ok();
         let skip_backface = std::env::var("REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS").ok();
+        let traversal_stats = std::env::var("REVOLUMETRIC_VPT_TRAVERSAL_STATS").ok();
         let render_mode = std::env::var("REVOLUMETRIC_RENDER_MODE").ok();
         let vpt_max_bounces = std::env::var("REVOLUMETRIC_VPT_MAX_BOUNCES").ok();
         let debug_view = std::env::var("REVOLUMETRIC_LIGHTING_DEBUG_VIEW").ok();
@@ -226,9 +230,10 @@ impl LightingSettings {
             std::env::var("REVOLUMETRIC_DENOISER_ATROUS_ITERATIONS").ok();
         let vpt_debug_view = std::env::var("REVOLUMETRIC_VPT_DEBUG_VIEW").ok();
         let sun_angular_radius = std::env::var("REVOLUMETRIC_SUN_ANGULAR_RADIUS").ok();
-        Self::from_values_report_with_denoiser(
+        Self::from_values_report_full(
             shadows.as_deref(),
             skip_backface.as_deref(),
+            traversal_stats.as_deref(),
             render_mode.as_deref(),
             vpt_max_bounces.as_deref(),
             debug_view.as_deref(),
@@ -267,9 +272,10 @@ impl LightingSettings {
         debug_view: Option<&str>,
         exposure: Option<&str>,
     ) -> LightingSettingsParseResult {
-        Self::from_values_report_with_denoiser(
+        Self::from_values_report_full(
             shadows,
             skip_backface_shadows,
+            None,
             render_mode,
             vpt_max_bounces,
             debug_view,
@@ -294,6 +300,35 @@ impl LightingSettings {
         vpt_debug_view: Option<&str>,
         sun_angular_radius: Option<&str>,
     ) -> LightingSettingsParseResult {
+        Self::from_values_report_full(
+            shadows,
+            skip_backface_shadows,
+            None,
+            render_mode,
+            vpt_max_bounces,
+            debug_view,
+            exposure,
+            denoiser,
+            denoiser_atrous_iterations,
+            vpt_debug_view,
+            sun_angular_radius,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_values_report_full(
+        shadows: Option<&str>,
+        skip_backface_shadows: Option<&str>,
+        vpt_traversal_stats: Option<&str>,
+        render_mode: Option<&str>,
+        vpt_max_bounces: Option<&str>,
+        debug_view: Option<&str>,
+        exposure: Option<&str>,
+        denoiser: Option<&str>,
+        denoiser_atrous_iterations: Option<&str>,
+        vpt_debug_view: Option<&str>,
+        sun_angular_radius: Option<&str>,
+    ) -> LightingSettingsParseResult {
         let mut settings = Self::default();
         let mut warnings = Vec::new();
 
@@ -309,6 +344,14 @@ impl LightingSettings {
             &mut settings.skip_backface_shadows,
             skip_backface_shadows,
             "REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS",
+            "on|off|1|0|true|false",
+            parse_bool_value,
+            &mut warnings,
+        );
+        apply_optional_override(
+            &mut settings.vpt_traversal_stats_enabled,
+            vpt_traversal_stats,
+            "REVOLUMETRIC_VPT_TRAVERSAL_STATS",
             "on|off|1|0|true|false",
             parse_bool_value,
             &mut warnings,
@@ -388,6 +431,9 @@ impl LightingSettings {
         }
         if self.skip_backface_shadows {
             flags |= LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS;
+        }
+        if self.vpt_traversal_stats_enabled {
+            flags |= LIGHTING_FLAG_VPT_TRAVERSAL_STATS;
         }
         flags |= (self.debug_view.as_gpu_value() << LIGHTING_DEBUG_VIEW_SHIFT)
             & LIGHTING_DEBUG_VIEW_MASK;
@@ -836,11 +882,44 @@ mod tests {
 
         assert!(settings.shadows_enabled);
         assert!(!settings.skip_backface_shadows);
+        assert!(!settings.vpt_traversal_stats_enabled);
         assert_eq!(settings.render_mode, RenderMode::Vpt);
         assert_eq!(settings.vpt_max_bounces, 2);
         assert_eq!(settings.sun_angular_radius, 0.02);
         assert_eq!(settings.debug_view, LightingDebugView::Final);
         assert_eq!(settings.exposure, 1.0);
+    }
+
+    #[test]
+    fn lighting_settings_can_enable_vpt_traversal_stats_without_growing_scene_ubo() {
+        let result = LightingSettings::from_values_report_full(
+            None,
+            None,
+            Some("on"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let mut uniforms = GpuSceneUniforms::zeroed();
+
+        uniforms.apply_lighting_settings(result.settings);
+
+        assert!(result.warnings.is_empty());
+        assert!(result.settings.vpt_traversal_stats_enabled);
+        assert_eq!(std::mem::size_of::<GpuSceneUniforms>(), 224);
+        assert_eq!(
+            uniforms.lighting_flags & LIGHTING_FLAG_VPT_TRAVERSAL_STATS,
+            LIGHTING_FLAG_VPT_TRAVERSAL_STATS
+        );
+        assert!(
+            crate::render::source_checks::read_source("assets/shaders/shared/scene_common.slang")
+                .contains("LIGHTING_FLAG_VPT_TRAVERSAL_STATS")
+        );
     }
 
     #[test]
@@ -917,6 +996,7 @@ mod tests {
         let settings = LightingSettings {
             shadows_enabled: true,
             skip_backface_shadows: true,
+            vpt_traversal_stats_enabled: false,
             render_mode: RenderMode::Vpt,
             vpt_max_bounces: 2,
             sun_angular_radius: 0.02,
@@ -1085,6 +1165,7 @@ mod tests {
             let settings = LightingSettings {
                 shadows_enabled: true,
                 skip_backface_shadows: true,
+                vpt_traversal_stats_enabled: false,
                 render_mode: RenderMode::Vpt,
                 vpt_max_bounces: 2,
                 sun_angular_radius: 0.02,

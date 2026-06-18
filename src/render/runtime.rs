@@ -351,7 +351,10 @@ impl RenderRuntime {
                 profiler: self.gpu_profiler.as_ref(),
             },
         )?;
+        let frame_slot = frame.frame_slot;
         let submitted_fence = record_result.submitted_fence;
+        let traversal_stats_requested = record_result.traversal_stats_requested;
+        let traversal_stats = record_result.traversal_stats;
         let mut pending_capture = record_result.pending_capture;
         outcome.rendered = true;
         let completion = self.renderer.end_frame(frame)?;
@@ -369,8 +372,18 @@ impl RenderRuntime {
         {
             Self::clear_ucvh_frame_changes(ucvh);
         }
-        if let Some(metadata) = pending_capture.take() {
+        if traversal_stats_requested || pending_capture.is_some() {
             self.renderer.wait_for_fence(submitted_fence)?;
+        }
+        if let Some(snapshot) = traversal_stats {
+            tracing::info!("{}", snapshot.format_log_line());
+        } else if traversal_stats_requested {
+            match self.vpt_pipeline.traversal_stats_snapshot(frame_slot)? {
+                Some(snapshot) => tracing::info!("{}", snapshot.format_log_line()),
+                None => tracing::warn!("TraversalStats requested but no stats buffer exists"),
+            }
+        }
+        if let Some(metadata) = pending_capture.take() {
             if let Some(capture) = &self.capture {
                 capture.write_rgba8_capture(&metadata)?;
                 outcome.wrote_capture = true;

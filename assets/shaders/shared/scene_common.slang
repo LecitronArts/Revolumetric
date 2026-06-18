@@ -4,6 +4,7 @@
 
 static const uint LIGHTING_FLAG_SHADOWS_ENABLED = 1u << 0;
 static const uint LIGHTING_FLAG_SKIP_BACKFACE_SHADOWS = 1u << 1;
+static const uint LIGHTING_FLAG_VPT_TRAVERSAL_STATS = 1u << 2;
 static const uint LIGHTING_DEBUG_VIEW_SHIFT = 28u;
 static const uint LIGHTING_DEBUG_VIEW_MASK = 0xFu << LIGHTING_DEBUG_VIEW_SHIFT;
 static const uint LIGHTING_DEBUG_VIEW_FINAL = 0u;
@@ -74,6 +75,10 @@ struct SceneUniforms {
     float3   camera_forward;  // 12B
     float    _pad4;           // 4B
 };                            // total: 224B, matches Rust repr(C) layout exactly
+
+bool scene_vpt_traversal_stats_enabled(SceneUniforms scene) {
+    return (scene.lighting_flags & LIGHTING_FLAG_VPT_TRAVERSAL_STATS) != 0u;
+}
 
 struct ScenePrimaryRay {
     float3 origin;

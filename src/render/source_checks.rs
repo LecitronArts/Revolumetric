@@ -180,4 +180,133 @@ mod tests {
             "run README visual baseline docs",
         );
     }
+
+    #[test]
+    fn traversal_stats_are_wired_to_vpt_shaders_passes_and_docs() {
+        let scene_common = read_source("assets/shaders/shared/scene_common.slang");
+        let traverse = read_source("assets/shaders/shared/voxel_traverse.slang");
+        let vpt = read_source("assets/shaders/passes/vpt.slang");
+        let vpt_surface = read_source("assets/shaders/passes/vpt_surface.slang");
+        let area_initial = read_source("assets/shaders/passes/area_restir_initial.slang");
+        let vpt_pass = read_source("src/render/passes/vpt.rs");
+        let vpt_surface_pass = read_source("src/render/passes/vpt_surface.rs");
+        let area_pass = read_source("src/render/passes/area_restir.rs");
+        let pipeline = read_source("src/render/vpt_pipeline.rs");
+        let runtime = read_source("src/render/runtime.rs");
+        let readme = read_source("README.md");
+
+        assert_contains_all(
+            &scene_common,
+            &[
+                "LIGHTING_FLAG_VPT_TRAVERSAL_STATS",
+                "bool scene_vpt_traversal_stats_enabled",
+            ],
+            "scene shader traversal stats flag",
+        );
+        assert_contains_all(
+            &traverse,
+            &[
+                "VPT_TRAVERSAL_STAT_PRIMARY_RAYS",
+                "VPT_TRAVERSAL_STAT_SHADOW_RAYS",
+                "VPT_TRAVERSAL_STAT_HIERARCHY_SKIP_TESTS",
+                "VPT_TRAVERSAL_STAT_HIERARCHY_SKIPS_ACCEPTED",
+                "VPT_TRAVERSAL_STAT_BRICK_DDA_CALLS",
+                "VPT_TRAVERSAL_STAT_BRICK_DDA_STEPS",
+                "VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_CALLS",
+                "VPT_TRAVERSAL_STAT_BRICK_ANY_HIT_STEPS",
+                "vpt_traversal_stats_add(",
+                "RWStructuredBuffer<uint> stats",
+                "InterlockedAdd(stats[counter_index], value",
+            ],
+            "shared traversal stats shader",
+        );
+
+        for (name, shader, binding) in [
+            ("vpt", vpt.as_str(), "[[vk::binding(19, 0)]]"),
+            (
+                "vpt_surface",
+                vpt_surface.as_str(),
+                "[[vk::binding(23, 0)]]",
+            ),
+            (
+                "area_restir_initial",
+                area_initial.as_str(),
+                "[[vk::binding(15, 0)]]",
+            ),
+        ] {
+            assert!(
+                shader.contains(binding),
+                "{name} shader must bind traversal stats at {binding}"
+            );
+            assert!(
+                shader.contains("RWStructuredBuffer<uint> traversal_stats"),
+                "{name} shader must expose traversal stats storage buffer"
+            );
+            assert!(
+                shader.contains("scene_vpt_traversal_stats_enabled("),
+                "{name} shader must gate counter writes on SceneUniforms"
+            );
+        }
+
+        assert_contains_all(
+            &vpt_pass,
+            &[
+                "DescriptorBindingSpec::compute(19, vk::DescriptorType::STORAGE_BUFFER)",
+                "update_traversal_stats_descriptor",
+                "traversal_stats_resource",
+                "AccessKind::ComputeShaderReadWrite",
+            ],
+            "VPT pass traversal stats binding",
+        );
+        assert_contains_all(
+            &vpt_surface_pass,
+            &[
+                "DescriptorBindingSpec::compute(23, vk::DescriptorType::STORAGE_BUFFER)",
+                "update_traversal_stats_descriptor",
+                "traversal_stats_resource",
+                "AccessKind::ComputeShaderReadWrite",
+            ],
+            "VPT surface pass traversal stats binding",
+        );
+        assert_contains_all(
+            &area_pass,
+            &[
+                "DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_BUFFER)",
+                "update_traversal_stats_descriptors",
+                "traversal_stats_resource",
+                "AccessKind::ComputeShaderReadWrite",
+            ],
+            "Area ReSTIR traversal stats binding",
+        );
+        assert_contains_all(
+            &pipeline,
+            &[
+                "VptTraversalStatsBuffer",
+                "traversal_stats_buffers",
+                "traversal_stats_buffer(frame.frame_slot)",
+                "VptFrameRecordResult",
+                "traversal_stats: Option<VptTraversalStatsSnapshot>",
+                "for buffer in self.traversal_stats_buffers",
+                "buffer.destroy(device, allocator)",
+            ],
+            "VPT pipeline traversal stats readback",
+        );
+        assert_contains_all(
+            &runtime,
+            &[
+                "record_result.traversal_stats",
+                "wait_for_fence(submitted_fence)",
+                "TraversalStats",
+            ],
+            "runtime traversal stats logging",
+        );
+        assert_contains_all(
+            &readme,
+            &[
+                "REVOLUMETRIC_VPT_TRAVERSAL_STATS=on|off|1|0|true|false",
+                "TraversalStats",
+            ],
+            "README traversal stats docs",
+        );
+    }
 }

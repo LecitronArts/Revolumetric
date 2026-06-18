@@ -15,7 +15,7 @@ use crate::render::passes::area_restir::{AreaRestirPass, AreaRestirPassCreateInf
 use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::postprocess::{PostprocessGraphInputs, PostprocessPass};
 use crate::render::passes::restir_di::{RestirDiPass, RestirDiPassCreateInfo};
-use crate::render::passes::vpt::VptPass;
+use crate::render::passes::vpt::{VptGraphInputs, VptPass, VptPassCreateInfo, VptPassResizeInfo};
 use crate::render::passes::vpt_atrous::{
     VptAtrousGraphInputs, VptAtrousPass, VptAtrousPassCreateInfo, VptAtrousPassResizeInfo,
 };
@@ -36,7 +36,9 @@ use crate::render::passes::vpt_nrd_resolve::{
     VptNrdResolveGraphInputs, VptNrdResolvePass, VptNrdResolvePassCreateInfo,
     VptNrdResolvePassResizeInfo,
 };
-use crate::render::passes::vpt_surface::VptSurfacePass;
+use crate::render::passes::vpt_surface::{
+    VptSurfacePass, VptSurfacePassCreateInfo, VptSurfacePassResizeInfo,
+};
 use crate::render::passes::vpt_temporal::{
     VptTemporalGraphInputs, VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
 };
@@ -47,6 +49,7 @@ use crate::render::scene_ubo::{
     LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, VptDenoiserMode,
     build_scene_uniforms,
 };
+use crate::render::traversal_stats::{VptTraversalStatsBuffer, VptTraversalStatsSnapshot};
 use crate::render::vpt_history::{
     GpuVptHistoryUniforms, VPT_HISTORY_FLAG_CAMERA_CUT, VPT_HISTORY_FLAG_LIGHTS_INVALIDATED,
     VPT_HISTORY_FLAG_RESIZE, VPT_HISTORY_FLAG_SCENE_INVALIDATED,
@@ -106,6 +109,8 @@ pub struct VptFrameRecordResult {
     pub pending_capture: Option<CaptureMetadata>,
     pub submitted_fence: vk::Fence,
     pub rendered_vpt: bool,
+    pub traversal_stats_requested: bool,
+    pub traversal_stats: Option<VptTraversalStatsSnapshot>,
 }
 
 pub struct VptPipelineFrameState {
@@ -215,6 +220,7 @@ pub struct VptRuntimePipeline {
     pub vpt_atrous_pass: Option<VptAtrousPass>,
     pub area_restir_pass: Option<AreaRestirPass>,
     pub restir_di_pass: Option<RestirDiPass>,
+    pub traversal_stats_buffers: Vec<VptTraversalStatsBuffer>,
     pub frame_state: VptPipelineFrameState,
 }
 
@@ -286,6 +292,7 @@ impl VptRuntimePipeline {
             vpt_atrous_pass: None,
             area_restir_pass: None,
             restir_di_pass: None,
+            traversal_stats_buffers: Vec::new(),
             frame_state: VptPipelineFrameState::default(),
         }
     }
@@ -301,6 +308,9 @@ impl VptRuntimePipeline {
         restir_di_enabled: bool,
         area_restir_enabled: bool,
     ) {
+        if !self.ensure_traversal_stats_buffers(renderer, scene_ubo.frame_count()) {
+            return;
+        }
         self.ensure_vpt_surface_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
@@ -312,6 +322,67 @@ impl VptRuntimePipeline {
         self.ensure_vpt_temporal_pass(renderer, scene_ubo);
         self.ensure_vpt_atrous_pass(renderer, scene_ubo);
         self.ensure_postprocess_pass(renderer, scene_ubo);
+    }
+
+    fn ensure_traversal_stats_buffers(
+        &mut self,
+        renderer: &RenderDevice,
+        frame_count: usize,
+    ) -> bool {
+        if self.traversal_stats_buffers.len() == frame_count {
+            return true;
+        }
+
+        for buffer in std::mem::take(&mut self.traversal_stats_buffers) {
+            buffer.destroy(renderer.device(), renderer.allocator());
+        }
+
+        let mut buffers = Vec::with_capacity(frame_count);
+        for _slot in 0..frame_count {
+            match VptTraversalStatsBuffer::new(renderer.device(), renderer.allocator()) {
+                Ok(buffer) => buffers.push(buffer),
+                Err(error) => {
+                    tracing::error!(%error, "failed to create VPT traversal stats buffer");
+                    for buffer in buffers {
+                        buffer.destroy(renderer.device(), renderer.allocator());
+                    }
+                    return false;
+                }
+            }
+        }
+        self.traversal_stats_buffers = buffers;
+        self.sync_traversal_stats_descriptors(renderer.device(), frame_count);
+        true
+    }
+
+    pub fn traversal_stats_buffer(&self, frame_slot: usize) -> Option<&VptTraversalStatsBuffer> {
+        self.traversal_stats_buffers.get(frame_slot)
+    }
+
+    pub fn traversal_stats_snapshot(
+        &self,
+        frame_slot: usize,
+    ) -> Result<Option<VptTraversalStatsSnapshot>> {
+        self.traversal_stats_buffer(frame_slot)
+            .map(VptTraversalStatsBuffer::snapshot)
+            .transpose()
+    }
+
+    fn sync_traversal_stats_descriptors(&self, device: &ash::Device, frame_count: usize) {
+        for slot in 0..frame_count {
+            let Some(stats_buffer) = self.traversal_stats_buffer(slot) else {
+                continue;
+            };
+            if let Some(vpt_surface) = &self.vpt_surface_pass {
+                vpt_surface.update_traversal_stats_descriptor(device, slot, stats_buffer);
+            }
+            if let Some(area_restir) = &self.area_restir_pass {
+                area_restir.update_traversal_stats_descriptors(device, slot, stats_buffer);
+            }
+            if let Some(vpt) = &self.vpt_pass {
+                vpt.update_traversal_stats_descriptor(device, slot, stats_buffer);
+            }
+        }
     }
 
     fn ensure_vpt_surface_pass(
@@ -337,11 +408,14 @@ impl VptRuntimePipeline {
         match VptSurfacePass::new(
             renderer.device(),
             renderer.allocator(),
-            extent.width,
-            extent.height,
-            spirv,
-            ucvh_gpu,
-            scene_ubo,
+            VptSurfacePassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                spirv_bytes: spirv,
+                ucvh_gpu,
+                scene_ubo,
+                traversal_stats_buffers: &self.traversal_stats_buffers,
+            },
         ) {
             Ok(pass) => {
                 tracing::info!(
@@ -380,11 +454,14 @@ impl VptRuntimePipeline {
         match VptPass::new(
             renderer.device(),
             renderer.allocator(),
-            extent.width,
-            extent.height,
-            spirv,
-            ucvh_gpu,
-            scene_ubo,
+            VptPassCreateInfo {
+                width: extent.width,
+                height: extent.height,
+                spirv_bytes: spirv,
+                ucvh_gpu,
+                scene_ubo,
+                traversal_stats_buffers: &self.traversal_stats_buffers,
+            },
         ) {
             Ok(pass) => {
                 tracing::info!(
@@ -711,6 +788,7 @@ impl VptRuntimePipeline {
                 spatial_spirv,
                 scene_ubo,
                 ucvh_gpu,
+                traversal_stats_buffers: &self.traversal_stats_buffers,
             },
         ) {
             Ok(pass) => {
@@ -903,6 +981,7 @@ impl VptRuntimePipeline {
         let mut current_vpt_view_proj = None;
         let mut current_nrd_frame_state = None;
         let mut nrd_adapter_pass_recorded = false;
+        let traversal_stats_requested = inputs.lighting_settings.vpt_traversal_stats_enabled;
         let scene_key = Self::make_scene_key(
             inputs.sun_direction,
             inputs.sun_intensity,
@@ -1102,15 +1181,30 @@ impl VptRuntimePipeline {
             ) {
                 let slot = frame.frame_slot;
                 let profiler = inputs.profiler;
+                let traversal_stats_resource = if traversal_stats_requested {
+                    self.traversal_stats_buffer(frame.frame_slot).map(|buffer| {
+                        buffer.clear_cpu();
+                        graph.import_buffer_with_access(
+                            buffer.handle(),
+                            buffer.size(),
+                            buffer.usage(),
+                            AccessKind::Undefined,
+                        )
+                    })
+                } else {
+                    None
+                };
                 let surface_graph = vpt_surface.register_bootstrap_graph(
                     &mut graph,
                     self.frame_state.vpt_temporal_history_initialized,
                     slot,
+                    traversal_stats_resource,
                     profiler,
                 );
                 let bootstrap_surface_resources = surface_graph.surface_writes;
                 let mut final_surface_writes = bootstrap_surface_resources;
                 let previous_surface_resources = surface_graph.previous_surface_resources;
+                let mut traversal_stats_resource = surface_graph.traversal_stats_resource;
                 let mut vpt_area_restir_reads = None;
                 if inputs.area_restir_enabled
                     && let Some(area_restir) = &self.area_restir_pass
@@ -1126,9 +1220,11 @@ impl VptRuntimePipeline {
                         self.frame_state.area_restir_history_initialized,
                         bootstrap_surface_resources,
                         previous_surface_resources,
+                        traversal_stats_resource,
                         inputs.profiler,
                     );
                     final_surface_writes = area_graph.final_surface_writes;
+                    traversal_stats_resource = area_graph.traversal_stats_resource;
                     vpt_area_restir_reads = Some((
                         area_graph.uniform_resource,
                         area_graph.selected_current_resource,
@@ -1185,11 +1281,14 @@ impl VptRuntimePipeline {
 
                 let vpt_outputs = vpt.register_graph(
                     &mut graph,
-                    slot,
-                    self.frame_state.vpt_accumulation_needs_init,
-                    vpt_restir_reads,
-                    vpt_area_restir_reads,
-                    profiler,
+                    VptGraphInputs {
+                        frame_slot: slot,
+                        accumulation_needs_init: self.frame_state.vpt_accumulation_needs_init,
+                        restir_reads: vpt_restir_reads,
+                        area_restir_reads: vpt_area_restir_reads,
+                        traversal_stats_resource,
+                        profiler,
+                    },
                 );
                 let noisy_radiance_dep = vpt_outputs.noisy_radiance;
                 let noisy_moments_dep = vpt_outputs.noisy_moments;
@@ -1592,6 +1691,8 @@ impl VptRuntimePipeline {
             pending_capture,
             submitted_fence: frame.in_flight_fence,
             rendered_vpt,
+            traversal_stats_requested,
+            traversal_stats: None,
         })
     }
 
@@ -1612,12 +1713,32 @@ impl VptRuntimePipeline {
         self.frame_state.reset_for_resize_or_camera_cut();
 
         if let Some(vpt) = &mut self.vpt_pass {
-            vpt.resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
-                .context("failed to resize VPT images")?;
+            vpt.resize_images(
+                &device,
+                allocator,
+                VptPassResizeInfo {
+                    width,
+                    height,
+                    scene_ubo,
+                    ucvh_gpu,
+                    traversal_stats_buffers: &self.traversal_stats_buffers,
+                },
+            )
+            .context("failed to resize VPT images")?;
         }
         if let Some(vpt_surface) = &mut self.vpt_surface_pass {
             vpt_surface
-                .resize_images(&device, allocator, width, height, scene_ubo, ucvh_gpu)
+                .resize_images(
+                    &device,
+                    allocator,
+                    VptSurfacePassResizeInfo {
+                        width,
+                        height,
+                        scene_ubo,
+                        ucvh_gpu,
+                        traversal_stats_buffers: &self.traversal_stats_buffers,
+                    },
+                )
                 .context("failed to resize VPT surface images")?;
             if restir_di_enabled && let Some(restir_di) = &self.restir_di_pass {
                 restir_di.update_surface_descriptors(&device, vpt_surface);
@@ -1828,6 +1949,9 @@ impl VptRuntimePipeline {
         }
         if let Some(pass) = self.restir_di_pass {
             pass.destroy(device, allocator);
+        }
+        for buffer in self.traversal_stats_buffers {
+            buffer.destroy(device, allocator);
         }
     }
 }
@@ -2166,6 +2290,7 @@ mod tests {
                 denoiser_mode: VptDenoiserMode::Svgf,
                 denoiser_atrous_iterations: 4,
                 vpt_debug_view: VptDebugView::Final,
+                ..LightingSettings::default()
             },
             RestirDiSettings::default(),
             AreaRestirSettings::default(),
@@ -2186,6 +2311,7 @@ mod tests {
                 denoiser_mode: VptDenoiserMode::Off,
                 denoiser_atrous_iterations: 2,
                 vpt_debug_view: VptDebugView::Final,
+                ..LightingSettings::default()
             },
             RestirDiSettings::default(),
             AreaRestirSettings::default(),

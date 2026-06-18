@@ -55,6 +55,7 @@ Rendering settings can be overridden through environment variables:
 - `REVOLUMETRIC_DENOISER=off|svgf|relax|reblur`: selects VPT denoising. `relax` and `reblur` use the native NRD path when the `nrd` Cargo feature and NRD SDK are available; otherwise they fall back to the existing SVGF path.
 - `REVOLUMETRIC_DENOISER_ATROUS_ITERATIONS=0..5`: controls the fallback SVGF/A-trous iteration budget and related denoiser settings.
 - `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z|nrd_validation`: selects VPT diagnostics. Area ReSTIR, voxel traversal, and NRD guide/debug views are written through the final postprocess path without temporal smoothing.
+- `REVOLUMETRIC_VPT_TRAVERSAL_STATS=on|off|1|0|true|false`: enables per-frame VPT traversal counter readback. When enabled, the runtime waits for the submitted frame fence and logs a `TraversalStats` line with primary/shadow ray counts, hierarchy skip counts, and brick DDA step counts.
 
 Invalid rendering environment values emit parse warnings and keep the default for the invalid setting.
 

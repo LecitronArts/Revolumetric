@@ -18,6 +18,7 @@ use crate::render::passes::vpt_surface::{
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
+use crate::render::traversal_stats::VptTraversalStatsBuffer;
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct AreaRestirPass {
@@ -43,6 +44,7 @@ pub struct AreaRestirPassCreateInfo<'a> {
     pub spatial_spirv: &'a [u8],
     pub scene_ubo: &'a SceneUniformBuffer,
     pub ucvh_gpu: &'a UcvhGpuResources,
+    pub traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
 }
 
 pub struct AreaRestirGraphBuffers<'a> {
@@ -51,6 +53,7 @@ pub struct AreaRestirGraphBuffers<'a> {
     pub selected_current_buffer: &'a GpuBuffer,
     pub selected_current_resource: ResourceHandle,
     pub final_surface_writes: VptCurrentSurfaceResources,
+    pub traversal_stats_resource: Option<ResourceHandle>,
 }
 
 struct AreaRestirBuffers {
@@ -88,7 +91,7 @@ fn area_restir_effective_settings(
 }
 
 impl AreaRestirPass {
-    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 15] {
+    pub(crate) fn initial_descriptor_binding_specs() -> [DescriptorBindingSpec; 16] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -105,6 +108,7 @@ impl AreaRestirPass {
             DescriptorBindingSpec::compute(12, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(13, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::compute(14, vk::DescriptorType::STORAGE_BUFFER),
+            DescriptorBindingSpec::compute(15, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
@@ -210,6 +214,13 @@ impl AreaRestirPass {
         pass.write_descriptor_sets(device);
         pass.write_scene_descriptors(device, info.scene_ubo);
         pass.write_ucvh_descriptors(device, info.ucvh_gpu);
+        for slot in 0..info.frame_count {
+            pass.update_traversal_stats_descriptors(
+                device,
+                slot,
+                &info.traversal_stats_buffers[slot],
+            );
+        }
         Ok(pass)
     }
 
@@ -241,6 +252,7 @@ impl AreaRestirPass {
         history_initialized: bool,
         bootstrap_surface_writes: VptCurrentSurfaceResources,
         previous_surface_resources: VptPreviousSurfaceResources,
+        traversal_stats_resource: Option<ResourceHandle>,
         profiler: Option<&'a GpuProfiler>,
     ) -> AreaRestirGraphBuffers<'a> {
         let settings = area_restir_effective_settings(settings, history_initialized);
@@ -309,6 +321,7 @@ impl AreaRestirPass {
             AccessKind::Undefined,
         );
 
+        let mut traversal_stats_after_initial = traversal_stats_resource;
         let initial_writes = graph.add_pass("area_restir_initial", QueueType::Compute, |builder| {
             builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
             builder.read_as(
@@ -330,6 +343,11 @@ impl AreaRestirPass {
             };
             builder.write_as(initial_output_resource, AccessKind::ComputeShaderWrite);
             builder.write_as(debug_resource, AccessKind::ComputeShaderWrite);
+            if let Some(traversal_stats_resource) = traversal_stats_resource {
+                traversal_stats_after_initial = Some(
+                    builder.write_as(traversal_stats_resource, AccessKind::ComputeShaderReadWrite),
+                );
+            }
             Box::new(move |ctx| {
                 if let Some(profiler) = profiler {
                     profiler.begin_scope(
@@ -453,6 +471,7 @@ impl AreaRestirPass {
             uniform_buffer,
             selected_current_buffer,
         );
+        let mut traversal_stats_after_selected_surface = traversal_stats_after_initial;
         let selected_surface_writes =
             graph.add_pass("vpt_surface_selected", QueueType::Compute, |builder| {
                 builder.read_as(uniform_resource, AccessKind::ComputeShaderRead);
@@ -460,6 +479,12 @@ impl AreaRestirPass {
                 bootstrap_surface_writes.for_each(|surface_write| {
                     builder.write_as(surface_write, AccessKind::ComputeShaderWrite);
                 });
+                if let Some(traversal_stats_resource) = traversal_stats_after_initial {
+                    traversal_stats_after_selected_surface = Some(
+                        builder
+                            .write_as(traversal_stats_resource, AccessKind::ComputeShaderReadWrite),
+                    );
+                }
                 Box::new(move |ctx| {
                     if let Some(profiler) = profiler {
                         profiler.begin_scope(
@@ -481,8 +506,9 @@ impl AreaRestirPass {
                 })
             });
 
-        let final_surface_writes =
-            VptCurrentSurfaceResources::from_graph_writes(selected_surface_writes);
+        let final_surface_writes = VptCurrentSurfaceResources::from_graph_writes(
+            selected_surface_writes.iter().copied().take(9).collect(),
+        );
 
         AreaRestirGraphBuffers {
             uniform_buffer,
@@ -490,6 +516,7 @@ impl AreaRestirPass {
             selected_current_buffer,
             selected_current_resource: selected_resource,
             final_surface_writes,
+            traversal_stats_resource: traversal_stats_after_selected_surface,
         }
     }
 
@@ -729,6 +756,27 @@ impl AreaRestirPass {
                 &ucvh_gpu.material_buffer,
             ],
         );
+    }
+
+    pub fn update_traversal_stats_descriptors(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        traversal_stats: &VptTraversalStatsBuffer,
+    ) {
+        let Some(&descriptor_set) = self.initial_stage.descriptor_sets.get(frame_slot) else {
+            return;
+        };
+        let stats_info = vk::DescriptorBufferInfo::default()
+            .buffer(traversal_stats.handle())
+            .offset(0)
+            .range(traversal_stats.size());
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(15)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&stats_info));
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
     }
 }
 

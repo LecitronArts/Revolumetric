@@ -14,6 +14,7 @@ use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::{GpuRestirDiReservoir, GpuRestirDiUniforms};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
+use crate::render::traversal_stats::VptTraversalStatsBuffer;
 use crate::voxel::gpu_upload::UcvhGpuResources;
 
 pub struct VptPass {
@@ -48,8 +49,34 @@ pub struct VptNrdNoisyResources {
     pub material_factors: ResourceHandle,
 }
 
+pub struct VptPassCreateInfo<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub spirv_bytes: &'a [u8],
+    pub ucvh_gpu: &'a UcvhGpuResources,
+    pub scene_ubo: &'a SceneUniformBuffer,
+    pub traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
+}
+
+pub struct VptPassResizeInfo<'a> {
+    pub width: u32,
+    pub height: u32,
+    pub scene_ubo: &'a SceneUniformBuffer,
+    pub ucvh_gpu: &'a UcvhGpuResources,
+    pub traversal_stats_buffers: &'a [VptTraversalStatsBuffer],
+}
+
+pub struct VptGraphInputs<'a> {
+    pub frame_slot: usize,
+    pub accumulation_needs_init: bool,
+    pub restir_reads: Option<(ResourceHandle, ResourceHandle)>,
+    pub area_restir_reads: Option<(ResourceHandle, ResourceHandle)>,
+    pub traversal_stats_resource: Option<ResourceHandle>,
+    pub profiler: Option<&'a GpuProfiler>,
+}
+
 impl VptPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 19] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 20] {
         [
             DescriptorBindingSpec::compute(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::compute(1, vk::DescriptorType::STORAGE_IMAGE),
@@ -70,23 +97,20 @@ impl VptPass {
             DescriptorBindingSpec::compute(16, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(17, vk::DescriptorType::STORAGE_IMAGE),
             DescriptorBindingSpec::compute(18, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::compute(19, vk::DescriptorType::STORAGE_BUFFER),
         ]
     }
 
     pub fn new(
         device: &ash::Device,
         allocator: &GpuAllocator,
-        width: u32,
-        height: u32,
-        spirv_bytes: &[u8],
-        ucvh_gpu: &UcvhGpuResources,
-        scene_ubo: &SceneUniformBuffer,
+        info: VptPassCreateInfo<'_>,
     ) -> Result<Self> {
         let descriptor_set_layout = DescriptorLayoutBuilder::new()
             .add_binding_specs(&Self::descriptor_binding_specs())
             .build(device)?;
 
-        let frame_count = scene_ubo.frame_count();
+        let frame_count = info.scene_ubo.frame_count();
         let pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -98,7 +122,7 @@ impl VptPass {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 9 * frame_count as u32,
+                descriptor_count: 10 * frame_count as u32,
             },
         ];
         let descriptor_pool = match DescriptorPool::new(device, frame_count as u32, &pool_sizes) {
@@ -118,7 +142,7 @@ impl VptPass {
             }
         };
 
-        let images = match create_vpt_images(device, allocator, width, height) {
+        let images = match create_vpt_images(device, allocator, info.width, info.height) {
             Ok(image) => image,
             Err(error) => {
                 descriptor_pool.destroy(device);
@@ -129,7 +153,7 @@ impl VptPass {
         write_descriptor_sets(
             device,
             &descriptor_sets,
-            scene_ubo,
+            info.scene_ubo,
             &VptImagesRef {
                 noisy_radiance_image: &images.noisy_radiance_image,
                 noisy_moments_image: &images.noisy_moments_image,
@@ -138,7 +162,8 @@ impl VptPass {
                 nrd_residual_radiance: &images.nrd_residual_radiance,
                 nrd_material_factors: &images.nrd_material_factors,
             },
-            ucvh_gpu,
+            info.ucvh_gpu,
+            info.traversal_stats_buffers,
         );
 
         let disabled_restir_uniform_buffers =
@@ -201,7 +226,7 @@ impl VptPass {
             &disabled_area_restir_reservoir_buffer,
         );
 
-        let shader_module = match create_shader_module(device, spirv_bytes) {
+        let shader_module = match create_shader_module(device, info.spirv_bytes) {
             Ok(module) => module,
             Err(error) => {
                 disabled_area_restir_reservoir_buffer.destroy(device, allocator);
@@ -258,12 +283,9 @@ impl VptPass {
         &mut self,
         device: &ash::Device,
         allocator: &GpuAllocator,
-        width: u32,
-        height: u32,
-        scene_ubo: &SceneUniformBuffer,
-        ucvh_gpu: &UcvhGpuResources,
+        info: VptPassResizeInfo<'_>,
     ) -> Result<()> {
-        let new_images = create_vpt_images(device, allocator, width, height)?;
+        let new_images = create_vpt_images(device, allocator, info.width, info.height)?;
         let old_images = VptImages {
             noisy_radiance_image: std::mem::replace(
                 &mut self.noisy_radiance_image,
@@ -294,7 +316,7 @@ impl VptPass {
         write_descriptor_sets(
             device,
             &self.descriptor_sets,
-            scene_ubo,
+            info.scene_ubo,
             &VptImagesRef {
                 noisy_radiance_image: &self.noisy_radiance_image,
                 noisy_moments_image: &self.noisy_moments_image,
@@ -303,7 +325,8 @@ impl VptPass {
                 nrd_residual_radiance: &self.nrd_residual_radiance,
                 nrd_material_factors: &self.nrd_material_factors,
             },
-            ucvh_gpu,
+            info.ucvh_gpu,
+            info.traversal_stats_buffers,
         );
         write_restir_descriptor_sets(
             device,
@@ -380,6 +403,24 @@ impl VptPass {
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
+    pub fn update_traversal_stats_descriptor(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        traversal_stats: &VptTraversalStatsBuffer,
+    ) {
+        let stats_info = vk::DescriptorBufferInfo::default()
+            .buffer(traversal_stats.handle())
+            .offset(0)
+            .range(traversal_stats.size());
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.descriptor_sets[frame_slot])
+            .dst_binding(19)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(std::slice::from_ref(&stats_info));
+        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+    }
+
     pub fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_slot: usize) {
         let extent = self.noisy_radiance_image.extent;
 
@@ -400,13 +441,9 @@ impl VptPass {
     pub fn register_graph<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
-        frame_slot: usize,
-        accumulation_needs_init: bool,
-        restir_reads: Option<(ResourceHandle, ResourceHandle)>,
-        area_restir_reads: Option<(ResourceHandle, ResourceHandle)>,
-        profiler: Option<&'a GpuProfiler>,
+        inputs: VptGraphInputs<'a>,
     ) -> VptGraphOutputs {
-        let noisy_initial_access = if accumulation_needs_init {
+        let noisy_initial_access = if inputs.accumulation_needs_init {
             AccessKind::Undefined
         } else {
             AccessKind::ComputeShaderRead
@@ -481,12 +518,13 @@ impl VptPass {
                 nrd_material_factors_resource,
                 AccessKind::ComputeShaderWrite,
             );
-            if let Some((restir_uniform_resource, restir_reservoir_resource)) = restir_reads {
+            if let Some((restir_uniform_resource, restir_reservoir_resource)) = inputs.restir_reads
+            {
                 builder.read_as(restir_uniform_resource, AccessKind::ComputeShaderRead);
                 builder.read_as(restir_reservoir_resource, AccessKind::ComputeShaderRead);
             }
             if let Some((area_uniform_resource, area_selected_reservoir_resource)) =
-                area_restir_reads
+                inputs.area_restir_reads
             {
                 builder.read_as(area_uniform_resource, AccessKind::ComputeShaderRead);
                 builder.read_as(
@@ -494,21 +532,24 @@ impl VptPass {
                     AccessKind::ComputeShaderRead,
                 );
             }
+            if let Some(traversal_stats_resource) = inputs.traversal_stats_resource {
+                builder.write_as(traversal_stats_resource, AccessKind::ComputeShaderReadWrite);
+            }
             Box::new(move |ctx| {
-                if let Some(profiler) = profiler {
+                if let Some(profiler) = inputs.profiler {
                     profiler.begin_scope(
                         ctx.device,
                         ctx.command_buffer,
-                        frame_slot,
+                        inputs.frame_slot,
                         GpuProfileScope::Vpt,
                     );
                 }
-                self.record(ctx.device, ctx.command_buffer, frame_slot);
-                if let Some(profiler) = profiler {
+                self.record(ctx.device, ctx.command_buffer, inputs.frame_slot);
+                if let Some(profiler) = inputs.profiler {
                     profiler.end_scope(
                         ctx.device,
                         ctx.command_buffer,
-                        frame_slot,
+                        inputs.frame_slot,
                         GpuProfileScope::Vpt,
                     );
                 }
@@ -689,6 +730,7 @@ fn write_descriptor_sets(
     scene_ubo: &SceneUniformBuffer,
     images: &VptImagesRef<'_>,
     ucvh_gpu: &UcvhGpuResources,
+    traversal_stats_buffers: &[VptTraversalStatsBuffer],
 ) {
     let ucvh_buffers = [
         &ucvh_gpu.hierarchy_l0_buffer,
@@ -790,6 +832,18 @@ fn write_descriptor_sets(
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(std::slice::from_ref(&nrd_material_info)),
         ]);
+        let stats_buffer = &traversal_stats_buffers[set_idx];
+        let stats_info = vk::DescriptorBufferInfo::default()
+            .buffer(stats_buffer.handle())
+            .offset(0)
+            .range(stats_buffer.size());
+        writes.push(
+            vk::WriteDescriptorSet::default()
+                .dst_set(ds)
+                .dst_binding(19)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&stats_info)),
+        );
         unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 }

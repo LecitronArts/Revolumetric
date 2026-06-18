@@ -74,6 +74,9 @@ RWTexture2D<float4> nrd_residual_radiance;
 [[vk::image_format("rgba16f")]]
 RWTexture2D<float4> nrd_material_factors;
 
+[[vk::binding(19, 0)]]
+RWStructuredBuffer<uint> traversal_stats;
+
 static const float VPT_NRD_INVALID_HIT_DISTANCE = 65504.0;
 static const float VPT_NRD_MIN_ALBEDO = 0.001;
 
@@ -149,7 +152,9 @@ bool voxel_shadow_occluded_from_hit(HitResult hit, float3 shadow_dir, float max_
         hierarchy_l2,
         hierarchy_l3,
         hierarchy_l4,
-        brick_occupancy
+        brick_occupancy,
+        traversal_stats,
+        scene_vpt_traversal_stats_enabled(scene_ubo)
     );
 }
 
@@ -388,7 +393,9 @@ VptTraceSample trace_path(Ray ray, SceneUniforms scene, uint2 pixel, inout uint 
             hierarchy_l3,
             hierarchy_l4,
             brick_occupancy,
-            brick_materials
+            brick_materials,
+            traversal_stats,
+            scene_vpt_traversal_stats_enabled(scene)
         );
         if (bounce == 0u) {
             sample.first_hit = hit;
