@@ -54,6 +54,8 @@ use crate::render::vpt_history::{
 use crate::voxel::gpu_upload::UcvhGpuResources;
 use crate::voxel::ucvh::{Ucvh, UcvhInvalidationRegion, UcvhMotionEvent};
 
+const VPT_SCENE_KEY_WORDS: usize = 35;
+
 #[derive(Debug, Clone, Copy)]
 pub struct VptCameraFrame {
     pub position: glam::Vec3,
@@ -109,7 +111,7 @@ pub struct VptFrameRecordResult {
 pub struct VptPipelineFrameState {
     pub vpt_sample_index: u32,
     pub last_vpt_camera_key: Option<[u32; 15]>,
-    pub last_vpt_scene_key: Option<[u32; 14]>,
+    pub last_vpt_scene_key: Option<[u32; VPT_SCENE_KEY_WORDS]>,
     pub history_reset_generation: u32,
     pub vpt_accumulation_needs_init: bool,
     pub vpt_temporal_history_initialized: bool,
@@ -173,8 +175,6 @@ impl VptPipelineFrameState {
         self.vpt_temporal_history_initialized = false;
         self.postprocess_output_initialized = false;
         self.vpt_nrd_texture_pools_initialized = false;
-        self.area_restir_history_initialized = false;
-        self.restir_di_history_initialized = false;
     }
 }
 
@@ -229,9 +229,11 @@ impl VptRuntimePipeline {
         sun_direction: glam::Vec3,
         sun_intensity: glam::Vec3,
         lighting_settings: LightingSettings,
+        restir_di_settings: RestirDiSettings,
+        area_restir_settings: AreaRestirSettings,
         restir_di_enabled: bool,
         area_restir_enabled: bool,
-    ) -> [u32; 14] {
+    ) -> [u32; VPT_SCENE_KEY_WORDS] {
         [
             sun_direction.x.to_bits(),
             sun_direction.y.to_bits(),
@@ -245,8 +247,29 @@ impl VptRuntimePipeline {
             lighting_settings.sun_angular_radius.to_bits(),
             lighting_settings.denoiser_mode.as_scene_key_value(),
             lighting_settings.denoiser_atrous_iterations,
+            lighting_settings.vpt_debug_view.as_gpu_value(),
+            lighting_settings.debug_view.as_gpu_value(),
             restir_di_enabled as u32,
+            restir_di_settings.enabled as u32,
+            restir_di_settings.temporal_enabled as u32,
+            restir_di_settings.spatial_enabled as u32,
+            restir_di_settings.initial_candidate_count,
+            restir_di_settings.spatial_sample_count,
+            restir_di_settings.history_length,
+            restir_di_settings.debug_view.as_gpu_value(),
             area_restir_enabled as u32,
+            area_restir_settings.enabled as u32,
+            area_restir_settings.temporal_enabled as u32,
+            area_restir_settings.spatial_enabled as u32,
+            area_restir_settings.subpixel_enabled as u32,
+            area_restir_settings.lens_enabled as u32,
+            area_restir_settings.initial_candidate_count,
+            area_restir_settings.spatial_sample_count,
+            area_restir_settings.history_length,
+            area_restir_settings.normal_threshold.to_bits(),
+            area_restir_settings.depth_threshold.to_bits(),
+            area_restir_settings.spatial_radius.to_bits(),
+            area_restir_settings.debug_view.as_gpu_value(),
         ]
     }
 
@@ -884,6 +907,8 @@ impl VptRuntimePipeline {
             inputs.sun_direction,
             inputs.sun_intensity,
             inputs.lighting_settings,
+            inputs.restir_di_settings,
+            inputs.area_restir_settings,
             inputs.restir_di_enabled,
             inputs.area_restir_enabled,
         );
@@ -1903,6 +1928,8 @@ fn capture_effective_denoiser_mode_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::area_restir::AreaRestirDebugView;
+    use crate::render::restir_di::RestirDiDebugView;
     use crate::render::scene_ubo::{
         LightingDebugView, LightingSettings, RenderMode, VptDebugView, VptDenoiserMode,
     };
@@ -1922,7 +1949,7 @@ mod tests {
         let mut state = VptPipelineFrameState {
             vpt_sample_index: 7,
             last_vpt_camera_key: Some([1; 15]),
-            last_vpt_scene_key: Some([2; 14]),
+            last_vpt_scene_key: Some([2; VPT_SCENE_KEY_WORDS]),
             history_reset_generation: 9,
             vpt_accumulation_needs_init: false,
             vpt_temporal_history_initialized: true,
@@ -1941,7 +1968,7 @@ mod tests {
 
         assert_eq!(state.vpt_sample_index, 0);
         assert_eq!(state.last_vpt_camera_key, None);
-        assert_eq!(state.last_vpt_scene_key, Some([2; 14]));
+        assert_eq!(state.last_vpt_scene_key, Some([2; VPT_SCENE_KEY_WORDS]));
         assert_eq!(state.history_reset_generation, 10);
         assert!(state.vpt_accumulation_needs_init);
         assert!(!state.vpt_temporal_history_initialized);
@@ -1957,11 +1984,11 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_scene_reset_clears_history_without_touching_camera_history() {
+    fn frame_state_scene_reset_clears_output_history_without_touching_camera_or_restir_history() {
         let mut state = VptPipelineFrameState {
             vpt_sample_index: 11,
             last_vpt_camera_key: Some([1; 15]),
-            last_vpt_scene_key: Some([2; 14]),
+            last_vpt_scene_key: Some([2; VPT_SCENE_KEY_WORDS]),
             history_reset_generation: 3,
             vpt_accumulation_needs_init: false,
             vpt_temporal_history_initialized: true,
@@ -1986,8 +2013,8 @@ mod tests {
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
         assert!(!state.vpt_nrd_texture_pools_initialized);
-        assert!(!state.area_restir_history_initialized);
-        assert!(!state.restir_di_history_initialized);
+        assert!(state.area_restir_history_initialized);
+        assert!(state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
         assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
         assert_eq!(
@@ -1999,6 +2026,35 @@ mod tests {
             Some(glam::Mat4::from_scale(glam::Vec3::splat(3.0)))
         );
         assert_eq!(state.previous_nrd_elapsed_seconds, Some(12.0));
+    }
+
+    #[test]
+    fn scene_key_reset_preserves_independent_restir_histories() {
+        let mut state = VptPipelineFrameState {
+            vpt_sample_index: 11,
+            last_vpt_camera_key: Some([1; 15]),
+            last_vpt_scene_key: Some([2; VPT_SCENE_KEY_WORDS]),
+            history_reset_generation: 3,
+            vpt_accumulation_needs_init: false,
+            vpt_temporal_history_initialized: true,
+            postprocess_output_initialized: true,
+            vpt_nrd_texture_pools_initialized: true,
+            area_restir_history_initialized: true,
+            restir_di_history_initialized: true,
+            previous_vpt_view_proj: Some(glam::Mat4::IDENTITY),
+            previous_vpt_resolution: Some([1280, 720]),
+            previous_nrd_world_to_view: Some(glam::Mat4::from_scale(glam::Vec3::splat(2.0))),
+            previous_nrd_view_to_clip: Some(glam::Mat4::from_scale(glam::Vec3::splat(3.0))),
+            previous_nrd_elapsed_seconds: Some(12.0),
+        };
+
+        state.reset_for_scene_change();
+
+        assert!(!state.vpt_temporal_history_initialized);
+        assert!(!state.postprocess_output_initialized);
+        assert!(!state.vpt_nrd_texture_pools_initialized);
+        assert!(state.area_restir_history_initialized);
+        assert!(state.restir_di_history_initialized);
     }
 
     #[test]
@@ -2111,6 +2167,8 @@ mod tests {
                 denoiser_atrous_iterations: 4,
                 vpt_debug_view: VptDebugView::Final,
             },
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
             false,
             false,
         );
@@ -2129,6 +2187,8 @@ mod tests {
                 denoiser_atrous_iterations: 2,
                 vpt_debug_view: VptDebugView::Final,
             },
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
             true,
             true,
         );
@@ -2151,6 +2211,8 @@ mod tests {
             glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
             glam::Vec3::new(2.0, 1.5, 1.25),
             base_settings,
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
             false,
             false,
         );
@@ -2158,10 +2220,193 @@ mod tests {
             glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
             glam::Vec3::new(2.0, 1.5, 1.25),
             relax_settings,
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
             false,
             false,
         );
 
         assert_ne!(base, relax);
+    }
+
+    #[test]
+    fn scene_key_tracks_vpt_debug_view_changes() {
+        let final_key = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            LightingSettings::default(),
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
+            false,
+            false,
+        );
+        let debug_key = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            LightingSettings {
+                vpt_debug_view: VptDebugView::ReservoirWeight,
+                ..LightingSettings::default()
+            },
+            RestirDiSettings::default(),
+            AreaRestirSettings::default(),
+            false,
+            false,
+        );
+
+        assert_ne!(
+            final_key, debug_key,
+            "switching VPT debug views must invalidate accumulated history from the previous output mode"
+        );
+    }
+
+    #[test]
+    fn scene_key_tracks_restir_di_runtime_tuning() {
+        let base = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            LightingSettings::default(),
+            RestirDiSettings {
+                enabled: true,
+                ..RestirDiSettings::default()
+            },
+            AreaRestirSettings::default(),
+            true,
+            false,
+        );
+
+        for changed_restir in [
+            RestirDiSettings {
+                enabled: true,
+                temporal_enabled: false,
+                ..RestirDiSettings::default()
+            },
+            RestirDiSettings {
+                enabled: true,
+                spatial_enabled: true,
+                ..RestirDiSettings::default()
+            },
+            RestirDiSettings {
+                enabled: true,
+                initial_candidate_count: 8,
+                ..RestirDiSettings::default()
+            },
+            RestirDiSettings {
+                enabled: true,
+                spatial_sample_count: 7,
+                ..RestirDiSettings::default()
+            },
+            RestirDiSettings {
+                enabled: true,
+                history_length: 32,
+                ..RestirDiSettings::default()
+            },
+            RestirDiSettings {
+                enabled: true,
+                debug_view: RestirDiDebugView::ReservoirWeight,
+                ..RestirDiSettings::default()
+            },
+        ] {
+            let changed = VptRuntimePipeline::make_scene_key(
+                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                glam::Vec3::new(2.0, 1.5, 1.25),
+                LightingSettings::default(),
+                changed_restir,
+                AreaRestirSettings::default(),
+                true,
+                false,
+            );
+            assert_ne!(
+                base, changed,
+                "ReSTIR-DI UI tuning {changed_restir:?} must be part of the VPT scene key"
+            );
+        }
+    }
+
+    #[test]
+    fn scene_key_tracks_area_restir_runtime_tuning() {
+        let base = VptRuntimePipeline::make_scene_key(
+            glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+            glam::Vec3::new(2.0, 1.5, 1.25),
+            LightingSettings::default(),
+            RestirDiSettings::default(),
+            AreaRestirSettings {
+                enabled: true,
+                ..AreaRestirSettings::default()
+            },
+            false,
+            true,
+        );
+
+        for changed_area in [
+            AreaRestirSettings {
+                enabled: true,
+                temporal_enabled: false,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                spatial_enabled: false,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                subpixel_enabled: false,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                lens_enabled: false,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                initial_candidate_count: 8,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                spatial_sample_count: 8,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                history_length: 32,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                normal_threshold: 0.5,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                depth_threshold: 0.08,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                spatial_radius: 48.0,
+                ..AreaRestirSettings::default()
+            },
+            AreaRestirSettings {
+                enabled: true,
+                debug_view: AreaRestirDebugView::Weight,
+                ..AreaRestirSettings::default()
+            },
+        ] {
+            let changed = VptRuntimePipeline::make_scene_key(
+                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
+                glam::Vec3::new(2.0, 1.5, 1.25),
+                LightingSettings::default(),
+                RestirDiSettings::default(),
+                changed_area,
+                false,
+                true,
+            );
+            assert_ne!(
+                base, changed,
+                "Area ReSTIR UI tuning {changed_area:?} must be part of the VPT scene key"
+            );
+        }
     }
 }

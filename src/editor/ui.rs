@@ -166,7 +166,7 @@ impl EditorUi {
                     EditorPanel::Restir => {
                         show_restir_panel(ui, lighting, restir_di, area_restir, self.show_advanced);
                     }
-                    EditorPanel::Debug => show_debug_panel(ui, lighting, area_restir),
+                    EditorPanel::Debug => show_debug_panel(ui, lighting, restir_di, area_restir),
                 }
             });
     }
@@ -257,22 +257,88 @@ pub fn set_restir_di_enabled(settings: &mut RestirDiSettings, enabled: bool) {
     settings.enabled = enabled;
 }
 
+pub fn set_restir_di_debug_view(
+    lighting: &mut LightingSettings,
+    restir_di: &mut RestirDiSettings,
+    area_restir: &mut AreaRestirSettings,
+    debug_view: RestirDiDebugView,
+) {
+    restir_di.debug_view = debug_view;
+    match restir_di_debug_to_vpt_debug_view(debug_view) {
+        Some(vpt_debug_view) => {
+            lighting.vpt_debug_view = vpt_debug_view;
+            area_restir.debug_view = AreaRestirDebugView::Off;
+        }
+        None if debug_view != RestirDiDebugView::Off => {
+            lighting.vpt_debug_view = VptDebugView::Final;
+            area_restir.debug_view = AreaRestirDebugView::Off;
+        }
+        None if lighting.vpt_debug_view == VptDebugView::ReservoirWeight => {
+            lighting.vpt_debug_view = VptDebugView::Final;
+        }
+        None => {}
+    }
+}
+
 pub fn set_area_restir_enabled(settings: &mut AreaRestirSettings, enabled: bool) {
     settings.enabled = enabled;
 }
 
+pub fn restir_di_debug_to_vpt_debug_view(debug_view: RestirDiDebugView) -> Option<VptDebugView> {
+    match debug_view {
+        RestirDiDebugView::ReservoirWeight => Some(VptDebugView::ReservoirWeight),
+        RestirDiDebugView::Off
+        | RestirDiDebugView::LightId
+        | RestirDiDebugView::Visibility
+        | RestirDiDebugView::TemporalValid
+        | RestirDiDebugView::SpatialNeighbors => None,
+    }
+}
+
+pub fn vpt_debug_to_restir_di_debug_view(debug_view: VptDebugView) -> Option<RestirDiDebugView> {
+    match debug_view {
+        VptDebugView::ReservoirWeight => Some(RestirDiDebugView::ReservoirWeight),
+        _ => None,
+    }
+}
+
 pub fn set_area_restir_debug_view(
     lighting: &mut LightingSettings,
+    restir_di: &mut RestirDiSettings,
     area_restir: &mut AreaRestirSettings,
     debug_view: AreaRestirDebugView,
 ) {
     area_restir.debug_view = debug_view;
     match area_restir_debug_to_vpt_debug_view(debug_view) {
-        Some(vpt_debug_view) => lighting.vpt_debug_view = vpt_debug_view,
+        Some(vpt_debug_view) => {
+            lighting.vpt_debug_view = vpt_debug_view;
+            restir_di.debug_view = RestirDiDebugView::Off;
+        }
         None if is_area_vpt_debug_view(lighting.vpt_debug_view) => {
             lighting.vpt_debug_view = VptDebugView::Final;
         }
         None => {}
+    }
+}
+
+pub fn set_vpt_debug_view(
+    lighting: &mut LightingSettings,
+    restir_di: &mut RestirDiSettings,
+    area_restir: &mut AreaRestirSettings,
+    debug_view: VptDebugView,
+) {
+    lighting.vpt_debug_view = debug_view;
+
+    if let Some(restir_debug) = vpt_debug_to_restir_di_debug_view(debug_view) {
+        restir_di.debug_view = restir_debug;
+    } else {
+        restir_di.debug_view = RestirDiDebugView::Off;
+    }
+
+    if let Some(area_debug) = vpt_debug_to_area_restir_debug_view(debug_view) {
+        area_restir.debug_view = area_debug;
+    } else {
+        area_restir.debug_view = AreaRestirDebugView::Off;
     }
 }
 
@@ -287,6 +353,20 @@ pub fn area_restir_debug_to_vpt_debug_view(
         AreaRestirDebugView::HistoryValid => Some(VptDebugView::AreaHistoryValid),
         AreaRestirDebugView::Rejection => Some(VptDebugView::AreaRejection),
         AreaRestirDebugView::Jacobian => Some(VptDebugView::AreaJacobian),
+    }
+}
+
+pub fn vpt_debug_to_area_restir_debug_view(
+    debug_view: VptDebugView,
+) -> Option<AreaRestirDebugView> {
+    match debug_view {
+        VptDebugView::AreaSubpixel => Some(AreaRestirDebugView::Subpixel),
+        VptDebugView::AreaLens => Some(AreaRestirDebugView::Lens),
+        VptDebugView::AreaWeight => Some(AreaRestirDebugView::Weight),
+        VptDebugView::AreaHistoryValid => Some(AreaRestirDebugView::HistoryValid),
+        VptDebugView::AreaRejection => Some(AreaRestirDebugView::Rejection),
+        VptDebugView::AreaJacobian => Some(AreaRestirDebugView::Jacobian),
+        _ => None,
     }
 }
 
@@ -379,36 +459,15 @@ fn show_restir_panel(
     ui.add(egui::Slider::new(&mut restir_di.spatial_sample_count, 0..=8).text("spatial samples"));
     ui.add(egui::Slider::new(&mut restir_di.history_length, 1..=64).text("history length"));
     if show_advanced {
+        let mut restir_debug = restir_di.debug_view;
         egui::ComboBox::from_id_salt("restir_di_debug")
-            .selected_text(restir_di_debug_label(restir_di.debug_view))
+            .selected_text(restir_di_debug_label(restir_debug))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut restir_di.debug_view, RestirDiDebugView::Off, "Off");
-                ui.selectable_value(
-                    &mut restir_di.debug_view,
-                    RestirDiDebugView::ReservoirWeight,
-                    "Reservoir Weight",
-                );
-                ui.selectable_value(
-                    &mut restir_di.debug_view,
-                    RestirDiDebugView::LightId,
-                    "Light ID",
-                );
-                ui.selectable_value(
-                    &mut restir_di.debug_view,
-                    RestirDiDebugView::Visibility,
-                    "Visibility",
-                );
-                ui.selectable_value(
-                    &mut restir_di.debug_view,
-                    RestirDiDebugView::TemporalValid,
-                    "Temporal Valid",
-                );
-                ui.selectable_value(
-                    &mut restir_di.debug_view,
-                    RestirDiDebugView::SpatialNeighbors,
-                    "Spatial Neighbors",
-                );
+                restir_di_debug_combo(ui, &mut restir_debug);
             });
+        if restir_debug != restir_di.debug_view {
+            set_restir_di_debug_view(lighting, restir_di, area_restir, restir_debug);
+        }
     }
 
     ui.separator();
@@ -450,13 +509,14 @@ fn show_restir_panel(
         .selected_text(area_restir_debug_label(area_debug))
         .show_ui(ui, |ui| area_restir_debug_combo(ui, &mut area_debug));
     if area_debug != area_restir.debug_view {
-        set_area_restir_debug_view(lighting, area_restir, area_debug);
+        set_area_restir_debug_view(lighting, restir_di, area_restir, area_debug);
     }
 }
 
 fn show_debug_panel(
     ui: &mut egui::Ui,
     lighting: &mut LightingSettings,
+    restir_di: &mut RestirDiSettings,
     area: &mut AreaRestirSettings,
 ) {
     ui.label("Lighting Debug");
@@ -478,13 +538,29 @@ fn show_debug_panel(
 
     ui.separator();
     ui.label("VPT Debug");
+    let mut vpt_debug = lighting.vpt_debug_view;
     egui::ComboBox::from_id_salt("vpt_debug_view")
-        .selected_text(vpt_debug_label(lighting.vpt_debug_view))
+        .selected_text(vpt_debug_label(vpt_debug))
         .show_ui(ui, |ui| {
             for (view, label) in VPT_DEBUG_OPTIONS {
-                ui.selectable_value(&mut lighting.vpt_debug_view, *view, *label);
+                ui.selectable_value(&mut vpt_debug, *view, *label);
             }
         });
+    if vpt_debug != lighting.vpt_debug_view {
+        set_vpt_debug_view(lighting, restir_di, area, vpt_debug);
+    }
+
+    ui.separator();
+    ui.label("ReSTIR-DI Debug");
+    let mut restir_debug = restir_di.debug_view;
+    egui::ComboBox::from_id_salt("debug_restir_di_view")
+        .selected_text(restir_di_debug_label(restir_debug))
+        .show_ui(ui, |ui| {
+            restir_di_debug_combo(ui, &mut restir_debug);
+        });
+    if restir_debug != restir_di.debug_view {
+        set_restir_di_debug_view(lighting, restir_di, area, restir_debug);
+    }
 
     ui.separator();
     let mut area_debug = area.debug_view;
@@ -492,7 +568,7 @@ fn show_debug_panel(
         .selected_text(area_restir_debug_label(area_debug))
         .show_ui(ui, |ui| area_restir_debug_combo(ui, &mut area_debug));
     if area_debug != area.debug_view {
-        set_area_restir_debug_view(lighting, area, area_debug);
+        set_area_restir_debug_view(lighting, restir_di, area, area_debug);
     }
 }
 
@@ -501,6 +577,27 @@ fn denoiser_combo(ui: &mut egui::Ui, mode: &mut VptDenoiserMode) {
     ui.selectable_value(mode, VptDenoiserMode::Svgf, "SVGF");
     ui.selectable_value(mode, VptDenoiserMode::Relax, "NRD RELAX");
     ui.selectable_value(mode, VptDenoiserMode::Reblur, "NRD REBLUR");
+}
+
+fn restir_di_debug_combo(ui: &mut egui::Ui, debug_view: &mut RestirDiDebugView) {
+    ui.selectable_value(debug_view, RestirDiDebugView::Off, "Off");
+    ui.selectable_value(
+        debug_view,
+        RestirDiDebugView::ReservoirWeight,
+        "Reservoir Weight",
+    );
+    ui.selectable_value(debug_view, RestirDiDebugView::LightId, "Light ID");
+    ui.selectable_value(debug_view, RestirDiDebugView::Visibility, "Visibility");
+    ui.selectable_value(
+        debug_view,
+        RestirDiDebugView::TemporalValid,
+        "Temporal Valid",
+    );
+    ui.selectable_value(
+        debug_view,
+        RestirDiDebugView::SpatialNeighbors,
+        "Spatial Neighbors",
+    );
 }
 
 fn area_restir_debug_combo(ui: &mut egui::Ui, debug_view: &mut AreaRestirDebugView) {
@@ -620,12 +717,19 @@ mod tests {
     #[test]
     fn area_restir_debug_bridge_updates_area_and_vpt_debug_views() {
         let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
         let mut area = AreaRestirSettings::default();
 
-        set_area_restir_debug_view(&mut lighting, &mut area, AreaRestirDebugView::Weight);
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area,
+            AreaRestirDebugView::Weight,
+        );
 
         assert_eq!(area.debug_view, AreaRestirDebugView::Weight);
         assert_eq!(lighting.vpt_debug_view, VptDebugView::AreaWeight);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
     }
 
     #[test]
@@ -638,14 +742,25 @@ mod tests {
             debug_view: AreaRestirDebugView::Lens,
             ..AreaRestirSettings::default()
         };
+        let mut restir_di = RestirDiSettings::default();
 
-        set_area_restir_debug_view(&mut lighting, &mut area, AreaRestirDebugView::Off);
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area,
+            AreaRestirDebugView::Off,
+        );
 
         assert_eq!(area.debug_view, AreaRestirDebugView::Off);
         assert_eq!(lighting.vpt_debug_view, VptDebugView::Final);
 
         lighting.vpt_debug_view = VptDebugView::Normal;
-        set_area_restir_debug_view(&mut lighting, &mut area, AreaRestirDebugView::Off);
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area,
+            AreaRestirDebugView::Off,
+        );
 
         assert_eq!(lighting.vpt_debug_view, VptDebugView::Normal);
     }
@@ -706,5 +821,254 @@ mod tests {
             scene_panel.contains("lighting.sun_angular_radius <= 0.0"),
             "sun angular radius UI must sanitize non-positive values back to the default finite disk"
         );
+    }
+
+    #[test]
+    fn debug_panel_exposes_restir_di_debug_controls_without_advanced_gate() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let debug_panel = source
+            .split("fn show_debug_panel")
+            .nth(1)
+            .expect("debug panel function should exist")
+            .split("fn denoiser_combo")
+            .next()
+            .expect("debug panel should end before combo helpers");
+
+        assert!(
+            debug_panel.contains("restir_di: &mut RestirDiSettings"),
+            "Debug panel must receive the live ReSTIR-DI settings, not only lighting and Area ReSTIR"
+        );
+        assert!(
+            debug_panel.contains("debug_restir_di_view"),
+            "Debug panel must expose a stable ReSTIR-DI debug combo id"
+        );
+        assert!(
+            debug_panel
+                .contains("set_restir_di_debug_view(lighting, restir_di, area, restir_debug)"),
+            "Debug panel must synchronize the live ReSTIR-DI debug view with the VPT debug view"
+        );
+    }
+
+    #[test]
+    fn restir_di_debug_bridge_updates_restir_and_vpt_debug_views() {
+        let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::ReservoirWeight,
+        );
+
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::ReservoirWeight);
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::ReservoirWeight);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+    }
+
+    #[test]
+    fn restir_di_debug_off_restores_final_only_from_restir_debug_view() {
+        let mut lighting = LightingSettings {
+            vpt_debug_view: VptDebugView::ReservoirWeight,
+            ..LightingSettings::default()
+        };
+        let mut restir_di = RestirDiSettings {
+            debug_view: RestirDiDebugView::ReservoirWeight,
+            ..RestirDiSettings::default()
+        };
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::Off,
+        );
+
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::Final);
+
+        lighting.vpt_debug_view = VptDebugView::Direct;
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::Off,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::Direct);
+    }
+
+    #[test]
+    fn restir_di_non_vpt_debug_views_fall_back_to_final_and_clear_area_restir_debug_view() {
+        for restir_debug in [
+            RestirDiDebugView::LightId,
+            RestirDiDebugView::Visibility,
+            RestirDiDebugView::TemporalValid,
+            RestirDiDebugView::SpatialNeighbors,
+        ] {
+            let mut lighting = LightingSettings::default();
+            let mut restir_di = RestirDiSettings::default();
+            let mut area_restir = AreaRestirSettings::default();
+
+            set_area_restir_debug_view(
+                &mut lighting,
+                &mut restir_di,
+                &mut area_restir,
+                AreaRestirDebugView::Lens,
+            );
+            set_restir_di_debug_view(
+                &mut lighting,
+                &mut restir_di,
+                &mut area_restir,
+                restir_debug,
+            );
+
+            assert_eq!(restir_di.debug_view, restir_debug);
+            assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+            assert_eq!(lighting.vpt_debug_view, VptDebugView::Final);
+
+            set_restir_di_debug_view(
+                &mut lighting,
+                &mut restir_di,
+                &mut area_restir,
+                RestirDiDebugView::ReservoirWeight,
+            );
+            set_restir_di_debug_view(
+                &mut lighting,
+                &mut restir_di,
+                &mut area_restir,
+                restir_debug,
+            );
+
+            assert_eq!(restir_di.debug_view, restir_debug);
+            assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+            assert_eq!(lighting.vpt_debug_view, VptDebugView::Final);
+        }
+    }
+
+    #[test]
+    fn selecting_bridged_vpt_debug_view_clears_other_restir_debug_view() {
+        let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            AreaRestirDebugView::Lens,
+        );
+        set_vpt_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            VptDebugView::ReservoirWeight,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::ReservoirWeight);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::ReservoirWeight);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+
+        set_vpt_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            VptDebugView::AreaJacobian,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::AreaJacobian);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Jacobian);
+    }
+
+    #[test]
+    fn selecting_area_restir_debug_view_clears_restir_di_debug_view() {
+        let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::ReservoirWeight,
+        );
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            AreaRestirDebugView::Weight,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::AreaWeight);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Weight);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
+    }
+
+    #[test]
+    fn selecting_restir_di_debug_view_clears_area_restir_debug_view() {
+        let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            AreaRestirDebugView::Jacobian,
+        );
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::ReservoirWeight,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::ReservoirWeight);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::ReservoirWeight);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+    }
+
+    #[test]
+    fn selecting_plain_vpt_debug_view_clears_restir_debug_views() {
+        let mut lighting = LightingSettings::default();
+        let mut restir_di = RestirDiSettings::default();
+        let mut area_restir = AreaRestirSettings::default();
+
+        set_restir_di_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            RestirDiDebugView::ReservoirWeight,
+        );
+        set_vpt_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            VptDebugView::Final,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::Final);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
+
+        set_area_restir_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            AreaRestirDebugView::Lens,
+        );
+        set_vpt_debug_view(
+            &mut lighting,
+            &mut restir_di,
+            &mut area_restir,
+            VptDebugView::Direct,
+        );
+
+        assert_eq!(lighting.vpt_debug_view, VptDebugView::Direct);
+        assert_eq!(restir_di.debug_view, RestirDiDebugView::Off);
+        assert_eq!(area_restir.debug_view, AreaRestirDebugView::Off);
     }
 }

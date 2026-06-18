@@ -301,7 +301,7 @@ impl RenderRuntime {
             }
         }
 
-        let Some(scene_ubo) = self.scene_ubo.as_ref() else {
+        if self.scene_ubo.is_none() {
             tracing::warn!("skipping render frame until scene UBO is initialized");
             let completion = self.renderer.end_frame(frame)?;
             if completion.swapchain_recreated {
@@ -313,7 +313,18 @@ impl RenderRuntime {
                 )?;
             }
             return Ok(outcome);
-        };
+        }
+
+        self.ensure_passes(
+            input.ucvh.as_deref(),
+            input.settings,
+            input.restir_di_enabled,
+            input.area_restir_enabled,
+        );
+        let scene_ubo = self
+            .scene_ubo
+            .as_ref()
+            .expect("scene UBO was checked before ensuring VPT passes");
 
         let record_result = self.vpt_pipeline.record_and_execute_frame(
             &self.renderer,
@@ -575,5 +586,38 @@ mod tests {
         assert!(runtime_impl.contains("self.renderer.swapchain_extent()"));
         assert!(runtime_impl.contains("if frame.swapchain_recreated"));
         assert!(runtime_impl.contains("if completion.swapchain_recreated"));
+    }
+
+    #[test]
+    fn render_frame_revalidates_runtime_toggled_passes_before_recording_vpt() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before UCVH helpers");
+        let compact = crate::render::source_checks::compact(render_frame);
+        let scene_ubo_guard = compact
+            .find("ifself.scene_ubo.is_none(){")
+            .expect("render_frame must guard missing scene UBO before rebuilding passes");
+        let ensure_passes = compact
+            .find(
+                "self.ensure_passes(input.ucvh.as_deref(),input.settings,input.restir_di_enabled,input.area_restir_enabled,);",
+            )
+            .expect("render_frame must ensure passes before recording");
+        let record_vpt = compact
+            .find("self.vpt_pipeline.record_and_execute_frame(")
+            .expect("render_frame must call the VPT recorder");
+
+        assert!(
+            scene_ubo_guard < ensure_passes,
+            "render_frame must wait until scene UBO exists before rebuilding GPU passes"
+        );
+        assert!(
+            ensure_passes < record_vpt,
+            "render_frame must ensure passes with current UI settings before recording so live denoiser/ReSTIR toggles can instantiate their GPU passes"
+        );
     }
 }
