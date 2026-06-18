@@ -1,0 +1,27 @@
+{
+  "captureFrame": 2,
+  "frames": 3,
+  "cases": [
+    {
+      "name": "svgf_final",
+      "denoiser": "svgf",
+      "debugView": "final",
+      "requiresNrd": false,
+      "expectedEffectiveDenoiser": "svgf"
+    },
+    {
+      "name": "reblur_final",
+      "denoiser": "reblur",
+      "debugView": "final",
+      "requiresNrd": true,
+      "expectedEffectiveDenoiser": "reblur"
+    },
+    {
+      "name": "reblur_nrd_validation",
+      "denoiser": "reblur",
+      "debugView": "nrd_validation",
+      "requiresNrd": true,
+      "expectedEffectiveDenoiser": "reblur"
+    }
+  ]
+}

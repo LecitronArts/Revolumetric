@@ -109,4 +109,75 @@ mod tests {
             "GitHub CI workflow",
         );
     }
+
+    #[test]
+    fn visual_baseline_script_validates_captures_metadata_and_nonblank_ppm() {
+        let script = read_source("run/validate-visual-baseline.ps1");
+
+        assert_contains_all(
+            &script,
+            &[
+                "[string]$Manifest",
+                "visual-baselines.json",
+                "REVOLUMETRIC_CAPTURE_FRAME",
+                "REVOLUMETRIC_CAPTURE_DIR",
+                "REVOLUMETRIC_CAPTURE_PREFIX",
+                "ConvertFrom-Json",
+                "Assert-CaptureMetadata",
+                "Assert-PpmMatchesMetadata",
+                "Assert-PpmHasNonZeroRgb",
+                ".\\run\\validate-nrd.ps1",
+                "cargo run --features desktop --bin revolumetric",
+            ],
+            "visual baseline script",
+        );
+    }
+
+    #[test]
+    fn visual_baseline_manifest_covers_svgf_and_reblur_debug_cases() {
+        let manifest = read_source("run/visual-baselines.json");
+
+        assert_contains_all(
+            &manifest,
+            &[
+                "\"captureFrame\": 2",
+                "\"frames\": 3",
+                "\"name\": \"svgf_final\"",
+                "\"denoiser\": \"svgf\"",
+                "\"expectedEffectiveDenoiser\": \"svgf\"",
+                "\"name\": \"reblur_final\"",
+                "\"denoiser\": \"reblur\"",
+                "\"expectedEffectiveDenoiser\": \"reblur\"",
+                "\"name\": \"reblur_nrd_validation\"",
+                "\"debugView\": \"nrd_validation\"",
+            ],
+            "visual baseline manifest",
+        );
+    }
+
+    #[test]
+    fn docs_expose_visual_baseline_validation_entrypoint() {
+        let readme = read_source("README.md");
+        let run_readme = read_source("run/README.md");
+
+        assert_contains_all(
+            &readme,
+            &[
+                ".\\run\\validate-visual-baseline.ps1",
+                ".\\run\\validate-visual-baseline.ps1 -Nrd",
+                "visual regression baseline",
+            ],
+            "README visual baseline docs",
+        );
+        assert_contains_all(
+            &run_readme,
+            &[
+                ".\\run\\validate-visual-baseline.ps1",
+                "run/visual-baselines.json",
+                "PPM",
+                "metadata",
+            ],
+            "run README visual baseline docs",
+        );
+    }
 }

@@ -23,6 +23,8 @@ By default, if `slangc` is missing, the build script writes empty placeholder `.
 .\run\validate-local.ps1
 .\run\validate-local.ps1 -StrictShaders
 .\run\validate-local.ps1 -StrictShaders -Nrd
+.\run\validate-visual-baseline.ps1
+.\run\validate-visual-baseline.ps1 -Nrd
 cargo run --features desktop --bin revolumetric
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 ```
@@ -111,9 +113,15 @@ Validation matrix for this MVP:
 .\run\validate-local.ps1
 .\run\validate-local.ps1 -StrictShaders
 .\run\validate-local.ps1 -StrictShaders -Nrd
+.\run\validate-visual-baseline.ps1
+.\run\validate-visual-baseline.ps1 -Nrd
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_VPT_MAX_BOUNCES|REVOLUMETRIC_EXPOSURE|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
 ```
+
+The visual regression baseline wrapper captures deterministic smoke frames and
+checks the PPM/metadata contract. It is a baseline health gate, not a final image
+quality judgment.
 
 ## Current Shape
 

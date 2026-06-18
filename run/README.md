@@ -41,6 +41,18 @@ test/build gates. `-Nrd` adds native NRD library tests when the SDK is
 available. `-NrdRuntime` runs the ReBLUR runtime smoke through
 `validate-nrd.ps1`.
 
+For visual regression baseline smoke tests:
+
+```powershell
+.\run\validate-visual-baseline.ps1
+.\run\validate-visual-baseline.ps1 -Nrd
+```
+
+The visual cases live in `run/visual-baselines.json`. The script captures PPM
+output and metadata, then validates dimensions, denoiser/debug metadata, and
+that the capture is not all-zero RGB. The default run avoids NRD; `-Nrd` adds
+ReBLUR final and NRD validation debug captures.
+
 If an IDE launch environment does not inherit the Vulkan SDK `PATH`, set an
 explicit shader compiler path:
 

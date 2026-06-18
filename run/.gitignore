@@ -3,3 +3,5 @@
 !README.md
 !validate-local.ps1
 !validate-nrd.ps1
+!validate-visual-baseline.ps1
+!visual-baselines.json
