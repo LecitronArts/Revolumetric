@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-validation:
+    name: CPU validation
+    runs-on: windows-latest
+    env:
+      REVOLUMETRIC_SHADER_COMPILE: skip
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Show toolchain
+        shell: pwsh
+        run: cargo --version
+
+      - name: Validate
+        shell: pwsh
+        run: .\run\validate-local.ps1

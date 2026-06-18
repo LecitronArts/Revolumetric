@@ -28,8 +28,18 @@ When building with `--features nrd`, `build.rs` uses this order:
 Use the checked-in validation wrapper from the repo root:
 
 ```powershell
+.\run\validate-local.ps1
+.\run\validate-local.ps1 -StrictShaders
+.\run\validate-local.ps1 -StrictShaders -Nrd
 .\run\validate-nrd.ps1 -Frames 3
 ```
+
+`validate-local.ps1` is the local/CI validation entrypoint. By default it runs
+formatting, CPU-only library tests, and clippy with
+`REVOLUMETRIC_SHADER_COMPILE=skip`. `-StrictShaders` adds strict Slang library
+test/build gates. `-Nrd` adds native NRD library tests when the SDK is
+available. `-NrdRuntime` runs the ReBLUR runtime smoke through
+`validate-nrd.ps1`.
 
 If an IDE launch environment does not inherit the Vulkan SDK `PATH`, set an
 explicit shader compiler path:

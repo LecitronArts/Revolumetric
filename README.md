@@ -20,13 +20,11 @@ By default, if `slangc` is missing, the build script writes empty placeholder `.
 ## Common Commands
 
 ```powershell
-cargo test
-$env:REVOLUMETRIC_SHADER_COMPILE = "skip"; cargo test; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
-$env:REVOLUMETRIC_SHADER_COMPILE = "strict"; cargo test --lib; cargo build --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
-cargo clippy --all-targets -- -D warnings
-cargo build
+.\run\validate-local.ps1
+.\run\validate-local.ps1 -StrictShaders
+.\run\validate-local.ps1 -StrictShaders -Nrd
 cargo run --features desktop --bin revolumetric
-.\run\validate-nrd.ps1 -Frames 3
+.\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 ```
 
 ## Runtime And Build Config
@@ -52,7 +50,7 @@ Rendering settings can be overridden through environment variables:
   The default sun intensity is interpreted as solar-disk radiance and the VPT direct-light estimator evaluates Lambertian `f * Li * cos / pdf`; changing the angular radius changes the sampled disk solid angle rather than applying a legacy directional-light brightness compensation.
 - `REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS=on|off|1|0|true|false`: skips backface shadow hits when enabled.
 - `REVOLUMETRIC_LIGHTING_DEBUG_VIEW=final|off|diffuse|direct|normal`: selects runtime lighting debug output.
-- `REVOLUMETRIC_DENOISER=off|svgf|relax|reblur`: selects VPT denoising. `relax` uses the native NRD path only when the `nrd` Cargo feature and NRD SDK are available; otherwise it falls back to the existing SVGF path.
+- `REVOLUMETRIC_DENOISER=off|svgf|relax|reblur`: selects VPT denoising. `relax` and `reblur` use the native NRD path when the `nrd` Cargo feature and NRD SDK are available; otherwise they fall back to the existing SVGF path.
 - `REVOLUMETRIC_DENOISER_ATROUS_ITERATIONS=0..5`: controls the fallback SVGF/A-trous iteration budget and related denoiser settings.
 - `REVOLUMETRIC_VPT_DEBUG_VIEW=final|raw|temporal|variance|history_valid|motion|normal|depth|reservoir_weight|direct|indirect|area_subpixel|area_lens|area_weight|area_history_valid|area_rejection|area_jacobian|voxel_brick|voxel_local|voxel_hit|nrd_normal_roughness|nrd_viewz|nrd_motion|nrd_motion_z|nrd_validation`: selects VPT diagnostics. Area ReSTIR, voxel traversal, and NRD guide/debug views are written through the final postprocess path without temporal smoothing.
 
@@ -110,9 +108,10 @@ RenderGraph currently supports imported resources, explicit access declarations,
 Validation matrix for this MVP:
 
 ```powershell
-$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
-$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo clippy --all-targets -- -D warnings; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
-$env:REVOLUMETRIC_SHADER_COMPILE='strict'; cargo test --lib; cargo build --lib; Remove-Item Env:\REVOLUMETRIC_SHADER_COMPILE
+.\run\validate-local.ps1
+.\run\validate-local.ps1 -StrictShaders
+.\run\validate-local.ps1 -StrictShaders -Nrd
+.\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_VPT_MAX_BOUNCES|REVOLUMETRIC_EXPOSURE|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
 ```
 
