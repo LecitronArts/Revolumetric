@@ -1207,6 +1207,7 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
 #[test]
 fn vpt_nrd_adapter_declares_relax_integration_contract() {
     let adapter = source("src/render/passes/vpt_nrd_adapter.rs");
+    let frame_settings = source("src/render/passes/vpt_nrd_adapter/frame_settings.rs");
     let rust_api = source("src/render/nrd_adapter.rs");
     let sys = source("src/render/nrd_sys.rs");
     let native_header = source("native/nrd_adapter.h");
@@ -1410,11 +1411,10 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "Ready(Box<VptNrdReadyBackend>)",
         "Unavailable(String)",
         "pub struct VptNrdReadyBackend",
-        "pub struct VptNrdFrameSettingsInputs",
-        "pub struct VptNrdFrameSettings",
-        "pub enum NrdAccumulationMode",
-        "pub enum NrdCheckerboardMode",
-        "pub enum NrdHitDistanceReconstructionMode",
+        "mod frame_settings;",
+        "pub use frame_settings::{",
+        "VptNrdFrameSettings",
+        "VptNrdFrameSettingsInputs",
         "pub struct VptNrdTexturePoolPlan",
         "pub struct VptNrdTexturePoolImagePlan",
         "pub struct VptNrdDispatchResourcePlan",
@@ -1438,7 +1438,6 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "refresh_dispatches",
         "refresh_constant_upload_plan",
         "denoiser_mode: VptDenoiserMode",
-        "reblur_diffuse: NrdReblurDiffuseSettings",
         "pub fn is_ready(&self) -> bool",
         "pub fn dispatch_count(&self) -> usize",
         "pub fn unavailable_reason(&self) -> Option<&str>",
@@ -1450,6 +1449,19 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "GpuProfileScope::VptNrdAdapter",
     ] {
         assert!(adapter.contains(token), "NRD adapter pass missing {token}");
+    }
+    for token in [
+        "pub struct VptNrdFrameSettingsInputs",
+        "pub struct VptNrdFrameSettings",
+        "pub enum NrdAccumulationMode",
+        "pub enum NrdCheckerboardMode",
+        "pub enum NrdHitDistanceReconstructionMode",
+        "reblur_diffuse: NrdReblurDiffuseSettings",
+    ] {
+        assert!(
+            frame_settings.contains(token),
+            "NRD adapter frame settings module missing {token}"
+        );
     }
     for token in [
         "builder.read_as(packed.diff_radiance_hitdist,AccessKind::ComputeShaderRead);",

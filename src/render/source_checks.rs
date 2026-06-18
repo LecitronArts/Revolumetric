@@ -309,4 +309,36 @@ mod tests {
             "README traversal stats docs",
         );
     }
+
+    #[test]
+    fn vpt_nrd_adapter_keeps_frame_settings_in_focused_submodule() {
+        let adapter = read_source("src/render/passes/vpt_nrd_adapter.rs");
+        let frame_settings = read_source("src/render/passes/vpt_nrd_adapter/frame_settings.rs");
+
+        assert_contains_all(
+            &adapter,
+            &[
+                "mod frame_settings;",
+                "pub use frame_settings::{",
+                "VptNrdFrameSettings",
+                "VptNrdFrameSettingsInputs",
+            ],
+            "VPT NRD adapter frame settings module wiring",
+        );
+        assert!(
+            !adapter.contains("fn build_nrd_common_settings"),
+            "VPT NRD adapter root should not own NRD frame settings construction"
+        );
+        assert_contains_all(
+            &frame_settings,
+            &[
+                "pub struct VptNrdFrameSettingsInputs",
+                "pub struct VptNrdFrameSettings",
+                "pub(crate) fn build_initial_nrd_frame_settings",
+                "pub(crate) fn validate_nrd_library_desc",
+                "fn build_nrd_common_settings",
+            ],
+            "VPT NRD adapter frame settings module",
+        );
+    }
 }
