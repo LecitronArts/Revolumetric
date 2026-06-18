@@ -895,4 +895,21 @@ mod tests {
             "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
         );
     }
+
+    #[test]
+    fn restir_area_profile_wrapper_uses_current_csv_scope_columns() {
+        let wrapper = crate::render::source_checks::read_source("tools/profile_restir_area.ps1");
+
+        for scope in GpuProfileScope::ALL {
+            let column = scope.csv_column();
+            assert!(
+                wrapper.contains(&format!("\"{column}\"")),
+                "profile wrapper must summarize current profiler CSV column {column}"
+            );
+        }
+        assert!(
+            !wrapper.contains("\"vpt_surface_ms\""),
+            "profile wrapper must not reference the removed combined VPT surface CSV column"
+        );
+    }
 }

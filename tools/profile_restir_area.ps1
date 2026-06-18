@@ -71,7 +71,8 @@ try {
 
     Write-Host "profile=$Csv frames=$Frames warmup=$WarmupFrames direct_spatial=$(-not $NoDirectSpatial)"
     foreach ($column in @(
-        "vpt_surface_ms",
+        "vpt_surface_bootstrap_ms",
+        "vpt_surface_selected_ms",
         "vpt_ms",
         "restir_di_initial_ms",
         "restir_di_temporal_ms",
@@ -80,7 +81,13 @@ try {
         "area_restir_temporal_ms",
         "area_restir_spatial_ms",
         "vpt_temporal_ms",
+        "vpt_atrous_ms",
+        "vpt_nrd_confidence_ms",
+        "vpt_nrd_frontend_ms",
+        "vpt_nrd_adapter_ms",
+        "vpt_nrd_resolve_ms",
         "postprocess_ms",
+        "blit_to_swapchain_ms",
         "total_ms"
     )) {
         $values = $rows | ForEach-Object { [double]$_.$column } | Sort-Object
