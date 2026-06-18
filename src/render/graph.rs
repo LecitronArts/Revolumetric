@@ -2,11 +2,16 @@ use anyhow::{Result, anyhow};
 use ash::vk;
 use std::collections::{BTreeMap, VecDeque};
 
+use crate::render::allocator::GpuAllocator;
+use crate::render::buffer::GpuBuffer;
+use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pass_context::{PassBuilder, PassContext};
 use crate::render::resource::{
     AccessKind, PassDecl, QueueType, ResourceAccess, ResourceDesc, ResourceHandle,
-    ResourceLifetime, ResourceOrigin, TransientAliasCandidate, TransientResourceSlot,
+    ResourceLifetime, ResourceOrigin, TransientAliasCandidate, TransientResourceBinding,
+    TransientResourceSlot,
 };
+use gpu_allocator::MemoryLocation;
 
 type ExecuteFn<'a> = Box<dyn FnOnce(&mut PassContext) + 'a>;
 
@@ -23,6 +28,7 @@ pub struct RenderGraph<'a> {
     resource_lifetimes: Vec<ResourceLifetime>,
     transient_alias_candidates: Vec<TransientAliasCandidate>,
     transient_resource_slots: Vec<TransientResourceSlot>,
+    transient_resource_bindings: Vec<TransientResourceBinding>,
     image_handles: BTreeMap<u32, vk::Image>,
     buffer_handles: BTreeMap<u32, vk::Buffer>,
     imported_accesses: BTreeMap<u32, AccessKind>,
@@ -46,6 +52,114 @@ pub enum BarrierTiming {
     AfterPass,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TransientBindingMode {
+    RequireBound,
+    AllowDeferredTransient,
+}
+
+#[derive(Default)]
+pub struct RenderGraphTransientResources {
+    image_slots: BTreeMap<usize, GpuImage>,
+    buffer_slots: BTreeMap<usize, GpuBuffer>,
+}
+
+impl RenderGraphTransientResources {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn ensure_for_graph(
+        &mut self,
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+        graph: &mut RenderGraph<'_>,
+    ) -> Result<()> {
+        let mut active_image_slots = BTreeMap::new();
+        let mut active_buffer_slots = BTreeMap::new();
+
+        for slot in graph.transient_resource_slots() {
+            match &slot.desc {
+                ResourceDesc::Image {
+                    width,
+                    height,
+                    format,
+                    usage,
+                } => {
+                    let recreate = self.image_slots.get(&slot.slot_index).is_none_or(|image| {
+                        image.extent.width != *width
+                            || image.extent.height != *height
+                            || image.extent.depth != 1
+                            || image.format != *format
+                    });
+                    if recreate && let Some(image) = self.image_slots.remove(&slot.slot_index) {
+                        image.destroy(device, allocator);
+                    }
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        self.image_slots.entry(slot.slot_index)
+                    {
+                        let image = GpuImage::new(
+                            device,
+                            allocator,
+                            &GpuImageDesc {
+                                width: *width,
+                                height: *height,
+                                depth: 1,
+                                format: *format,
+                                usage: *usage,
+                                aspect: vk::ImageAspectFlags::COLOR,
+                                name: "render_graph_transient_image",
+                            },
+                        )?;
+                        entry.insert(image);
+                    }
+                    if let Some(image) = self.image_slots.get(&slot.slot_index) {
+                        active_image_slots.insert(slot.slot_index, image.handle);
+                    }
+                }
+                ResourceDesc::Buffer { size, usage } => {
+                    let recreate = self
+                        .buffer_slots
+                        .get(&slot.slot_index)
+                        .is_none_or(|buffer| buffer.size != *size || buffer.usage != *usage);
+                    if recreate && let Some(buffer) = self.buffer_slots.remove(&slot.slot_index) {
+                        buffer.destroy(device, allocator);
+                    }
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        self.buffer_slots.entry(slot.slot_index)
+                    {
+                        let buffer = GpuBuffer::new(
+                            device,
+                            allocator,
+                            *size,
+                            *usage,
+                            MemoryLocation::GpuOnly,
+                            "render_graph_transient_buffer",
+                        )?;
+                        entry.insert(buffer);
+                    }
+                    if let Some(buffer) = self.buffer_slots.get(&slot.slot_index) {
+                        active_buffer_slots.insert(slot.slot_index, buffer.handle);
+                    }
+                }
+            }
+        }
+
+        graph.bind_transient_slot_images(&active_image_slots);
+        graph.bind_transient_slot_buffers(&active_buffer_slots);
+        Ok(())
+    }
+
+    pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
+        for (_, image) in self.image_slots {
+            image.destroy(device, allocator);
+        }
+        for (_, buffer) in self.buffer_slots {
+            buffer.destroy(device, allocator);
+        }
+    }
+}
+
 impl<'a> RenderGraph<'a> {
     pub fn new() -> Self {
         Self {
@@ -56,6 +170,7 @@ impl<'a> RenderGraph<'a> {
             resource_lifetimes: Vec::new(),
             transient_alias_candidates: Vec::new(),
             transient_resource_slots: Vec::new(),
+            transient_resource_bindings: Vec::new(),
             image_handles: BTreeMap::new(),
             buffer_handles: BTreeMap::new(),
             imported_accesses: BTreeMap::new(),
@@ -71,6 +186,7 @@ impl<'a> RenderGraph<'a> {
         self.resource_lifetimes.clear();
         self.transient_alias_candidates.clear();
         self.transient_resource_slots.clear();
+        self.transient_resource_bindings.clear();
         self.compiled = false;
     }
 
@@ -195,11 +311,69 @@ impl<'a> RenderGraph<'a> {
         self.invalidate_compile_products();
     }
 
+    pub fn bind_transient_slot_images(&mut self, slot_images: &BTreeMap<usize, vk::Image>) {
+        for binding in &self.transient_resource_bindings {
+            let Some(&image) = slot_images.get(&binding.slot_index) else {
+                continue;
+            };
+            if matches!(
+                self.resources.get(&binding.resource_id),
+                Some(ResourceDesc::Image { .. })
+            ) {
+                self.image_handles.insert(binding.resource_id, image);
+            }
+        }
+    }
+
+    pub fn bound_image(&self, handle: ResourceHandle) -> Option<vk::Image> {
+        self.image_handles.get(&handle.id).copied()
+    }
+
+    pub fn bind_transient_slot_buffers(&mut self, slot_buffers: &BTreeMap<usize, vk::Buffer>) {
+        for binding in &self.transient_resource_bindings {
+            let Some(&buffer) = slot_buffers.get(&binding.slot_index) else {
+                continue;
+            };
+            if matches!(
+                self.resources.get(&binding.resource_id),
+                Some(ResourceDesc::Buffer { .. })
+            ) {
+                self.buffer_handles.insert(binding.resource_id, buffer);
+            }
+        }
+    }
+
+    pub fn bound_buffer(&self, handle: ResourceHandle) -> Option<vk::Buffer> {
+        self.buffer_handles.get(&handle.id).copied()
+    }
+
     pub fn compile(&mut self) -> Result<()> {
+        self.compile_internal(
+            TransientBindingMode::RequireBound,
+            None::<fn(&mut Self) -> Result<()>>,
+        )
+    }
+
+    pub fn compile_with_graph_owned_transients(
+        &mut self,
+        bind_transients: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        self.compile_internal(
+            TransientBindingMode::AllowDeferredTransient,
+            Some(bind_transients),
+        )
+    }
+
+    fn compile_internal(
+        &mut self,
+        transient_binding_mode: TransientBindingMode,
+        bind_transients: Option<impl FnOnce(&mut Self) -> Result<()>>,
+    ) -> Result<()> {
         self.resource_lifetimes.clear();
         self.transient_alias_candidates.clear();
         self.transient_resource_slots.clear();
-        self.validate_resource_references()?;
+        self.transient_resource_bindings.clear();
+        self.validate_resource_references(transient_binding_mode)?;
         self.validate_resource_timeline()?;
         self.barrier_plan.clear();
 
@@ -262,7 +436,12 @@ impl<'a> RenderGraph<'a> {
         self.sorted_order = order;
         self.resource_lifetimes = self.compute_resource_lifetimes();
         self.transient_resource_slots = self.compute_transient_resource_slots();
+        self.transient_resource_bindings =
+            Self::compute_transient_resource_bindings(&self.transient_resource_slots);
         self.transient_alias_candidates = self.compute_transient_alias_candidates();
+        if let Some(bind_transients) = bind_transients {
+            bind_transients(self)?;
+        }
         let barrier_plan = self.plan_barriers();
         self.validate_barrier_resource_bindings(&barrier_plan)?;
         self.barrier_plan = barrier_plan;
@@ -388,6 +567,25 @@ impl<'a> RenderGraph<'a> {
         }
 
         slots.into_iter().map(|(slot, _last_step)| slot).collect()
+    }
+
+    fn compute_transient_resource_bindings(
+        slots: &[TransientResourceSlot],
+    ) -> Vec<TransientResourceBinding> {
+        let mut bindings = slots
+            .iter()
+            .flat_map(|slot| {
+                slot.resource_ids
+                    .iter()
+                    .copied()
+                    .map(|resource_id| TransientResourceBinding {
+                        resource_id,
+                        slot_index: slot.slot_index,
+                    })
+            })
+            .collect::<Vec<_>>();
+        bindings.sort_by_key(|binding| (binding.resource_id, binding.slot_index));
+        bindings
     }
 
     fn producer_map(&self) -> Result<BTreeMap<(u32, u32), usize>> {
@@ -526,11 +724,22 @@ impl<'a> RenderGraph<'a> {
         Ok(())
     }
 
-    fn validate_image_binding(&self, pass_name: &str, handle: ResourceHandle) -> Result<()> {
+    fn validate_image_binding(
+        &self,
+        pass_name: &str,
+        handle: ResourceHandle,
+        transient_binding_mode: TransientBindingMode,
+    ) -> Result<()> {
         if matches!(
             self.resources.get(&handle.id),
             Some(ResourceDesc::Image { .. })
         ) {
+            if transient_binding_mode == TransientBindingMode::AllowDeferredTransient
+                && self.resource_origins.get(&handle.id) == Some(&ResourceOrigin::Transient)
+                && !self.image_handles.contains_key(&handle.id)
+            {
+                return Ok(());
+            }
             match self.image_handles.get(&handle.id) {
                 Some(&image) if image != vk::Image::null() => {}
                 _ => {
@@ -545,11 +754,22 @@ impl<'a> RenderGraph<'a> {
         Ok(())
     }
 
-    fn validate_buffer_binding(&self, pass_name: &str, handle: ResourceHandle) -> Result<()> {
+    fn validate_buffer_binding(
+        &self,
+        pass_name: &str,
+        handle: ResourceHandle,
+        transient_binding_mode: TransientBindingMode,
+    ) -> Result<()> {
         if matches!(
             self.resources.get(&handle.id),
             Some(ResourceDesc::Buffer { .. })
         ) {
+            if transient_binding_mode == TransientBindingMode::AllowDeferredTransient
+                && self.resource_origins.get(&handle.id) == Some(&ResourceOrigin::Transient)
+                && !self.buffer_handles.contains_key(&handle.id)
+            {
+                return Ok(());
+            }
             match self.buffer_handles.get(&handle.id) {
                 Some(&buffer) if buffer != vk::Buffer::null() => {}
                 _ => {
@@ -667,7 +887,10 @@ impl<'a> RenderGraph<'a> {
         Ok(())
     }
 
-    fn validate_resource_references(&self) -> Result<()> {
+    fn validate_resource_references(
+        &self,
+        transient_binding_mode: TransientBindingMode,
+    ) -> Result<()> {
         for pass in &self.passes {
             for read in &pass.decl.reads {
                 if !self.resources.contains_key(&read.id) {
@@ -700,9 +923,13 @@ impl<'a> RenderGraph<'a> {
                         access.handle.id
                     ));
                 };
-                self.validate_image_binding(pass.decl.name, access.handle)?;
+                self.validate_image_binding(pass.decl.name, access.handle, transient_binding_mode)?;
                 self.validate_image_usage(pass.decl.name, *access, desc)?;
-                self.validate_buffer_binding(pass.decl.name, access.handle)?;
+                self.validate_buffer_binding(
+                    pass.decl.name,
+                    access.handle,
+                    transient_binding_mode,
+                )?;
                 self.validate_buffer_usage(pass.decl.name, *access, desc)?;
                 if access.kind == AccessKind::Present && !matches!(desc, ResourceDesc::Image { .. })
                 {
@@ -798,6 +1025,21 @@ impl<'a> RenderGraph<'a> {
                 );
             }
         }
+    }
+
+    pub fn execute_with_transient_resources(
+        mut self,
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+        transient_resources: &mut RenderGraphTransientResources,
+        command_buffer: vk::CommandBuffer,
+        frame_index: u64,
+    ) -> Result<()> {
+        self.compile_with_graph_owned_transients(|graph| {
+            transient_resources.ensure_for_graph(device, allocator, graph)
+        })?;
+        self.execute(device, command_buffer, frame_index);
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -925,6 +1167,10 @@ impl<'a> RenderGraph<'a> {
     pub fn transient_resource_slots(&self) -> &[TransientResourceSlot] {
         &self.transient_resource_slots
     }
+
+    pub fn transient_resource_bindings(&self) -> &[TransientResourceBinding] {
+        &self.transient_resource_bindings
+    }
 }
 
 impl Default for RenderGraph<'_> {
@@ -938,6 +1184,7 @@ mod tests {
     use super::*;
     use crate::render::resource::{
         AccessKind, QueueType, ResourceDesc, ResourceOrigin, TransientAliasCandidate,
+        TransientResourceBinding,
     };
     use ash::vk::Handle;
 
@@ -1287,6 +1534,127 @@ mod tests {
             .collect();
         assert_eq!(image_slots.len(), 1);
         assert_eq!(image_slots[0].resource_ids, vec![first.id, second.id]);
+    }
+
+    #[test]
+    fn rendergraph_transient_allocation_plan_maps_resources_to_slots() {
+        let mut graph = RenderGraph::new();
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(901));
+        let marker = graph.add_pass("first_read", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.create_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER);
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_buffer(marker, fake_buffer(902));
+        let second = graph.add_pass("second_write", QueueType::Compute, |builder| {
+            builder.depend_on(marker);
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(second, fake_image(903));
+
+        graph.compile().unwrap();
+
+        let bindings = graph.transient_resource_bindings();
+        assert!(bindings.contains(&TransientResourceBinding {
+            resource_id: first.id,
+            slot_index: 0,
+        }));
+        assert!(bindings.contains(&TransientResourceBinding {
+            resource_id: second.id,
+            slot_index: 0,
+        }));
+    }
+
+    #[test]
+    fn rendergraph_transient_slot_handles_bind_all_resources_in_slot() {
+        let mut graph = RenderGraph::new();
+        let first = graph.add_pass("first_write", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(first, fake_image(911));
+        let marker = graph.add_pass("first_read", QueueType::Compute, |builder| {
+            builder.read_as(first, AccessKind::ComputeShaderRead);
+            builder.create_buffer(4, vk::BufferUsageFlags::STORAGE_BUFFER);
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_buffer(marker, fake_buffer(912));
+        let second = graph.add_pass("second_write", QueueType::Compute, |builder| {
+            builder.depend_on(marker);
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.bind_image(second, fake_image(913));
+        graph.compile().unwrap();
+
+        let mut image_slots = BTreeMap::new();
+        image_slots.insert(0, fake_image(999));
+        graph.bind_transient_slot_images(&image_slots);
+
+        assert_eq!(graph.bound_image(first), Some(fake_image(999)));
+        assert_eq!(graph.bound_image(second), Some(fake_image(999)));
+    }
+
+    #[test]
+    fn rendergraph_compile_with_graph_owned_transients_allows_deferred_transient_binding() {
+        let mut graph = RenderGraph::new();
+        let image = graph.add_pass("producer", QueueType::Compute, |builder| {
+            builder.create_image(
+                64,
+                64,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE,
+            );
+            Box::new(|_ctx| {})
+        })[0];
+        graph.add_pass("consumer", QueueType::Compute, |builder| {
+            builder.read_as(image, AccessKind::ComputeShaderRead);
+            Box::new(|_ctx| {})
+        });
+
+        let plain_error = graph.compile().unwrap_err().to_string();
+        assert!(plain_error.contains("non-null bound vk::Image"));
+
+        graph
+            .compile_with_graph_owned_transients(|graph| {
+                let mut slot_images = BTreeMap::new();
+                slot_images.insert(0, fake_image(919));
+                graph.bind_transient_slot_images(&slot_images);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(graph.bound_image(image), Some(fake_image(919)));
+        assert!(graph.planned_barriers().iter().any(|barrier| {
+            barrier.resource == image
+                && barrier.from == AccessKind::ComputeShaderWrite
+                && barrier.to == AccessKind::ComputeShaderRead
+        }));
     }
 
     #[test]

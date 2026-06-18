@@ -124,6 +124,12 @@ pub struct TransientResourceSlot {
     pub resource_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransientResourceBinding {
+    pub resource_id: u32,
+    pub slot_index: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct PassDecl {
     pub name: &'static str,
@@ -188,5 +194,16 @@ mod tests {
                 usage: vk::BufferUsageFlags::STORAGE_BUFFER,
             }
         );
+    }
+
+    #[test]
+    fn rendergraph_transient_resource_binding_exposes_resource_and_slot_ids() {
+        let binding = TransientResourceBinding {
+            resource_id: 12,
+            slot_index: 3,
+        };
+
+        assert_eq!(binding.resource_id, 12);
+        assert_eq!(binding.slot_index, 3);
     }
 }

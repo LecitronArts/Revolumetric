@@ -341,4 +341,43 @@ mod tests {
             "VPT NRD adapter frame settings module",
         );
     }
+
+    #[test]
+    fn rendergraph_exposes_graph_owned_transient_allocation_path() {
+        let graph = read_source("src/render/graph.rs");
+        let pipeline = read_source("src/render/vpt_pipeline.rs");
+        let readme = read_source("README.md");
+
+        assert_contains_all(
+            &graph,
+            &[
+                "pub struct RenderGraphTransientResources",
+                "compile_with_graph_owned_transients",
+                "ensure_for_graph",
+                "bind_transient_slot_images",
+                "bind_transient_slot_buffers",
+                "execute_with_transient_resources",
+            ],
+            "RenderGraph graph-owned transient allocation path",
+        );
+        assert_contains_all(
+            &pipeline,
+            &[
+                "render_graph_transients",
+                "ensure_render_graph_transients",
+                "execute_with_transient_resources",
+                "transients.destroy(device, allocator)",
+            ],
+            "VPT runtime graph-owned transient cache",
+        );
+        assert_contains_all(
+            &readme,
+            &[
+                "graph-owned transient image and buffer allocation",
+                "descriptor automation",
+                "resource aliasing",
+            ],
+            "README RenderGraph transient allocation status",
+        );
+    }
 }

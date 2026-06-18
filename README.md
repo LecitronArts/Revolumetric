@@ -106,7 +106,7 @@ Default runtime flow:
 
 The current VPT path is still noisy and progressive. The active implementation plan is to replace simple progressive averaging with explicit VPT surface state, temporal reprojection, moments, and edge-aware denoising.
 
-RenderGraph currently supports imported resources, explicit access declarations, dependency validation, graph-owned image and buffer barrier emission for the active pass chains. It does not yet own full transient allocation, descriptor automation, or async compute scheduling.
+RenderGraph currently supports imported resources, explicit access declarations, dependency validation, graph-owned image and buffer barrier emission for the active pass chains, and graph-owned transient image and buffer allocation for graph-created resources. It does not yet own descriptor automation, resource aliasing, or async compute scheduling.
 
 Validation matrix for this MVP:
 
@@ -141,7 +141,7 @@ Implemented pieces include:
 Known prototype limits:
 
 - `app.rs` still owns too much runtime orchestration.
-- The render graph owns image access transitions, but it does not yet own real transient GPU resource allocation or descriptor automation.
+- The render graph owns image access transitions and non-aliased graph-owned transient image and buffer allocation. Descriptor automation and resource aliasing are not implemented yet.
 - VPT temporal denoising and Area ReSTIR are still experimental and need representative scene captures before visual quality can be considered validated.
 - Postprocess owns exposure/ACES/gamma, but bloom and richer display controls are not implemented.
 - External asset import is not implemented.

@@ -10,7 +10,7 @@ use crate::render::device::RenderDevice;
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::frame::FrameContext;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
-use crate::render::graph::RenderGraph;
+use crate::render::graph::{RenderGraph, RenderGraphTransientResources};
 use crate::render::passes::area_restir::{AreaRestirPass, AreaRestirPassCreateInfo};
 use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::postprocess::{PostprocessGraphInputs, PostprocessPass};
@@ -221,6 +221,7 @@ pub struct VptRuntimePipeline {
     pub area_restir_pass: Option<AreaRestirPass>,
     pub restir_di_pass: Option<RestirDiPass>,
     pub traversal_stats_buffers: Vec<VptTraversalStatsBuffer>,
+    pub render_graph_transients: Vec<RenderGraphTransientResources>,
     pub frame_state: VptPipelineFrameState,
 }
 
@@ -293,6 +294,7 @@ impl VptRuntimePipeline {
             area_restir_pass: None,
             restir_di_pass: None,
             traversal_stats_buffers: Vec::new(),
+            render_graph_transients: Vec::new(),
             frame_state: VptPipelineFrameState::default(),
         }
     }
@@ -311,6 +313,7 @@ impl VptRuntimePipeline {
         if !self.ensure_traversal_stats_buffers(renderer, scene_ubo.frame_count()) {
             return;
         }
+        self.ensure_render_graph_transients(renderer, scene_ubo.frame_count());
         self.ensure_vpt_surface_pass(renderer, scene_ubo, ucvh_gpu);
         self.ensure_vpt_nrd_confidence_pass(renderer, scene_ubo);
         self.ensure_vpt_pass(renderer, scene_ubo, ucvh_gpu);
@@ -353,6 +356,20 @@ impl VptRuntimePipeline {
         self.traversal_stats_buffers = buffers;
         self.sync_traversal_stats_descriptors(renderer.device(), frame_count);
         true
+    }
+
+    fn ensure_render_graph_transients(&mut self, renderer: &RenderDevice, frame_count: usize) {
+        if self.render_graph_transients.len() == frame_count {
+            return;
+        }
+
+        for transients in std::mem::take(&mut self.render_graph_transients) {
+            transients.destroy(renderer.device(), renderer.allocator());
+        }
+
+        self.render_graph_transients = (0..frame_count)
+            .map(|_| RenderGraphTransientResources::new())
+            .collect();
     }
 
     pub fn traversal_stats_buffer(&self, frame_slot: usize) -> Option<&VptTraversalStatsBuffer> {
@@ -973,6 +990,7 @@ impl VptRuntimePipeline {
         mut inputs: VptFrameInputs<'_>,
     ) -> Result<VptFrameRecordResult> {
         let mut graph = RenderGraph::new();
+        self.ensure_render_graph_transients(renderer, inputs.scene_ubo.frame_count());
         let mut pending_capture = None;
         let mut rendered_vpt = false;
         let mut vpt_accumulation_written = false;
@@ -1659,8 +1677,17 @@ impl VptRuntimePipeline {
                 frame.swapchain_image_layout,
             )?;
         }
-        graph.compile()?;
-        graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
+        let transients = self
+            .render_graph_transients
+            .get_mut(frame.frame_slot)
+            .context("missing RenderGraph transient resources for frame slot")?;
+        graph.execute_with_transient_resources(
+            renderer.device(),
+            renderer.allocator(),
+            transients,
+            frame.command_buffer,
+            frame.frame_index,
+        )?;
 
         if let Some(current_view_proj) = current_vpt_view_proj {
             self.frame_state.previous_vpt_view_proj = Some(current_view_proj);
@@ -1952,6 +1979,9 @@ impl VptRuntimePipeline {
         }
         for buffer in self.traversal_stats_buffers {
             buffer.destroy(device, allocator);
+        }
+        for transients in self.render_graph_transients {
+            transients.destroy(device, allocator);
         }
     }
 }
