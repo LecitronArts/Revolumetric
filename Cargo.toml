@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    "crates/revolumetric-nrd",
+    "crates/revolumetric-nrd-sys",
+]
+resolver = "3"
+
 [package]
 name = "revolumetric"
 version = "0.1.0"
@@ -14,6 +21,7 @@ gpu-allocator = { version = "0.28", features = ["vulkan"] }
 hecs = "0.11"
 parking_lot = "0.12"
 raw-window-handle = "0.6"
+revolumetric-nrd = { path = "crates/revolumetric-nrd" }
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "0.9"
@@ -31,7 +39,7 @@ crate-type = ["cdylib", "rlib"]
 [features]
 # Feature used to gate the desktop/native binary so Android builds only the library
 desktop = []
-nrd = []
+nrd = ["revolumetric-nrd/nrd"]
 default = []
 
 [[bin]]
@@ -52,7 +60,6 @@ path = "android-release.pfx"
 keystore_password = "Revolumetric_Release_2026"
 
 [build-dependencies]
-cc = "1"
 walkdir = "2"
 
 [profile.release]

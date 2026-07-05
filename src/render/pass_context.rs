@@ -48,16 +48,27 @@ impl PassBuilder {
         format: vk::Format,
         usage: vk::ImageUsageFlags,
     ) -> ResourceHandle {
+        self.create_image_as(width, height, format, usage, AccessKind::ComputeShaderWrite)
+    }
+
+    pub fn create_image_as(
+        &mut self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        kind: AccessKind,
+    ) -> ResourceHandle {
         let handle = ResourceHandle {
             id: self.next_resource_id,
             version: 0,
         };
         self.next_resource_id += 1;
         self.writes.push(handle);
-        self.accesses.push(ResourceAccess {
-            handle,
-            kind: AccessKind::ComputeShaderWrite,
-        });
+        if kind.is_read_write() {
+            self.reads.push(handle);
+        }
+        self.accesses.push(ResourceAccess { handle, kind });
         self.resource_descs.push((
             handle,
             ResourceDesc::Image {
@@ -75,16 +86,25 @@ impl PassBuilder {
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
     ) -> ResourceHandle {
+        self.create_buffer_as(size, usage, AccessKind::ComputeShaderWrite)
+    }
+
+    pub fn create_buffer_as(
+        &mut self,
+        size: vk::DeviceSize,
+        usage: vk::BufferUsageFlags,
+        kind: AccessKind,
+    ) -> ResourceHandle {
         let handle = ResourceHandle {
             id: self.next_resource_id,
             version: 0,
         };
         self.next_resource_id += 1;
         self.writes.push(handle);
-        self.accesses.push(ResourceAccess {
-            handle,
-            kind: AccessKind::ComputeShaderWrite,
-        });
+        if kind.is_read_write() {
+            self.reads.push(handle);
+        }
+        self.accesses.push(ResourceAccess { handle, kind });
         self.resource_descs
             .push((handle, ResourceDesc::Buffer { size, usage }));
         handle
@@ -99,7 +119,7 @@ impl PassBuilder {
             id: handle.id,
             version: handle.version + 1,
         };
-        if kind == AccessKind::ComputeShaderReadWrite {
+        if kind.is_read_write() {
             self.reads.push(handle);
         }
         self.writes.push(new);
@@ -116,4 +136,27 @@ pub struct PassContext<'a> {
     pub device: &'a ash::Device,
     pub command_buffer: vk::CommandBuffer,
     pub frame_index: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_image_as_records_custom_access_kind() {
+        let mut builder = PassBuilder::new("rt_surface", QueueType::RayTracing, 0);
+        let handle = builder.create_image_as(
+            128,
+            128,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::RayTracingShaderWrite,
+        );
+
+        assert_eq!(handle.id, 0);
+        assert_eq!(builder.writes, vec![handle]);
+        assert_eq!(builder.reads, Vec::<ResourceHandle>::new());
+        assert_eq!(builder.accesses.len(), 1);
+        assert_eq!(builder.accesses[0].kind, AccessKind::RayTracingShaderWrite);
+    }
 }

@@ -910,6 +910,26 @@ fn restir_di_spatial_neighbor_rotation_is_stable_across_stationary_frames() {
 }
 
 #[test]
+fn restir_di_reuse_acceptance_rng_is_stationary_across_frames() {
+    for (name, shader_path) in [
+        ("temporal", "assets/shaders/passes/restir_di_temporal.slang"),
+        ("spatial", "assets/shaders/passes/restir_di_spatial.slang"),
+    ] {
+        let shader = source(shader_path);
+        let compact = shader.split_whitespace().collect::<String>();
+
+        assert!(
+            compact.contains("uintrng_state=hash_u32(index*1973u);"),
+            "{name} reuse acceptance RNG should be seeded only from the pixel index"
+        );
+        assert!(
+            !shader.contains("restir.frame_index"),
+            "{name} reuse acceptance RNG must not depend on the display frame index"
+        );
+    }
+}
+
+#[test]
 fn restir_di_pass_does_not_issue_pass_local_barriers() {
     let implementation = source("src/render/passes/restir_di.rs");
     let implementation = implementation

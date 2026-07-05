@@ -1616,7 +1616,6 @@ dependencies = [
  "ash",
  "ash-window",
  "bytemuck",
- "cc",
  "crossbeam",
  "egui",
  "egui-winit",
@@ -1625,6 +1624,7 @@ dependencies = [
  "hecs",
  "parking_lot",
  "raw-window-handle",
+ "revolumetric-nrd",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -1632,6 +1632,21 @@ dependencies = [
  "tracing-subscriber",
  "walkdir",
  "winit",
+]
+
+[[package]]
+name = "revolumetric-nrd"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "revolumetric-nrd-sys",
+]
+
+[[package]]
+name = "revolumetric-nrd-sys"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

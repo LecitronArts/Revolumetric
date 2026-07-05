@@ -5,13 +5,10 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::device::RenderDevice;
 use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
-use crate::render::nrd_adapter::{
-    NrdDescriptorType, NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc,
-    NrdResourceType, NrdSamplerDesc, NrdTextureImageDesc,
-};
 use crate::render::pass_context::PassBuilder;
 use crate::render::passes::vpt_nrd_confidence::{VptNrdConfidencePass, VptNrdConfidenceResources};
 use crate::render::passes::vpt_nrd_frontend::{VptNrdFrontendPass, VptNrdPackedResources};
@@ -19,6 +16,11 @@ use crate::render::passes::vpt_surface::{VptCurrentSurfaceResources, VptSurfaceP
 use crate::render::pipeline::{ComputePipeline, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::scene_ubo::{SceneUniformBuffer, VptDenoiserMode};
+use revolumetric_nrd::{
+    NrdDescriptorType, NrdDispatchSnapshot, NrdInstance, NrdInstanceSnapshot, NrdLibraryDesc,
+    NrdResourceDescExt, NrdResourceRangeDescExt, NrdResourceType, NrdSamplerDesc,
+    NrdTextureDescExt, NrdTextureImageDesc,
+};
 
 mod frame_settings;
 
@@ -658,8 +660,7 @@ impl VptNrdAdapterPass {
 
     pub fn update_frame_settings(
         &mut self,
-        device: &ash::Device,
-        allocator: &GpuAllocator,
+        renderer: &RenderDevice,
         settings: VptNrdFrameSettings,
         image_refs: VptNrdAdapterPassImageRefs<'_>,
         frame_slot: usize,
@@ -687,13 +688,7 @@ impl VptNrdAdapterPass {
             backend.state.dispatches.len()
         };
         if new_dispatch_count != current_dispatch_count {
-            self.rebuild_descriptor_resources(
-                device,
-                allocator,
-                frame_count,
-                image_refs,
-                frame_slot,
-            )
+            self.rebuild_descriptor_resources(renderer, frame_count, image_refs, frame_slot)
         } else {
             let descriptor_update_plan = build_descriptor_update_plan(
                 &self.backend,
@@ -731,12 +726,13 @@ impl VptNrdAdapterPass {
 
     fn rebuild_descriptor_resources(
         &mut self,
-        device: &ash::Device,
-        allocator: &GpuAllocator,
+        renderer: &RenderDevice,
         frame_count: usize,
         image_refs: VptNrdAdapterPassImageRefs<'_>,
         frame_slot: usize,
     ) -> Result<()> {
+        let device = renderer.device();
+        let allocator = renderer.allocator();
         let new_shared_descriptor_resources = create_shared_descriptor_resources(
             device,
             allocator,
@@ -782,6 +778,10 @@ impl VptNrdAdapterPass {
                 return Err(error).context("failed to rebuild VPT NRD pipeline resources");
             }
         };
+
+        renderer.wait_idle().context(
+            "failed to idle Vulkan device before rebuilding VPT NRD descriptor resources",
+        )?;
 
         let old_pipeline_resources = self.pipeline_resources.replace(new_pipeline_resources);
         let old_shared_descriptor_resources = self
@@ -1325,7 +1325,7 @@ impl VptNrdPipelineLayoutPlan {
         snapshot.pipelines.iter().map(Self::from_pipeline).collect()
     }
 
-    fn from_pipeline(pipeline: &crate::render::nrd_adapter::NrdPipelineSnapshot) -> Result<Self> {
+    fn from_pipeline(pipeline: &revolumetric_nrd::NrdPipelineSnapshot) -> Result<Self> {
         let resource_ranges = pipeline
             .resource_ranges
             .iter()
@@ -1359,7 +1359,7 @@ impl VptNrdPipelineShaderPlan {
             .collect()
     }
 
-    fn from_pipeline(pipeline: &crate::render::nrd_adapter::NrdPipelineSnapshot) -> Result<Self> {
+    fn from_pipeline(pipeline: &revolumetric_nrd::NrdPipelineSnapshot) -> Result<Self> {
         anyhow::ensure!(
             !pipeline.spirv_bytecode.is_empty(),
             "NRD pipeline shader bytecode is empty"
@@ -2848,7 +2848,7 @@ fn build_pool_plan(
     prefix: &str,
     width: u32,
     height: u32,
-    textures: &[crate::render::nrd_adapter::NrdTextureDesc],
+    textures: &[revolumetric_nrd::NrdTextureDesc],
 ) -> Result<Vec<VptNrdTexturePoolImagePlan>> {
     textures
         .iter()
@@ -2957,11 +2957,11 @@ fn create_adapter_image(
 mod tests {
     use super::*;
     use crate::render::graph::BarrierTiming;
-    use crate::render::nrd_adapter::{
+    use ash::vk::Handle;
+    use revolumetric_nrd::{
         NrdNormalEncoding, NrdPipelineSnapshot, NrdRoughnessEncoding, NrdSamplerDesc,
         NrdTextureFormat,
     };
-    use ash::vk::Handle;
 
     #[cfg(not(feature = "nrd"))]
     #[test]
@@ -3126,7 +3126,7 @@ mod tests {
     fn pipeline_layout_plan_rejects_unknown_resource_range_descriptor_type() {
         let snapshot = instance_snapshot_with_pipelines(vec![pipeline_with_raw_range(
             "bad_descriptor",
-            &[crate::render::nrd_adapter::NrdResourceRangeDesc {
+            &[revolumetric_nrd::NrdResourceRangeDesc {
                 descriptor_type: NrdDescriptorType::Unsupported as u32,
                 descriptors_num: 1,
             }],
@@ -3961,6 +3961,33 @@ mod tests {
         assert!(
             old_pipeline_destroy < old_shared_destroy,
             "old pipelines must be destroyed before old shared descriptor set layouts"
+        );
+    }
+
+    #[test]
+    fn descriptor_resource_rebuild_waits_for_submitted_gpu_work_before_destroying_old_resources() {
+        let source =
+            crate::render::source_checks::read_source("src/render/passes/vpt_nrd_adapter.rs");
+        let rebuild_start = source
+            .find("    fn rebuild_descriptor_resources(")
+            .expect("rebuild_descriptor_resources should exist");
+        let record_start = source[rebuild_start..]
+            .find("    pub fn record(")
+            .map(|offset| rebuild_start + offset)
+            .expect("record should follow rebuild_descriptor_resources");
+        let rebuild_body = &source[rebuild_start..record_start];
+        let compact = crate::render::source_checks::compact(rebuild_body);
+
+        let wait = compact
+            .find("renderer.wait_idle(")
+            .expect("descriptor resource rebuild must wait for submitted GPU work");
+        let old_pipeline_destroy = compact
+            .find("old_pipeline_resources.destroy(device)")
+            .expect("old pipeline resources must be explicitly destroyed");
+
+        assert!(
+            wait < old_pipeline_destroy,
+            "descriptor resource rebuild must wait before destroying old pipelines and descriptor sets that may still be referenced by submitted command buffers"
         );
     }
 
@@ -5346,8 +5373,8 @@ mod tests {
     fn texture(
         format: NrdTextureFormat,
         downsample_factor: u16,
-    ) -> crate::render::nrd_adapter::NrdTextureDesc {
-        crate::render::nrd_adapter::NrdTextureDesc {
+    ) -> revolumetric_nrd::NrdTextureDesc {
+        revolumetric_nrd::NrdTextureDesc {
             format: format as u32,
             downsample_factor,
             reserved0: 0,
@@ -5355,8 +5382,8 @@ mod tests {
     }
 
     fn instance_snapshot_with_pools(
-        permanent_pool: &[crate::render::nrd_adapter::NrdTextureDesc],
-        transient_pool: &[crate::render::nrd_adapter::NrdTextureDesc],
+        permanent_pool: &[revolumetric_nrd::NrdTextureDesc],
+        transient_pool: &[revolumetric_nrd::NrdTextureDesc],
     ) -> NrdInstanceSnapshot {
         NrdInstanceSnapshot {
             constant_buffer_and_samplers_space_index: 0,
@@ -5396,7 +5423,7 @@ mod tests {
 
     fn pipeline(
         shader_identifier: &str,
-        resource_ranges: &[crate::render::nrd_adapter::NrdResourceRangeDesc],
+        resource_ranges: &[revolumetric_nrd::NrdResourceRangeDesc],
         has_constant_data: bool,
     ) -> NrdPipelineSnapshot {
         pipeline_with_raw_range(shader_identifier, resource_ranges, has_constant_data)
@@ -5404,7 +5431,7 @@ mod tests {
 
     fn pipeline_with_raw_range(
         shader_identifier: &str,
-        resource_ranges: &[crate::render::nrd_adapter::NrdResourceRangeDesc],
+        resource_ranges: &[revolumetric_nrd::NrdResourceRangeDesc],
         has_constant_data: bool,
     ) -> NrdPipelineSnapshot {
         NrdPipelineSnapshot {
@@ -5418,8 +5445,8 @@ mod tests {
     fn resource_range(
         descriptor_type: NrdDescriptorType,
         descriptors_num: u32,
-    ) -> crate::render::nrd_adapter::NrdResourceRangeDesc {
-        crate::render::nrd_adapter::NrdResourceRangeDesc {
+    ) -> revolumetric_nrd::NrdResourceRangeDesc {
+        revolumetric_nrd::NrdResourceRangeDesc {
             descriptor_type: descriptor_type as u32,
             descriptors_num,
         }
@@ -5606,8 +5633,8 @@ mod tests {
         descriptor_type: NrdDescriptorType,
         resource_type: NrdResourceType,
         index_in_pool: u16,
-    ) -> crate::render::nrd_adapter::NrdResourceDesc {
-        crate::render::nrd_adapter::NrdResourceDesc {
+    ) -> revolumetric_nrd::NrdResourceDesc {
+        revolumetric_nrd::NrdResourceDesc {
             descriptor_type: descriptor_type as u32,
             resource_type: resource_type as u32,
             index_in_pool,
@@ -5615,9 +5642,7 @@ mod tests {
         }
     }
 
-    fn dispatch_snapshot(
-        resources: &[crate::render::nrd_adapter::NrdResourceDesc],
-    ) -> NrdDispatchSnapshot {
+    fn dispatch_snapshot(resources: &[revolumetric_nrd::NrdResourceDesc]) -> NrdDispatchSnapshot {
         NrdDispatchSnapshot {
             name: "Relax Diffuse".to_owned(),
             identifier: 0,
@@ -5641,7 +5666,7 @@ mod tests {
     }
 
     fn dispatch_snapshot_with_resources_and_constants(
-        resources: &[crate::render::nrd_adapter::NrdResourceDesc],
+        resources: &[revolumetric_nrd::NrdResourceDesc],
         constant_buffer_data: &[u8],
         matches_previous_dispatch: bool,
     ) -> NrdDispatchSnapshot {

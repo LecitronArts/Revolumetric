@@ -382,7 +382,8 @@ impl UcvhGpuResources {
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
                 vk::DependencyFlags::empty(),
                 &[barrier],
                 &[],
@@ -439,7 +440,8 @@ impl UcvhGpuResources {
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER
+                    | vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
                 vk::DependencyFlags::empty(),
                 &[barrier],
                 &[],
@@ -634,9 +636,13 @@ mod tests {
             crate::render::source_checks::read_source("assets/shaders/passes/vpt.slang");
         let surface_shader =
             crate::render::source_checks::read_source("assets/shaders/passes/vpt_surface.slang");
+        let rt_surface_shader = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_surface.rchit.slang",
+        );
 
         assert!(vpt_shader.contains("ConstantBuffer<UcvhConfig> ucvh_config"));
         assert!(surface_shader.contains("ConstantBuffer<UcvhConfig> ucvh_config"));
+        assert!(rt_surface_shader.contains("ConstantBuffer<UcvhConfig> ucvh_config"));
         let config_usage = UcvhGpuResources::config_buffer_usage();
         let storage_usage = UcvhGpuResources::device_storage_buffer_usage();
 
@@ -646,6 +652,34 @@ mod tests {
         assert!(storage_usage.contains(vk::BufferUsageFlags::STORAGE_BUFFER));
         assert!(storage_usage.contains(vk::BufferUsageFlags::TRANSFER_DST));
         assert!(!storage_usage.contains(vk::BufferUsageFlags::UNIFORM_BUFFER));
+    }
+
+    #[test]
+    fn ucvh_upload_barriers_make_buffers_visible_to_compute_and_ray_tracing_shaders() {
+        let source = crate::render::source_checks::read_source("src/voxel/gpu_upload.rs");
+        let upload_all = source
+            .split("pub fn upload_all")
+            .nth(1)
+            .expect("UcvhGpuResources::upload_all should exist")
+            .split("pub fn upload_motion_guide")
+            .next()
+            .expect("upload_all should end before upload_motion_guide");
+        let upload_motion = source
+            .split("pub fn upload_motion_guide")
+            .nth(1)
+            .expect("UcvhGpuResources::upload_motion_guide should exist")
+            .split("fn copy_to_staging")
+            .next()
+            .expect("upload_motion_guide should end before copy helpers");
+
+        for body in [upload_all, upload_motion] {
+            assert!(body.contains("PipelineStageFlags::COMPUTE_SHADER"));
+            assert!(
+                body.contains("PipelineStageFlags::RAY_TRACING_SHADER_KHR"),
+                "UCVH upload barriers must make copied buffers visible to RT shaders"
+            );
+            assert!(body.contains("dst_access_mask(vk::AccessFlags::SHADER_READ)"));
+        }
     }
 
     #[test]

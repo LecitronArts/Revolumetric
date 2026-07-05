@@ -1,0 +1,15 @@
+[package]
+name = "revolumetric-nrd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ash = "0.38"
+revolumetric-nrd-sys = { path = "../revolumetric-nrd-sys" }
+
+[features]
+nrd = ["revolumetric-nrd-sys/nrd"]
+default = []
+
+[lib]
+path = "src/lib.rs"

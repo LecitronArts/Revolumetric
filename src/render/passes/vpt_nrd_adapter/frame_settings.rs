@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use crate::render::nrd_adapter::{
+use revolumetric_nrd::{
     NrdCommonSettings, NrdLibraryDesc, NrdNormalEncoding, NrdReblurDiffuseSettings,
     NrdRelaxDiffuseSettings, NrdRoughnessEncoding,
 };

@@ -73,7 +73,7 @@ struct SceneUniforms {
     float3   camera_up;       // 12B
     float    focal_distance;  // 4B
     float3   camera_forward;  // 12B
-    float    _pad4;           // 4B
+    uint     history_reset_generation; // 4B
 };                            // total: 224B, matches Rust repr(C) layout exactly
 
 bool scene_vpt_traversal_stats_enabled(SceneUniforms scene) {

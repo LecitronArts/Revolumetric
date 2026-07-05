@@ -18,6 +18,24 @@ impl DescriptorBindingSpec {
             count: 1,
         }
     }
+
+    pub fn ray_tracing(binding: u32, descriptor_type: vk::DescriptorType) -> Self {
+        Self {
+            binding,
+            descriptor_type,
+            stage_flags: ray_tracing_shader_stage_flags(),
+            count: 1,
+        }
+    }
+}
+
+pub(crate) fn ray_tracing_shader_stage_flags() -> vk::ShaderStageFlags {
+    vk::ShaderStageFlags::RAYGEN_KHR
+        | vk::ShaderStageFlags::ANY_HIT_KHR
+        | vk::ShaderStageFlags::CLOSEST_HIT_KHR
+        | vk::ShaderStageFlags::MISS_KHR
+        | vk::ShaderStageFlags::INTERSECTION_KHR
+        | vk::ShaderStageFlags::CALLABLE_KHR
 }
 
 pub struct DescriptorLayoutBuilder {
@@ -127,10 +145,24 @@ pub(crate) fn assert_specs_match_shader_bindings(
         "{pass_name} descriptor spec count must match shader reflection"
     );
     for spec in specs {
+        assert_eq!(
+            spec.count, 1,
+            "{pass_name} descriptor binding {} must describe exactly one descriptor",
+            spec.binding
+        );
+        assert!(
+            spec.stage_flags
+                .intersects(vk::ShaderStageFlags::COMPUTE | ray_tracing_shader_stage_flags()),
+            "{pass_name} descriptor binding {} must target compute or ray-tracing stages",
+            spec.binding
+        );
         let expected_kind = match spec.descriptor_type {
             vk::DescriptorType::UNIFORM_BUFFER => DescriptorKind::UniformBuffer,
             vk::DescriptorType::STORAGE_BUFFER => DescriptorKind::StorageBuffer,
             vk::DescriptorType::STORAGE_IMAGE => DescriptorKind::StorageImage,
+            vk::DescriptorType::SAMPLED_IMAGE => DescriptorKind::SampledImage,
+            vk::DescriptorType::SAMPLER => DescriptorKind::Sampler,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => DescriptorKind::AccelerationStructure,
             other => panic!("{pass_name} uses unsupported descriptor type {other:?}"),
         };
         assert!(
@@ -146,6 +178,7 @@ pub(crate) fn assert_specs_match_shader_bindings(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::shader_reflect::{DescriptorBinding, DescriptorKind, ShaderReflection};
 
     #[test]
     fn compute_descriptor_spec_uses_compute_stage_and_count_one() {
@@ -154,5 +187,107 @@ mod tests {
         assert_eq!(spec.descriptor_type, vk::DescriptorType::UNIFORM_BUFFER);
         assert_eq!(spec.stage_flags, vk::ShaderStageFlags::COMPUTE);
         assert_eq!(spec.count, 1);
+    }
+
+    #[test]
+    fn assert_specs_match_shader_bindings_rejects_wrong_stage_flags() {
+        let reflection = ShaderReflection {
+            entry_point: "main".to_string(),
+            bindings: vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::UniformBuffer,
+                name: "scene_ubo".to_string(),
+            }],
+        };
+        let specs = [DescriptorBindingSpec {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            stage_flags: vk::ShaderStageFlags::VERTEX,
+            count: 1,
+        }];
+
+        let result = std::panic::catch_unwind(|| {
+            assert_specs_match_shader_bindings("test pass", &specs, &reflection);
+        });
+
+        assert!(
+            result.is_err(),
+            "descriptor binding validation must reject wrong stage flags"
+        );
+    }
+
+    #[test]
+    fn assert_specs_match_shader_bindings_rejects_wrong_descriptor_count() {
+        let reflection = ShaderReflection {
+            entry_point: "main".to_string(),
+            bindings: vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::UniformBuffer,
+                name: "scene_ubo".to_string(),
+            }],
+        };
+        let specs = [DescriptorBindingSpec {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            count: 4,
+        }];
+
+        let result = std::panic::catch_unwind(|| {
+            assert_specs_match_shader_bindings("test pass", &specs, &reflection);
+        });
+
+        assert!(
+            result.is_err(),
+            "descriptor binding validation must reject wrong descriptor counts"
+        );
+    }
+
+    #[test]
+    fn assert_specs_match_shader_bindings_accepts_sampled_image_and_sampler_types() {
+        let reflection = ShaderReflection {
+            entry_point: "main".to_string(),
+            bindings: vec![
+                DescriptorBinding {
+                    set: 0,
+                    binding: 0,
+                    kind: DescriptorKind::SampledImage,
+                    name: "egui_texture".to_string(),
+                },
+                DescriptorBinding {
+                    set: 0,
+                    binding: 1,
+                    kind: DescriptorKind::Sampler,
+                    name: "egui_sampler".to_string(),
+                },
+            ],
+        };
+        let specs = [
+            DescriptorBindingSpec::compute(0, vk::DescriptorType::SAMPLED_IMAGE),
+            DescriptorBindingSpec::compute(1, vk::DescriptorType::SAMPLER),
+        ];
+
+        assert_specs_match_shader_bindings("ui pass", &specs, &reflection);
+    }
+
+    #[test]
+    fn assert_specs_match_shader_bindings_accepts_ray_tracing_and_acceleration_structure_types() {
+        let reflection = ShaderReflection {
+            entry_point: "main".to_string(),
+            bindings: vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::AccelerationStructure,
+                name: "scene_tlas".to_string(),
+            }],
+        };
+        let specs = [DescriptorBindingSpec::ray_tracing(
+            0,
+            vk::DescriptorType::ACCELERATION_STRUCTURE_KHR,
+        )];
+
+        assert_specs_match_shader_bindings("rt pass", &specs, &reflection);
     }
 }

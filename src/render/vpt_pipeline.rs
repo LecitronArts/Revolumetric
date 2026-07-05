@@ -180,6 +180,8 @@ impl VptPipelineFrameState {
         self.vpt_temporal_history_initialized = false;
         self.postprocess_output_initialized = false;
         self.vpt_nrd_texture_pools_initialized = false;
+        self.area_restir_history_initialized = false;
+        self.restir_di_history_initialized = false;
     }
 }
 
@@ -597,9 +599,7 @@ impl VptRuntimePipeline {
             lighting_settings.denoiser_mode,
             VptDenoiserMode::Relax | VptDenoiserMode::Reblur
         ) {
-            if let Some(pass) = self.vpt_nrd_adapter_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_vpt_nrd_adapter_chain(renderer);
             return;
         }
         if let Some(pass) = self.vpt_nrd_adapter_pass.as_ref() {
@@ -607,8 +607,8 @@ impl VptRuntimePipeline {
                 return;
             }
         }
-        if let Some(pass) = self.vpt_nrd_adapter_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_vpt_nrd_adapter_chain(renderer) {
+            return;
         }
         if self.vpt_surface_pass.is_none()
             || self.vpt_nrd_confidence_pass.is_none()
@@ -657,6 +657,25 @@ impl VptRuntimePipeline {
                 tracing::error!(%error, "failed to create VPT NRD adapter pass");
             }
         }
+    }
+
+    fn destroy_vpt_nrd_adapter_chain(&mut self, renderer: &RenderDevice) -> bool {
+        if self.vpt_nrd_adapter_pass.is_none() && self.vpt_nrd_resolve_pass.is_none() {
+            return true;
+        }
+        if let Err(error) = renderer.wait_idle() {
+            tracing::error!(%error, "failed to idle Vulkan device before destroying VPT NRD adapter resources");
+            return false;
+        }
+        if let Some(pass) = self.vpt_nrd_resolve_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        if let Some(pass) = self.vpt_nrd_adapter_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        self.frame_state.vpt_nrd_texture_pools_initialized = false;
+        self.frame_state.postprocess_output_initialized = false;
+        true
     }
 
     fn ensure_vpt_nrd_resolve_pass(
@@ -1025,30 +1044,6 @@ impl VptRuntimePipeline {
                 frame.swapchain_extent.width,
                 frame.swapchain_extent.height,
             );
-            let camera_key = [
-                camera.position.x.to_bits(),
-                camera.position.y.to_bits(),
-                camera.position.z.to_bits(),
-                camera.forward.x.to_bits(),
-                camera.forward.y.to_bits(),
-                camera.forward.z.to_bits(),
-                camera.up.x.to_bits(),
-                camera.up.y.to_bits(),
-                camera.up.z.to_bits(),
-                camera.fov_y_radians.to_bits(),
-                camera.aperture_radius.to_bits(),
-                camera.focal_distance.to_bits(),
-                frame.swapchain_extent.width,
-                frame.swapchain_extent.height,
-                inputs.lighting_settings.vpt_max_bounces,
-            ];
-            if self.frame_state.last_vpt_camera_key == Some(camera_key) {
-                self.frame_state.vpt_sample_index =
-                    self.frame_state.vpt_sample_index.saturating_add(1);
-            } else {
-                self.frame_state.vpt_sample_index = 0;
-                self.frame_state.last_vpt_camera_key = Some(camera_key);
-            }
             let scene_vpt_sample_index = if self.frame_state.vpt_accumulation_needs_init {
                 0
             } else {
@@ -1070,6 +1065,7 @@ impl VptRuntimePipeline {
                 time: inputs.elapsed_seconds,
                 lighting_settings: inputs.lighting_settings,
                 vpt_sample_index: scene_vpt_sample_index,
+                history_reset_generation: self.frame_state.history_reset_generation,
             });
             inputs.scene_ubo.update(frame.frame_slot, &scene_data);
 
@@ -1349,8 +1345,7 @@ impl VptRuntimePipeline {
                     ) {
                         if vpt_nrd_adapter.is_ready() {
                             match vpt_nrd_adapter.update_frame_settings(
-                                renderer.device(),
-                                renderer.allocator(),
+                                renderer,
                                 nrd_frame_settings,
                                 VptNrdAdapterPassImageRefs {
                                     frontend: vpt_nrd_frontend,
@@ -1703,6 +1698,7 @@ impl VptRuntimePipeline {
             self.frame_state.vpt_nrd_texture_pools_initialized = true;
         }
         if vpt_accumulation_written {
+            self.frame_state.vpt_sample_index = self.frame_state.vpt_sample_index.saturating_add(1);
             self.frame_state.vpt_accumulation_needs_init = false;
             self.frame_state.vpt_temporal_history_initialized = true;
             self.frame_state.postprocess_output_initialized = true;
@@ -1732,12 +1728,15 @@ impl VptRuntimePipeline {
         width: u32,
         height: u32,
         lighting_settings: LightingSettings,
-        restir_di_enabled: bool,
-        area_restir_enabled: bool,
+        _restir_di_enabled: bool,
+        _area_restir_enabled: bool,
     ) -> Result<()> {
         let device = renderer.device().clone();
         let allocator = renderer.allocator();
         self.frame_state.reset_for_resize_or_camera_cut();
+        renderer
+            .wait_idle()
+            .context("failed to idle Vulkan device before resizing VPT resources")?;
 
         if let Some(vpt) = &mut self.vpt_pass {
             vpt.resize_images(
@@ -1767,12 +1766,17 @@ impl VptRuntimePipeline {
                     },
                 )
                 .context("failed to resize VPT surface images")?;
-            if restir_di_enabled && let Some(restir_di) = &self.restir_di_pass {
-                restir_di.update_surface_descriptors(&device, vpt_surface);
-            }
-            if area_restir_enabled && let Some(area_restir) = &self.area_restir_pass {
-                area_restir.update_surface_descriptors(&device, vpt_surface);
-            }
+        }
+        if let (Some(restir_di), Some(vpt_surface)) = (&self.restir_di_pass, &self.vpt_surface_pass)
+        {
+            restir_di.update_surface_descriptors(&device, vpt_surface);
+        }
+        if let (Some(area_restir), Some(vpt_surface)) =
+            (&self.area_restir_pass, &self.vpt_surface_pass)
+        {
+            area_restir.update_surface_descriptors(&device, vpt_surface);
+            area_restir.update_scene_descriptors(&device, scene_ubo);
+            area_restir.update_ucvh_descriptors(&device, ucvh_gpu);
         }
         if let (Some(vpt_nrd_frontend), Some(vpt), Some(vpt_surface)) = (
             &mut self.vpt_nrd_frontend_pass,
@@ -1862,12 +1866,12 @@ impl VptRuntimePipeline {
                 )
                 .context("failed to resize VPT NRD resolve images")?;
         }
-        if restir_di_enabled && let Some(restir_di) = &mut self.restir_di_pass {
+        if let Some(restir_di) = &mut self.restir_di_pass {
             restir_di
                 .resize_buffers(&device, allocator, width, height)
                 .context("failed to resize ReSTIR-DI buffers")?;
         }
-        if area_restir_enabled && let Some(area_restir) = &mut self.area_restir_pass {
+        if let Some(area_restir) = &mut self.area_restir_pass {
             area_restir
                 .resize_buffers(&device, allocator, width, height)
                 .context("failed to resize Area ReSTIR buffers")?;
@@ -2138,7 +2142,8 @@ mod tests {
     }
 
     #[test]
-    fn frame_state_scene_reset_clears_output_history_without_touching_camera_or_restir_history() {
+    fn frame_state_scene_reset_clears_output_history_and_restir_history_without_touching_camera_state()
+     {
         let mut state = VptPipelineFrameState {
             vpt_sample_index: 11,
             last_vpt_camera_key: Some([1; 15]),
@@ -2167,8 +2172,8 @@ mod tests {
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
         assert!(!state.vpt_nrd_texture_pools_initialized);
-        assert!(state.area_restir_history_initialized);
-        assert!(state.restir_di_history_initialized);
+        assert!(!state.area_restir_history_initialized);
+        assert!(!state.restir_di_history_initialized);
         assert_eq!(state.previous_vpt_view_proj, Some(glam::Mat4::IDENTITY));
         assert_eq!(state.previous_vpt_resolution, Some([1280, 720]));
         assert_eq!(
@@ -2183,7 +2188,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_key_reset_preserves_independent_restir_histories() {
+    fn scene_key_reset_clears_restir_histories() {
         let mut state = VptPipelineFrameState {
             vpt_sample_index: 11,
             last_vpt_camera_key: Some([1; 15]),
@@ -2207,8 +2212,26 @@ mod tests {
         assert!(!state.vpt_temporal_history_initialized);
         assert!(!state.postprocess_output_initialized);
         assert!(!state.vpt_nrd_texture_pools_initialized);
-        assert!(state.area_restir_history_initialized);
-        assert!(state.restir_di_history_initialized);
+        assert!(!state.area_restir_history_initialized);
+        assert!(!state.restir_di_history_initialized);
+    }
+
+    #[test]
+    fn scene_uniform_inputs_forward_history_reset_generation_from_frame_state() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let scene_uniforms = source
+            .split("let scene_data = build_scene_uniforms(SceneUniformInputs {")
+            .nth(1)
+            .expect("scene uniform construction should exist")
+            .split("});")
+            .next()
+            .expect("scene uniform construction should terminate");
+        let compact = crate::render::source_checks::compact(scene_uniforms);
+
+        assert!(
+            compact.contains("history_reset_generation:self.frame_state.history_reset_generation"),
+            "VPT scene uniforms must receive the frame state's history reset generation"
+        );
     }
 
     #[test]
@@ -2383,6 +2406,108 @@ mod tests {
         );
 
         assert_ne!(base, relax);
+    }
+
+    #[test]
+    fn nrd_adapter_rebuild_waits_for_submitted_gpu_work_before_destroying_old_pass() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let ensure_adapter = source
+            .split("fn ensure_vpt_nrd_adapter_pass")
+            .nth(1)
+            .expect("VptRuntimePipeline::ensure_vpt_nrd_adapter_pass should exist")
+            .split("fn ensure_vpt_nrd_resolve_pass")
+            .next()
+            .expect("NRD adapter ensure function should end before resolve ensure");
+        let compact = crate::render::source_checks::compact(ensure_adapter);
+
+        assert!(compact.contains("self.destroy_vpt_nrd_adapter_chain(renderer);"));
+        assert!(compact.contains("if!self.destroy_vpt_nrd_adapter_chain(renderer){return;}"));
+
+        let teardown = source
+            .split("fn destroy_vpt_nrd_adapter_chain")
+            .nth(1)
+            .expect("VptRuntimePipeline::destroy_vpt_nrd_adapter_chain should exist")
+            .split("fn ensure_vpt_nrd_resolve_pass")
+            .next()
+            .expect("NRD adapter teardown helper should end before resolve ensure");
+        let compact_teardown = crate::render::source_checks::compact(teardown);
+        let wait = compact_teardown
+            .find("renderer.wait_idle(")
+            .expect("NRD adapter teardown must wait for submitted GPU work");
+        let destroy_resolve = compact_teardown
+            .find("pass.destroy(renderer.device(),renderer.allocator());")
+            .expect("NRD adapter teardown should destroy stale pass resources");
+
+        assert!(
+            wait < destroy_resolve,
+            "NRD adapter pass rebuild must wait for submitted GPU work before destroying pipelines/images/views referenced by earlier frame command buffers"
+        );
+        assert!(
+            compact_teardown.contains("self.vpt_nrd_resolve_pass.take()"),
+            "NRD resolve pass descriptors point at adapter images and must be torn down with the adapter"
+        );
+        assert!(
+            compact_teardown.contains("self.vpt_nrd_adapter_pass.take()"),
+            "NRD adapter pass should be destroyed only through the synchronized teardown helper"
+        );
+    }
+
+    #[test]
+    fn resize_waits_for_submitted_gpu_work_before_replacing_pass_resources() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let resize = source
+            .split("pub fn resize(")
+            .nth(1)
+            .expect("VptRuntimePipeline::resize should exist")
+            .split("pub fn destroy(")
+            .next()
+            .expect("resize should end before destroy");
+        let compact = crate::render::source_checks::compact(resize);
+        let wait = compact
+            .find("renderer.wait_idle(")
+            .expect("VptRuntimePipeline::resize must wait for submitted GPU work");
+        let first_resize = compact
+            .find(".resize_images(")
+            .expect("VptRuntimePipeline::resize should resize pass-owned images");
+
+        assert!(
+            wait < first_resize,
+            "pass resize replaces and destroys old images/buffers, so it must wait before any resize_images/resize_buffers call"
+        );
+    }
+
+    #[test]
+    fn resize_refreshes_existing_restir_passes_even_when_temporarily_disabled() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let resize = source
+            .split("pub fn resize(")
+            .nth(1)
+            .expect("VptRuntimePipeline::resize should exist")
+            .split("pub fn destroy(")
+            .next()
+            .expect("resize should end before destroy");
+        let compact = crate::render::source_checks::compact(resize);
+
+        assert!(
+            compact.contains("ifletSome(restir_di)=&mutself.restir_di_pass{")
+                && compact.contains("restir_di.resize_buffers(&device,allocator,width,height)")
+                && compact.contains("restir_di.update_surface_descriptors(&device,vpt_surface);")
+                && !compact
+                    .contains("ifrestir_di_enabled&&letSome(restir_di)=&mutself.restir_di_pass{"),
+            "resize must refresh an existing ReSTIR-DI pass even when the pass is temporarily disabled"
+        );
+
+        assert!(
+            compact.contains("ifletSome(area_restir)=&mutself.area_restir_pass{")
+                && compact.contains("area_restir.resize_buffers(&device,allocator,width,height)")
+                && compact.contains("area_restir.update_surface_descriptors(&device,vpt_surface);")
+                && compact.contains("area_restir.update_scene_descriptors(&device,scene_ubo);")
+                && compact.contains("area_restir.update_ucvh_descriptors(&device,ucvh_gpu);")
+                && !compact.contains(
+                    "ifarea_restir_enabled&&letSome(area_restir)=&mutself.area_restir_pass{"
+                ),
+            "resize must refresh an existing Area ReSTIR pass even when the pass is temporarily disabled"
+        );
     }
 
     #[test]

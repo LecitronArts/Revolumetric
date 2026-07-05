@@ -19,6 +19,9 @@ pub enum DescriptorKind {
     UniformBuffer,
     StorageBuffer,
     StorageImage,
+    SampledImage,
+    Sampler,
+    AccelerationStructure,
 }
 
 impl ShaderReflection {
@@ -167,6 +170,7 @@ fn descriptor_kind_from_reflection_parameter(parameter: &str) -> Result<Descript
 
     match type_kind {
         "constantBuffer" => Ok(DescriptorKind::UniformBuffer),
+        "samplerState" => Ok(DescriptorKind::Sampler),
         "resource" => {
             let base_shape = string_field(ty, "baseShape")
                 .ok_or_else(|| anyhow!("resource missing baseShape"))?;
@@ -174,13 +178,12 @@ fn descriptor_kind_from_reflection_parameter(parameter: &str) -> Result<Descript
                 "structuredBuffer" => Ok(DescriptorKind::StorageBuffer),
                 "texture2D" | "texture3D" => match string_field(ty, "access") {
                     Some("readWrite") => Ok(DescriptorKind::StorageImage),
+                    Some("read") | Some("readOnly") | None => Ok(DescriptorKind::SampledImage),
                     Some(access) => Err(anyhow!(
                         "texture resource access {access:?} is not supported by descriptor specs"
                     )),
-                    None => Err(anyhow!(
-                        "texture resource missing access; sampled images are not supported"
-                    )),
                 },
+                "accelerationStructure" => Ok(DescriptorKind::AccelerationStructure),
                 other => Err(anyhow!("unsupported resource baseShape {other:?}")),
             }
         }
@@ -359,6 +362,14 @@ fn parse_descriptor_declaration(line: &str) -> Option<(DescriptorKind, String)> 
         DescriptorKind::StorageBuffer
     } else if line.starts_with("RWTexture2D<") || line.starts_with("RWTexture3D<") {
         DescriptorKind::StorageImage
+    } else if line.starts_with("Texture2D<") || line.starts_with("Texture3D<") {
+        DescriptorKind::SampledImage
+    } else if line.starts_with("SamplerState") {
+        DescriptorKind::Sampler
+    } else if line.starts_with("RaytracingAccelerationStructure")
+        || line.starts_with("AccelerationStructureKHR")
+    {
+        DescriptorKind::AccelerationStructure
     } else {
         return None;
     };
@@ -374,7 +385,7 @@ fn parse_descriptor_declaration(line: &str) -> Option<(DescriptorKind, String)> 
 fn reflection_json_path_for_source(source_path: &str) -> Option<std::path::PathBuf> {
     let path = std::path::Path::new(source_path);
     let parent = path.parent()?;
-    if parent.file_name()?.to_str()? != "passes" {
+    if !matches!(parent.file_name()?.to_str()?, "passes" | "ui") {
         return None;
     }
     let stem = path.file_stem()?.to_str()?;
@@ -388,6 +399,23 @@ fn reflection_json_path_for_source(source_path: &str) -> Option<std::path::PathB
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    fn unique_ui_shader_source_path(tag: &str) -> String {
+        let suffix = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time should be after UNIX_EPOCH")
+            .as_nanos();
+        format!("assets/shaders/ui/{tag}_{suffix}.slang")
+    }
+
+    struct TempFile(PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
 
     #[test]
     fn parses_slang_descriptor_bindings() {
@@ -434,7 +462,7 @@ StructuredBuffer<NodeL0> hierarchy_l0;
     fn rejects_unknown_descriptor_declaration() {
         let source = r#"
 [[vk::binding(3, 0)]]
-SamplerState sampler_state;
+ByteAddressBuffer byte_address_buffer;
 "#;
 
         let error = ShaderReflection::from_slang_source("main", source).unwrap_err();
@@ -442,6 +470,70 @@ SamplerState sampler_state;
             error
                 .to_string()
                 .contains("unsupported descriptor declaration")
+        );
+    }
+
+    #[test]
+    fn parses_slang_ray_tracing_acceleration_structure_bindings() {
+        let source = r#"
+[[vk::binding(0, 0)]]
+RaytracingAccelerationStructure scene_tlas;
+"#;
+
+        let reflection = ShaderReflection::from_slang_source("main", source).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::AccelerationStructure,
+                name: "scene_tlas".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn ui_shader_reflection_json_path_is_discovered() {
+        let path = reflection_json_path_for_source("assets/shaders/ui/egui.frag.slang")
+            .expect("ui shaders should look up a reflection JSON file");
+
+        assert_eq!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("egui.frag.reflection.json")
+        );
+    }
+
+    #[test]
+    fn parses_slang_ui_descriptor_bindings_from_source_fallback() {
+        let source = r#"
+[[vk::binding(0, 0)]]
+Texture2D<float4> egui_texture;
+
+[[vk::binding(1, 0)]]
+SamplerState egui_sampler;
+"#;
+        let source_path = unique_ui_shader_source_path("source_fallback");
+
+        let reflection =
+            ShaderReflection::from_slang_compiled_or_source("main", &source_path, source).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![
+                DescriptorBinding {
+                    set: 0,
+                    binding: 0,
+                    kind: DescriptorKind::SampledImage,
+                    name: "egui_texture".to_string(),
+                },
+                DescriptorBinding {
+                    set: 0,
+                    binding: 1,
+                    kind: DescriptorKind::Sampler,
+                    name: "egui_sampler".to_string(),
+                },
+            ]
         );
     }
 
@@ -497,6 +589,33 @@ SamplerState sampler_state;
     }
 
     #[test]
+    fn parses_acceleration_structure_reflection_json_binding() {
+        let json = r#"
+{
+  "parameters": [
+    {
+      "name": "scene_tlas",
+      "binding": { "kind": "descriptorTableSlot", "index": 0 },
+      "type": { "kind": "resource", "baseShape": "accelerationStructure" }
+    }
+  ]
+}
+"#;
+
+        let reflection = ShaderReflection::from_slang_reflection_json("main", json).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 0,
+                kind: DescriptorKind::AccelerationStructure,
+                name: "scene_tlas".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn ignores_push_constant_buffers_in_reflection_json_bindings() {
         let json = r#"
 {
@@ -537,7 +656,7 @@ SamplerState sampler_state;
     }
 
     #[test]
-    fn rejects_sampled_texture_reflection_json() {
+    fn parses_sampled_texture_reflection_json_as_sampled_image() {
         let json = r#"
 {
   "parameters": [
@@ -550,11 +669,118 @@ SamplerState sampler_state;
 }
 "#;
 
-        let error = ShaderReflection::from_slang_reflection_json("main", json).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("unsupported Slang reflection parameter sampled_image")
+        let reflection = ShaderReflection::from_slang_reflection_json("main", json).unwrap();
+        assert_eq!(
+            reflection.bindings,
+            vec![DescriptorBinding {
+                set: 0,
+                binding: 1,
+                kind: DescriptorKind::SampledImage,
+                name: "sampled_image".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_slang_ui_descriptor_bindings_from_reflection_json_over_source() {
+        let source_path = unique_ui_shader_source_path("json_priority");
+        let json_path = reflection_json_path_for_source(&source_path)
+            .expect("ui shaders should look up a reflection JSON file");
+        fs::create_dir_all(
+            json_path
+                .parent()
+                .expect("reflection JSON should have a parent"),
+        )
+        .expect("reflection JSON directory should be creatable");
+        let _cleanup = TempFile(json_path.clone());
+        fs::write(
+            &json_path,
+            r#"
+{
+  "parameters": [
+    {
+      "name": "json_texture",
+      "binding": { "kind": "descriptorTableSlot", "index": 0 },
+      "type": { "kind": "resource", "baseShape": "texture2D" }
+    },
+    {
+      "name": "json_sampler",
+      "binding": { "kind": "descriptorTableSlot", "index": 1 },
+      "type": { "kind": "samplerState" }
+    }
+  ]
+}
+"#,
+        )
+        .expect("reflection JSON should be writable");
+
+        let source = r#"
+[[vk::binding(0, 0)]]
+Texture2D<float4> source_texture;
+
+[[vk::binding(1, 0)]]
+SamplerState source_sampler;
+"#;
+
+        let reflection =
+            ShaderReflection::from_slang_compiled_or_source("main", &source_path, source).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![
+                DescriptorBinding {
+                    set: 0,
+                    binding: 0,
+                    kind: DescriptorKind::SampledImage,
+                    name: "json_texture".to_string(),
+                },
+                DescriptorBinding {
+                    set: 0,
+                    binding: 1,
+                    kind: DescriptorKind::Sampler,
+                    name: "json_sampler".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_slang_ui_reflection_json_bindings() {
+        let json = r#"
+{
+  "parameters": [
+    {
+      "name": "egui_texture",
+      "binding": { "kind": "descriptorTableSlot", "index": 0 },
+      "type": { "kind": "resource", "baseShape": "texture2D" }
+    },
+    {
+      "name": "egui_sampler",
+      "binding": { "kind": "descriptorTableSlot", "index": 1 },
+      "type": { "kind": "samplerState" }
+    }
+  ]
+}
+"#;
+
+        let reflection = ShaderReflection::from_slang_reflection_json("main", json).unwrap();
+
+        assert_eq!(
+            reflection.bindings,
+            vec![
+                DescriptorBinding {
+                    set: 0,
+                    binding: 0,
+                    kind: DescriptorKind::SampledImage,
+                    name: "egui_texture".to_string(),
+                },
+                DescriptorBinding {
+                    set: 0,
+                    binding: 1,
+                    kind: DescriptorKind::Sampler,
+                    name: "egui_sampler".to_string(),
+                },
+            ]
         );
     }
 }

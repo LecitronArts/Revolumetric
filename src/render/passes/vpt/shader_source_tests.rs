@@ -1007,7 +1007,7 @@ fn vpt_nrd_frontend_pass_declares_relax_packing_contract() {
 #[test]
 fn vpt_nrd_reblur_hit_distance_parameters_match_native_settings() {
     let shader = source("assets/shaders/passes/vpt_nrd_frontend.slang");
-    let sys = source("src/render/nrd_sys.rs");
+    let sys = source("crates/revolumetric-nrd-sys/src/lib.rs");
     let compact_shader = shader.split_whitespace().collect::<String>();
     let compact_sys = sys.split_whitespace().collect::<String>();
 
@@ -1208,11 +1208,11 @@ fn vpt_nrd_confidence_pass_declares_history_confidence_contract() {
 fn vpt_nrd_adapter_declares_relax_integration_contract() {
     let adapter = source("src/render/passes/vpt_nrd_adapter.rs");
     let frame_settings = source("src/render/passes/vpt_nrd_adapter/frame_settings.rs");
-    let rust_api = source("src/render/nrd_adapter.rs");
-    let sys = source("src/render/nrd_sys.rs");
-    let native_header = source("native/nrd_adapter.h");
-    let native_cpp = source("native/nrd_adapter.cpp");
-    let build_rs = source("build.rs");
+    let rust_api = source("crates/revolumetric-nrd/src/lib.rs");
+    let sys = source("crates/revolumetric-nrd-sys/src/lib.rs");
+    let native_header = source("crates/revolumetric-nrd-sys/native/nrd_adapter.h");
+    let native_cpp = source("crates/revolumetric-nrd-sys/native/nrd_adapter.cpp");
+    let build_rs = source("crates/revolumetric-nrd-sys/build.rs");
     let render_mod = source("src/render/mod.rs");
     let pass_mod = source("src/render/passes/mod.rs");
     let pipeline = source("src/render/vpt_pipeline.rs");
@@ -1240,7 +1240,7 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         assert!(sys.contains(token), "NRD sys layer missing {token}");
     }
     for token in [
-        "pub use crate::render::nrd_sys::{",
+        "pub use revolumetric_nrd_sys::{",
         "pub struct NrdTextureImageDesc",
         "pub struct NrdResourceBindingDesc",
         "pub struct NrdPipelineSnapshot",
@@ -1248,6 +1248,9 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         "pub struct NrdDispatchSnapshot",
         "pub struct NrdUnavailableError",
         "pub type NrdResult<T> = Result<T, NrdUnavailableError>",
+        "pub trait NrdTextureDescExt",
+        "pub trait NrdResourceDescExt",
+        "pub trait NrdResourceRangeDescExt",
         "pub struct NrdInstance",
         "#[cfg(feature = \"nrd\")]",
         "#[cfg(not(feature = \"nrd\"))]",
@@ -1262,10 +1265,12 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         assert!(rust_api.contains(token), "NRD Rust API missing {token}");
     }
     for token in [
+        "println!(\"cargo:rerun-if-env-changed=REVOLUMETRIC_NRD_ROOT\");",
+        "if !nrd_feature_enabled()",
+        "fn validate_nrd_sdk_root() -> PathBuf",
+        "println!(\"cargo:rerun-if-changed=native/nrd_adapter.h\");",
         "fn nrd_library_dir(root: &Path) -> PathBuf",
-        "NRD_STATIC_LIBRARY=ON",
-        "NRD_EMBEDS_SPIRV_SHADERS=ON",
-        "NRD_SUPPORTS_HISTORY_CONFIDENCE=ON",
+        "include(\"native\")",
         "cargo:rustc-link-lib=static=NRD",
     ] {
         assert!(build_rs.contains(token), "NRD build gate missing {token}");
@@ -1498,8 +1503,8 @@ fn vpt_nrd_adapter_declares_relax_integration_contract() {
         );
     }
 
-    assert!(render_mod.contains("pub mod nrd_adapter;"));
-    assert!(render_mod.contains("pub mod nrd_sys;"));
+    assert!(!render_mod.contains("pub mod nrd_adapter;"));
+    assert!(!render_mod.contains("pub mod nrd_sys;"));
     assert!(pass_mod.contains("pub mod vpt_nrd_adapter;"));
     assert!(profiler.contains("VptNrdAdapter"));
     assert!(profiler.contains("vpt_nrd_adapter_ms"));
@@ -2107,6 +2112,53 @@ fn vpt_temporal_seeds_valid_history_when_no_previous_history_is_accepted() {
 }
 
 #[test]
+fn vpt_temporal_encodes_history_reset_generation_in_radiance_alpha_and_gates_reuse() {
+    let scene_common = source("assets/shaders/shared/scene_common.slang");
+    let shader = std::fs::read_to_string("assets/shaders/passes/vpt_temporal.slang")
+        .expect("VPT temporal shader should exist");
+    let compact_shader = shader.split_whitespace().collect::<String>();
+
+    assert!(
+        scene_common.contains("history_reset_generation"),
+        "scene ABI must expose history_reset_generation for temporal history gating"
+    );
+
+    for token in [
+        "uintvpt_history_generation_half_bits(uintgeneration)",
+        "floatvpt_history_generation_alpha(uinthistory_generation_bits)",
+        "previous_history_generation_bits=f32tof16(previous_accumulated_radiance.a);",
+        "previous_history_generation_bits!=current_history_generation_bits",
+        "history_generation_alpha=vpt_history_generation_alpha(current_history_generation_bits);",
+        "accumulated_radiance_image[pixel]=float4(accumulated,history_generation_alpha);",
+    ] {
+        assert!(
+            compact_shader.contains(token),
+            "VPT temporal history generation gate missing {token}"
+        );
+    }
+
+    let generation_gate_idx = compact_shader
+        .find("previous_history_generation_bits!=current_history_generation_bits")
+        .expect("generation gate should exist before reusing previous history");
+    let compatibility_idx = compact_shader
+        .find("!compatible_history(pixel,tap_pixel)")
+        .expect("surface compatibility check should exist");
+    let generation_helper_idx = compact_shader
+        .find("uintvpt_history_generation_half_bits(uintgeneration)")
+        .expect("generation helper should exist");
+    let previous_radiance_idx = compact_shader
+        .find("previous_accumulated_radiance_image[tap_pixel]")
+        .expect("previous accumulated radiance access should exist");
+    let previous_moments_idx = compact_shader
+        .find("previous_accumulated_moments_history_image[tap_pixel]")
+        .expect("previous accumulated moments access should exist");
+
+    assert!(generation_helper_idx < generation_gate_idx);
+    assert!(generation_gate_idx < compatibility_idx);
+    assert!(previous_radiance_idx < previous_moments_idx);
+}
+
+#[test]
 fn app_does_not_rewrite_all_vpt_temporal_descriptors_per_frame() {
     let runtime = std::fs::read_to_string("src/render/runtime.rs")
         .expect("app source should be readable for VPT temporal descriptor lifetime test");
@@ -2183,17 +2235,12 @@ fn app_resets_vpt_temporal_state_on_resize_and_key_changes() {
     );
     assert!(pipeline.contains("self.frame_state.reset_for_resize_or_camera_cut();"));
     assert!(compact.contains("self.frame_state.vpt_temporal_history_initialized"));
-    assert!(pipeline.contains("camera.fov_y_radians.to_bits()"));
     assert!(pipeline.contains("frame.swapchain_extent.width"));
-    assert!(pipeline.contains("inputs.lighting_settings.vpt_max_bounces"));
+    assert!(pipeline.contains("lighting_settings.vpt_max_bounces"));
     assert!(pipeline.contains("initialized postprocess pass from VPT output"));
     assert!(pipeline.contains("skipping VPT frame until required passes are initialized"));
     assert!(pipeline.contains("graph.has_final_access(AccessKind::Present)"));
     assert!(pipeline.contains("add_swapchain_clear_present_pass"));
-    assert!(
-        source
-            .contains("fn resize_render_runtime(&mut self, width: u32, height: u32) -> Result<()>")
-    );
     assert!(!source.contains("graph.add_pass(\"primary_ray\""));
     assert!(!source.contains("primary_ray_writes"));
     assert!(pipeline.contains("graph.import_image_with_access("));
@@ -2229,6 +2276,33 @@ fn app_keeps_vpt_first_use_sample_zero_until_noisy_radiance_is_written() {
 }
 
 #[test]
+fn app_keeps_vpt_primary_sampling_sequence_advancing_without_camera_key_resets() {
+    let pipeline = source("src/render/vpt_pipeline.rs");
+    let compact = pipeline.split_whitespace().collect::<String>();
+
+    assert!(
+        compact.contains(
+            "letscene_vpt_sample_index=ifself.frame_state.vpt_accumulation_needs_init{0}else{self.frame_state.vpt_sample_index};"
+        ),
+        "scene UBO sample index must still be gated only by explicit accumulation initialization"
+    );
+    assert!(
+        compact.contains(
+            "ifvpt_accumulation_written{self.frame_state.vpt_sample_index=self.frame_state.vpt_sample_index.saturating_add(1);"
+        ),
+        "VPT sample index must advance when a noisy accumulation frame is written"
+    );
+    assert!(
+        !compact.contains("ifself.frame_state.last_vpt_camera_key==Some(camera_key){"),
+        "moving the camera must not reset the primary sampling sequence"
+    );
+    assert!(
+        !compact.contains("self.frame_state.vpt_sample_index=0;self.frame_state.last_vpt_camera_key=Some(camera_key);"),
+        "camera-key changes must not zero the primary sampling index"
+    );
+}
+
+#[test]
 fn app_supports_frame_limited_runtime_smoke_validation() {
     let source = std::fs::read_to_string("src/app.rs")
         .expect("app source should be readable for runtime smoke validation test");
@@ -2252,6 +2326,39 @@ fn desktop_builds_reject_placeholder_shaders_instead_of_opening_black_window() {
         "desktop builds require real shaders",
     ] {
         assert!(build.contains(token), "build.rs missing {token}");
+    }
+}
+
+#[test]
+fn build_script_tracks_ui_shaders_and_shader_compile_modes() {
+    let build = source("build.rs");
+    let build_support = source("src/build_support.rs");
+
+    for token in [
+        "#[path = \"src/build_support.rs\"]",
+        "mod build_support;",
+        "for job in ui_shader_jobs(shader_dir) {",
+        "shader_jobs.push(job);",
+        "if shader_compile_mode == ShaderCompileMode::Skip",
+        "ShaderCompileMode::Auto =>",
+        "ShaderCompileMode::Strict =>",
+        "ShaderCompileMode::Skip =>",
+        "write_placeholder_spirv_files(&shader_jobs, &out_dir);",
+        "cargo:rerun-if-changed=assets/shaders",
+        "cargo:rerun-if-changed=assets/shaders/passes",
+    ] {
+        assert!(build.contains(token), "build.rs missing {token}");
+    }
+    for token in [
+        "pub fn ui_shader_jobs(shader_dir: &Path) -> Vec<ShaderJobSpec>",
+        "shader_dir.join(\"ui\").join(\"egui.vert.slang\")",
+        "shader_dir.join(\"ui\").join(\"egui.frag.slang\")",
+        "ui_shader_jobs_only_collects_existing_ui_shaders",
+    ] {
+        assert!(
+            build_support.contains(token),
+            "src/build_support.rs missing {token}"
+        );
     }
 }
 
@@ -2674,7 +2781,7 @@ fn vpt_temporal_denoiser_disabled_short_circuits_to_raw_passthrough() {
 
     assert!(
         compact_temporal.contains(
-            "if((scene.denoiser_flags&DENOISER_FLAG_ENABLED)==0u){accumulated_radiance_image[pixel]=float4(noisy_radiance.rgb,1.0);accumulated_moments_history_image[pixel]=float4(noisy_moments.xy,current_surface_valid?1.0:0.0,current_surface_valid?1.0:0.0);return;}"
+            "if((scene.denoiser_flags&DENOISER_FLAG_ENABLED)==0u){accumulated_radiance_image[pixel]=float4(noisy_radiance.rgb,history_generation_alpha);accumulated_moments_history_image[pixel]=float4(noisy_moments.xy,current_surface_valid?1.0:0.0,current_surface_valid?1.0:0.0);return;}"
         ),
         "denoiser-off temporal path must write raw noisy radiance and return before filtering"
     );
@@ -2766,7 +2873,9 @@ fn vpt_debug_views_are_actually_routed_to_temporal_output() {
     assert!(
         temporal.contains("debug_view_bypasses_temporal(scene.vpt_debug_view)")
             && temporal
-                .contains("accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, 1.0);")
+                .contains(
+                    "accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, history_generation_alpha);"
+                )
             && temporal.contains("return;"),
         "raw/ReSTIR/direct/indirect debug views must bypass temporal reuse and firefly clamps"
     );
@@ -2805,7 +2914,7 @@ fn vpt_nrd_guide_debug_views_are_routed_to_temporal_output() {
         "visualize_nrd_motion_z",
         "surface_view_z[pixel]",
         "motion.z",
-        "accumulated_radiance_image[pixel] = float4(guide_debug, 1.0);",
+        "accumulated_radiance_image[pixel] = float4(guide_debug, history_generation_alpha);",
     ] {
         assert!(
             temporal.contains(token),
@@ -3354,8 +3463,11 @@ fn voxel_traversal_uses_direction_aware_entry_cells_instead_of_fixed_nudge() {
         .expect("voxel traversal shader should be readable");
 
     for token in [
-        "static const float DDA_GRID_BOUNDARY_EPSILON",
         "float dda_adjust_boundary_position(",
+        "float dda_boundary_ulp(",
+        "float dda_next_up(",
+        "float dda_next_down(",
+        "nextafter(",
         "int dda_start_coord(",
         "int3 dda_start_coord3(",
         "dda_start_coord3(entry_pos",
@@ -3368,8 +3480,38 @@ fn voxel_traversal_uses_direction_aware_entry_cells_instead_of_fixed_nudge() {
     }
 
     assert!(
+        !traverse.contains("DDA_GRID_BOUNDARY_EPSILON = 1.0e-5"),
+        "fixed boundary epsilon loses nudging power once coordinates exceed the literal's scale"
+    );
+    assert!(
+        !traverse.contains("target_t + DDA_GRID_BOUNDARY_EPSILON"),
+        "hierarchy skip reset must not rely on a fixed t-space offset"
+    );
+    assert!(
         !traverse.contains("t_enter + 0.001"),
         "fixed t-space entry nudges perturb cell selection at voxel and brick boundaries"
+    );
+}
+
+#[test]
+fn voxel_traversal_brick_grid_steps_do_not_truncate_large_grids() {
+    let traverse = std::fs::read_to_string("assets/shaders/shared/voxel_traverse.slang")
+        .expect("voxel traversal shader should be readable");
+
+    for token in [
+        "int max_steps = igrid.x + igrid.y + igrid.z;",
+        "for (int i = 0; i < max_steps; i++) {",
+        "for (int i = 0; i < max_steps && current_t < max_t; i++) {",
+    ] {
+        assert!(
+            traverse.contains(token),
+            "brick-grid traversal missing grid-sized loop token {token}"
+        );
+    }
+
+    assert!(
+        !traverse.contains("i < 256"),
+        "brick-grid traversal must not truncate larger grids at 256 steps"
     );
 }
 
@@ -3416,7 +3558,7 @@ fn voxel_hierarchy_skip_reinitializes_dda_state_in_constant_time() {
 
     for token in [
         "void reset_brick_dda_at_t(",
-        "float reset_t = target_t + DDA_GRID_BOUNDARY_EPSILON",
+        "float reset_t = dda_next_up(target_t);",
         "float3 reset_pos = ray.origin + ray.direction * reset_t;",
         "brick_coord = dda_start_coord3(reset_pos / 8.0, step_dir, igrid - int3(1));",
         "ray_axis_t_max(ray.origin.x, ray.direction.x, ray.inv_dir.x",

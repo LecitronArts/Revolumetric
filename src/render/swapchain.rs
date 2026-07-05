@@ -21,6 +21,54 @@ pub struct SwapchainManager {
     pub height: u32,
 }
 
+struct SwapchainCreationCleanup<'a> {
+    device: &'a Device,
+    swapchain_loader: &'a ash::khr::swapchain::Device,
+    handle: Option<vk::SwapchainKHR>,
+    image_views: Vec<vk::ImageView>,
+}
+
+impl<'a> SwapchainCreationCleanup<'a> {
+    fn new(device: &'a Device, swapchain_loader: &'a ash::khr::swapchain::Device) -> Self {
+        Self {
+            device,
+            swapchain_loader,
+            handle: None,
+            image_views: Vec::new(),
+        }
+    }
+
+    fn set_handle(&mut self, handle: vk::SwapchainKHR) {
+        self.handle = Some(handle);
+    }
+
+    fn push_image_view(&mut self, image_view: vk::ImageView) {
+        self.image_views.push(image_view);
+    }
+
+    fn finish(mut self) -> (vk::SwapchainKHR, Vec<vk::ImageView>) {
+        (
+            self.handle
+                .take()
+                .expect("Swapchain creation cleanup missing handle"),
+            std::mem::take(&mut self.image_views),
+        )
+    }
+}
+
+impl Drop for SwapchainCreationCleanup<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            for image_view in self.image_views.drain(..) {
+                self.device.destroy_image_view(image_view, None);
+            }
+            if let Some(handle) = self.handle.take() {
+                self.swapchain_loader.destroy_swapchain(handle, None);
+            }
+        }
+    }
+}
+
 impl Default for SwapchainManager {
     fn default() -> Self {
         Self {
@@ -58,6 +106,7 @@ impl SwapchainManager {
         let present_mode = choose_present_mode(&support.present_modes);
         let extent = choose_extent(&support.capabilities, desired_width, desired_height);
         let image_count = choose_image_count(&support.capabilities);
+        let mut cleanup = SwapchainCreationCleanup::new(device, swapchain_loader);
 
         let queue_family_indices = [graphics_queue_family_index, present_queue_family_index];
         let (image_sharing_mode, queue_family_indices) =
@@ -85,15 +134,16 @@ impl SwapchainManager {
 
         let handle = unsafe { swapchain_loader.create_swapchain(&create_info, None) }
             .context("failed to create Vulkan swapchain")?;
+        cleanup.set_handle(handle);
         let images = unsafe { swapchain_loader.get_swapchain_images(handle) }
             .context("failed to fetch Vulkan swapchain images")?;
-        let image_views = images
-            .iter()
-            .copied()
-            .map(|image| create_image_view(device, image, surface_format.format))
-            .collect::<Result<Vec<_>>>()?;
+        for image in images.iter().copied() {
+            let image_view = create_image_view(device, image, surface_format.format)?;
+            cleanup.push_image_view(image_view);
+        }
         let image_layouts = vec![vk::ImageLayout::UNDEFINED; images.len()];
         let in_flight_fences = vec![vk::Fence::null(); images.len()];
+        let (handle, image_views) = cleanup.finish();
 
         Ok(Self {
             handle,
@@ -211,4 +261,22 @@ fn create_image_view(
 
     unsafe { device.create_image_view(&create_info, None) }
         .context("failed to create Vulkan swapchain image view")
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn swapchain_constructor_uses_cleanup_guard_for_partial_success() {
+        let source = crate::render::source_checks::read_source("src/render/swapchain.rs");
+        crate::render::source_checks::assert_contains_all(
+            &source,
+            &[
+                "SwapchainCreationCleanup::new(device, swapchain_loader)",
+                "cleanup.set_handle(handle);",
+                "cleanup.push_image_view(image_view);",
+                "cleanup.finish()",
+            ],
+            "swapchain constructor cleanup guard",
+        );
+    }
 }

@@ -15,6 +15,7 @@ pub const LIGHTING_DEBUG_VIEW_FINAL: u32 = 0;
 pub const LIGHTING_DEBUG_VIEW_DIRECT_DIFFUSE: u32 = 1;
 pub const LIGHTING_DEBUG_VIEW_NORMAL: u32 = 2;
 pub const RENDER_MODE_VPT: u32 = 1;
+pub const RENDER_MODE_RT: u32 = 2;
 pub const DENOISER_FLAG_ENABLED: u32 = 1 << 0;
 pub const DENOISER_MODE_SHIFT: u32 = 28;
 pub const DENOISER_MODE_MASK: u32 = 0x3 << DENOISER_MODE_SHIFT;
@@ -56,7 +57,9 @@ pub enum LightingDebugView {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderMode {
+    Auto,
     Vpt,
+    Rt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +102,9 @@ pub enum VptDenoiserMode {
 impl RenderMode {
     pub fn as_gpu_value(self) -> u32 {
         match self {
+            Self::Auto => RENDER_MODE_VPT,
             Self::Vpt => RENDER_MODE_VPT,
+            Self::Rt => RENDER_MODE_RT,
         }
     }
 }
@@ -200,7 +205,7 @@ impl Default for LightingSettings {
             shadows_enabled: true,
             skip_backface_shadows: false,
             vpt_traversal_stats_enabled: false,
-            render_mode: RenderMode::Vpt,
+            render_mode: RenderMode::Auto,
             vpt_max_bounces: 2,
             sun_angular_radius: 0.02,
             debug_view: LightingDebugView::Final,
@@ -360,7 +365,7 @@ impl LightingSettings {
             &mut settings.render_mode,
             render_mode,
             "REVOLUMETRIC_RENDER_MODE",
-            "vpt",
+            "auto|vpt|rt",
             parse_render_mode,
             &mut warnings,
         );
@@ -571,8 +576,12 @@ fn parse_vpt_debug_view(value: &str) -> Option<VptDebugView> {
 
 fn parse_render_mode(value: &str) -> Option<RenderMode> {
     let value = value.trim();
-    if value.eq_ignore_ascii_case("vpt") {
+    if value.eq_ignore_ascii_case("auto") {
+        Some(RenderMode::Auto)
+    } else if value.eq_ignore_ascii_case("vpt") {
         Some(RenderMode::Vpt)
+    } else if value.eq_ignore_ascii_case("rt") {
+        Some(RenderMode::Rt)
     } else {
         None
     }
@@ -649,7 +658,7 @@ pub struct GpuSceneUniforms {
     pub camera_up: [f32; 3],         // 12B
     pub focal_distance: f32,         // 4B
     pub camera_forward: [f32; 3],    // 12B
-    pub _pad4: f32,                  // 4B
+    pub history_reset_generation: u32, // 4B
 }
 
 impl GpuSceneUniforms {
@@ -680,6 +689,7 @@ pub struct SceneUniformInputs {
     pub time: f32,
     pub lighting_settings: LightingSettings,
     pub vpt_sample_index: u32,
+    pub history_reset_generation: u32,
 }
 
 pub fn build_scene_uniforms(inputs: SceneUniformInputs) -> GpuSceneUniforms {
@@ -708,7 +718,7 @@ pub fn build_scene_uniforms(inputs: SceneUniformInputs) -> GpuSceneUniforms {
         camera_up: inputs.camera_up.normalize_or_zero().to_array(),
         focal_distance: inputs.focal_distance.max(1.0e-3),
         camera_forward: inputs.camera_forward.normalize_or_zero().to_array(),
-        _pad4: 0.0,
+        history_reset_generation: inputs.history_reset_generation,
     };
     uniforms.apply_lighting_settings(inputs.lighting_settings);
     uniforms
@@ -883,7 +893,7 @@ mod tests {
         assert!(settings.shadows_enabled);
         assert!(!settings.skip_backface_shadows);
         assert!(!settings.vpt_traversal_stats_enabled);
-        assert_eq!(settings.render_mode, RenderMode::Vpt);
+        assert_eq!(settings.render_mode, RenderMode::Auto);
         assert_eq!(settings.vpt_max_bounces, 2);
         assert_eq!(settings.sun_angular_radius, 0.02);
         assert_eq!(settings.debug_view, LightingDebugView::Final);
@@ -923,10 +933,10 @@ mod tests {
     }
 
     #[test]
-    fn lighting_settings_default_is_vpt_only() {
+    fn lighting_settings_default_requests_auto_backend_selection() {
         let settings = LightingSettings::default();
 
-        assert_eq!(settings.render_mode, RenderMode::Vpt);
+        assert_eq!(settings.render_mode, RenderMode::Auto);
         assert_eq!(
             settings.gpu_flags() & LIGHTING_FLAG_SHADOWS_ENABLED,
             LIGHTING_FLAG_SHADOWS_ENABLED
@@ -934,11 +944,20 @@ mod tests {
     }
 
     #[test]
+    fn lighting_settings_parse_auto_render_mode() {
+        let parsed =
+            LightingSettings::from_values_report(None, None, Some("auto"), None, None, None);
+
+        assert_eq!(parsed.settings.render_mode, RenderMode::Auto);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
     fn legacy_vct_render_mode_is_rejected() {
         let result =
             LightingSettings::from_values_report(None, None, Some("vct"), None, None, None);
 
-        assert_eq!(result.settings.render_mode, RenderMode::Vpt);
+        assert_eq!(result.settings.render_mode, RenderMode::Auto);
         assert!(
             result
                 .warnings
@@ -959,6 +978,14 @@ mod tests {
         assert_eq!(settings.vpt_max_bounces, 4);
         assert_eq!(uniforms.render_mode, RENDER_MODE_VPT);
         assert_eq!(uniforms.vpt_max_bounces, 4);
+    }
+
+    #[test]
+    fn lighting_settings_parse_rt_render_mode() {
+        let parsed = LightingSettings::from_values_report(None, None, Some("rt"), None, None, None);
+
+        assert_eq!(parsed.settings.render_mode, RenderMode::Rt);
+        assert!(parsed.warnings.is_empty());
     }
 
     #[test]
@@ -1022,6 +1049,7 @@ mod tests {
             time: 12.5,
             lighting_settings: settings,
             vpt_sample_index: 9,
+            history_reset_generation: 17,
         });
 
         assert_eq!(uniforms.resolution, [800, 600]);
@@ -1035,6 +1063,7 @@ mod tests {
         assert_eq!(uniforms.render_mode, RENDER_MODE_VPT);
         assert_eq!(uniforms.vpt_sample_index, 9);
         assert_eq!(uniforms.vpt_max_bounces, 2);
+        assert_eq!(uniforms.history_reset_generation, 17);
         assert_eq!(uniforms.camera_right, [1.0, 0.0, 0.0]);
         assert_eq!(uniforms.camera_up, [0.0, 1.0, 0.0]);
         assert_eq!(uniforms.camera_forward, [0.0, 0.0, 1.0]);

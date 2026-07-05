@@ -8,7 +8,10 @@ use crate::render::device::RenderDevice;
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::gpu_profiler::{GpuProfiler, GpuProfilerConfig};
 use crate::render::restir_di::RestirDiSettings;
-use crate::render::scene_ubo::{LightingSettings, SceneUniformBuffer};
+use crate::render::rt_capabilities::{RenderBackend, RtCapabilities, resolve_render_backend};
+use crate::render::rt_pipeline::{RtFrameInputs, RtRuntimePipeline};
+use crate::render::rt_settings::RtSettings;
+use crate::render::scene_ubo::{LightingSettings, RenderMode, SceneUniformBuffer};
 use crate::render::vpt_pipeline::{
     UcvhFrameChanges, VptCameraFrame, VptFrameInputs, VptRuntimePipeline,
 };
@@ -18,6 +21,7 @@ use crate::voxel::ucvh::Ucvh;
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSettings {
     pub lighting: LightingSettings,
+    pub rt: RtSettings,
     pub restir_di: RestirDiSettings,
     pub area_restir: AreaRestirSettings,
 }
@@ -46,11 +50,16 @@ pub struct RenderFrameOutcome {
 
 pub struct RenderRuntime {
     renderer: RenderDevice,
+    rt_capabilities: RtCapabilities,
+    render_backend: RenderBackend,
+    last_render_backend: RenderBackend,
+    rt_history_reset_generation: u32,
     gpu_profiler: Option<GpuProfiler>,
     capture: Option<RenderCapture>,
     scene_ubo: Option<SceneUniformBuffer>,
     ucvh_gpu: Option<UcvhGpuResources>,
     ucvh_uploaded: bool,
+    rt_pipeline: RtRuntimePipeline,
     vpt_pipeline: VptRuntimePipeline,
     #[cfg(not(target_os = "android"))]
     egui_renderer: Option<EguiRenderer>,
@@ -59,9 +68,21 @@ pub struct RenderRuntime {
 impl RenderRuntime {
     pub fn new(window: &Window, settings: RuntimeSettings, ucvh: Option<&Ucvh>) -> Result<Self> {
         let renderer = RenderDevice::new(window)?;
+        let rt_capabilities = renderer.rt_capabilities();
+        let render_backend =
+            resolve_render_backend(settings.lighting.render_mode, rt_capabilities.supported());
+
+        if settings.lighting.render_mode == RenderMode::Rt && render_backend == RenderBackend::Vpt {
+            tracing::warn!(
+                device = %renderer.physical_device_name(),
+                "requested RT backend but hardware support was unavailable; falling back to VPT"
+            );
+        }
 
         tracing::info!(
             renderer = %renderer.backend_name(),
+            render_backend = ?render_backend,
+            rt_supported = rt_capabilities.supported(),
             physical_device = %renderer.physical_device_name(),
             graphics_queue_family = renderer.graphics_queue_family_index(),
             present_queue_family = renderer.present_queue_family_index(),
@@ -152,11 +173,16 @@ impl RenderRuntime {
 
         let mut runtime = Self {
             renderer,
+            rt_capabilities,
+            render_backend,
+            last_render_backend: render_backend,
+            rt_history_reset_generation: 0,
             gpu_profiler,
             capture,
             scene_ubo,
             ucvh_gpu,
             ucvh_uploaded: false,
+            rt_pipeline: RtRuntimePipeline::new(),
             vpt_pipeline: VptRuntimePipeline::new(),
             #[cfg(not(target_os = "android"))]
             egui_renderer,
@@ -174,6 +200,14 @@ impl RenderRuntime {
         &self.renderer
     }
 
+    pub fn render_backend(&self) -> RenderBackend {
+        self.render_backend
+    }
+
+    pub fn rt_capabilities(&self) -> RtCapabilities {
+        self.rt_capabilities
+    }
+
     pub fn ensure_passes(
         &mut self,
         ucvh: Option<&Ucvh>,
@@ -182,15 +216,28 @@ impl RenderRuntime {
         area_restir_enabled: bool,
     ) {
         if let Some(scene_ubo) = self.scene_ubo.as_ref() {
-            self.vpt_pipeline.ensure_passes(
-                &self.renderer,
-                scene_ubo,
-                ucvh,
-                self.ucvh_gpu.as_ref(),
-                settings.lighting,
-                restir_di_enabled,
-                area_restir_enabled,
-            );
+            match self.render_backend {
+                RenderBackend::Rt => {
+                    self.rt_pipeline.ensure_passes(
+                        &self.renderer,
+                        scene_ubo,
+                        ucvh,
+                        self.ucvh_gpu.as_ref(),
+                        settings.rt,
+                    );
+                }
+                RenderBackend::Vpt => {
+                    self.vpt_pipeline.ensure_passes(
+                        &self.renderer,
+                        scene_ubo,
+                        ucvh,
+                        self.ucvh_gpu.as_ref(),
+                        settings.lighting,
+                        restir_di_enabled,
+                        area_restir_enabled,
+                    );
+                }
+            }
         }
     }
 
@@ -216,18 +263,33 @@ impl RenderRuntime {
     ) -> Result<()> {
         self.ensure_passes(ucvh, settings, restir_di_enabled, area_restir_enabled);
         let extent = self.renderer.swapchain_extent();
-        if let (Some(scene_ubo), Some(ucvh_gpu)) = (self.scene_ubo.as_ref(), self.ucvh_gpu.as_ref())
-        {
-            self.vpt_pipeline.resize(
-                &self.renderer,
-                scene_ubo,
-                ucvh_gpu,
-                extent.width,
-                extent.height,
-                settings.lighting,
-                restir_di_enabled,
-                area_restir_enabled,
-            )?;
+        if let Some(scene_ubo) = self.scene_ubo.as_ref() {
+            match self.render_backend {
+                RenderBackend::Rt => {
+                    self.rt_history_reset_generation =
+                        self.rt_history_reset_generation.wrapping_add(1);
+                    self.rt_pipeline.resize(
+                        &self.renderer,
+                        scene_ubo,
+                        extent.width,
+                        extent.height,
+                    )?;
+                }
+                RenderBackend::Vpt => {
+                    if let Some(ucvh_gpu) = self.ucvh_gpu.as_ref() {
+                        self.vpt_pipeline.resize(
+                            &self.renderer,
+                            scene_ubo,
+                            ucvh_gpu,
+                            extent.width,
+                            extent.height,
+                            settings.lighting,
+                            restir_di_enabled,
+                            area_restir_enabled,
+                        )?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -236,6 +298,13 @@ impl RenderRuntime {
         let mut outcome = RenderFrameOutcome::default();
         let frame = self.renderer.begin_frame()?;
         outcome.began_frame = true;
+
+        if self.last_render_backend != self.render_backend {
+            self.rt_history_reset_generation = self.rt_history_reset_generation.wrapping_add(1);
+            self.rt_pipeline
+                .reset_history(self.rt_history_reset_generation);
+            self.last_render_backend = self.render_backend;
+        }
 
         if frame.swapchain_recreated {
             self.resize_pipeline_to_swapchain(
@@ -324,33 +393,59 @@ impl RenderRuntime {
         let scene_ubo = self
             .scene_ubo
             .as_ref()
-            .expect("scene UBO was checked before ensuring VPT passes");
+            .expect("scene UBO was checked before ensuring render passes");
 
-        let record_result = self.vpt_pipeline.record_and_execute_frame(
-            &self.renderer,
-            &frame,
-            #[cfg(not(target_os = "android"))]
-            self.egui_renderer.as_mut(),
-            #[cfg(not(target_os = "android"))]
-            input.egui_frame.as_ref(),
-            VptFrameInputs {
-                scene_ubo,
-                camera: input.camera,
-                sun_direction: input.sun_direction,
-                sun_intensity: input.sun_intensity,
-                elapsed_seconds: input.elapsed_seconds,
-                lighting_settings: input.settings.lighting,
-                restir_di_settings: input.settings.restir_di,
-                area_restir_settings: input.settings.area_restir,
-                restir_di_enabled: input.restir_di_enabled,
-                area_restir_enabled: input.area_restir_enabled,
-                ucvh_ready: self.ucvh_uploaded,
-                ucvh_frame_changes,
-                ucvh_motion_event_count,
-                capture: self.capture.as_mut(),
-                profiler: self.gpu_profiler.as_ref(),
-            },
-        )?;
+        let as_rebuild_generation = self.rt_pipeline.as_rebuild_generation();
+        let record_result = match self.render_backend {
+            RenderBackend::Rt => self.rt_pipeline.record_and_execute_frame(
+                &self.renderer,
+                &frame,
+                #[cfg(not(target_os = "android"))]
+                self.egui_renderer.as_mut(),
+                #[cfg(not(target_os = "android"))]
+                input.egui_frame.as_ref(),
+                RtFrameInputs {
+                    scene_ubo,
+                    camera: input.camera,
+                    sun_direction: input.sun_direction,
+                    sun_intensity: input.sun_intensity,
+                    elapsed_seconds: input.elapsed_seconds,
+                    lighting_settings: input.settings.lighting,
+                    rt_settings: input.settings.rt,
+                    ucvh_ready: self.ucvh_uploaded,
+                    ucvh: input.ucvh.as_deref(),
+                    ucvh_gpu: self.ucvh_gpu.as_ref(),
+                    external_history_reset_generation: self
+                        .rt_history_reset_generation
+                        .max(as_rebuild_generation),
+                },
+            )?,
+            RenderBackend::Vpt => self.vpt_pipeline.record_and_execute_frame(
+                &self.renderer,
+                &frame,
+                #[cfg(not(target_os = "android"))]
+                self.egui_renderer.as_mut(),
+                #[cfg(not(target_os = "android"))]
+                input.egui_frame.as_ref(),
+                VptFrameInputs {
+                    scene_ubo,
+                    camera: input.camera,
+                    sun_direction: input.sun_direction,
+                    sun_intensity: input.sun_intensity,
+                    elapsed_seconds: input.elapsed_seconds,
+                    lighting_settings: input.settings.lighting,
+                    restir_di_settings: input.settings.restir_di,
+                    area_restir_settings: input.settings.area_restir,
+                    restir_di_enabled: input.restir_di_enabled,
+                    area_restir_enabled: input.area_restir_enabled,
+                    ucvh_ready: self.ucvh_uploaded,
+                    ucvh_frame_changes,
+                    ucvh_motion_event_count,
+                    capture: self.capture.as_mut(),
+                    profiler: self.gpu_profiler.as_ref(),
+                },
+            )?,
+        };
         let frame_slot = frame.frame_slot;
         let submitted_fence = record_result.submitted_fence;
         let traversal_stats_requested = record_result.traversal_stats_requested;
@@ -425,6 +520,12 @@ impl Drop for RenderRuntime {
         if let Some(egui_renderer) = self.egui_renderer.take() {
             egui_renderer.destroy(self.renderer.device(), self.renderer.allocator());
         }
+        let rt_pipeline = std::mem::take(&mut self.rt_pipeline);
+        rt_pipeline.destroy(
+            self.renderer.device(),
+            self.renderer.allocator(),
+            self.renderer.acceleration_structure_loader(),
+        );
         let vpt_pipeline = std::mem::take(&mut self.vpt_pipeline);
         vpt_pipeline.destroy(self.renderer.device(), self.renderer.allocator());
         if let Some(gpu) = self.ucvh_gpu.take() {
@@ -439,6 +540,8 @@ impl Drop for RenderRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::render::rt_capabilities::{RenderBackend, resolve_render_backend};
+    use crate::render::rt_settings::{RtDebugView, RtSettings};
     use crate::voxel::brick::VoxelCell;
     use crate::voxel::ucvh::{UcvhConfig, UcvhMotionEvent};
 
@@ -514,6 +617,40 @@ mod tests {
         }
         assert!(source.contains(".render_frame("));
         assert!(source.contains(".resize("));
+    }
+
+    #[test]
+    fn rt_settings_parse_valid_overrides() {
+        let parsed = RtSettings::from_values(
+            Some("on"),
+            Some("off"),
+            Some("true"),
+            Some("32"),
+            Some("0.85"),
+            Some("0.02"),
+            Some("surface"),
+            Some("off"),
+            Some("4"),
+        );
+
+        assert!(parsed.settings.restir_di_enabled);
+        assert!(!parsed.settings.restir_gi_enabled);
+        assert!(parsed.settings.temporal_denoise_enabled);
+        assert!(!parsed.settings.restir_di_spatial_enabled);
+        assert_eq!(parsed.settings.restir_di_spatial_sample_count, 4);
+        assert_eq!(parsed.settings.history_length, 32);
+        assert_eq!(parsed.settings.normal_threshold, 0.85);
+        assert_eq!(parsed.settings.depth_threshold, 0.02);
+        assert_eq!(parsed.settings.debug_view, RtDebugView::Surface);
+        assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn runtime_resolves_rt_to_vpt_when_hardware_support_is_missing() {
+        assert_eq!(
+            resolve_render_backend(crate::render::scene_ubo::RenderMode::Rt, false),
+            RenderBackend::Vpt
+        );
     }
 
     #[test]
@@ -632,5 +769,87 @@ mod tests {
             ensure_passes < record_vpt,
             "render_frame must ensure passes with current UI settings before recording so live denoiser/ReSTIR toggles can instantiate their GPU passes"
         );
+    }
+
+    #[test]
+    fn render_runtime_routes_selected_rt_backend_to_rt_pipeline() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let runtime_struct = source
+            .split("pub struct RenderRuntime")
+            .nth(1)
+            .expect("RenderRuntime struct should exist")
+            .split("impl RenderRuntime")
+            .next()
+            .expect("RenderRuntime struct should end before impl");
+        assert!(
+            runtime_struct.contains("rt_pipeline: RtRuntimePipeline"),
+            "RenderRuntime must own the hardware RT pipeline beside the VPT fallback"
+        );
+
+        let ensure_passes = source
+            .split("pub fn ensure_passes(")
+            .nth(1)
+            .expect("RenderRuntime::ensure_passes should exist")
+            .split("pub fn resize(")
+            .next()
+            .expect("ensure_passes should end before resize");
+        assert!(ensure_passes.contains("RenderBackend::Rt"));
+        assert!(ensure_passes.contains("self.rt_pipeline.ensure_passes"));
+
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before helpers");
+        let compact = crate::render::source_checks::compact(render_frame);
+        assert!(compact.contains("matchself.render_backend{"));
+        assert!(compact.contains("RenderBackend::Rt=>self.rt_pipeline.record_and_execute_frame("));
+        assert!(
+            compact.contains("RenderBackend::Vpt=>self.vpt_pipeline.record_and_execute_frame(")
+        );
+    }
+
+    #[test]
+    fn render_runtime_passes_ucvh_gpu_resources_to_rt_pipeline() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+
+        let ensure_passes = source
+            .split("pub fn ensure_passes(")
+            .nth(1)
+            .expect("RenderRuntime::ensure_passes should exist")
+            .split("pub fn resize(")
+            .next()
+            .expect("ensure_passes should end before resize");
+        let ensure_compact = crate::render::source_checks::compact(ensure_passes);
+        assert!(
+            ensure_compact.contains(
+                "self.rt_pipeline.ensure_passes(&self.renderer,scene_ubo,ucvh,self.ucvh_gpu.as_ref(),settings.rt,"
+            ),
+            "RT pass creation must receive CPU UCVH, GPU UCVH resources, and RT settings"
+        );
+
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before helpers");
+        let compact = crate::render::source_checks::compact(render_frame);
+        assert!(
+            compact.contains("ucvh_gpu:self.ucvh_gpu.as_ref()"),
+            "RT frame inputs must receive GPU UCVH resources for descriptor refresh"
+        );
+    }
+
+    #[test]
+    fn runtime_resets_rt_history_when_backend_or_scene_generation_changes() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+
+        assert!(source.contains("history_reset_generation"));
+        assert!(source.contains("as_rebuild_generation"));
+        assert!(source.contains("rt_history_reset_generation"));
     }
 }

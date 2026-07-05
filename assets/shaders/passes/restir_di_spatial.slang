@@ -112,7 +112,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
     );
     float selected_target_pdf = center_target_pdf;
 
-    uint rng_state = hash_u32(index * 1973u ^ restir.frame_index * 9277u);
+    uint rng_state = hash_u32(index * 1973u);
     uint offset_rotation = hash_u32(index) & 7u;
     for (uint sample = 0u; sample < min(restir.spatial_sample_count, 8u); sample++) {
         if (combined_m >= spatial_m_limit) {

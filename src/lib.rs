@@ -5,6 +5,7 @@ use winit::platform::android::activity::AndroidApp;
 
 pub mod app;
 pub mod assets;
+pub mod build_support;
 pub mod ecs;
 #[cfg(not(target_os = "android"))]
 pub mod editor;

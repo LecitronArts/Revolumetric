@@ -25,6 +25,7 @@ pub enum QueueType {
     Graphics,
     Compute,
     Transfer,
+    RayTracing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +34,12 @@ pub enum AccessKind {
     ComputeShaderRead,
     ComputeShaderReadWrite,
     ComputeShaderWrite,
+    RayTracingShaderRead,
+    RayTracingShaderReadWrite,
+    RayTracingShaderWrite,
+    AccelerationStructureBuildRead,
+    AccelerationStructureBuildReadWrite,
+    AccelerationStructureBuildWrite,
     TransferRead,
     TransferWrite,
     ColorAttachmentWrite,
@@ -56,6 +63,14 @@ impl AccessKind {
             Self::ComputeShaderRead | Self::ComputeShaderReadWrite | Self::ComputeShaderWrite => {
                 vk::PipelineStageFlags::COMPUTE_SHADER
             }
+            Self::RayTracingShaderRead
+            | Self::RayTracingShaderReadWrite
+            | Self::RayTracingShaderWrite => vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            Self::AccelerationStructureBuildRead
+            | Self::AccelerationStructureBuildReadWrite
+            | Self::AccelerationStructureBuildWrite => {
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+            }
             Self::TransferRead | Self::TransferWrite => vk::PipelineStageFlags::TRANSFER,
             Self::ColorAttachmentWrite => vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
             Self::Present => vk::PipelineStageFlags::BOTTOM_OF_PIPE,
@@ -70,6 +85,21 @@ impl AccessKind {
                 vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
             }
             Self::ComputeShaderWrite => vk::AccessFlags::SHADER_WRITE,
+            Self::RayTracingShaderRead => vk::AccessFlags::SHADER_READ,
+            Self::RayTracingShaderReadWrite => {
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE
+            }
+            Self::RayTracingShaderWrite => vk::AccessFlags::SHADER_WRITE,
+            Self::AccelerationStructureBuildRead => {
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+            }
+            Self::AccelerationStructureBuildReadWrite => {
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                    | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
+            }
+            Self::AccelerationStructureBuildWrite => {
+                vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR
+            }
             Self::TransferRead => vk::AccessFlags::TRANSFER_READ,
             Self::TransferWrite => vk::AccessFlags::TRANSFER_WRITE,
             Self::ColorAttachmentWrite => vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
@@ -83,11 +113,44 @@ impl AccessKind {
             Self::ComputeShaderRead | Self::ComputeShaderReadWrite | Self::ComputeShaderWrite => {
                 vk::ImageLayout::GENERAL
             }
+            Self::RayTracingShaderRead
+            | Self::RayTracingShaderReadWrite
+            | Self::RayTracingShaderWrite
+            | Self::AccelerationStructureBuildRead
+            | Self::AccelerationStructureBuildReadWrite
+            | Self::AccelerationStructureBuildWrite => vk::ImageLayout::GENERAL,
             Self::TransferRead => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             Self::TransferWrite => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             Self::ColorAttachmentWrite => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             Self::Present => vk::ImageLayout::PRESENT_SRC_KHR,
         }
+    }
+
+    pub fn is_read_write(self) -> bool {
+        matches!(
+            self,
+            Self::ComputeShaderReadWrite
+                | Self::RayTracingShaderReadWrite
+                | Self::AccelerationStructureBuildReadWrite
+        )
+    }
+
+    pub fn is_ray_tracing_shader(self) -> bool {
+        matches!(
+            self,
+            Self::RayTracingShaderRead
+                | Self::RayTracingShaderReadWrite
+                | Self::RayTracingShaderWrite
+        )
+    }
+
+    pub fn is_acceleration_structure_build(self) -> bool {
+        matches!(
+            self,
+            Self::AccelerationStructureBuildRead
+                | Self::AccelerationStructureBuildReadWrite
+                | Self::AccelerationStructureBuildWrite
+        )
     }
 }
 
@@ -205,5 +268,56 @@ mod tests {
 
         assert_eq!(binding.resource_id, 12);
         assert_eq!(binding.slot_index, 3);
+    }
+
+    #[test]
+    fn access_kind_maps_rt_and_acceleration_structure_accesses_to_vulkan_barrier_fields() {
+        let cases = [
+            (
+                AccessKind::RayTracingShaderRead,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags::SHADER_READ,
+                vk::ImageLayout::GENERAL,
+            ),
+            (
+                AccessKind::RayTracingShaderReadWrite,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                vk::ImageLayout::GENERAL,
+            ),
+            (
+                AccessKind::RayTracingShaderWrite,
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+                vk::AccessFlags::SHADER_WRITE,
+                vk::ImageLayout::GENERAL,
+            ),
+            (
+                AccessKind::AccelerationStructureBuildRead,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR,
+                vk::ImageLayout::GENERAL,
+            ),
+            (
+                AccessKind::AccelerationStructureBuildReadWrite,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags::ACCELERATION_STRUCTURE_READ_KHR
+                    | vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                vk::ImageLayout::GENERAL,
+            ),
+            (
+                AccessKind::AccelerationStructureBuildWrite,
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR,
+                vk::AccessFlags::ACCELERATION_STRUCTURE_WRITE_KHR,
+                vk::ImageLayout::GENERAL,
+            ),
+        ];
+
+        for (kind, stage, access, layout) in cases {
+            assert_eq!(kind.stage_flags(), stage);
+            assert_eq!(kind.access_flags(), access);
+            assert_eq!(kind.image_layout(), layout);
+        }
+        assert!(AccessKind::RayTracingShaderRead.is_ray_tracing_shader());
+        assert!(AccessKind::AccelerationStructureBuildWrite.is_acceleration_structure_build());
     }
 }

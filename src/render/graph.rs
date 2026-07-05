@@ -798,7 +798,20 @@ impl<'a> RenderGraph<'a> {
             AccessKind::Undefined | AccessKind::Present => vk::ImageUsageFlags::empty(),
             AccessKind::ComputeShaderRead
             | AccessKind::ComputeShaderReadWrite
-            | AccessKind::ComputeShaderWrite => vk::ImageUsageFlags::STORAGE,
+            | AccessKind::ComputeShaderWrite
+            | AccessKind::RayTracingShaderRead
+            | AccessKind::RayTracingShaderReadWrite
+            | AccessKind::RayTracingShaderWrite => vk::ImageUsageFlags::STORAGE,
+            AccessKind::AccelerationStructureBuildRead
+            | AccessKind::AccelerationStructureBuildReadWrite
+            | AccessKind::AccelerationStructureBuildWrite => {
+                return Err(anyhow!(
+                    "pass '{}' resource id {} access {:?} cannot target an image resource",
+                    pass_name,
+                    access.handle.id,
+                    access.kind
+                ));
+            }
             AccessKind::TransferRead => vk::ImageUsageFlags::TRANSFER_SRC,
             AccessKind::TransferWrite => vk::ImageUsageFlags::TRANSFER_DST,
             AccessKind::ColorAttachmentWrite => vk::ImageUsageFlags::COLOR_ATTACHMENT,
@@ -834,6 +847,22 @@ impl<'a> RenderGraph<'a> {
             AccessKind::ComputeShaderReadWrite | AccessKind::ComputeShaderWrite => {
                 vk::BufferUsageFlags::STORAGE_BUFFER
             }
+            AccessKind::RayTracingShaderRead => {
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER
+            }
+            AccessKind::RayTracingShaderReadWrite | AccessKind::RayTracingShaderWrite => {
+                vk::BufferUsageFlags::STORAGE_BUFFER
+            }
+            AccessKind::AccelerationStructureBuildRead => {
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+            }
+            AccessKind::AccelerationStructureBuildReadWrite => {
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_KHR
+                    | vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+            }
+            AccessKind::AccelerationStructureBuildWrite => {
+                vk::BufferUsageFlags::ACCELERATION_STRUCTURE_STORAGE_KHR
+            }
             AccessKind::TransferRead => vk::BufferUsageFlags::TRANSFER_SRC,
             AccessKind::TransferWrite => vk::BufferUsageFlags::TRANSFER_DST,
             AccessKind::ColorAttachmentWrite => vk::BufferUsageFlags::empty(),
@@ -855,13 +884,10 @@ impl<'a> RenderGraph<'a> {
         let mut latest_version: BTreeMap<u32, u32> = BTreeMap::new();
         for pass in &self.passes {
             for read in &pass.decl.reads {
-                let current = latest_version
-                    .get(&read.id)
-                    .copied()
-                    .unwrap_or(read.version);
-                if read.version < current {
+                let current = latest_version.get(&read.id).copied().unwrap_or(0);
+                if read.version != current {
                     return Err(anyhow!(
-                        "pass '{}' reads stale resource version {} for id {}; latest version is {}",
+                        "pass '{}' reads resource version {} for id {}; current version is {}",
                         pass.decl.name,
                         read.version,
                         read.id,
@@ -1183,8 +1209,8 @@ impl Default for RenderGraph<'_> {
 mod tests {
     use super::*;
     use crate::render::resource::{
-        AccessKind, QueueType, ResourceDesc, ResourceOrigin, TransientAliasCandidate,
-        TransientResourceBinding,
+        AccessKind, QueueType, ResourceDesc, ResourceHandle, ResourceOrigin,
+        TransientAliasCandidate, TransientResourceBinding,
     };
     use ash::vk::Handle;
 
@@ -1245,6 +1271,36 @@ mod tests {
         // Producer should come before consumer in sorted_order
         assert_eq!(graph.sorted_order[0], 0); // producer
         assert_eq!(graph.sorted_order[1], 1); // consumer
+    }
+
+    #[test]
+    fn rendergraph_rejects_future_version_reads() {
+        let mut graph = RenderGraph::new();
+        let imported = graph.import_image_with_access(
+            fake_image(1),
+            64,
+            64,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::Undefined,
+        );
+
+        graph.add_pass("future_reader", QueueType::Compute, move |builder| {
+            builder.read_as(
+                ResourceHandle {
+                    id: imported.id,
+                    version: 1,
+                },
+                AccessKind::ComputeShaderRead,
+            );
+            Box::new(|_ctx| {})
+        });
+
+        let error = graph.compile().unwrap_err().to_string();
+        assert!(
+            error.contains("reads resource version 1"),
+            "future-version reads must be rejected, got: {error}"
+        );
     }
 
     #[test]
@@ -2204,6 +2260,32 @@ mod tests {
     }
 
     #[test]
+    fn compile_plans_ray_tracing_barriers_between_trace_and_temporal_passes() {
+        let mut graph = RenderGraph::new();
+        let image = graph.import_image_with_access(
+            fake_image(115),
+            128,
+            128,
+            vk::Format::R16G16B16A16_SFLOAT,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::RayTracingShaderWrite,
+        );
+
+        graph.add_pass("rt_temporal", QueueType::RayTracing, |builder| {
+            builder.read_as(image, AccessKind::RayTracingShaderRead);
+            Box::new(|_ctx| {})
+        });
+        graph.bind_image(image, fake_image(115));
+
+        graph.compile().unwrap();
+        let barriers = graph.barrier_plan();
+        assert_eq!(barriers.len(), 1);
+        assert_eq!(barriers[0].resource, image);
+        assert_eq!(barriers[0].from, AccessKind::RayTracingShaderWrite);
+        assert_eq!(barriers[0].to, AccessKind::RayTracingShaderRead);
+    }
+
+    #[test]
     fn read_old_version_before_write_new_version_keeps_submission_order() {
         let mut graph = RenderGraph::new();
         let image = graph.import_image_with_access(
@@ -2256,7 +2338,37 @@ mod tests {
         });
 
         let error = graph.compile().unwrap_err();
-        assert!(error.to_string().contains("stale resource version"));
+        assert!(
+            error.to_string().contains("reads resource version 0"),
+            "expected stale-version read rejection, got: {error}"
+        );
+    }
+
+    #[test]
+    fn compile_rejects_stale_version_write_after_newer_write() {
+        let mut graph = RenderGraph::new();
+        let image = graph.import_image_with_access(
+            fake_image(111),
+            64,
+            64,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::STORAGE,
+            AccessKind::ComputeShaderRead,
+        );
+
+        graph.add_pass("write_twice", QueueType::Compute, |builder| {
+            builder.write_as(image, AccessKind::ComputeShaderWrite);
+            builder.write_as(image, AccessKind::ComputeShaderWrite);
+            Box::new(|_ctx| {})
+        });
+
+        let error = graph.compile().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("writes stale resource version 1"),
+            "expected stale-version write rejection, got: {error}"
+        );
     }
 
     #[test]

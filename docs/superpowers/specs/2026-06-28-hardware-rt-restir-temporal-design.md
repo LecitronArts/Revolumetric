@@ -14,10 +14,10 @@ The target end state is:
 
 ## Current Facts
 
-- The repository is currently VPT-only in active runtime docs and code.
-- `src/render/device.rs` enables swapchain, buffer device address, compute shader derivatives, and dynamic rendering, but not ray tracing pipeline or acceleration structure extensions.
-- Existing code already has render graph, pass wrappers, settings parsing, history state, and ReSTIR-related research scaffolding.
-- Current ReSTIR-DI, Area ReSTIR, and VPT temporal docs are useful references for settings and history conventions, but they are not a hardware RT backend.
+- The default runtime path is `auto`: RT-capable devices use the hardware RT backend, while unsupported devices use VPT fallback. `REVOLUMETRIC_RENDER_MODE=vpt` still forces VPT, and `REVOLUMETRIC_RENDER_MODE=rt` explicitly requests RT with VPT fallback when unavailable.
+- `src/render/device.rs` now probes the ray tracing pipeline and acceleration structure support required by the RT backend while preserving VPT fallback behavior.
+- Existing render graph, pass wrappers, settings parsing, history state, and ReSTIR-related scaffolding are still shared references for the RT path.
+- RT ReSTIR-DI and RT ReSTIR-GI are distinct hardware RT backend passes; VPT ReSTIR-DI and Area ReSTIR remain separate VPT features.
 
 ## Scope Boundary
 
@@ -49,6 +49,8 @@ Use a staged rollout, not a single leap:
 3. ReSTIR-GI on the same RT backend.
 4. Optional spatial ReSTIR reuse only after temporal history and lighting are stable.
 
+Current implementation note: RT ReSTIR-DI spatial reuse is present as an opt-in setting and remains disabled by default. RT ReSTIR-GI currently uses temporal reuse only.
+
 Reasoning:
 
 - The backend risk and algorithm risk should not be mixed in the same release step.
@@ -69,6 +71,8 @@ Recommended shape:
 - Rebuild only dirty bricks or dirty regions when UCVH changes.
 - Use ray tracing pipeline shaders for primary visibility, direct-light visibility, and indirect path evaluation.
 - Keep brick-local material lookup and any fine voxel logic in shader code.
+
+Current implementation note: the RT scene backend keeps a cached occupied-brick AABB list and, after the initial full scan, resamples only UCVH invalidation regions before deciding whether the AS geometry changed. If the occupied-brick AABB set changes but the BLAS primitive count and TLAS instance count still match, the GPU path rewrites the host-visible AABB input buffer and records BLAS/TLAS `UPDATE` builds against the existing acceleration-structure resources. If the counts change or the scene becomes empty, it falls back to full resource rebuild or resource clearing.
 
 ### 2. Render Modes
 
@@ -128,7 +132,7 @@ Minimum viable behavior:
 - reuse reservoirs temporally
 - resolve direct lighting in the final lighting pass
 
-Spatial reuse is intentionally deferred until temporal behavior is stable.
+Spatial reuse should remain opt-in and disabled by default until temporal behavior is stable.
 
 ### ReSTIR-GI
 
@@ -159,7 +163,7 @@ Recommended resources:
 
 Recommended settings:
 
-- `REVOLUMETRIC_RENDER_MODE=rt|vpt`
+- `REVOLUMETRIC_RENDER_MODE=auto|rt|vpt`
 - `REVOLUMETRIC_RT_RESTIR_DI=on|off`
 - `REVOLUMETRIC_RT_RESTIR_GI=on|off`
 - `REVOLUMETRIC_RT_TEMPORAL_DENOISE=on|off`
@@ -202,4 +206,3 @@ Additional verification:
 - ReSTIR-DI paper: https://research.nvidia.com/labs/rtr/publication/bitterli2020spatiotemporal/
 - ReSTIR-GI paper: https://research.nvidia.com/publication/2021-06_restir-gi-path-resampling-real-time-path-tracing
 - Shader Execution Reordering overview: https://developer.nvidia.com/rtx-kit
-

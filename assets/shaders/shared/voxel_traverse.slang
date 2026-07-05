@@ -12,7 +12,6 @@
 #include "voxel_common.slang"
 
 static const float DDA_TIE_EPSILON = 1.0e-6;
-static const float DDA_GRID_BOUNDARY_EPSILON = 1.0e-5;
 static const uint VOXEL_TRAVERSAL_NO_SKIP_BRICK = 0xffffffffu;
 static const uint VPT_TRAVERSAL_STAT_PRIMARY_RAYS = 0u;
 static const uint VPT_TRAVERSAL_STAT_SHADOW_RAYS = 1u;
@@ -41,6 +40,24 @@ float dda_next_t(float3 t_max) {
     return min(t_max.x, min(t_max.y, t_max.z));
 }
 
+float dda_next_up(float value) {
+    return nextafter(value, value + 1.0);
+}
+
+float dda_next_down(float value) {
+    return nextafter(value, value - 1.0);
+}
+
+float dda_boundary_ulp(float position, int step_dir) {
+    if (step_dir > 0) {
+        return dda_next_up(position) - position;
+    }
+    if (step_dir < 0) {
+        return position - dda_next_down(position);
+    }
+    return 0.0;
+}
+
 bool dda_axis_is_tied(float axis_t, float next_t) {
     return abs(axis_t - next_t) <= DDA_TIE_EPSILON * max(abs(next_t), 1.0);
 }
@@ -51,8 +68,8 @@ float dda_adjust_boundary_position(float position, int step_dir) {
     }
 
     float nearest_boundary = round(position);
-    if (abs(position - nearest_boundary) <= DDA_GRID_BOUNDARY_EPSILON) {
-        return position + float(step_dir) * DDA_GRID_BOUNDARY_EPSILON;
+    if (abs(position - nearest_boundary) <= dda_boundary_ulp(nearest_boundary, step_dir)) {
+        return step_dir > 0 ? dda_next_up(position) : dda_next_down(position);
     }
     return position;
 }
@@ -176,7 +193,7 @@ void reset_brick_dda_at_t(
     inout float current_t,
     float target_t
 ) {
-    float reset_t = target_t + DDA_GRID_BOUNDARY_EPSILON;
+    float reset_t = dda_next_up(target_t);
     current_t = reset_t;
     float3 reset_pos = ray.origin + ray.direction * reset_t;
     brick_coord = dda_start_coord3(reset_pos / 8.0, step_dir, igrid - int3(1));
@@ -438,7 +455,7 @@ HitResult trace_primary_ray(
     // Max brick steps: grid diagonal
     int max_steps = igrid.x + igrid.y + igrid.z;
     float current_t = t_enter;
-    for (int i = 0; i < max_steps && i < 256; i++) {
+    for (int i = 0; i < max_steps; i++) {
         if (any(brick_coord < int3(0)) || any(brick_coord >= igrid))
             break;
 
@@ -562,7 +579,7 @@ bool trace_any_hit_ray_skip_voxel(
 
     int max_steps = igrid.x + igrid.y + igrid.z;
     float current_t = t_enter;
-    for (int i = 0; i < max_steps && i < 256 && current_t < max_t; i++) {
+    for (int i = 0; i < max_steps && current_t < max_t; i++) {
         if (any(brick_coord < int3(0)) || any(brick_coord >= igrid)) {
             break;
         }

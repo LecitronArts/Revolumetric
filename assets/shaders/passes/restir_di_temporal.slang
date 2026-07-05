@@ -165,7 +165,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             );
             float combined_weight_sum = current_weight + history_weight;
 
-            uint rng_state = hash_u32(index * 1973u ^ restir.frame_index * 9277u);
+            uint rng_state = hash_u32(index * 1973u);
             if (history_weight > 0.0
                 && rand01(rng_state) * max(combined_weight_sum, 1.0e-4) <= history_weight) {
                 reservoir = history_reservoir;

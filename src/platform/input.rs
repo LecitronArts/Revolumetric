@@ -27,6 +27,12 @@ impl InputState {
         self.move_right = 0.0;
         self.move_up = 0.0;
     }
+
+    pub fn clear_for_focus_loss(&mut self) {
+        self.reset_axes();
+        self.clear_per_frame();
+        self.right_mouse_held = false;
+    }
 }
 
 #[cfg(test)]
@@ -79,5 +85,26 @@ mod tests {
         assert_eq!(state.move_right, 0.0);
         assert_eq!(state.move_up, 0.0);
         assert_eq!(state.mouse_dx, 10.0); // not cleared
+    }
+
+    #[test]
+    fn clear_for_focus_loss_clears_axes_and_per_frame_state() {
+        let mut state = InputState {
+            move_forward: 1.0,
+            move_right: -1.0,
+            move_up: 1.0,
+            mouse_dx: 10.0,
+            mouse_dy: -5.0,
+            right_mouse_held: true,
+            scroll_delta: 2.0,
+        };
+        state.clear_for_focus_loss();
+        assert_eq!(state.move_forward, 0.0);
+        assert_eq!(state.move_right, 0.0);
+        assert_eq!(state.move_up, 0.0);
+        assert_eq!(state.mouse_dx, 0.0);
+        assert_eq!(state.mouse_dy, 0.0);
+        assert_eq!(state.scroll_delta, 0.0);
+        assert!(!state.right_mouse_held);
     }
 }

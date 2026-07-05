@@ -6,9 +6,9 @@ use std::os::raw::c_char;
 use std::ptr::NonNull;
 
 #[cfg(feature = "nrd")]
-use crate::render::nrd_sys;
+use revolumetric_nrd_sys as nrd_sys;
 
-pub use crate::render::nrd_sys::{
+pub use revolumetric_nrd_sys::{
     NrdCommonSettings, NrdDescriptorType, NrdDispatchDesc, NrdInstanceDesc, NrdLibraryDesc,
     NrdNormalEncoding, NrdPipelineDesc, NrdReblurDiffuseSettings, NrdReblurHitDistanceParameters,
     NrdRelaxDiffuseSettings, NrdResourceDesc, NrdResourceRangeDesc, NrdResourceType,
@@ -89,8 +89,12 @@ impl std::error::Error for NrdUnavailableError {}
 
 pub type NrdResult<T> = Result<T, NrdUnavailableError>;
 
-impl NrdTextureDesc {
-    pub fn image_desc(self) -> NrdResult<NrdTextureImageDesc> {
+pub trait NrdTextureDescExt {
+    fn image_desc(self) -> NrdResult<NrdTextureImageDesc>;
+}
+
+impl NrdTextureDescExt for NrdTextureDesc {
+    fn image_desc(self) -> NrdResult<NrdTextureImageDesc> {
         Ok(NrdTextureImageDesc {
             format: nrd_texture_format_to_vk(self.format)?,
             downsample_factor: self.downsample_factor,
@@ -98,8 +102,12 @@ impl NrdTextureDesc {
     }
 }
 
-impl NrdResourceDesc {
-    pub fn binding_desc(self) -> NrdResult<NrdResourceBindingDesc> {
+pub trait NrdResourceDescExt {
+    fn binding_desc(self) -> NrdResult<NrdResourceBindingDesc>;
+}
+
+impl NrdResourceDescExt for NrdResourceDesc {
+    fn binding_desc(self) -> NrdResult<NrdResourceBindingDesc> {
         Ok(NrdResourceBindingDesc {
             descriptor_type: nrd_descriptor_type_from_abi(self.descriptor_type)?,
             resource_type: nrd_resource_type_from_abi(self.resource_type)?,
@@ -108,8 +116,12 @@ impl NrdResourceDesc {
     }
 }
 
-impl NrdResourceRangeDesc {
-    pub fn binding_desc(self) -> NrdResult<NrdResourceRangeBindingDesc> {
+pub trait NrdResourceRangeDescExt {
+    fn binding_desc(self) -> NrdResult<NrdResourceRangeBindingDesc>;
+}
+
+impl NrdResourceRangeDescExt for NrdResourceRangeDesc {
+    fn binding_desc(self) -> NrdResult<NrdResourceRangeBindingDesc> {
         Ok(NrdResourceRangeBindingDesc {
             descriptor_type: nrd_descriptor_type_from_abi(self.descriptor_type)?,
             descriptors_num: self.descriptors_num,

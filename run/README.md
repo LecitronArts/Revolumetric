@@ -20,7 +20,7 @@ run/
       ShaderMakeBlob.lib  # needed by official static NRD builds
 ```
 
-When building with `--features nrd`, `build.rs` uses this order:
+When building with `--features nrd`, `crates/revolumetric-nrd-sys/build.rs` uses this order:
 
 1. `REVOLUMETRIC_NRD_ROOT`, if set.
 2. `run/nrd`, if the environment variable is unset.

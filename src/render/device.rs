@@ -7,6 +7,7 @@ use winit::window::Window;
 
 use crate::render::allocator::GpuAllocator;
 use crate::render::frame::{FrameCompletion, FrameContext};
+use crate::render::rt_capabilities::{RtCapabilities, probe_rt_capabilities};
 use crate::render::swapchain::{SwapchainManager, SwapchainSupport};
 
 // ash 0.38 is generated from Vulkan 1.3.281 and only exposes the older NV
@@ -20,6 +21,192 @@ struct FrameResources {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     in_flight_fence: vk::Fence,
+}
+
+struct RenderDeviceConstructionCleanup {
+    instance: Option<Instance>,
+    surface_loader: Option<ash::khr::surface::Instance>,
+    surface: Option<vk::SurfaceKHR>,
+    device: Option<Device>,
+    swapchain_loader: Option<ash::khr::swapchain::Device>,
+    swapchain: Option<SwapchainManager>,
+}
+
+impl RenderDeviceConstructionCleanup {
+    fn new(
+        instance: Instance,
+        surface_loader: ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+    ) -> Self {
+        Self {
+            instance: Some(instance),
+            surface_loader: Some(surface_loader),
+            surface: Some(surface),
+            device: None,
+            swapchain_loader: None,
+            swapchain: None,
+        }
+    }
+
+    fn instance(&self) -> &Instance {
+        self.instance
+            .as_ref()
+            .expect("RenderDevice construction instance should exist")
+    }
+
+    fn surface_loader(&self) -> &ash::khr::surface::Instance {
+        self.surface_loader
+            .as_ref()
+            .expect("RenderDevice construction surface loader should exist")
+    }
+
+    fn surface(&self) -> vk::SurfaceKHR {
+        self.surface
+            .expect("RenderDevice construction surface should exist")
+    }
+
+    fn device(&self) -> &Device {
+        self.device
+            .as_ref()
+            .expect("RenderDevice construction device should exist")
+    }
+
+    fn swapchain_loader(&self) -> &ash::khr::swapchain::Device {
+        self.swapchain_loader
+            .as_ref()
+            .expect("RenderDevice construction swapchain loader should exist")
+    }
+
+    fn swapchain(&self) -> &SwapchainManager {
+        self.swapchain
+            .as_ref()
+            .expect("RenderDevice construction swapchain should exist")
+    }
+
+    fn set_device(&mut self, device: Device) {
+        self.device = Some(device);
+    }
+
+    fn set_swapchain_loader(&mut self, swapchain_loader: ash::khr::swapchain::Device) {
+        self.swapchain_loader = Some(swapchain_loader);
+    }
+
+    fn set_swapchain(&mut self, swapchain: SwapchainManager) {
+        self.swapchain = Some(swapchain);
+    }
+
+    fn finish(
+        mut self,
+    ) -> (
+        Instance,
+        ash::khr::surface::Instance,
+        vk::SurfaceKHR,
+        Device,
+        ash::khr::swapchain::Device,
+        SwapchainManager,
+    ) {
+        (
+            self.instance.take().expect("RenderDevice instance missing"),
+            self.surface_loader
+                .take()
+                .expect("RenderDevice surface loader missing"),
+            self.surface.take().expect("RenderDevice surface missing"),
+            self.device.take().expect("RenderDevice device missing"),
+            self.swapchain_loader
+                .take()
+                .expect("RenderDevice swapchain loader missing"),
+            self.swapchain
+                .take()
+                .expect("RenderDevice swapchain missing"),
+        )
+    }
+}
+
+impl Drop for RenderDeviceConstructionCleanup {
+    fn drop(&mut self) {
+        unsafe {
+            if let (Some(swapchain), Some(device), Some(swapchain_loader)) = (
+                self.swapchain.as_mut(),
+                self.device.as_ref(),
+                self.swapchain_loader.as_ref(),
+            ) {
+                swapchain.destroy(device, swapchain_loader);
+            }
+            if let Some(device) = self.device.take() {
+                device.destroy_device(None);
+            }
+            if let (Some(surface), Some(surface_loader)) =
+                (self.surface.take(), self.surface_loader.as_ref())
+            {
+                surface_loader.destroy_surface(surface, None);
+            }
+            if let Some(instance) = self.instance.take() {
+                instance.destroy_instance(None);
+            }
+        }
+    }
+}
+
+struct FrameResourcesCreationCleanup<'a> {
+    device: &'a Device,
+    command_pool: Option<vk::CommandPool>,
+    image_available_semaphore: Option<vk::Semaphore>,
+    render_finished_semaphore: Option<vk::Semaphore>,
+    in_flight_fence: Option<vk::Fence>,
+}
+
+impl<'a> FrameResourcesCreationCleanup<'a> {
+    fn new(device: &'a Device) -> Self {
+        Self {
+            device,
+            command_pool: None,
+            image_available_semaphore: None,
+            render_finished_semaphore: None,
+            in_flight_fence: None,
+        }
+    }
+
+    fn set_command_pool(&mut self, command_pool: vk::CommandPool) {
+        self.command_pool = Some(command_pool);
+    }
+
+    fn set_image_available_semaphore(&mut self, semaphore: vk::Semaphore) {
+        self.image_available_semaphore = Some(semaphore);
+    }
+
+    fn set_render_finished_semaphore(&mut self, semaphore: vk::Semaphore) {
+        self.render_finished_semaphore = Some(semaphore);
+    }
+
+    fn set_in_flight_fence(&mut self, fence: vk::Fence) {
+        self.in_flight_fence = Some(fence);
+    }
+
+    fn disarm(&mut self) {
+        self.command_pool = None;
+        self.image_available_semaphore = None;
+        self.render_finished_semaphore = None;
+        self.in_flight_fence = None;
+    }
+}
+
+impl Drop for FrameResourcesCreationCleanup<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(fence) = self.in_flight_fence.take() {
+                self.device.destroy_fence(fence, None);
+            }
+            if let Some(semaphore) = self.render_finished_semaphore.take() {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(semaphore) = self.image_available_semaphore.take() {
+                self.device.destroy_semaphore(semaphore, None);
+            }
+            if let Some(command_pool) = self.command_pool.take() {
+                self.device.destroy_command_pool(command_pool, None);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -64,6 +251,12 @@ pub struct RenderDevice {
     present_queue_family_index: u32,
     physical_device_name: String,
     backend_name: &'static str,
+    rt_capabilities: RtCapabilities,
+    acceleration_structure_loader: Option<ash::khr::acceleration_structure::Device>,
+    ray_tracing_pipeline_loader: Option<ash::khr::ray_tracing_pipeline::Device>,
+    rt_pipeline_properties: vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static>,
+    acceleration_structure_properties:
+        vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static>,
     frame_index: u64,
     current_frame: usize,
     frames: Vec<FrameResources>,
@@ -162,12 +355,21 @@ impl RenderDevice {
             }
         };
 
-        let device_extension_names = [
-            ash::khr::swapchain::NAME.as_ptr(),
-            KHR_COMPUTE_SHADER_DERIVATIVES_NAME.as_ptr(),
-        ];
-        let selection =
-            pick_physical_device(&instance, &surface_loader, surface, &device_extension_names)?;
+        let mut cleanup = RenderDeviceConstructionCleanup::new(instance, surface_loader, surface);
+
+        let device_extension_names = base_device_extension_names();
+        let selection = pick_physical_device(
+            cleanup.instance(),
+            cleanup.surface_loader(),
+            cleanup.surface(),
+            &device_extension_names,
+        )?;
+        let rt_capabilities = probe_rt_capabilities(cleanup.instance(), selection.physical_device);
+        let rt_pipeline_properties =
+            query_rt_pipeline_properties(cleanup.instance(), selection.physical_device);
+        let acceleration_structure_properties =
+            query_acceleration_structure_properties(cleanup.instance(), selection.physical_device);
+        let device_extension_names = device_extension_names_for_capabilities(rt_capabilities);
 
         let queue_family_indices =
             if selection.graphics_queue_family_index == selection.present_queue_family_index {
@@ -189,54 +391,104 @@ impl RenderDevice {
             })
             .collect::<Vec<_>>();
 
-        let mut bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
         let mut compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(true);
         let mut dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
+        let mut acceleration_structure_features =
+            vk::PhysicalDeviceAccelerationStructureFeaturesKHR::default()
+                .acceleration_structure(rt_capabilities.supported());
+        let mut ray_tracing_pipeline_features =
+            vk::PhysicalDeviceRayTracingPipelineFeaturesKHR::default()
+                .ray_tracing_pipeline(rt_capabilities.supported());
 
-        let physical_features =
-            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
+        let physical_features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
 
-        let device_create_info = vk::DeviceCreateInfo::default()
+        let mut device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .enabled_extension_names(&device_extension_names)
             .enabled_features(&physical_features)
             .push_next(&mut dynamic_rendering_features)
             .push_next(&mut compute_derivatives_features)
-            .push_next(&mut bda_features);
+            .push_next(&mut vulkan12_features);
+        if rt_capabilities.supported() {
+            device_create_info = device_create_info
+                .push_next(&mut acceleration_structure_features)
+                .push_next(&mut ray_tracing_pipeline_features);
+        }
 
-        let device =
-            unsafe { instance.create_device(selection.physical_device, &device_create_info, None) }
-                .context("failed to create logical Vulkan device")?;
+        let device = unsafe {
+            cleanup
+                .instance()
+                .create_device(selection.physical_device, &device_create_info, None)
+        }
+        .context("failed to create logical Vulkan device")?;
+        cleanup.set_device(device);
 
-        let allocator = GpuAllocator::new(&instance, &device, selection.physical_device)?;
+        let allocator = GpuAllocator::new(
+            cleanup.instance(),
+            cleanup.device(),
+            selection.physical_device,
+        )?;
 
-        let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-        let graphics_queue =
-            unsafe { device.get_device_queue(selection.graphics_queue_family_index, 0) };
-        let present_queue =
-            unsafe { device.get_device_queue(selection.present_queue_family_index, 0) };
-        let swapchain_support =
-            query_swapchain_support(&surface_loader, surface, selection.physical_device)?;
+        let swapchain_loader =
+            ash::khr::swapchain::Device::new(cleanup.instance(), cleanup.device());
+        cleanup.set_swapchain_loader(swapchain_loader);
+        let graphics_queue = unsafe {
+            cleanup
+                .device()
+                .get_device_queue(selection.graphics_queue_family_index, 0)
+        };
+        let present_queue = unsafe {
+            cleanup
+                .device()
+                .get_device_queue(selection.present_queue_family_index, 0)
+        };
+        let swapchain_support = query_swapchain_support(
+            cleanup.surface_loader(),
+            cleanup.surface(),
+            selection.physical_device,
+        )?;
         let swapchain = SwapchainManager::new(
-            &device,
-            &swapchain_loader,
-            surface,
+            cleanup.device(),
+            cleanup.swapchain_loader(),
+            cleanup.surface(),
             &swapchain_support,
             selection.graphics_queue_family_index,
             selection.present_queue_family_index,
             desired_width,
             desired_height,
         )?;
+        cleanup.set_swapchain(swapchain);
 
         let frames = create_frame_resources(
-            &device,
+            cleanup.device(),
             selection.graphics_queue_family_index,
-            swapchain.images.len(),
+            cleanup.swapchain().images.len(),
         )?;
+
+        let (instance, surface_loader, surface, device, swapchain_loader, swapchain) =
+            cleanup.finish();
+        let acceleration_structure_loader = if rt_capabilities.supported() {
+            Some(ash::khr::acceleration_structure::Device::new(
+                &instance, &device,
+            ))
+        } else {
+            None
+        };
+        let ray_tracing_pipeline_loader = if rt_capabilities.supported() {
+            Some(ash::khr::ray_tracing_pipeline::Device::new(
+                &instance, &device,
+            ))
+        } else {
+            None
+        };
 
         Ok(Self {
             _entry: entry,
@@ -253,6 +505,11 @@ impl RenderDevice {
             present_queue_family_index: selection.present_queue_family_index,
             physical_device_name: selection.device_name,
             backend_name: "vulkan-bootstrap",
+            rt_capabilities,
+            acceleration_structure_loader,
+            ray_tracing_pipeline_loader,
+            rt_pipeline_properties,
+            acceleration_structure_properties,
             frame_index: 0,
             current_frame: 0,
             frames,
@@ -482,6 +739,31 @@ impl RenderDevice {
         }
     }
 
+    pub fn wait_for_other_frame_fences(&self, excluded_fence: vk::Fence) -> Result<()> {
+        let fences = self
+            .frames
+            .iter()
+            .map(|frame| frame.in_flight_fence)
+            .filter(|&fence| fence != excluded_fence && fence != vk::Fence::null())
+            .collect::<Vec<_>>();
+        if fences.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            self.device
+                .wait_for_fences(&fences, true, u64::MAX)
+                .context("failed to wait for other Vulkan frame fences")
+        }
+    }
+
+    pub fn wait_idle(&self) -> Result<()> {
+        unsafe {
+            self.device
+                .device_wait_idle()
+                .context("failed to idle Vulkan device")
+        }
+    }
+
     pub fn surface(&self) -> vk::SurfaceKHR {
         self.surface
     }
@@ -521,6 +803,36 @@ impl RenderDevice {
         }
     }
 
+    pub fn rt_capabilities(&self) -> RtCapabilities {
+        self.rt_capabilities
+    }
+
+    pub fn supports_rt(&self) -> bool {
+        self.rt_capabilities.supported()
+    }
+
+    pub fn acceleration_structure_loader(
+        &self,
+    ) -> Option<&ash::khr::acceleration_structure::Device> {
+        self.acceleration_structure_loader.as_ref()
+    }
+
+    pub fn ray_tracing_pipeline_loader(&self) -> Option<&ash::khr::ray_tracing_pipeline::Device> {
+        self.ray_tracing_pipeline_loader.as_ref()
+    }
+
+    pub fn rt_pipeline_properties(
+        &self,
+    ) -> vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static> {
+        self.rt_pipeline_properties
+    }
+
+    pub fn acceleration_structure_properties(
+        &self,
+    ) -> vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static> {
+        self.acceleration_structure_properties
+    }
+
     pub fn graphics_queue_timestamp_valid_bits(&self) -> u32 {
         unsafe {
             self.instance
@@ -551,20 +863,30 @@ fn create_frame_resources(
     queue_family_index: u32,
     count: usize,
 ) -> Result<Vec<FrameResources>> {
-    (0..count)
-        .map(|_| create_single_frame_resources(device, queue_family_index))
-        .collect()
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        match create_single_frame_resources(device, queue_family_index) {
+            Ok(frame) => frames.push(frame),
+            Err(error) => {
+                destroy_frame_resources(device, &mut frames);
+                return Err(error);
+            }
+        }
+    }
+    Ok(frames)
 }
 
 fn create_single_frame_resources(
     device: &Device,
     queue_family_index: u32,
 ) -> Result<FrameResources> {
+    let mut cleanup = FrameResourcesCreationCleanup::new(device);
     let command_pool_info = vk::CommandPoolCreateInfo::default()
         .queue_family_index(queue_family_index)
         .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     let command_pool = unsafe { device.create_command_pool(&command_pool_info, None) }
         .context("failed to create Vulkan command pool")?;
+    cleanup.set_command_pool(command_pool);
 
     let command_buffer_allocate_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(command_pool)
@@ -579,12 +901,16 @@ fn create_single_frame_resources(
     let semaphore_info = vk::SemaphoreCreateInfo::default();
     let image_available_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
         .context("failed to create Vulkan image-available semaphore")?;
+    cleanup.set_image_available_semaphore(image_available_semaphore);
     let render_finished_semaphore = unsafe { device.create_semaphore(&semaphore_info, None) }
         .context("failed to create Vulkan render-finished semaphore")?;
+    cleanup.set_render_finished_semaphore(render_finished_semaphore);
 
     let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
     let in_flight_fence = unsafe { device.create_fence(&fence_info, None) }
         .context("failed to create Vulkan in-flight fence")?;
+    cleanup.set_in_flight_fence(in_flight_fence);
+    cleanup.disarm();
 
     Ok(FrameResources {
         command_pool,
@@ -637,15 +963,15 @@ fn pick_physical_device(
                     )?;
                     let (
                         features,
-                        bda_features,
                         compute_derivatives_features,
                         dynamic_rendering_features,
+                        vulkan12_features,
                     ) = query_required_device_features(instance, physical_device);
                     ensure_required_device_features(
                         &features,
-                        &bda_features,
                         &compute_derivatives_features,
                         &dynamic_rendering_features,
+                        &vulkan12_features,
                     )?;
                     Ok(PhysicalDeviceSelection {
                         physical_device,
@@ -769,44 +1095,88 @@ fn ensure_required_device_extensions(
     Ok(())
 }
 
+fn base_device_extension_names() -> Vec<*const c_char> {
+    vec![
+        ash::khr::swapchain::NAME.as_ptr(),
+        KHR_COMPUTE_SHADER_DERIVATIVES_NAME.as_ptr(),
+    ]
+}
+
+fn device_extension_names_for_capabilities(rt_capabilities: RtCapabilities) -> Vec<*const c_char> {
+    let mut extension_names = base_device_extension_names();
+    if rt_capabilities.supported() {
+        extension_names.extend([
+            ash::khr::deferred_host_operations::NAME.as_ptr(),
+            ash::khr::acceleration_structure::NAME.as_ptr(),
+            ash::khr::ray_tracing_pipeline::NAME.as_ptr(),
+        ]);
+    }
+    extension_names
+}
+
 fn query_required_device_features(
     instance: &Instance,
     physical_device: vk::PhysicalDevice,
 ) -> (
     vk::PhysicalDeviceFeatures,
-    vk::PhysicalDeviceBufferDeviceAddressFeatures<'static>,
     vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV<'static>,
     vk::PhysicalDeviceDynamicRenderingFeatures<'static>,
+    vk::PhysicalDeviceVulkan12Features<'static>,
 ) {
-    let mut bda_features = vk::PhysicalDeviceBufferDeviceAddressFeatures::default();
     let mut compute_derivatives_features =
         vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default();
     let mut dynamic_rendering_features = vk::PhysicalDeviceDynamicRenderingFeatures::default();
+    let mut vulkan12_features = vk::PhysicalDeviceVulkan12Features::default();
     let mut features2 = vk::PhysicalDeviceFeatures2::default()
         .push_next(&mut dynamic_rendering_features)
         .push_next(&mut compute_derivatives_features)
-        .push_next(&mut bda_features);
+        .push_next(&mut vulkan12_features);
     unsafe {
         instance.get_physical_device_features2(physical_device, &mut features2);
     }
     (
         features2.features,
-        bda_features,
         compute_derivatives_features,
         dynamic_rendering_features,
+        vulkan12_features,
     )
+}
+
+fn query_rt_pipeline_properties(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> vk::PhysicalDeviceRayTracingPipelinePropertiesKHR<'static> {
+    let mut rt_pipeline_properties = vk::PhysicalDeviceRayTracingPipelinePropertiesKHR::default();
+    let mut properties2 =
+        vk::PhysicalDeviceProperties2::default().push_next(&mut rt_pipeline_properties);
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties2);
+    }
+    rt_pipeline_properties
+}
+
+fn query_acceleration_structure_properties(
+    instance: &Instance,
+    physical_device: vk::PhysicalDevice,
+) -> vk::PhysicalDeviceAccelerationStructurePropertiesKHR<'static> {
+    let mut acceleration_structure_properties =
+        vk::PhysicalDeviceAccelerationStructurePropertiesKHR::default();
+    let mut properties2 =
+        vk::PhysicalDeviceProperties2::default().push_next(&mut acceleration_structure_properties);
+    unsafe {
+        instance.get_physical_device_properties2(physical_device, &mut properties2);
+    }
+    acceleration_structure_properties
 }
 
 fn ensure_required_device_features(
     features: &vk::PhysicalDeviceFeatures,
-    bda_features: &vk::PhysicalDeviceBufferDeviceAddressFeatures<'_>,
     compute_derivatives_features: &vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV<'_>,
     dynamic_rendering_features: &vk::PhysicalDeviceDynamicRenderingFeatures<'_>,
+    vulkan12_features: &vk::PhysicalDeviceVulkan12Features<'_>,
 ) -> Result<()> {
-    if bda_features.buffer_device_address == vk::FALSE {
-        return Err(anyhow!(
-            "missing required Vulkan feature: bufferDeviceAddress"
-        ));
+    if features.shader_int16 == vk::FALSE {
+        return Err(anyhow!("missing required Vulkan feature: shaderInt16"));
     }
     if features.shader_storage_image_extended_formats == vk::FALSE {
         return Err(anyhow!(
@@ -820,6 +1190,14 @@ fn ensure_required_device_features(
     }
     if dynamic_rendering_features.dynamic_rendering == vk::FALSE {
         return Err(anyhow!("missing required Vulkan feature: dynamicRendering"));
+    }
+    if vulkan12_features.buffer_device_address == vk::FALSE {
+        return Err(anyhow!(
+            "missing required Vulkan feature: bufferDeviceAddress"
+        ));
+    }
+    if vulkan12_features.shader_float16 == vk::FALSE {
+        return Err(anyhow!("missing required Vulkan feature: shaderFloat16"));
     }
     Ok(())
 }
@@ -865,6 +1243,60 @@ mod tests {
     }
 
     #[test]
+    fn frame_resource_creation_cleans_up_partial_success_on_error() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+
+        let frame_resources = source
+            .split("fn create_frame_resources(")
+            .nth(1)
+            .expect("create_frame_resources should exist")
+            .split("fn create_single_frame_resources(")
+            .next()
+            .expect("create_frame_resources should end before create_single_frame_resources");
+        let compact_frames = crate::render::source_checks::compact(frame_resources);
+        assert!(compact_frames.contains("destroy_frame_resources(device,&mutframes);"));
+        assert!(compact_frames.contains("frames.push(frame)"));
+
+        let single_frame_resources = source
+            .split("fn create_single_frame_resources(")
+            .nth(1)
+            .expect("create_single_frame_resources should exist")
+            .split("fn destroy_frame_resources(")
+            .next()
+            .expect("create_single_frame_resources should end before destroy_frame_resources");
+        let compact_single = crate::render::source_checks::compact(single_frame_resources);
+        assert!(compact_single.contains("FrameResourcesCreationCleanup::new(device)"));
+        assert!(compact_single.contains("cleanup.set_command_pool(command_pool)"));
+        assert!(compact_single.contains("cleanup.set_image_available_semaphore"));
+        assert!(compact_single.contains("cleanup.set_render_finished_semaphore"));
+        assert!(compact_single.contains("cleanup.set_in_flight_fence"));
+        assert!(compact_single.contains("cleanup.disarm()"));
+    }
+
+    #[test]
+    fn render_device_constructor_uses_cleanup_guard_for_partially_initialized_resources() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let constructor = source
+            .split("pub fn new(window: &Window) -> Result<Self>")
+            .nth(1)
+            .expect("RenderDevice::new should exist")
+            .split("pub fn backend_name")
+            .next()
+            .expect("RenderDevice::new should end before backend_name");
+        let compact = crate::render::source_checks::compact(constructor);
+
+        assert!(compact.contains(
+            "letmutcleanup=RenderDeviceConstructionCleanup::new(instance,surface_loader,surface);"
+        ));
+        assert!(compact.contains("cleanup.set_device(device);"));
+        assert!(compact.contains("cleanup.set_swapchain_loader(swapchain_loader);"));
+        assert!(compact.contains("cleanup.set_swapchain(swapchain);"));
+        assert!(compact.contains(
+            "let(instance,surface_loader,surface,device,swapchain_loader,swapchain)=cleanup.finish();"
+        ));
+    }
+
+    #[test]
     fn device_reports_swapchain_recreation_from_frame_completion() {
         let source = crate::render::source_checks::read_source("src/render/device.rs");
         let end_frame = source
@@ -899,43 +1331,61 @@ mod tests {
     }
 
     #[test]
+    fn render_device_can_wait_for_other_frame_fences_before_shared_resource_mutation() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let compact = crate::render::source_checks::compact(&source);
+
+        assert!(compact.contains(
+            "pubfnwait_for_other_frame_fences(&self,excluded_fence:vk::Fence)->Result<()>"
+        ));
+        assert!(
+            compact.contains(".filter(|&fence|fence!=excluded_fence&&fence!=vk::Fence::null())")
+        );
+        assert!(compact.contains(".wait_for_fences(&fences,true,u64::MAX)"));
+    }
+
+    #[test]
     fn required_device_features_accept_supported_features() {
-        let features =
-            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
-        let bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
         let compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(true);
         let dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
 
         ensure_required_device_features(
             &features,
-            &bda_features,
             &compute_derivatives_features,
             &dynamic_rendering_features,
+            &vulkan12_features,
         )
         .unwrap();
     }
 
     #[test]
     fn required_device_features_report_missing_bda() {
-        let features =
-            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
-        let bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(false);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
         let compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(true);
         let dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(false)
+            .shader_float16(true);
 
         let error = ensure_required_device_features(
             &features,
-            &bda_features,
             &compute_derivatives_features,
             &dynamic_rendering_features,
+            &vulkan12_features,
         )
         .unwrap_err();
 
@@ -944,21 +1394,23 @@ mod tests {
 
     #[test]
     fn required_device_features_report_missing_storage_image_extended_formats() {
-        let features =
-            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(false);
-        let bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(false)
+            .shader_int16(true);
         let compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(true);
         let dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
 
         let error = ensure_required_device_features(
             &features,
-            &bda_features,
             &compute_derivatives_features,
             &dynamic_rendering_features,
+            &vulkan12_features,
         )
         .unwrap_err();
 
@@ -970,22 +1422,48 @@ mod tests {
     }
 
     #[test]
-    fn required_device_features_report_missing_compute_derivative_quads() {
+    fn required_device_features_report_missing_shader_int16() {
         let features =
             vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
-        let bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
+
+        let error = ensure_required_device_features(
+            &features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+            &vulkan12_features,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("shaderInt16"));
+    }
+
+    #[test]
+    fn required_device_features_report_missing_compute_derivative_quads() {
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
         let compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(false);
         let dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
 
         let error = ensure_required_device_features(
             &features,
-            &bda_features,
             &compute_derivatives_features,
             &dynamic_rendering_features,
+            &vulkan12_features,
         )
         .unwrap_err();
 
@@ -994,21 +1472,23 @@ mod tests {
 
     #[test]
     fn required_device_features_report_missing_dynamic_rendering() {
-        let features =
-            vk::PhysicalDeviceFeatures::default().shader_storage_image_extended_formats(true);
-        let bda_features =
-            vk::PhysicalDeviceBufferDeviceAddressFeatures::default().buffer_device_address(true);
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
         let compute_derivatives_features =
             vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
                 .compute_derivative_group_quads(true);
         let dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(false);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(true);
 
         let error = ensure_required_device_features(
             &features,
-            &bda_features,
             &compute_derivatives_features,
             &dynamic_rendering_features,
+            &vulkan12_features,
         )
         .unwrap_err();
 
@@ -1016,15 +1496,113 @@ mod tests {
     }
 
     #[test]
+    fn required_device_features_report_missing_shader_float16() {
+        let features = vk::PhysicalDeviceFeatures::default()
+            .shader_storage_image_extended_formats(true)
+            .shader_int16(true);
+        let compute_derivatives_features =
+            vk::PhysicalDeviceComputeShaderDerivativesFeaturesNV::default()
+                .compute_derivative_group_quads(true);
+        let dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let vulkan12_features = vk::PhysicalDeviceVulkan12Features::default()
+            .buffer_device_address(true)
+            .shader_float16(false);
+
+        let error = ensure_required_device_features(
+            &features,
+            &compute_derivatives_features,
+            &dynamic_rendering_features,
+            &vulkan12_features,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("shaderFloat16"));
+    }
+
+    #[test]
+    fn device_extensions_append_rt_dependencies_only_when_fully_supported() {
+        let supported = RtCapabilities {
+            acceleration_structure: true,
+            ray_tracing_pipeline: true,
+            deferred_host_operations: true,
+            buffer_device_address: true,
+        };
+        let unsupported = RtCapabilities {
+            acceleration_structure: false,
+            ..supported
+        };
+
+        let supported_names =
+            extension_name_strings(&device_extension_names_for_capabilities(supported));
+        let unsupported_names =
+            extension_name_strings(&device_extension_names_for_capabilities(unsupported));
+
+        assert_eq!(
+            unsupported_names,
+            extension_name_strings(&base_device_extension_names())
+        );
+        for required in [
+            ash::khr::acceleration_structure::NAME,
+            ash::khr::ray_tracing_pipeline::NAME,
+            ash::khr::deferred_host_operations::NAME,
+        ] {
+            assert!(
+                supported_names.contains(&required.to_string_lossy().into_owned()),
+                "RT-capable devices must enable required extension {}",
+                required.to_string_lossy()
+            );
+            assert!(
+                !unsupported_names.contains(&required.to_string_lossy().into_owned()),
+                "VPT-only devices must not request optional RT extension {}",
+                required.to_string_lossy()
+            );
+        }
+    }
+
+    #[test]
+    fn device_exposes_acceleration_structure_loader_for_rt_backend() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+
+        assert!(source.contains(
+            "acceleration_structure_loader: Option<ash::khr::acceleration_structure::Device>"
+        ));
+        assert!(source.contains(
+            "pub fn acceleration_structure_loader(&self) -> Option<&ash::khr::acceleration_structure::Device>"
+        ));
+        assert!(source.contains("ash::khr::acceleration_structure::Device::new"));
+    }
+
+    #[test]
+    fn device_creation_enables_16_bit_shader_features() {
+        let source = crate::render::source_checks::read_source("src/render/device.rs");
+        let constructor = source
+            .split("pub fn new(window: &Window) -> Result<Self>")
+            .nth(1)
+            .expect("RenderDevice::new should exist")
+            .split("let allocator = GpuAllocator::new")
+            .next()
+            .expect("device creation should precede allocator creation");
+        let compact = crate::render::source_checks::compact(constructor);
+
+        assert!(compact.contains("PhysicalDeviceVulkan12Features"));
+        assert!(compact.contains(".buffer_device_address(true)"));
+        assert!(compact.contains(".shader_float16(true)"));
+        assert!(compact.contains(".shader_int16(true)"));
+        assert!(compact.contains(".push_next(&mutvulkan12_features)"));
+        assert!(!compact.contains("PhysicalDeviceBufferDeviceAddressFeatures::default()"));
+    }
+
+    #[test]
     fn required_device_extensions_include_khr_compute_shader_derivatives_for_nrd_spirv() {
         let source = crate::render::source_checks::read_source("src/render/device.rs");
         let device_extensions = source
-            .split("let device_extension_names")
+            .split("fn base_device_extension_names()")
             .nth(1)
-            .expect("device extension list should exist")
-            .split("let selection")
+            .expect("base device extension list should exist")
+            .split("fn device_extension_names_for_capabilities")
             .next()
-            .expect("device extension list should be before physical-device selection");
+            .expect("base device extension list should end before RT extension helper");
 
         assert!(device_extensions.contains("KHR_COMPUTE_SHADER_DERIVATIVES_NAME"));
         assert!(source.contains("VK_KHR_compute_shader_derivatives"));
@@ -1043,5 +1621,16 @@ mod tests {
 
         assert!(constructor.contains("PhysicalDeviceDynamicRenderingFeatures"));
         assert!(constructor.contains(".dynamic_rendering(true)"));
+    }
+
+    fn extension_name_strings(names: &[*const c_char]) -> Vec<String> {
+        names
+            .iter()
+            .map(|&name| {
+                unsafe { CStr::from_ptr(name) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
     }
 }

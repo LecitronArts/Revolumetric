@@ -27,6 +27,7 @@ use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::EguiFrame;
 use crate::render::restir_di::RestirDiSettings;
+use crate::render::rt_settings::RtSettings;
 use crate::render::runtime::{RenderFrameInput, RenderRuntime, RuntimeSettings};
 use crate::render::scene_ubo::{LightingSettings, VptDebugView};
 use crate::render::vpt_pipeline::VptCameraFrame;
@@ -85,6 +86,7 @@ struct RevolumetricApp {
     render_runtime: Option<RenderRuntime>,
     ucvh: Option<Ucvh>,
     lighting_settings: LightingSettings,
+    rt_settings: RtSettings,
     area_restir_settings: AreaRestirSettings,
     restir_di_settings: RestirDiSettings,
     window_descriptor: WindowDescriptor,
@@ -163,6 +165,25 @@ fn camera_should_receive_input(kind: CameraInputEventKind, capture: UiInputCaptu
     }
 }
 
+fn should_request_redraw_for_size(size: winit::dpi::PhysicalSize<u32>) -> bool {
+    size.width > 0 && size.height > 0
+}
+
+fn clear_input_for_inactive_window(
+    input: Option<&mut InputState>,
+    touch_look: &mut TouchLookState,
+    window: Option<&Window>,
+) {
+    if let Some(input) = input {
+        input.clear_for_focus_loss();
+    }
+    touch_look.clear();
+    if let Some(window) = window {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        window.set_cursor_visible(true);
+    }
+}
+
 impl RevolumetricApp {
     fn new() -> Self {
         let mut world = World::new();
@@ -185,6 +206,7 @@ impl RevolumetricApp {
             render_runtime: None,
             ucvh: None,
             lighting_settings: LightingSettings::default(),
+            rt_settings: RtSettings::default(),
             area_restir_settings: AreaRestirSettings::default(),
             restir_di_settings: RestirDiSettings::default(),
             window_descriptor: WindowDescriptor::default(),
@@ -215,6 +237,7 @@ impl RevolumetricApp {
     fn runtime_settings(&self) -> RuntimeSettings {
         RuntimeSettings {
             lighting: self.lighting_settings,
+            rt: self.rt_settings,
             restir_di: self.restir_di_settings,
             area_restir: self.area_restir_settings,
         }
@@ -322,7 +345,7 @@ impl RevolumetricApp {
             return UiInputCapture::default();
         };
         let response = egui_state.on_window_event(window, event);
-        if response.repaint {
+        if response.repaint && should_request_redraw_for_size(window.inner_size()) {
             window.request_redraw();
         }
         let Some(egui_ctx) = self.egui_ctx.as_ref() else {
@@ -490,6 +513,16 @@ impl ApplicationHandler for RevolumetricApp {
             );
         }
         self.lighting_settings = lighting_settings_result.settings;
+        let rt_settings_result = RtSettings::from_env();
+        for warning in &rt_settings_result.warnings {
+            tracing::warn!(
+                variable = warning.variable,
+                value = %warning.value,
+                expected = warning.expected,
+                "invalid RT setting override; using default value"
+            );
+        }
+        self.rt_settings = rt_settings_result.settings;
         let restir_di_settings_result = RestirDiSettings::from_env();
         for warning in &restir_di_settings_result.warnings {
             tracing::warn!(
@@ -573,8 +606,7 @@ impl ApplicationHandler for RevolumetricApp {
             WindowEvent::RedrawRequested => {
                 // Skip rendering when minimized (zero-size window)
                 if let Some(window) = &self.window {
-                    let size = window.inner_size();
-                    if size.width == 0 || size.height == 0 {
+                    if !should_request_redraw_for_size(window.inner_size()) {
                         return;
                     }
                 }
@@ -596,6 +628,11 @@ impl ApplicationHandler for RevolumetricApp {
             }
             WindowEvent::Resized(size) => {
                 if size.width == 0 || size.height == 0 {
+                    clear_input_for_inactive_window(
+                        self.world.resource_mut::<InputState>(),
+                        &mut self.touch_look,
+                        self.window.as_ref(),
+                    );
                     return; // minimized, skip resize
                 }
                 if let Err(error) = self.resize_render_runtime(size.width, size.height) {
@@ -665,15 +702,11 @@ impl ApplicationHandler for RevolumetricApp {
                 }
             }
             WindowEvent::Focused(false) => {
-                if let Some(input) = self.world.resource_mut::<InputState>() {
-                    input.reset_axes();
-                    input.right_mouse_held = false;
-                }
-                self.touch_look.clear();
-                if let Some(window) = &self.window {
-                    let _ = window.set_cursor_grab(CursorGrabMode::None);
-                    window.set_cursor_visible(true);
-                }
+                clear_input_for_inactive_window(
+                    self.world.resource_mut::<InputState>(),
+                    &mut self.touch_look,
+                    self.window.as_ref(),
+                );
             }
             _ => {}
         }
@@ -695,7 +728,9 @@ impl ApplicationHandler for RevolumetricApp {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
+        if let Some(window) = &self.window
+            && should_request_redraw_for_size(window.inner_size())
+        {
             window.request_redraw();
         }
     }
@@ -764,6 +799,22 @@ mod tests {
                 wants_keyboard_input: true,
                 ..UiInputCapture::default()
             }
+        ));
+    }
+
+    #[test]
+    fn redraw_requests_are_suppressed_for_minimized_windows() {
+        assert!(should_request_redraw_for_size(
+            winit::dpi::PhysicalSize::new(1, 1)
+        ));
+        assert!(!should_request_redraw_for_size(
+            winit::dpi::PhysicalSize::new(0, 1)
+        ));
+        assert!(!should_request_redraw_for_size(
+            winit::dpi::PhysicalSize::new(1, 0)
+        ));
+        assert!(!should_request_redraw_for_size(
+            winit::dpi::PhysicalSize::new(0, 0)
         ));
     }
 

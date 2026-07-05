@@ -128,6 +128,14 @@ float luminance_of(float3 radiance) {
     return max(dot(radiance, float3(0.2126, 0.7152, 0.0722)), 0.0);
 }
 
+uint vpt_history_generation_half_bits(uint generation) {
+    return f32tof16(float(generation));
+}
+
+float vpt_history_generation_alpha(uint history_generation_bits) {
+    return f16tof32(history_generation_bits);
+}
+
 bool debug_view_bypasses_temporal(uint debug_view) {
     return debug_view == VPT_DEBUG_VIEW_RAW
         || debug_view == VPT_DEBUG_VIEW_RESERVOIR_WEIGHT
@@ -386,7 +394,8 @@ ReprojectedHistorySample sample_reprojected_history(
     uint2 pixel,
     int2 previous_base_pixel,
     float2 history_fraction,
-    uint2 resolution
+    uint2 resolution,
+    uint current_history_generation_bits
 ) {
     ReprojectedHistorySample history = (ReprojectedHistorySample)0;
 
@@ -399,6 +408,12 @@ ReprojectedHistorySample sample_reprojected_history(
         }
 
         uint2 tap_pixel = uint2(tap_pixel_i);
+        float4 previous_accumulated_radiance = previous_accumulated_radiance_image[tap_pixel];
+        uint previous_history_generation_bits = f32tof16(previous_accumulated_radiance.a);
+        if (previous_history_generation_bits != current_history_generation_bits) {
+            continue;
+        }
+
         if (!compatible_history(pixel, tap_pixel)) {
             continue;
         }
@@ -408,7 +423,7 @@ ReprojectedHistorySample sample_reprojected_history(
             continue;
         }
 
-        history.radiance += previous_accumulated_radiance_image[tap_pixel].rgb * tap_weight;
+        history.radiance += previous_accumulated_radiance.rgb * tap_weight;
         history.moments += previous_moments_history.xy * tap_weight;
         history.history_length += previous_moments_history.z * tap_weight;
         history.history_reliability += tap_weight;
@@ -454,6 +469,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (tid.x >= scene.resolution.x || tid.y >= scene.resolution.y) return;
 
     uint2 pixel = tid.xy;
+    uint current_history_generation_bits = vpt_history_generation_half_bits(scene.history_reset_generation);
+    float history_generation_alpha = vpt_history_generation_alpha(current_history_generation_bits);
     float4 noisy_radiance = noisy_radiance_image[pixel];
     float4 noisy_moments = noisy_moments_image[pixel];
     float4 motion = motion_history[pixel];
@@ -463,20 +480,20 @@ void main(uint3 tid : SV_DispatchThreadID) {
     FireflyClampStats firefly_stats = (FireflyClampStats)0;
 
     if (debug_view_bypasses_temporal(scene.vpt_debug_view)) {
-        accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, 1.0);
+        accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, history_generation_alpha);
         accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
         return;
     }
 
     if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NORMAL) {
         float3 normal_debug = current_surface_valid ? normalize(surface_normal_roughness[pixel].xyz) * 0.5 + 0.5 : float3(0.0);
-        accumulated_radiance_image[pixel] = float4(normal_debug, 1.0);
+        accumulated_radiance_image[pixel] = float4(normal_debug, history_generation_alpha);
         accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
         return;
     }
 
     if (scene.vpt_debug_view == VPT_DEBUG_VIEW_DEPTH) {
-        accumulated_radiance_image[pixel] = float4(visualize_linear_depth(surface_position_depth[pixel].w), 1.0);
+        accumulated_radiance_image[pixel] = float4(visualize_linear_depth(surface_position_depth[pixel].w), history_generation_alpha);
         accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
         return;
     }
@@ -496,13 +513,13 @@ void main(uint3 tid : SV_DispatchThreadID) {
         } else if (scene.vpt_debug_view == VPT_DEBUG_VIEW_NRD_MOTION_Z) {
             guide_debug = visualize_nrd_motion_z(motion.z, motion_valid);
         }
-        accumulated_radiance_image[pixel] = float4(guide_debug, 1.0);
+        accumulated_radiance_image[pixel] = float4(guide_debug, history_generation_alpha);
         accumulated_moments_history_image[pixel] = float4(noisy_moments.xy, current_surface_valid ? 1.0 : 0.0, current_surface_valid ? 1.0 : 0.0);
         return;
     }
 
     if ((scene.denoiser_flags & DENOISER_FLAG_ENABLED) == 0u) {
-        accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, 1.0);
+        accumulated_radiance_image[pixel] = float4(noisy_radiance.rgb, history_generation_alpha);
         accumulated_moments_history_image[pixel] = float4(
             noisy_moments.xy,
             current_surface_valid ? 1.0 : 0.0,
@@ -538,7 +555,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
                 pixel,
                 previous_base_pixel,
                 history_fraction,
-                scene.resolution
+                scene.resolution,
+                current_history_generation_bits
             );
             if (history.history_length > 0.0 && history.history_reliability > 0.0) {
                 ClampedRadianceSample history_clamped_noisy = clamp_noisy_radiance_to_history(
@@ -580,6 +598,6 @@ void main(uint3 tid : SV_DispatchThreadID) {
         accumulated = accumulated;
     }
 
-    accumulated_radiance_image[pixel] = float4(accumulated, 1.0);
+    accumulated_radiance_image[pixel] = float4(accumulated, history_generation_alpha);
     accumulated_moments_history_image[pixel] = float4(accumulated_moments, history_length, history_valid);
 }

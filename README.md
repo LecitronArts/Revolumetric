@@ -13,7 +13,8 @@ The project is currently an engine prototype, not a packaged application. The co
 - Optional native NRD validation requires an accepted NVIDIA NRD SDK checkout
   with headers and `NRD.lib`/`libNRD.a`. Static official NRD builds may also
   need `ShaderMakeBlob.lib` beside `NRD.lib`. Set `REVOLUMETRIC_NRD_ROOT`, or
-  place the SDK under `run/nrd`.
+  place the SDK under `run/nrd`. The native bridge now lives in
+  `crates/revolumetric-nrd-sys`.
 
 By default, if `slangc` is missing, the build script writes empty placeholder `.spv` files so Rust compilation can still proceed. Runtime render passes that require non-empty shaders will log warnings and skip initialization.
 
@@ -44,7 +45,7 @@ Invalid values fail the build instead of silently falling back to a default.
 
 Rendering settings can be overridden through environment variables:
 
-- `REVOLUMETRIC_RENDER_MODE=vpt`: accepted for compatibility; VPT is the only active renderer. Other values emit a parse warning and keep the VPT default.
+- `REVOLUMETRIC_RENDER_MODE=auto|vpt|rt`: selects automatic backend routing, the VPT renderer, or the hardware RT backend. `auto` is the default and uses RT on RT-capable devices, otherwise VPT. Explicit RT requests fall back to VPT when the device does not expose the required ray tracing support.
 - `REVOLUMETRIC_VPT_MAX_BOUNCES=1..8`: bounds VPT path length. Default is `2`.
 - `REVOLUMETRIC_EXPOSURE=<finite non-negative float>`: postprocess exposure multiplier before tonemap. Default is `1.0`.
 - `REVOLUMETRIC_LIGHTING_SHADOWS=on|off|1|0|true|false`: enables direct-light shadow rays.
@@ -58,6 +59,18 @@ Rendering settings can be overridden through environment variables:
 - `REVOLUMETRIC_VPT_TRAVERSAL_STATS=on|off|1|0|true|false`: enables per-frame VPT traversal counter readback. When enabled, the runtime waits for the submitted frame fence and logs a `TraversalStats` line with primary/shadow ray counts, hierarchy skip counts, and brick DDA step counts.
 
 Invalid rendering environment values emit parse warnings and keep the default for the invalid setting.
+
+Hardware RT settings are opt-in while the backend is being brought up:
+
+- `REVOLUMETRIC_RT_RESTIR_DI=on|off|1|0|true|false`: enables RT ReSTIR-DI direct-light reservoirs. Default is `off`.
+- `REVOLUMETRIC_RT_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables RT ReSTIR-DI spatial reservoir reuse after temporal history is valid. Default is `off`.
+- `REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES=0..8`: spatial neighbor sample count for RT ReSTIR-DI. Default is `4`.
+- `REVOLUMETRIC_RT_RESTIR_GI=on|off|1|0|true|false`: enables RT ReSTIR-GI after RT surface generation. It traces a one-bounce hardware RT indirect sample, stores an indirect path-vertex reservoir with temporal reuse, and feeds the reservoir into the RT final lighting resolve. The RT path still does not enable NRD, SER, or path guiding. Default is `off`.
+- `REVOLUMETRIC_RT_TEMPORAL_DENOISE=on|off|1|0|true|false`: enables the RT temporal-only accumulation path. Default is `on`.
+- `REVOLUMETRIC_RT_TEMPORAL_HISTORY_LENGTH=1..64`: RT temporal and reservoir history budget. Default is `20`.
+- `REVOLUMETRIC_RT_TEMPORAL_NORMAL_THRESHOLD=0.0..1.0`: normal compatibility threshold for RT temporal/spatial reuse. Default is `0.85`.
+- `REVOLUMETRIC_RT_TEMPORAL_DEPTH_THRESHOLD=0.0..1.0`: depth/position compatibility threshold for RT temporal/spatial reuse. Default is `0.02`.
+- `REVOLUMETRIC_RT_DEBUG_VIEW=off|final|surface|hit_distance|history_valid|direct_reservoir|indirect_reservoir|temporal`: selects RT diagnostics.
 
 ReSTIR-DI is an experimental direct-light reuse layer and is disabled by default:
 
@@ -91,9 +104,9 @@ The wrapper enables strict shader compilation, GPU CSV timing, ReSTIR-DI, ReSTIR
 
 ## Current Rendering Path
 
-The active renderer is VPT-only. The former Radiance Cascades and voxel cone tracing paths have been removed from active runtime code and shaders; older planning documents may mention them only as migration history.
+The default renderer selection is automatic: RT-capable devices use the hardware RT backend, and unsupported devices use VPT. `REVOLUMETRIC_RENDER_MODE=vpt` forces the VPT fallback path, while `REVOLUMETRIC_RENDER_MODE=rt` requires RT support and falls back to VPT with a warning when unavailable. The former Radiance Cascades and voxel cone tracing paths have been removed from active runtime code and shaders; older planning documents may mention them only as migration history.
 
-Default runtime flow:
+Default VPT runtime flow:
 
 1. UCVH upload/update.
 2. VPT surface state pass writes current/previous surface attributes and motion history.
@@ -103,6 +116,16 @@ Default runtime flow:
 6. VPT temporal denoise reprojects and clamps radiance history, while raw/direct/Area ReSTIR debug views bypass temporal smoothing.
 7. Postprocess applies exposure, ACES tonemap, and gamma, then writes LDR `rgba8`.
 8. Blit copies postprocess output to the swapchain.
+
+Opt-in hardware RT flow:
+
+1. UCVH and RT acceleration structures are updated.
+2. RT surface generation traces primary rays and writes surface attributes plus motion guides.
+3. Optional RT ReSTIR-DI builds direct-light reservoirs with temporal and optional spatial reuse.
+4. Optional RT ReSTIR-GI traces one-bounce indirect samples, stores path-vertex reservoirs, and applies temporal reuse.
+5. RT direct lighting resolves albedo, ReSTIR-DI direct light, and ReSTIR-GI indirect reservoirs into HDR radiance.
+6. RT temporal-only accumulation denoises the HDR radiance without using NRD.
+7. RT resolve writes the display image, then the render graph blits it to the swapchain.
 
 The current VPT path is still noisy and progressive. The active implementation plan is to replace simple progressive averaging with explicit VPT surface state, temporal reprojection, moments, and edge-aware denoising.
 
@@ -117,7 +140,21 @@ Validation matrix for this MVP:
 .\run\validate-visual-baseline.ps1
 .\run\validate-visual-baseline.ps1 -Nrd
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
-rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_VPT_MAX_BOUNCES|REVOLUMETRIC_EXPOSURE|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
+$env:REVOLUMETRIC_RENDER_MODE='rt'
+$env:REVOLUMETRIC_RT_RESTIR_DI='on'
+$env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL='on'
+$env:REVOLUMETRIC_RT_RESTIR_GI='on'
+$env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'
+cargo run --features desktop --bin revolumetric
+Remove-Item Env:\REVOLUMETRIC_RENDER_MODE
+Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI
+Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI_SPATIAL
+Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI
+Remove-Item Env:\REVOLUMETRIC_EXIT_AFTER_FRAMES
+$env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'
+cargo run --features desktop --bin revolumetric # default auto backend smoke
+Remove-Item Env:\REVOLUMETRIC_EXIT_AFTER_FRAMES
+rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_RT_RESTIR_DI|REVOLUMETRIC_RT_RESTIR_GI|REVOLUMETRIC_RT_TEMPORAL|REVOLUMETRIC_RT_DEBUG_VIEW|REVOLUMETRIC_VPT_RESTIR_DI" README.md docs/superpowers
 ```
 
 The visual regression baseline wrapper captures deterministic smoke frames and
@@ -134,13 +171,15 @@ Implemented pieces include:
 - UCVH brick storage, occupancy hierarchy, dirty tracking, and GPU upload.
 - Procedural demo scene generation.
 - VPT rendering, surface state, temporal denoise, HDR output, explicit post-processing, and swapchain presentation.
-- VPT-only ReSTIR-DI settings, direct-light table construction, shader skeletons, reservoir resources, and graph-gated pass wiring.
+- Hardware RT scene AABB caching with dirty-region resampling, RT surface generation, RT ReSTIR-DI, RT ReSTIR-GI, RT final lighting resolve, temporal-only accumulation, and swapchain presentation.
+- VPT ReSTIR-DI settings, direct-light table construction, shader skeletons, reservoir resources, and graph-gated pass wiring.
 - VPT-owned Area ReSTIR settings, sample-area reservoir resources, temporal/spatial reuse shaders, primary-ray integration, and debug visualization routing.
 - Unit tests for the CPU-side data structures and ABI-sensitive uniform layout.
 
 Known prototype limits:
 
 - `app.rs` still owns too much runtime orchestration.
+- RT acceleration structures resample only dirty UCVH brick regions after the initial scan, update/refit existing BLAS/TLAS resources when the AABB primitive and instance counts still match, and fall back to full resource rebuilds when the AS shape is no longer update-compatible.
 - The render graph owns image access transitions and non-aliased graph-owned transient image and buffer allocation. Descriptor automation and resource aliasing are not implemented yet.
 - VPT temporal denoising and Area ReSTIR are still experimental and need representative scene captures before visual quality can be considered validated.
 - Postprocess owns exposure/ACES/gamma, but bloom and richer display controls are not implemented.
