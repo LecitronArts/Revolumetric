@@ -45,6 +45,7 @@ pub struct GpuRtSurfacePixel {
     pub normal_roughness: [f32; 4],
     pub albedo_material: [f32; 4],
     pub motion_history: [f32; 4],
+    pub view_direction_background: [f32; 4],
     pub linear_depth: f32,
     pub material_id: u32,
     pub history_confidence: f32,
@@ -112,15 +113,19 @@ mod tests {
 
     #[test]
     fn rt_surface_pixel_layout_is_stable() {
-        assert_eq!(std::mem::size_of::<GpuRtSurfacePixel>(), 96);
+        assert_eq!(std::mem::size_of::<GpuRtSurfacePixel>(), 112);
         assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, position_depth), 0);
         assert_eq!(
-            std::mem::offset_of!(GpuRtSurfacePixel, history_confidence),
-            72
+            std::mem::offset_of!(GpuRtSurfacePixel, view_direction_background),
+            64
         );
-        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, hit_kind), 76);
-        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, brick_id), 80);
-        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, local), 84);
+        assert_eq!(
+            std::mem::offset_of!(GpuRtSurfacePixel, history_confidence),
+            88
+        );
+        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, hit_kind), 92);
+        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, brick_id), 96);
+        assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, local), 100);
     }
 
     #[test]
@@ -146,6 +151,7 @@ mod tests {
             "float normal_threshold",
             "float depth_threshold",
             "struct RtSurfacePixel",
+            "float4 view_direction_background",
             "float linear_depth",
             "uint material_id",
             "float history_confidence",

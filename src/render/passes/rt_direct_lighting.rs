@@ -37,6 +37,11 @@ pub struct GpuRtDirectLightingUniforms {
     pub width: u32,
     pub height: u32,
     pub shadows_enabled: u32,
+    pub _pad0: [u32; 2],
+    pub sky_color_sun_angular_radius: [f32; 4],
+    pub ground_color_pad: [f32; 4],
+    pub sun_direction_pad: [f32; 4],
+    pub sun_intensity_pad: [f32; 4],
 }
 
 pub struct RtDirectLightingPass {
@@ -61,6 +66,17 @@ pub struct RtDirectLightingCreateInfo<'a> {
     pub frame_count: usize,
     pub ucvh_gpu: &'a UcvhGpuResources,
     pub shaders: RtDirectLightingShaders<'a>,
+}
+
+#[derive(Clone, Copy)]
+pub struct RtDirectLightingFrameSettings {
+    pub rt_settings: RtSettings,
+    pub restir_di_active: bool,
+    pub restir_gi_active: bool,
+    pub shadows_enabled: bool,
+    pub sun_direction: glam::Vec3,
+    pub sun_intensity: glam::Vec3,
+    pub sun_angular_radius: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -282,21 +298,29 @@ impl RtDirectLightingPass {
         &self.current_radiance
     }
 
-    pub fn update_uniforms(
-        &self,
-        frame_slot: usize,
-        rt_settings: RtSettings,
-        restir_di_active: bool,
-        restir_gi_active: bool,
-        shadows_enabled: bool,
-    ) {
+    pub fn update_uniforms(&self, frame_slot: usize, settings: RtDirectLightingFrameSettings) {
         let uniforms = GpuRtDirectLightingUniforms {
-            restir_di_enabled: restir_di_active as u32,
-            restir_gi_enabled: restir_gi_active as u32,
-            debug_view: rt_settings.debug_view.as_gpu_value(),
+            restir_di_enabled: settings.restir_di_active as u32,
+            restir_gi_enabled: settings.restir_gi_active as u32,
+            debug_view: settings.rt_settings.debug_view.as_gpu_value(),
             width: self.width(),
             height: self.height(),
-            shadows_enabled: shadows_enabled as u32,
+            shadows_enabled: settings.shadows_enabled as u32,
+            _pad0: [0; 2],
+            sky_color_sun_angular_radius: [0.4, 0.5, 0.7, settings.sun_angular_radius],
+            ground_color_pad: [0.15, 0.1, 0.08, 0.0],
+            sun_direction_pad: [
+                settings.sun_direction.x,
+                settings.sun_direction.y,
+                settings.sun_direction.z,
+                0.0,
+            ],
+            sun_intensity_pad: [
+                settings.sun_intensity.x,
+                settings.sun_intensity.y,
+                settings.sun_intensity.z,
+                0.0,
+            ],
         };
         write_mapped(self.uniform_buffers[frame_slot].mapped_ptr(), &uniforms);
     }
@@ -823,7 +847,7 @@ mod shader_source_tests {
     fn rt_direct_lighting_uniform_layout_is_stable() {
         assert_eq!(
             std::mem::size_of::<super::GpuRtDirectLightingUniforms>(),
-            24
+            96
         );
         assert_eq!(
             std::mem::offset_of!(super::GpuRtDirectLightingUniforms, debug_view),
@@ -832,6 +856,17 @@ mod shader_source_tests {
         assert_eq!(
             std::mem::offset_of!(super::GpuRtDirectLightingUniforms, shadows_enabled),
             20
+        );
+        assert_eq!(
+            std::mem::offset_of!(
+                super::GpuRtDirectLightingUniforms,
+                sky_color_sun_angular_radius
+            ),
+            32
+        );
+        assert_eq!(
+            std::mem::offset_of!(super::GpuRtDirectLightingUniforms, sun_intensity_pad),
+            80
         );
     }
 
@@ -952,7 +987,7 @@ mod shader_source_tests {
             "rt_direct_resolve_reservoir(surface, reservoir, visible)",
             "StructuredBuffer<RestirGiReservoir> indirect_reservoirs",
             "rt_direct_resolve_indirect_reservoir(surface, indirect_reservoir)",
-            "current_radiance[launch_id.xy] = float4(albedo + direct + indirect, 1.0);",
+            "current_radiance[launch_id.xy] = float4(ambient + analytic_direct + direct + indirect, 1.0);",
         ] {
             assert!(
                 raygen.contains(token),
@@ -984,5 +1019,59 @@ mod shader_source_tests {
                 "RT direct-lighting intersection shader missing {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_direct_lighting_primary_miss_uses_sky_ground_background() {
+        let raygen = std::fs::read_to_string("assets/shaders/passes/rt_direct_lighting.rgen.slang")
+            .expect("rt_direct_lighting.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        for token in [
+            "float3rt_direct_background_color(RtSurfacePixelsurface)",
+            "float3miss_dir=normalize(surface.view_direction_background.xyz);",
+            "floatground_ndotl=max(rt_direct.sun_direction_pad.y,0.0);",
+            "float3finite_sun_irradiance=rt_direct.sun_intensity_pad.rgb*ground_ndotl*rt_direct_sun_disk_solid_angle();",
+            "returnlerp(rt_direct_sunlit_ground_color(),rt_direct.sky_color_sun_angular_radius.rgb,t);",
+            "current_radiance[launch_id.xy]=float4(rt_direct_background_color(surface),1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT direct-lighting primary miss must resolve to scene background; missing {token}"
+            );
+        }
+        assert!(
+            !compact.contains("float3miss_dir=normalize(-surface.normal_roughness.xyz);"),
+            "RT direct-lighting background must not infer miss ray direction from geometric normals"
+        );
+        assert!(
+            !compact.contains("current_radiance[launch_id.xy]=float4(0.0,0.0,0.0,1.0);"),
+            "RT direct-lighting must not turn primary miss pixels into a black bar"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_final_uses_scene_lighting_instead_of_flat_albedo() {
+        let raygen = std::fs::read_to_string("assets/shaders/passes/rt_direct_lighting.rgen.slang")
+            .expect("rt_direct_lighting.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        for token in [
+            "float3rt_direct_hemisphere_ambient(RtSurfacePixelsurface)",
+            "boolrt_direct_sun_visible(RtSurfacePixelsurface,float3sun_dir)",
+            "float3rt_direct_analytic_sun_direct(RtSurfacePixelsurface)",
+            "float3ambient=rt_direct_hemisphere_ambient(surface);",
+            "float3analytic_direct=rt_direct_analytic_sun_direct(surface);",
+            "current_radiance[launch_id.xy]=float4(ambient+analytic_direct+direct+indirect,1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT final lighting must keep analytic sun and ambient lighting visible; missing {token}"
+            );
+        }
+        assert!(
+            !compact.contains("current_radiance[launch_id.xy]=float4(albedo+direct+indirect,1.0);"),
+            "RT final lighting must not fall back to a flat unlit albedo image"
+        );
     }
 }

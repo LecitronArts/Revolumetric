@@ -55,6 +55,28 @@
       "expectedRtRestirDiRendered": true,
       "expectedRtRestirGiRendered": true,
       "expectedRtResolveReady": true
+    },
+    {
+      "name": "rt_final",
+      "renderMode": "rt",
+      "denoiser": "svgf",
+      "debugView": "final",
+      "requiresNrd": false,
+      "requiresRt": true,
+      "expectedRenderBackend": "rt",
+      "expectedEffectiveDenoiser": "svgf",
+      "expectedMinNonZeroPixelRatio": 0.25,
+      "expectedMinRgbRange": 32,
+      "rtDebugView": "off",
+      "rtRestirDi": true,
+      "rtRestirDiSpatial": true,
+      "rtRestirDiSpatialSamples": 4,
+      "rtRestirGi": true,
+      "rtTemporalDenoise": true,
+      "expectedRtFrameRendered": true,
+      "expectedRtRestirDiRendered": true,
+      "expectedRtRestirGiRendered": true,
+      "expectedRtResolveReady": true
     }
   ]
 }

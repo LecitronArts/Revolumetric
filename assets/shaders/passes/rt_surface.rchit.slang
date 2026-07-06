@@ -52,11 +52,12 @@ void main(inout RtSurfacePayload payload, in RtSurfaceIntersectionAttributes att
 
     payload.primitive_index = primitive_index;
     payload.instance_id = InstanceID();
+    payload.ray_direction = world_direction;
     if (!hit.hit) {
         payload.hit_kind = RT_SURFACE_HIT_KIND_MISS;
         payload.hit_t = hit_t;
         payload.position = float3(0.0);
-        payload.normal = normalize(attributes.object_normal);
+        payload.normal = -world_direction;
         payload.albedo = float3(0.0);
         payload.roughness = 1.0;
         payload.material_id = 0u;

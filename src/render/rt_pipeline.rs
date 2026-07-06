@@ -9,8 +9,10 @@ use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::frame::FrameContext;
 use crate::render::graph::RenderGraph;
 use crate::render::passes::blit_to_swapchain;
-use crate::render::passes::rt_direct_lighting::RtDirectLightingShaders;
-use crate::render::passes::rt_direct_lighting::{RtDirectLightingCreateInfo, RtDirectLightingPass};
+use crate::render::passes::rt_direct_lighting::{
+    RtDirectLightingCreateInfo, RtDirectLightingFrameSettings, RtDirectLightingPass,
+    RtDirectLightingShaders,
+};
 use crate::render::passes::rt_resolve::{RtResolveCreateInfo, RtResolvePass};
 use crate::render::passes::rt_restir_di::{RtRestirDiCreateInfo, RtRestirDiPass};
 use crate::render::passes::rt_restir_gi::{
@@ -18,7 +20,7 @@ use crate::render::passes::rt_restir_gi::{
 };
 use crate::render::passes::rt_surface::{RtSurfaceCreateInfo, RtSurfacePass, RtSurfaceShaders};
 use crate::render::passes::rt_temporal::{RtTemporalCreateInfo, RtTemporalPass};
-use crate::render::resource::{AccessKind, QueueType};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::build_direct_lights_from_ucvh;
 use crate::render::rt_history::{
     GpuRtHistoryUniforms, RT_HISTORY_FLAG_AS_REBUILT, RT_HISTORY_FLAG_CAMERA_CUT,
@@ -258,12 +260,17 @@ impl RtRuntimePipeline {
         &mut self,
         renderer: &RenderDevice,
         frame: &FrameContext,
-        #[cfg(not(target_os = "android"))] _egui_renderer: Option<&mut EguiRenderer>,
-        #[cfg(not(target_os = "android"))] _egui_frame: Option<&EguiFrame>,
+        #[cfg(not(target_os = "android"))] egui_renderer: Option<&mut EguiRenderer>,
+        #[cfg(not(target_os = "android"))] egui_frame: Option<&EguiFrame>,
         mut inputs: RtFrameInputs<'_>,
     ) -> Result<VptFrameRecordResult> {
         let mut graph = RenderGraph::new();
         let mut pending_capture = None;
+        #[cfg(not(target_os = "android"))]
+        let has_egui_overlay =
+            egui_renderer.is_some() && egui_frame.is_some_and(|frame| !frame.is_empty());
+        #[cfg(target_os = "android")]
+        let has_egui_overlay = false;
         if inputs.external_history_reset_generation > self.frame_state.history_reset_generation {
             self.frame_state
                 .reset_history(inputs.external_history_reset_generation);
@@ -580,10 +587,15 @@ impl RtRuntimePipeline {
                         let restir_gi_active = rt_restir_gi_rendered;
                         rt_direct_lighting.update_uniforms(
                             frame.frame_slot,
-                            inputs.rt_settings,
-                            restir_di_active,
-                            restir_gi_active,
-                            inputs.lighting_settings.shadows_enabled,
+                            RtDirectLightingFrameSettings {
+                                rt_settings: inputs.rt_settings,
+                                restir_di_active,
+                                restir_gi_active,
+                                shadows_enabled: inputs.lighting_settings.shadows_enabled,
+                                sun_direction: inputs.sun_direction,
+                                sun_intensity: inputs.sun_intensity,
+                                sun_angular_radius: inputs.lighting_settings.sun_angular_radius,
+                            },
                         );
                         rt_direct_lighting.update_frame_descriptors(
                             renderer.device(),
@@ -724,24 +736,60 @@ impl RtRuntimePipeline {
                                 "queued RT resolve capture"
                             );
                         }
-                        add_blit_to_swapchain_pass(
+                        let swapchain_after_blit = add_blit_to_swapchain_pass(
                             &mut graph,
                             rt_resolve_outputs.output,
                             rt_resolve.output_image.handle,
                             rt_resolve.output_image.extent,
                             frame,
                             capture_dependency,
+                            has_egui_overlay,
                         )?;
+                        #[cfg(not(target_os = "android"))]
+                        if has_egui_overlay {
+                            add_egui_overlay_present_pass(
+                                &mut graph,
+                                renderer,
+                                frame,
+                                egui_renderer,
+                                egui_frame,
+                                swapchain_after_blit,
+                            );
+                        }
                     } else {
                         skip_reason.get_or_insert(RtFrameSkipReason::UcvhGpuDescriptorsMissing);
                         tracing::warn!("skipping RT surface trace without UCVH GPU descriptors");
-                        add_swapchain_clear_present_pass(&mut graph, frame)?;
+                        let swapchain_after_clear =
+                            add_swapchain_clear_present_pass(&mut graph, frame, has_egui_overlay)?;
+                        #[cfg(not(target_os = "android"))]
+                        if has_egui_overlay {
+                            add_egui_overlay_present_pass(
+                                &mut graph,
+                                renderer,
+                                frame,
+                                egui_renderer,
+                                egui_frame,
+                                swapchain_after_clear,
+                            );
+                        }
                     }
                 }
                 _ => {
                     skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureMissing);
                     tracing::warn!("skipping RT surface trace without built TLAS and AABB buffer");
-                    add_swapchain_clear_present_pass(&mut graph, frame)?;
+                    let swapchain_after_clear =
+                        add_swapchain_clear_present_pass(&mut graph, frame, has_egui_overlay)?;
+                    #[cfg(not(target_os = "android"))]
+                    if has_egui_overlay {
+                        add_egui_overlay_present_pass(
+                            &mut graph,
+                            renderer,
+                            frame,
+                            egui_renderer,
+                            egui_frame,
+                            swapchain_after_clear,
+                        );
+                    }
                 }
             }
         } else {
@@ -753,7 +801,19 @@ impl RtRuntimePipeline {
                 rt_resolve = self.rt_resolve_pass.is_some(),
                 "skipping RT graph until required passes are initialized"
             );
-            add_swapchain_clear_present_pass(&mut graph, frame)?;
+            let swapchain_after_clear =
+                add_swapchain_clear_present_pass(&mut graph, frame, has_egui_overlay)?;
+            #[cfg(not(target_os = "android"))]
+            if has_egui_overlay {
+                add_egui_overlay_present_pass(
+                    &mut graph,
+                    renderer,
+                    frame,
+                    egui_renderer,
+                    egui_frame,
+                    swapchain_after_clear,
+                );
+            }
         }
 
         graph.compile()?;
@@ -1242,12 +1302,13 @@ fn capture_vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
 
 fn add_blit_to_swapchain_pass<'a>(
     graph: &mut RenderGraph<'a>,
-    src_resource: crate::render::resource::ResourceHandle,
+    src_resource: ResourceHandle,
     src_image: vk::Image,
     src_extent: vk::Extent3D,
     frame: &'a FrameContext,
-    capture_dependency: Option<crate::render::resource::ResourceHandle>,
-) -> Result<()> {
+    capture_dependency: Option<ResourceHandle>,
+    has_egui_overlay: bool,
+) -> Result<ResourceHandle> {
     let swapchain = graph.import_image_with_access(
         frame.swapchain_image,
         frame.swapchain_extent.width,
@@ -1256,13 +1317,15 @@ fn add_blit_to_swapchain_pass<'a>(
         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
         swapchain_access_from_layout(frame.swapchain_image_layout)?,
     );
-    graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
+    let blit_writes = graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
         builder.read_as(src_resource, AccessKind::TransferRead);
         if let Some(capture_dependency) = capture_dependency {
             builder.depend_on(capture_dependency);
         }
         builder.write_as(swapchain, AccessKind::TransferWrite);
-        builder.finish_as(swapchain, AccessKind::Present);
+        if !has_egui_overlay {
+            builder.finish_as(swapchain, AccessKind::Present);
+        }
         Box::new(move |ctx| {
             blit_to_swapchain::record_blit_core(
                 ctx.device,
@@ -1274,13 +1337,36 @@ fn add_blit_to_swapchain_pass<'a>(
             );
         })
     });
-    Ok(())
+    Ok(blit_writes[0])
+}
+
+#[cfg(not(target_os = "android"))]
+fn add_egui_overlay_present_pass<'a>(
+    graph: &mut RenderGraph<'a>,
+    renderer: &'a RenderDevice,
+    frame: &'a FrameContext,
+    egui_renderer: Option<&'a mut EguiRenderer>,
+    egui_frame: Option<&'a EguiFrame>,
+    swapchain_after_write: ResourceHandle,
+) {
+    if let (Some(egui_renderer), Some(egui_frame)) = (egui_renderer, egui_frame) {
+        graph.add_pass("egui_overlay", QueueType::Graphics, |builder| {
+            builder.write_as(swapchain_after_write, AccessKind::ColorAttachmentWrite);
+            builder.finish_as(swapchain_after_write, AccessKind::Present);
+            Box::new(move |_ctx| {
+                if let Err(error) = egui_renderer.record(renderer, frame, egui_frame) {
+                    tracing::error!(%error, "failed to record egui overlay");
+                }
+            })
+        });
+    }
 }
 
 fn add_swapchain_clear_present_pass<'a>(
     graph: &mut RenderGraph<'a>,
     frame: &'a FrameContext,
-) -> Result<()> {
+    has_egui_overlay: bool,
+) -> Result<ResourceHandle> {
     let swapchain = graph.import_image_with_access(
         frame.swapchain_image,
         frame.swapchain_extent.width,
@@ -1289,9 +1375,11 @@ fn add_swapchain_clear_present_pass<'a>(
         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
         swapchain_access_from_layout(frame.swapchain_image_layout)?,
     );
-    graph.add_pass("rt_clear_fallback", QueueType::Transfer, |builder| {
+    let clear_writes = graph.add_pass("rt_clear_fallback", QueueType::Transfer, |builder| {
         builder.write_as(swapchain, AccessKind::TransferWrite);
-        builder.finish_as(swapchain, AccessKind::Present);
+        if !has_egui_overlay {
+            builder.finish_as(swapchain, AccessKind::Present);
+        }
         Box::new(move |ctx| {
             let clear = vk::ClearColorValue {
                 float32: [0.0, 0.0, 0.0, 1.0],
@@ -1311,7 +1399,7 @@ fn add_swapchain_clear_present_pass<'a>(
             }
         })
     });
-    Ok(())
+    Ok(clear_writes[0])
 }
 
 fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
@@ -1550,6 +1638,91 @@ mod tests {
     }
 
     #[test]
+    fn rt_pipeline_records_egui_overlay_after_swapchain_blit() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT pipeline implementation should precede tests");
+        let record = source
+            .split("pub fn record_and_execute_frame")
+            .nth(1)
+            .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+            .split("pub fn destroy")
+            .next()
+            .expect("record_and_execute_frame should end before destroy");
+        let compact = crate::render::source_checks::compact(record);
+        let implementation_compact = crate::render::source_checks::compact(implementation);
+
+        for token in [
+            "egui_renderer:Option<&mutEguiRenderer>",
+            "egui_frame:Option<&EguiFrame>",
+            "lethas_egui_overlay=egui_renderer.is_some()&&egui_frame.is_some_and(|frame|!frame.is_empty());",
+            "letswapchain_after_blit=add_blit_to_swapchain_pass(",
+            "add_egui_overlay_present_pass(&mutgraph,renderer,frame,egui_renderer,egui_frame,swapchain_after_blit,);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT pipeline must composite desktop egui overlay after the swapchain blit; missing {token}"
+            );
+        }
+        for token in [
+            "fnadd_egui_overlay_present_pass<'a>(",
+            "graph.add_pass(\"egui_overlay\",QueueType::Graphics,|builder|{",
+            "builder.write_as(swapchain_after_write,AccessKind::ColorAttachmentWrite);",
+            "builder.finish_as(swapchain_after_write,AccessKind::Present);",
+            "egui_renderer.record(renderer,frame,egui_frame)",
+            "has_egui_overlay:bool",
+            "if!has_egui_overlay{builder.finish_as(swapchain,AccessKind::Present);}",
+            "Ok(blit_writes[0])",
+        ] {
+            assert!(
+                implementation_compact.contains(token),
+                "RT swapchain blit helper must leave present ownership to egui overlay when active; missing {token}"
+            );
+        }
+
+        let blit = compact
+            .find("letswapchain_after_blit=add_blit_to_swapchain_pass(")
+            .expect("RT pipeline should blit to swapchain");
+        let overlay = compact
+            .find("add_egui_overlay_present_pass(")
+            .expect("RT pipeline should record egui overlay after blit");
+        assert!(blit < overlay);
+    }
+
+    #[test]
+    fn rt_pipeline_records_egui_overlay_after_blit_and_clear_fallback() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT pipeline implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        for token in [
+            "fnadd_egui_overlay_present_pass<'a>(",
+            "builder.write_as(swapchain_after_write,AccessKind::ColorAttachmentWrite",
+            "builder.finish_as(swapchain_after_write,AccessKind::Present);",
+            "fnadd_swapchain_clear_present_pass<'a>(",
+            "has_egui_overlay:bool",
+            "if!has_egui_overlay{builder.finish_as(swapchain,AccessKind::Present);}",
+            "Ok(clear_writes[0])",
+            "add_egui_overlay_present_pass(&mutgraph,renderer,frame,egui_renderer,egui_frame,swapchain_after_clear,);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT fallback presentation must keep egui overlay before present; missing {token}"
+            );
+        }
+
+        assert!(
+            !compact.contains("add_swapchain_clear_present_pass(&mutgraph,frame)?"),
+            "RT fallback clear calls must pass overlay state and return the swapchain write handle"
+        );
+    }
+
+    #[test]
     fn rt_pipeline_capture_metadata_records_active_rt_passes() {
         let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
         let record = source
@@ -1765,7 +1938,7 @@ mod tests {
             "letrt_restir_gi_reservoir_buffer=rt_restir_gi.output_reservoir_buffer(frame.frame_slot)",
             "Some(rt_restir_gi_outputs.reservoirs)",
             "Some(rt_restir_gi_reservoir_buffer)",
-            "rt_direct_lighting.update_uniforms(frame.frame_slot,inputs.rt_settings,restir_di_active,restir_gi_active,inputs.lighting_settings.shadows_enabled,)",
+            "rt_direct_lighting.update_uniforms(frame.frame_slot,RtDirectLightingFrameSettings{rt_settings:inputs.rt_settings,restir_di_active,restir_gi_active,shadows_enabled:inputs.lighting_settings.shadows_enabled,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
             "rt_direct_lighting.update_frame_descriptors(renderer.device(),frame.frame_slot,rt_surface.surface_buffer(),rt_restir_di_reservoir_buffer,rt_restir_gi_reservoir_buffer,)",
             "rt_direct_lighting.register_graph(&mutgraph,frame.frame_slot,rt_surface_outputs.surface,rt_restir_di_reservoir_resource,rt_restir_gi_reservoir_resource,self.frame_state.direct_lighting_initialized,)",
         ] {
@@ -2086,7 +2259,9 @@ mod tests {
         let compact = crate::render::source_checks::compact(record);
 
         assert!(compact.contains("match(self.rt_scene.tlas_handle(),self.rt_scene.aabb_buffer())"));
-        assert!(compact.contains("add_swapchain_clear_present_pass(&mutgraph,frame)?"));
+        assert!(
+            compact.contains("add_swapchain_clear_present_pass(&mutgraph,frame,has_egui_overlay)?")
+        );
         assert!(compact.contains("self.frame_state.surface_initialized=rt_graph_rendered"));
     }
 

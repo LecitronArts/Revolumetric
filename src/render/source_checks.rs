@@ -220,10 +220,12 @@ mod tests {
                 "\"name\": \"reblur_nrd_validation\"",
                 "\"debugView\": \"nrd_validation\"",
                 "\"name\": \"rt_surface_debug\"",
+                "\"name\": \"rt_final\"",
                 "\"renderMode\": \"rt\"",
                 "\"requiresRt\": true",
                 "\"expectedRenderBackend\": \"rt\"",
                 "\"rtDebugView\": \"surface\"",
+                "\"rtDebugView\": \"off\"",
                 "\"rtRestirDi\": true",
                 "\"rtRestirDiSpatial\": true",
                 "\"rtRestirDiSpatialSamples\": 4",
@@ -255,6 +257,29 @@ mod tests {
                 "\"expectedMinRgbRange\": 32",
             ],
             "rt_surface_debug visual baseline case",
+        );
+
+        let rt_final_case = visual_baseline_case(&manifest, "rt_final");
+        assert_contains_all(
+            rt_final_case,
+            &[
+                "\"renderMode\": \"rt\"",
+                "\"requiresRt\": true",
+                "\"expectedRenderBackend\": \"rt\"",
+                "\"expectedMinNonZeroPixelRatio\": 0.25",
+                "\"expectedMinRgbRange\": 32",
+                "\"rtDebugView\": \"off\"",
+                "\"rtRestirDi\": true",
+                "\"rtRestirDiSpatial\": true",
+                "\"rtRestirDiSpatialSamples\": 4",
+                "\"rtRestirGi\": true",
+                "\"rtTemporalDenoise\": true",
+                "\"expectedRtFrameRendered\": true",
+                "\"expectedRtRestirDiRendered\": true",
+                "\"expectedRtRestirGiRendered\": true",
+                "\"expectedRtResolveReady\": true",
+            ],
+            "rt_final visual baseline case",
         );
 
         for nrd_case_name in ["reblur_final", "reblur_nrd_validation"] {

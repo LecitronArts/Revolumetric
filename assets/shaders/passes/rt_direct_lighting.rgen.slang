@@ -14,6 +14,11 @@ struct RtDirectLightingUniforms {
     uint width;
     uint height;
     uint shadows_enabled;
+    uint2 _pad0;
+    float4 sky_color_sun_angular_radius;
+    float4 ground_color_pad;
+    float4 sun_direction_pad;
+    float4 sun_intensity_pad;
 };
 
 [[vk::binding(0, 0)]]
@@ -36,6 +41,83 @@ StructuredBuffer<RestirGiReservoir> indirect_reservoirs;
 
 bool rt_direct_surface_valid(RtSurfacePixel surface) {
     return surface.hit_kind == RT_SURFACE_HIT_KIND_VOXEL && surface.position_depth.w >= 0.0;
+}
+
+static const float RT_DIRECT_TWO_PI = 6.28318530718;
+static const float RT_DIRECT_INV_PI = 0.31830988618;
+
+float rt_direct_sun_disk_solid_angle() {
+    float sun_radius = rt_direct.sky_color_sun_angular_radius.w;
+    if (sun_radius <= 0.0) {
+        return 0.0;
+    }
+
+    return max(RT_DIRECT_TWO_PI * (1.0 - cos(sun_radius)), 1.0e-8);
+}
+
+float3 rt_direct_sunlit_ground_color() {
+    float ground_ndotl = max(rt_direct.sun_direction_pad.y, 0.0);
+    float3 finite_sun_irradiance =
+        rt_direct.sun_intensity_pad.rgb * ground_ndotl * rt_direct_sun_disk_solid_angle();
+    return rt_direct.ground_color_pad.rgb * (1.0 + RT_DIRECT_INV_PI * finite_sun_irradiance);
+}
+
+float3 rt_direct_background_color(RtSurfacePixel surface) {
+    float3 miss_dir = normalize(surface.view_direction_background.xyz);
+    float t = saturate(miss_dir.y * 0.5 + 0.5);
+    return lerp(rt_direct_sunlit_ground_color(), rt_direct.sky_color_sun_angular_radius.rgb, t);
+}
+
+float3 rt_direct_hemisphere_ambient(RtSurfacePixel surface) {
+    float3 normal = normalize(surface.normal_roughness.xyz);
+    float t = saturate(normal.y * 0.5 + 0.5);
+    float3 ambient = lerp(
+        rt_direct_sunlit_ground_color(),
+        rt_direct.sky_color_sun_angular_radius.rgb,
+        t
+    );
+    return surface.albedo_material.rgb * ambient;
+}
+
+bool rt_direct_sun_visible(RtSurfacePixel surface, float3 sun_dir) {
+    if (rt_direct.shadows_enabled == 0u) {
+        return true;
+    }
+    if (!rt_direct_surface_valid(surface)) {
+        return false;
+    }
+
+    float3 normal = normalize(surface.normal_roughness.xyz);
+    RayDesc ray;
+    ray.Origin = surface.position_depth.xyz + normal * RT_DIRECT_SURFACE_BIAS + sun_dir * RT_DIRECT_SURFACE_BIAS;
+    ray.Direction = sun_dir;
+    ray.TMin = 0.001;
+    ray.TMax = 1.0e20;
+
+    RtShadowPayload payload = make_rt_shadow_payload(surface.brick_id, surface.local, ray.TMax);
+    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, ray, payload);
+    return payload.occluded == 0u;
+}
+
+float3 rt_direct_analytic_sun_direct(RtSurfacePixel surface) {
+    float solid_angle = rt_direct_sun_disk_solid_angle();
+    float3 sun_vector = rt_direct.sun_direction_pad.xyz;
+    if (solid_angle <= 0.0 || dot(sun_vector, sun_vector) <= 1.0e-8) {
+        return float3(0.0);
+    }
+
+    float3 sun_dir = normalize(sun_vector);
+    float3 normal = normalize(surface.normal_roughness.xyz);
+    float sun_term = max(dot(normal, sun_dir), 0.0);
+    if (sun_term <= 0.0 || !rt_direct_sun_visible(surface, sun_dir)) {
+        return float3(0.0);
+    }
+
+    return surface.albedo_material.rgb
+        * RT_LIGHTING_INV_PI
+        * rt_direct.sun_intensity_pad.rgb
+        * sun_term
+        * solid_angle;
 }
 
 float3 rt_direct_visualize_reservoir_weight(RestirDiReservoir reservoir) {
@@ -140,17 +222,18 @@ void main() {
 
     RtSurfacePixel surface = surface_pixels[index];
     if (!rt_direct_surface_valid(surface)) {
-        current_radiance[launch_id.xy] = float4(0.0, 0.0, 0.0, 1.0);
+        current_radiance[launch_id.xy] = float4(rt_direct_background_color(surface), 1.0);
         return;
     }
 
-    float3 albedo = surface.albedo_material.rgb;
     RestirDiReservoir reservoir = direct_reservoirs[index];
     if (rt_direct.restir_di_enabled != 0u && rt_direct.debug_view == RT_DEBUG_VIEW_DIRECT_RESERVOIR) {
         current_radiance[launch_id.xy] = float4(rt_direct_visualize_reservoir_weight(reservoir), 1.0);
         return;
     }
 
+    float3 ambient = rt_direct_hemisphere_ambient(surface);
+    float3 analytic_direct = rt_direct_analytic_sun_direct(surface);
     float3 direct = float3(0.0);
     if (rt_direct.restir_di_enabled != 0u) {
         bool visible = rt_direct_light_visible(surface, reservoir);
@@ -162,5 +245,5 @@ void main() {
         ? rt_direct_resolve_indirect_reservoir(surface, indirect_reservoir)
         : float3(0.0);
 
-    current_radiance[launch_id.xy] = float4(albedo + direct + indirect, 1.0);
+    current_radiance[launch_id.xy] = float4(ambient + analytic_direct + direct + indirect, 1.0);
 }

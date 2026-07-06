@@ -108,6 +108,10 @@ RtSurfacePixel surface_pixel_from_payload(RtSurfacePayload payload) {
     pixel.normal_roughness = float4(normalize(payload.normal), payload.roughness);
     pixel.albedo_material = float4(payload.albedo, float(payload.material_id));
     pixel.motion_history = rt_surface_invalid_motion_history();
+    pixel.view_direction_background = float4(
+        normalize(payload.ray_direction),
+        payload.hit_kind == RT_SURFACE_HIT_KIND_MISS ? 1.0 : 0.0
+    );
     pixel.linear_depth = payload.hit_t;
     pixel.material_id = payload.material_id;
     pixel.history_confidence = payload.hit_kind == RT_SURFACE_HIT_KIND_VOXEL ? 1.0 : 0.0;

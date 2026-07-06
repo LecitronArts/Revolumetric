@@ -999,6 +999,51 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn rt_surface_preserves_primary_ray_direction_for_background_misses() {
+        let common = std::fs::read_to_string("assets/shaders/shared/rt_surface_common.slang")
+            .expect("rt_surface common shader should be readable");
+        let raygen = std::fs::read_to_string("assets/shaders/passes/rt_surface.rgen.slang")
+            .expect("rt_surface raygen shader should be readable");
+        let miss = std::fs::read_to_string("assets/shaders/passes/rt_surface.rmiss.slang")
+            .expect("rt_surface miss shader should be readable");
+        let closest_hit = std::fs::read_to_string("assets/shaders/passes/rt_surface.rchit.slang")
+            .expect("rt_surface closest-hit shader should be readable");
+        let compact_common = crate::render::source_checks::compact(&common);
+        let compact_raygen = crate::render::source_checks::compact(&raygen);
+        let compact_miss = crate::render::source_checks::compact(&miss);
+        let compact_closest_hit = crate::render::source_checks::compact(&closest_hit);
+
+        for token in [
+            "float3ray_direction;",
+            "pixel.view_direction_background=float4(normalize(payload.ray_direction),payload.hit_kind==RT_SURFACE_HIT_KIND_MISS?1.0:0.0);",
+        ] {
+            assert!(
+                compact_common.contains(token),
+                "RT surface payload/pixel must carry explicit background direction; missing {token}"
+            );
+        }
+
+        assert!(
+            compact_raygen.contains(
+                "RtSurfacePayloadpayload=make_rt_surface_payload(primary_ray.direction);"
+            ),
+            "RT surface raygen must seed payload with primary camera ray direction"
+        );
+        assert!(
+            compact_miss.contains("payload.normal=-payload.ray_direction;"),
+            "true RT misses should keep a normal suitable for debug views"
+        );
+        assert!(
+            compact_closest_hit.contains("payload.ray_direction=world_direction;"),
+            "closest-hit local miss path must restore the original world ray direction for background shading"
+        );
+        assert!(
+            !compact_closest_hit.contains("payload.normal=normalize(attributes.object_normal);"),
+            "brick-local misses must not encode AABB normals as the background direction contract"
+        );
+    }
+
+    #[test]
     fn rt_surface_closest_hit_traverses_real_voxel_materials() {
         let closest_hit = std::fs::read_to_string("assets/shaders/passes/rt_surface.rchit.slang")
             .expect("rt_surface.rchit.slang should be readable");

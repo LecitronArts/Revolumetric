@@ -44,6 +44,8 @@ struct RtSurfacePixel {
     float4 normal_roughness;
     float4 albedo_material;
     float4 motion_history;
+    // xyz is the primary/view ray direction. w is 1.0 for miss/background pixels.
+    float4 view_direction_background;
     float linear_depth;
     uint material_id;
     float history_confidence;
