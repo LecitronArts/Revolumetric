@@ -117,6 +117,15 @@ impl RtRuntimePipeline {
         self.frame_state.as_rebuild_generation
     }
 
+    pub fn has_frame_resources(&self) -> bool {
+        self.rt_surface_pass.is_some()
+            || self.rt_restir_di_pass.is_some()
+            || self.rt_restir_gi_pass.is_some()
+            || self.rt_direct_lighting_pass.is_some()
+            || self.rt_temporal_pass.is_some()
+            || self.rt_resolve_pass.is_some()
+    }
+
     pub fn ensure_passes(
         &mut self,
         renderer: &RenderDevice,
@@ -1642,5 +1651,30 @@ mod tests {
         assert!(destroy.contains("acceleration_structure_loader"));
         let compact = crate::render::source_checks::compact(destroy);
         assert!(compact.contains("self.rt_scene.destroy("));
+    }
+
+    #[test]
+    fn rt_pipeline_exposes_frame_resource_presence_for_runtime_resize_routing() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT pipeline implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        for token in [
+            "pubfnhas_frame_resources(&self)->bool",
+            "self.rt_surface_pass.is_some()",
+            "self.rt_restir_di_pass.is_some()",
+            "self.rt_restir_gi_pass.is_some()",
+            "self.rt_direct_lighting_pass.is_some()",
+            "self.rt_temporal_pass.is_some()",
+            "self.rt_resolve_pass.is_some()",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT frame-resource helper missing {token}"
+            );
+        }
     }
 }

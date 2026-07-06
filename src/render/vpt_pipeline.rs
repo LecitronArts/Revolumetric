@@ -301,6 +301,20 @@ impl VptRuntimePipeline {
         }
     }
 
+    pub fn has_frame_resources(&self) -> bool {
+        self.postprocess_pass.is_some()
+            || self.vpt_surface_pass.is_some()
+            || self.vpt_nrd_confidence_pass.is_some()
+            || self.vpt_pass.is_some()
+            || self.vpt_nrd_frontend_pass.is_some()
+            || self.vpt_nrd_adapter_pass.is_some()
+            || self.vpt_nrd_resolve_pass.is_some()
+            || self.vpt_temporal_pass.is_some()
+            || self.vpt_atrous_pass.is_some()
+            || self.area_restir_pass.is_some()
+            || self.restir_di_pass.is_some()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_passes(
         &mut self,
@@ -2687,6 +2701,36 @@ mod tests {
             assert_ne!(
                 base, changed,
                 "Area ReSTIR UI tuning {changed_area:?} must be part of the VPT scene key"
+            );
+        }
+    }
+
+    #[test]
+    fn vpt_pipeline_exposes_frame_resource_presence_for_runtime_resize_routing() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("VPT pipeline implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        for token in [
+            "pubfnhas_frame_resources(&self)->bool",
+            "self.postprocess_pass.is_some()",
+            "self.vpt_surface_pass.is_some()",
+            "self.vpt_nrd_confidence_pass.is_some()",
+            "self.vpt_pass.is_some()",
+            "self.vpt_nrd_frontend_pass.is_some()",
+            "self.vpt_nrd_adapter_pass.is_some()",
+            "self.vpt_nrd_resolve_pass.is_some()",
+            "self.vpt_temporal_pass.is_some()",
+            "self.vpt_atrous_pass.is_some()",
+            "self.area_restir_pass.is_some()",
+            "self.restir_di_pass.is_some()",
+        ] {
+            assert!(
+                compact.contains(token),
+                "VPT frame-resource helper missing {token}"
             );
         }
     }

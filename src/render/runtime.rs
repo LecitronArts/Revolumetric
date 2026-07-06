@@ -306,34 +306,70 @@ impl RenderRuntime {
         self.refresh_render_backend(settings.lighting.render_mode);
         self.ensure_passes(ucvh, settings, restir_di_enabled, area_restir_enabled);
         let extent = self.renderer.swapchain_extent();
-        if let Some(scene_ubo) = self.scene_ubo.as_ref() {
-            match self.render_backend {
-                RenderBackend::Rt => {
-                    self.rt_history_reset_generation =
-                        self.rt_history_reset_generation.wrapping_add(1);
-                    self.rt_pipeline.resize(
-                        &self.renderer,
-                        scene_ubo,
-                        extent.width,
-                        extent.height,
-                    )?;
-                }
-                RenderBackend::Vpt => {
-                    if let Some(ucvh_gpu) = self.ucvh_gpu.as_ref() {
-                        self.vpt_pipeline.resize(
-                            &self.renderer,
-                            scene_ubo,
-                            ucvh_gpu,
-                            extent.width,
-                            extent.height,
-                            settings.lighting,
-                            restir_di_enabled,
-                            area_restir_enabled,
-                        )?;
-                    }
-                }
-            }
+        let Some(scene_ubo) = self.scene_ubo.take() else {
+            return Ok(());
+        };
+        let result = {
+            let scene_ubo = &scene_ubo;
+            (|| {
+                self.resize_rt_pipeline_to_swapchain(scene_ubo, extent.width, extent.height)?;
+                self.resize_vpt_pipeline_to_swapchain(
+                    scene_ubo,
+                    extent.width,
+                    extent.height,
+                    settings,
+                    restir_di_enabled,
+                    area_restir_enabled,
+                )?;
+                Ok(())
+            })()
+        };
+        self.scene_ubo = Some(scene_ubo);
+        result
+    }
+
+    fn resize_rt_pipeline_to_swapchain(
+        &mut self,
+        scene_ubo: &SceneUniformBuffer,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        if !(self.render_backend == RenderBackend::Rt || self.rt_pipeline.has_frame_resources()) {
+            return Ok(());
         }
+
+        self.rt_history_reset_generation = self.rt_history_reset_generation.wrapping_add(1);
+        self.rt_pipeline
+            .resize(&self.renderer, scene_ubo, width, height)?;
+        Ok(())
+    }
+
+    fn resize_vpt_pipeline_to_swapchain(
+        &mut self,
+        scene_ubo: &SceneUniformBuffer,
+        width: u32,
+        height: u32,
+        settings: RuntimeSettings,
+        restir_di_enabled: bool,
+        area_restir_enabled: bool,
+    ) -> Result<()> {
+        if !(self.render_backend == RenderBackend::Vpt || self.vpt_pipeline.has_frame_resources()) {
+            return Ok(());
+        }
+        let Some(ucvh_gpu) = self.ucvh_gpu.as_ref() else {
+            return Ok(());
+        };
+
+        self.vpt_pipeline.resize(
+            &self.renderer,
+            scene_ubo,
+            ucvh_gpu,
+            width,
+            height,
+            settings.lighting,
+            restir_di_enabled,
+            area_restir_enabled,
+        )?;
         Ok(())
     }
 
@@ -982,12 +1018,18 @@ mod tests {
         let ensure_passes = compact
             .find("self.ensure_passes(")
             .expect("resize must ensure passes");
-        let match_backend = compact
-            .find("matchself.render_backend{")
-            .expect("resize must branch on refreshed backend");
+        let rt_resize = compact
+            .find("self.resize_rt_pipeline_to_swapchain(")
+            .expect("resize must route RT resources through refreshed backend state");
+        let vpt_resize = compact
+            .find("self.resize_vpt_pipeline_to_swapchain(")
+            .expect("resize must route VPT resources through refreshed backend state");
 
         assert!(refresh < ensure_passes);
-        assert!(refresh < match_backend);
+        assert!(refresh < rt_resize);
+        assert!(refresh < vpt_resize);
+        assert!(ensure_passes < rt_resize);
+        assert!(ensure_passes < vpt_resize);
     }
 
     #[test]
@@ -1007,6 +1049,76 @@ mod tests {
                 runtime_impl.contains(token),
                 "backend refresh helper missing {token}"
             );
+        }
+    }
+
+    #[test]
+    fn resize_pipeline_to_swapchain_resizes_selected_and_existing_inactive_backends() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let resize_pipeline = source
+            .split("fn resize_pipeline_to_swapchain")
+            .nth(1)
+            .expect("resize_pipeline_to_swapchain should exist")
+            .split("pub fn render_frame")
+            .next()
+            .expect("resize helper should end before render_frame");
+        let compact = crate::render::source_checks::compact(resize_pipeline);
+
+        for token in [
+            "self.resize_rt_pipeline_to_swapchain(scene_ubo,extent.width,extent.height)?",
+            "self.resize_vpt_pipeline_to_swapchain(scene_ubo,extent.width,extent.height,settings,restir_di_enabled,area_restir_enabled,)?",
+        ] {
+            assert!(
+                compact.contains(token),
+                "runtime resize must route through backend resize helper {token}"
+            );
+        }
+
+        assert!(
+            !compact.contains("matchself.render_backend{"),
+            "resize must not resize only the currently selected backend because inactive backend resources can become stale"
+        );
+    }
+
+    #[test]
+    fn rt_resize_helper_resizes_selected_or_existing_rt_resources() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let helper = source
+            .split("fn resize_rt_pipeline_to_swapchain")
+            .nth(1)
+            .expect("resize_rt_pipeline_to_swapchain should exist")
+            .split("fn resize_vpt_pipeline_to_swapchain")
+            .next()
+            .expect("RT resize helper should end before VPT resize helper");
+        let compact = crate::render::source_checks::compact(helper);
+
+        for token in [
+            "self.render_backend==RenderBackend::Rt||self.rt_pipeline.has_frame_resources()",
+            "self.rt_history_reset_generation=self.rt_history_reset_generation.wrapping_add(1)",
+            "self.rt_pipeline.resize(&self.renderer,scene_ubo,width,height)?",
+        ] {
+            assert!(compact.contains(token), "RT resize helper missing {token}");
+        }
+    }
+
+    #[test]
+    fn vpt_resize_helper_resizes_selected_or_existing_vpt_resources() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let helper = source
+            .split("fn resize_vpt_pipeline_to_swapchain")
+            .nth(1)
+            .expect("resize_vpt_pipeline_to_swapchain should exist")
+            .split("pub fn render_frame")
+            .next()
+            .expect("VPT resize helper should end before render_frame");
+        let compact = crate::render::source_checks::compact(helper);
+
+        for token in [
+            "self.render_backend==RenderBackend::Vpt||self.vpt_pipeline.has_frame_resources()",
+            "letSome(ucvh_gpu)=self.ucvh_gpu.as_ref()else",
+            "self.vpt_pipeline.resize(&self.renderer,scene_ubo,ucvh_gpu,width,height,settings.lighting,restir_di_enabled,area_restir_enabled,)?",
+        ] {
+            assert!(compact.contains(token), "VPT resize helper missing {token}");
         }
     }
 }
