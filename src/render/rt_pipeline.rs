@@ -51,6 +51,17 @@ pub struct RtFrameInputs<'a> {
     pub external_history_reset_generation: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RtFrameStatus {
+    pub frame_resources_ready: bool,
+    pub surface_ready: bool,
+    pub restir_di_history_ready: bool,
+    pub restir_gi_history_ready: bool,
+    pub direct_lighting_ready: bool,
+    pub temporal_ready: bool,
+    pub resolve_ready: bool,
+}
+
 #[derive(Default)]
 pub struct RtPipelineFrameState {
     pub surface_initialized: bool,
@@ -127,6 +138,18 @@ impl RtRuntimePipeline {
             || self.rt_direct_lighting_pass.is_some()
             || self.rt_temporal_pass.is_some()
             || self.rt_resolve_pass.is_some()
+    }
+
+    pub fn frame_status(&self) -> RtFrameStatus {
+        RtFrameStatus {
+            frame_resources_ready: self.has_frame_resources(),
+            surface_ready: self.frame_state.surface_initialized,
+            restir_di_history_ready: self.frame_state.restir_di_history_initialized,
+            restir_gi_history_ready: self.frame_state.restir_gi_history_initialized,
+            direct_lighting_ready: self.frame_state.direct_lighting_initialized,
+            temporal_ready: self.frame_state.temporal_initialized,
+            resolve_ready: self.frame_state.resolve_initialized,
+        }
     }
 
     pub fn ensure_passes(
@@ -1262,6 +1285,53 @@ fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rt_pipeline_frame_status_defaults_to_not_ready() {
+        let pipeline = RtRuntimePipeline::new();
+
+        assert_eq!(pipeline.frame_status(), RtFrameStatus::default());
+    }
+
+    #[test]
+    fn rt_pipeline_frame_status_snapshots_internal_frame_state() {
+        let mut pipeline = RtRuntimePipeline::new();
+        pipeline.frame_state.surface_initialized = true;
+        pipeline.frame_state.restir_di_history_initialized = true;
+        pipeline.frame_state.restir_gi_history_initialized = true;
+        pipeline.frame_state.direct_lighting_initialized = true;
+        pipeline.frame_state.temporal_initialized = true;
+        pipeline.frame_state.resolve_initialized = true;
+
+        assert_eq!(
+            pipeline.frame_status(),
+            RtFrameStatus {
+                frame_resources_ready: false,
+                surface_ready: true,
+                restir_di_history_ready: true,
+                restir_gi_history_ready: true,
+                direct_lighting_ready: true,
+                temporal_ready: true,
+                resolve_ready: true,
+            }
+        );
+    }
+
+    #[test]
+    fn rt_pipeline_frame_status_reports_frame_resource_presence_from_passes() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT pipeline implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        assert!(compact.contains("pubfnframe_status(&self)->RtFrameStatus"));
+        assert!(
+            compact.contains("frame_resources_ready:self.has_frame_resources()"),
+            "RT frame status must report actual RT pass resource presence"
+        );
+    }
 
     #[test]
     fn rt_pipeline_registers_surface_direct_lighting_temporal_then_resolve_in_order() {

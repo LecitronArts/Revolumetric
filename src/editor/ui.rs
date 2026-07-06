@@ -3,6 +3,7 @@
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 use crate::render::restir_di::{RestirDiDebugView, RestirDiSettings};
 use crate::render::rt_capabilities::RenderBackend;
+use crate::render::rt_pipeline::RtFrameStatus;
 use crate::render::rt_settings::{RtDebugView, RtSettings};
 use crate::render::runtime::RenderRuntimeStatus;
 use crate::render::scene_ubo::{
@@ -113,6 +114,10 @@ impl EditorUi {
                     ui.label(format!(
                         "rt_supported {}",
                         rt_supported_label(runtime_status)
+                    ));
+                    ui.label(format!(
+                        "rt_frame {}",
+                        rt_frame_status_label(runtime_status)
                     ));
                     ui.separator();
                     ui.label(format!("{} x {}", viewport_extent[0], viewport_extent[1]));
@@ -232,6 +237,34 @@ impl EditorUi {
                     ui.monospace(format!(
                         "rt_supported={}",
                         rt_supported_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_frame={}",
+                        rt_frame_status_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_surface={}",
+                        rt_frame_surface_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_direct={}",
+                        rt_frame_direct_lighting_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_temporal_ready={}",
+                        rt_frame_temporal_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_resolve={}",
+                        rt_frame_resolve_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_di_history={}",
+                        rt_frame_restir_di_history_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_gi_history={}",
+                        rt_frame_restir_gi_history_label(runtime_status)
                     ));
                     ui.monospace(format!("denoiser={}", lighting.denoiser_mode_name()));
                     ui.monospace(format!("rt_di={}", rt.restir_di_enabled));
@@ -498,6 +531,37 @@ fn show_render_panel(
         ui.monospace(runtime_status_backend_label(runtime_status));
         ui.label("RT support");
         ui.monospace(rt_supported_label(runtime_status));
+    });
+    ui.horizontal(|ui| {
+        ui.label("RT frame");
+        ui.monospace(rt_frame_status_label(runtime_status));
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.label("RT ready");
+        ui.monospace(format!(
+            "surface {}",
+            rt_frame_surface_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "direct {}",
+            rt_frame_direct_lighting_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "temporal {}",
+            rt_frame_temporal_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "resolve {}",
+            rt_frame_resolve_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "di_history {}",
+            rt_frame_restir_di_history_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "gi_history {}",
+            rt_frame_restir_gi_history_label(runtime_status)
+        ));
     });
     if let Some(notice) = rt_backend_notice(lighting.render_mode, runtime_status) {
         ui.colored_label(egui::Color32::YELLOW, notice);
@@ -790,6 +854,54 @@ fn rt_supported_label(status: Option<RenderRuntimeStatus>) -> &'static str {
     }
 }
 
+fn rt_frame_status(status: Option<RenderRuntimeStatus>) -> Option<RtFrameStatus> {
+    status.and_then(|status| status.rt_frame_status)
+}
+
+fn rt_frame_status_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    match (status, rt_frame_status(status)) {
+        (None, _) => "pending",
+        (Some(_), None) => "inactive",
+        (_, Some(frame_status)) if frame_status.resolve_ready => "ready",
+        (_, Some(_)) => "warming",
+    }
+}
+
+fn rt_frame_bool_label(
+    status: Option<RenderRuntimeStatus>,
+    select: fn(RtFrameStatus) -> bool,
+) -> &'static str {
+    match rt_frame_status(status).map(select) {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "unknown",
+    }
+}
+
+fn rt_frame_surface_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.surface_ready)
+}
+
+fn rt_frame_direct_lighting_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.direct_lighting_ready)
+}
+
+fn rt_frame_temporal_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.temporal_ready)
+}
+
+fn rt_frame_resolve_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.resolve_ready)
+}
+
+fn rt_frame_restir_di_history_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.restir_di_history_ready)
+}
+
+fn rt_frame_restir_gi_history_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.restir_gi_history_ready)
+}
+
 fn rt_backend_notice(
     requested: RenderMode,
     status: Option<RenderRuntimeStatus>,
@@ -897,6 +1009,7 @@ mod tests {
     use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
     use crate::render::restir_di::RestirDiSettings;
     use crate::render::rt_capabilities::RenderBackend;
+    use crate::render::rt_pipeline::RtFrameStatus;
     use crate::render::rt_settings::{RtDebugView, RtSettings};
     use crate::render::runtime::RenderRuntimeStatus;
     use crate::render::scene_ubo::{LightingSettings, VptDebugView};
@@ -1004,10 +1117,12 @@ mod tests {
         let rt_status = RenderRuntimeStatus {
             actual_backend: RenderBackend::Rt,
             rt_supported: true,
+            rt_frame_status: None,
         };
         let vpt_status = RenderRuntimeStatus {
             actual_backend: RenderBackend::Vpt,
             rt_supported: false,
+            rt_frame_status: None,
         };
 
         assert_eq!(render_backend_label(RenderBackend::Rt), "RT");
@@ -1017,6 +1132,50 @@ mod tests {
         assert_eq!(rt_supported_label(Some(rt_status)), "true");
         assert_eq!(rt_supported_label(Some(vpt_status)), "false");
         assert_eq!(rt_supported_label(None), "unknown");
+    }
+
+    #[test]
+    fn runtime_status_labels_cover_backend_pending_and_rt_frame_states() {
+        let inactive = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: true,
+            rt_frame_status: None,
+        };
+        let warming = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+            rt_frame_status: Some(RtFrameStatus {
+                frame_resources_ready: true,
+                surface_ready: true,
+                ..RtFrameStatus::default()
+            }),
+        };
+        let ready = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+            rt_frame_status: Some(RtFrameStatus {
+                frame_resources_ready: true,
+                surface_ready: true,
+                restir_di_history_ready: true,
+                restir_gi_history_ready: false,
+                direct_lighting_ready: true,
+                temporal_ready: true,
+                resolve_ready: true,
+            }),
+        };
+
+        assert_eq!(rt_frame_status_label(None), "pending");
+        assert_eq!(rt_frame_status_label(Some(inactive)), "inactive");
+        assert_eq!(rt_frame_status_label(Some(warming)), "warming");
+        assert_eq!(rt_frame_status_label(Some(ready)), "ready");
+        assert_eq!(rt_frame_surface_label(Some(ready)), "true");
+        assert_eq!(rt_frame_direct_lighting_label(Some(ready)), "true");
+        assert_eq!(rt_frame_temporal_label(Some(ready)), "true");
+        assert_eq!(rt_frame_resolve_label(Some(ready)), "true");
+        assert_eq!(rt_frame_restir_di_history_label(Some(ready)), "true");
+        assert_eq!(rt_frame_restir_gi_history_label(Some(ready)), "false");
+        assert_eq!(rt_frame_resolve_label(Some(inactive)), "unknown");
+        assert_eq!(rt_frame_surface_label(None), "unknown");
     }
 
     #[test]
@@ -1069,14 +1228,17 @@ mod tests {
         let rt_active = RenderRuntimeStatus {
             actual_backend: RenderBackend::Rt,
             rt_supported: true,
+            rt_frame_status: None,
         };
         let rt_fallback = RenderRuntimeStatus {
             actual_backend: RenderBackend::Vpt,
             rt_supported: true,
+            rt_frame_status: None,
         };
         let rt_unsupported = RenderRuntimeStatus {
             actual_backend: RenderBackend::Vpt,
             rt_supported: false,
+            rt_frame_status: None,
         };
 
         assert_eq!(rt_backend_notice(RenderMode::Rt, Some(rt_active)), None);
@@ -1149,6 +1311,61 @@ mod tests {
             "rt_supported={}",
             "runtime_status_backend_label(runtime_status)",
             "rt_supported_label(runtime_status)",
+        ] {
+            assert!(console.contains(token), "console missing {token}");
+        }
+    }
+
+    #[test]
+    fn top_bar_render_panel_and_console_report_rt_frame_status() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        let top_bar = source
+            .split("fn show_top_bar")
+            .nth(1)
+            .expect("top bar should exist")
+            .split("fn show_left_rail")
+            .next()
+            .expect("top bar should end before left rail");
+        assert!(
+            top_bar.contains("rt_frame_status_label(runtime_status)"),
+            "top bar must expose RT frame status"
+        );
+
+        let render_panel = source
+            .split("fn show_render_panel")
+            .nth(1)
+            .expect("render panel should exist")
+            .split("fn show_restir_panel")
+            .next()
+            .expect("render panel should end before sampling panel");
+        for token in [
+            "rt_frame_status_label(runtime_status)",
+            "rt_frame_surface_label(runtime_status)",
+            "rt_frame_direct_lighting_label(runtime_status)",
+            "rt_frame_temporal_label(runtime_status)",
+            "rt_frame_resolve_label(runtime_status)",
+            "rt_frame_restir_di_history_label(runtime_status)",
+            "rt_frame_restir_gi_history_label(runtime_status)",
+        ] {
+            assert!(render_panel.contains(token), "render panel missing {token}");
+        }
+
+        let console = source
+            .split("fn show_console")
+            .nth(1)
+            .expect("console should exist")
+            .split("fn show_viewport_overlay")
+            .next()
+            .expect("console should end before overlay");
+        for token in [
+            "rt_frame={}",
+            "rt_surface={}",
+            "rt_direct={}",
+            "rt_temporal_ready={}",
+            "rt_resolve={}",
+            "rt_di_history={}",
+            "rt_gi_history={}",
         ] {
             assert!(console.contains(token), "console missing {token}");
         }

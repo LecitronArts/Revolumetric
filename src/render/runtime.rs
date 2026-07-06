@@ -9,7 +9,7 @@ use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::gpu_profiler::{GpuProfiler, GpuProfilerConfig};
 use crate::render::restir_di::RestirDiSettings;
 use crate::render::rt_capabilities::{RenderBackend, RtCapabilities, resolve_render_backend};
-use crate::render::rt_pipeline::{RtFrameInputs, RtRuntimePipeline};
+use crate::render::rt_pipeline::{RtFrameInputs, RtFrameStatus, RtRuntimePipeline};
 use crate::render::rt_settings::RtSettings;
 use crate::render::scene_ubo::{LightingSettings, RenderMode, SceneUniformBuffer};
 use crate::render::vpt_pipeline::{
@@ -52,6 +52,7 @@ pub struct RenderFrameOutcome {
 pub struct RenderRuntimeStatus {
     pub actual_backend: RenderBackend,
     pub rt_supported: bool,
+    pub rt_frame_status: Option<RtFrameStatus>,
 }
 
 pub struct RenderRuntime {
@@ -220,6 +221,9 @@ impl RenderRuntime {
         RenderRuntimeStatus {
             actual_backend: self.render_backend,
             rt_supported: self.rt_capabilities.supported(),
+            rt_frame_status: (self.render_backend == RenderBackend::Rt
+                || self.rt_pipeline.has_frame_resources())
+            .then(|| self.rt_pipeline.frame_status()),
         }
     }
 
@@ -982,6 +986,7 @@ mod tests {
         for token in [
             "pub actual_backend: RenderBackend",
             "pub rt_supported: bool",
+            "pub rt_frame_status: Option<RtFrameStatus>",
         ] {
             assert!(
                 status_struct.contains(token),
@@ -993,6 +998,7 @@ mod tests {
             .split("impl RenderRuntime")
             .nth(1)
             .expect("RenderRuntime impl should exist");
+        let runtime_impl_compact = crate::render::source_checks::compact(runtime_impl);
         for token in [
             "pub fn status(&self) -> RenderRuntimeStatus",
             "actual_backend: self.render_backend",
@@ -1001,6 +1007,17 @@ mod tests {
             assert!(
                 runtime_impl.contains(token),
                 "RenderRuntime::status missing {token}"
+            );
+        }
+        for token in [
+            "rt_frame_status:",
+            "self.render_backend==RenderBackend::Rt",
+            "self.rt_pipeline.has_frame_resources()",
+            "self.rt_pipeline.frame_status()",
+        ] {
+            assert!(
+                runtime_impl_compact.contains(token),
+                "RenderRuntime::status missing compact RT frame status token {token}"
             );
         }
     }
