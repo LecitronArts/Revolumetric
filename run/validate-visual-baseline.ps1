@@ -152,7 +152,18 @@ function Assert-PpmMatchesMetadata {
     }
 }
 
-function Assert-PpmHasNonZeroRgb {
+function Test-CaseProperty {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Case,
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName
+    )
+
+    $Case.PSObject.Properties.Name -contains $FieldName
+}
+
+function Measure-PpmSignal {
     param(
         [Parameter(Mandatory = $true)]
         [string]$PpmPath
@@ -160,12 +171,69 @@ function Assert-PpmHasNonZeroRgb {
 
     $bytes = [System.IO.File]::ReadAllBytes($PpmPath)
     $header = Read-PpmHeader -Bytes $bytes
-    for ($i = $header.DataOffset; $i -lt $bytes.Length; $i++) {
-        if ($bytes[$i] -ne 0) {
-            return
+    $pixelCount = $header.Width * $header.Height
+    if ($pixelCount -le 0) {
+        throw "PPM dimensions produced no pixels: $PpmPath"
+    }
+    $pixelEnd = $header.DataOffset + ($pixelCount * 3)
+    if ($bytes.Length -lt $pixelEnd) {
+        throw "PPM byte length was $($bytes.Length), expected at least $pixelEnd."
+    }
+
+    $nonZeroPixels = 0
+    $minRgb = 255
+    $maxRgb = 0
+    for ($i = $header.DataOffset; $i -lt $pixelEnd; $i += 3) {
+        $r = [int]$bytes[$i]
+        $g = [int]$bytes[$i + 1]
+        $b = [int]$bytes[$i + 2]
+        if ($r -ne 0 -or $g -ne 0 -or $b -ne 0) {
+            $nonZeroPixels++
+        }
+        $minRgb = [Math]::Min($minRgb, [Math]::Min($r, [Math]::Min($g, $b)))
+        $maxRgb = [Math]::Max($maxRgb, [Math]::Max($r, [Math]::Max($g, $b)))
+    }
+
+    [PSCustomObject]@{
+        PixelCount = $pixelCount
+        NonZeroPixels = $nonZeroPixels
+        NonZeroPixelRatio = [double]$nonZeroPixels / [double]$pixelCount
+        MinRgb = $minRgb
+        MaxRgb = $maxRgb
+        RgbRange = $maxRgb - $minRgb
+    }
+}
+
+function Assert-PpmSignal {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$PpmPath,
+        [Parameter(Mandatory = $true)]
+        [object]$Case
+    )
+
+    $signal = Measure-PpmSignal -PpmPath $PpmPath
+    if ($signal.NonZeroPixels -le 0) {
+        throw "PPM capture contains only zero RGB pixels: $PpmPath"
+    }
+    if (Test-CaseProperty -Case $Case -FieldName "expectedMinNonZeroPixelRatio") {
+        if ($null -eq $Case.expectedMinNonZeroPixelRatio) {
+            throw "PPM signal threshold expectedMinNonZeroPixelRatio was null for $($Case.name)."
+        }
+        $minRatio = [double]$Case.expectedMinNonZeroPixelRatio
+        if ($signal.NonZeroPixelRatio -lt $minRatio) {
+            throw "PPM non-zero pixel ratio $($signal.NonZeroPixelRatio) was below expected minimum $minRatio for $($Case.name)."
         }
     }
-    throw "PPM capture contains only zero RGB bytes: $PpmPath"
+    if (Test-CaseProperty -Case $Case -FieldName "expectedMinRgbRange") {
+        if ($null -eq $Case.expectedMinRgbRange) {
+            throw "PPM signal threshold expectedMinRgbRange was null for $($Case.name)."
+        }
+        $minRange = [int]$Case.expectedMinRgbRange
+        if ($signal.RgbRange -lt $minRange) {
+            throw "PPM RGB range $($signal.RgbRange) was below expected minimum $minRange for $($Case.name)."
+        }
+    }
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -288,7 +356,7 @@ try {
         $metadata = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
         Assert-CaptureMetadata -Metadata $metadata -Case $case -CaptureFrame $captureFrame
         Assert-PpmMatchesMetadata -PpmPath $ppmPath -Metadata $metadata
-        Assert-PpmHasNonZeroRgb -PpmPath $ppmPath
+        Assert-PpmSignal -PpmPath $ppmPath -Case $case
     }
 } finally {
     Set-Location $previousLocation

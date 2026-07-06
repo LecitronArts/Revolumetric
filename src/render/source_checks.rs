@@ -32,6 +32,20 @@ pub(crate) fn assert_compact_contains_all(source: &str, tokens: &[&str], context
 mod tests {
     use super::*;
 
+    fn visual_baseline_case<'a>(manifest: &'a str, name: &str) -> &'a str {
+        let after_name = manifest
+            .split(&format!("\"name\": \"{name}\""))
+            .nth(1)
+            .unwrap_or_else(|| panic!("visual baseline manifest should include {name}"));
+        after_name
+            .split("\n    },\n    {")
+            .next()
+            .expect("visual baseline case should end before the next case")
+            .split("\n    }\n  ]")
+            .next()
+            .expect("visual baseline case should end before the cases array")
+    }
+
     #[test]
     fn compact_ignores_line_endings_and_spacing() {
         let source = "builder\r\n    .add_binding(\r\n        6,\r\n    )";
@@ -140,7 +154,18 @@ mod tests {
                 "Assert-MetadataBooleanField",
                 "$Metadata.PSObject.Properties.Name -contains $FieldName",
                 "Assert-PpmMatchesMetadata",
-                "Assert-PpmHasNonZeroRgb",
+                "Measure-PpmSignal",
+                "Assert-PpmSignal",
+                "Assert-PpmSignal -PpmPath $ppmPath -Case $case",
+                "NonZeroPixelRatio",
+                "RgbRange",
+                "Test-CaseProperty",
+                "Test-CaseProperty -Case $Case -FieldName \"expectedMinNonZeroPixelRatio\"",
+                "Test-CaseProperty -Case $Case -FieldName \"expectedMinRgbRange\"",
+                "expectedMinNonZeroPixelRatio",
+                "expectedMinRgbRange",
+                "PPM signal threshold expectedMinNonZeroPixelRatio was null",
+                "PPM signal threshold expectedMinRgbRange was null",
                 "[switch]$Rt",
                 "requiresRt",
                 "REVOLUMETRIC_RT_DEBUG_VIEW",
@@ -165,6 +190,11 @@ mod tests {
                 "cargo run --features desktop --bin revolumetric",
             ],
             "visual baseline script",
+        );
+
+        assert!(
+            !script.contains("Assert-PpmHasNonZeroRgb"),
+            "visual baseline script must not keep the old one-byte non-zero PPM gate"
         );
     }
 
@@ -203,6 +233,38 @@ mod tests {
             ],
             "visual baseline manifest",
         );
+
+        let svgf_case = visual_baseline_case(&manifest, "svgf_final");
+        assert_contains_all(
+            svgf_case,
+            &[
+                "\"expectedMinNonZeroPixelRatio\": 0.25",
+                "\"expectedMinRgbRange\": 32",
+            ],
+            "svgf_final visual baseline case",
+        );
+
+        let rt_case = visual_baseline_case(&manifest, "rt_surface_debug");
+        assert_contains_all(
+            rt_case,
+            &[
+                "\"expectedMinNonZeroPixelRatio\": 0.25",
+                "\"expectedMinRgbRange\": 32",
+            ],
+            "rt_surface_debug visual baseline case",
+        );
+
+        for nrd_case_name in ["reblur_final", "reblur_nrd_validation"] {
+            let nrd_case = visual_baseline_case(&manifest, nrd_case_name);
+            assert!(
+                !nrd_case.contains("\"expectedMinNonZeroPixelRatio\""),
+                "{nrd_case_name} should not require measured PPM signal coverage"
+            );
+            assert!(
+                !nrd_case.contains("\"expectedMinRgbRange\""),
+                "{nrd_case_name} should not require measured PPM RGB range"
+            );
+        }
     }
 
     #[test]

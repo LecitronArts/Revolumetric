@@ -10,7 +10,9 @@
       "requiresNrd": false,
       "requiresRt": false,
       "expectedRenderBackend": "vpt",
-      "expectedEffectiveDenoiser": "svgf"
+      "expectedEffectiveDenoiser": "svgf",
+      "expectedMinNonZeroPixelRatio": 0.25,
+      "expectedMinRgbRange": 32
     },
     {
       "name": "reblur_final",
@@ -41,6 +43,8 @@
       "requiresRt": true,
       "expectedRenderBackend": "rt",
       "expectedEffectiveDenoiser": "svgf",
+      "expectedMinNonZeroPixelRatio": 0.25,
+      "expectedMinRgbRange": 32,
       "rtDebugView": "surface",
       "rtRestirDi": true,
       "rtRestirDiSpatial": true,
