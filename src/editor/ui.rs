@@ -2,8 +2,9 @@
 
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 use crate::render::restir_di::{RestirDiDebugView, RestirDiSettings};
+use crate::render::rt_settings::{RtDebugView, RtSettings};
 use crate::render::scene_ubo::{
-    LightingDebugView, LightingSettings, VptDebugView, VptDenoiserMode,
+    LightingDebugView, LightingSettings, RenderMode, VptDebugView, VptDenoiserMode,
 };
 use crate::render::vpt_pipeline::VptCameraFrame;
 
@@ -25,6 +26,7 @@ pub struct EditorUi {
 
 pub struct EditorUiFrameState<'a> {
     pub lighting: &'a mut LightingSettings,
+    pub rt: &'a mut RtSettings,
     pub restir_di: &'a mut RestirDiSettings,
     pub area_restir: &'a mut AreaRestirSettings,
     pub camera: VptCameraFrame,
@@ -64,6 +66,7 @@ impl EditorUi {
 
         let EditorUiFrameState {
             lighting,
+            rt,
             restir_di,
             area_restir,
             camera,
@@ -73,8 +76,8 @@ impl EditorUi {
 
         self.show_top_bar(ctx, lighting, viewport_extent, rendered_frames);
         self.show_left_rail(ctx, camera);
-        self.show_inspector(ctx, lighting, restir_di, area_restir);
-        self.show_console(ctx, lighting, restir_di, area_restir);
+        self.show_inspector(ctx, lighting, rt, restir_di, area_restir);
+        self.show_console(ctx, lighting, rt, restir_di, area_restir);
         self.show_viewport_overlay(ctx, camera, lighting);
     }
 
@@ -91,7 +94,7 @@ impl EditorUi {
                 ui.horizontal_centered(|ui| {
                     ui.strong("REVOLUMETRIC");
                     ui.separator();
-                    ui.label("VPT Editor");
+                    ui.label(format!("mode {}", render_mode_label(lighting.render_mode)));
                     ui.separator();
                     ui.label(format!("{} x {}", viewport_extent[0], viewport_extent[1]));
                     ui.label(format!("frame {rendered_frames}"));
@@ -151,6 +154,7 @@ impl EditorUi {
         &mut self,
         ctx: &egui::Context,
         lighting: &mut LightingSettings,
+        rt: &mut RtSettings,
         restir_di: &mut RestirDiSettings,
         area_restir: &mut AreaRestirSettings,
     ) {
@@ -162,11 +166,20 @@ impl EditorUi {
                 ui.add_space(4.0);
                 match self.selected_panel {
                     EditorPanel::Scene => show_scene_panel(ui, lighting),
-                    EditorPanel::Render => show_render_panel(ui, lighting),
+                    EditorPanel::Render => show_render_panel(ui, lighting, rt),
                     EditorPanel::Restir => {
-                        show_restir_panel(ui, lighting, restir_di, area_restir, self.show_advanced);
+                        show_restir_panel(
+                            ui,
+                            lighting,
+                            rt,
+                            restir_di,
+                            area_restir,
+                            self.show_advanced,
+                        );
                     }
-                    EditorPanel::Debug => show_debug_panel(ui, lighting, restir_di, area_restir),
+                    EditorPanel::Debug => {
+                        show_debug_panel(ui, lighting, rt, restir_di, area_restir)
+                    }
                 }
             });
     }
@@ -175,6 +188,7 @@ impl EditorUi {
         &self,
         ctx: &egui::Context,
         lighting: &LightingSettings,
+        rt: &RtSettings,
         restir_di: &RestirDiSettings,
         area_restir: &AreaRestirSettings,
     ) {
@@ -186,7 +200,14 @@ impl EditorUi {
                 ui.horizontal(|ui| {
                     ui.strong("Console");
                     ui.separator();
+                    ui.monospace(format!(
+                        "render_mode={}",
+                        render_mode_label(lighting.render_mode)
+                    ));
                     ui.monospace(format!("denoiser={}", lighting.denoiser_mode_name()));
+                    ui.monospace(format!("rt_di={}", rt.restir_di_enabled));
+                    ui.monospace(format!("rt_gi={}", rt.restir_gi_enabled));
+                    ui.monospace(format!("rt_temporal={}", rt.temporal_denoise_enabled));
                     ui.monospace(format!("restir_di={}", restir_di.enabled));
                     ui.monospace(format!("area_restir={}", area_restir.enabled));
                 });
@@ -251,6 +272,30 @@ pub fn clamp_vpt_max_bounces(value: u32) -> u32 {
 
 pub fn clamp_denoiser_atrous_iterations(value: u32) -> u32 {
     value.clamp(0, 5)
+}
+
+pub fn clamp_rt_history_length(value: u32) -> u32 {
+    value.clamp(1, 64)
+}
+
+pub fn clamp_rt_spatial_samples(value: u32) -> u32 {
+    value.clamp(0, 8)
+}
+
+pub fn sanitize_rt_temporal_thresholds(settings: &mut RtSettings) {
+    let defaults = RtSettings::default();
+    if !settings.normal_threshold.is_finite()
+        || settings.normal_threshold < 0.0
+        || settings.normal_threshold > 1.0
+    {
+        settings.normal_threshold = defaults.normal_threshold;
+    }
+    if !settings.depth_threshold.is_finite()
+        || settings.depth_threshold < 0.0
+        || settings.depth_threshold > 1.0
+    {
+        settings.depth_threshold = defaults.depth_threshold;
+    }
 }
 
 pub fn set_restir_di_enabled(settings: &mut RestirDiSettings, enabled: bool) {
@@ -407,8 +452,16 @@ fn show_scene_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings) {
     }
 }
 
-fn show_render_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings) {
-    ui.label("Path Tracing");
+fn show_render_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings, rt: &mut RtSettings) {
+    ui.label("Renderer");
+    egui::ComboBox::from_id_salt("render_mode")
+        .selected_text(render_mode_label(lighting.render_mode))
+        .show_ui(ui, |ui| {
+            render_mode_combo(ui, &mut lighting.render_mode);
+        });
+
+    ui.separator();
+    ui.label("VPT Path Tracing");
     ui.add(egui::Slider::new(&mut lighting.vpt_max_bounces, 1..=8).text("max bounces"));
     lighting.vpt_max_bounces = clamp_vpt_max_bounces(lighting.vpt_max_bounces);
     ui.add(
@@ -433,11 +486,21 @@ fn show_render_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings) {
     );
     lighting.denoiser_atrous_iterations =
         clamp_denoiser_atrous_iterations(lighting.denoiser_atrous_iterations);
+
+    ui.separator();
+    ui.label("RT Temporal");
+    ui.checkbox(&mut rt.temporal_denoise_enabled, "Temporal accumulation");
+    ui.add(egui::Slider::new(&mut rt.history_length, 1..=64).text("history length"));
+    rt.history_length = clamp_rt_history_length(rt.history_length);
+    ui.add(egui::Slider::new(&mut rt.normal_threshold, 0.0..=1.0).text("normal threshold"));
+    ui.add(egui::Slider::new(&mut rt.depth_threshold, 0.0..=1.0).text("depth threshold"));
+    sanitize_rt_temporal_thresholds(rt);
 }
 
 fn show_restir_panel(
     ui: &mut egui::Ui,
     lighting: &mut LightingSettings,
+    rt: &mut RtSettings,
     restir_di: &mut RestirDiSettings,
     area_restir: &mut AreaRestirSettings,
     show_advanced: bool,
@@ -511,11 +574,23 @@ fn show_restir_panel(
     if area_debug != area_restir.debug_view {
         set_area_restir_debug_view(lighting, restir_di, area_restir, area_debug);
     }
+
+    ui.separator();
+    ui.label("RT ReSTIR");
+    ui.checkbox(&mut rt.restir_di_enabled, "Enable RT ReSTIR-DI");
+    ui.checkbox(&mut rt.restir_di_spatial_enabled, "RT DI spatial reuse");
+    ui.add(
+        egui::Slider::new(&mut rt.restir_di_spatial_sample_count, 0..=8)
+            .text("RT DI spatial samples"),
+    );
+    rt.restir_di_spatial_sample_count = clamp_rt_spatial_samples(rt.restir_di_spatial_sample_count);
+    ui.checkbox(&mut rt.restir_gi_enabled, "Enable RT ReSTIR-GI");
 }
 
 fn show_debug_panel(
     ui: &mut egui::Ui,
     lighting: &mut LightingSettings,
+    rt: &mut RtSettings,
     restir_di: &mut RestirDiSettings,
     area: &mut AreaRestirSettings,
 ) {
@@ -570,6 +645,14 @@ fn show_debug_panel(
     if area_debug != area.debug_view {
         set_area_restir_debug_view(lighting, restir_di, area, area_debug);
     }
+
+    ui.separator();
+    ui.label("RT Debug");
+    egui::ComboBox::from_id_salt("debug_rt_view")
+        .selected_text(rt_debug_label(rt.debug_view))
+        .show_ui(ui, |ui| {
+            rt_debug_combo(ui, &mut rt.debug_view);
+        });
 }
 
 fn denoiser_combo(ui: &mut egui::Ui, mode: &mut VptDenoiserMode) {
@@ -577,6 +660,18 @@ fn denoiser_combo(ui: &mut egui::Ui, mode: &mut VptDenoiserMode) {
     ui.selectable_value(mode, VptDenoiserMode::Svgf, "SVGF");
     ui.selectable_value(mode, VptDenoiserMode::Relax, "NRD RELAX");
     ui.selectable_value(mode, VptDenoiserMode::Reblur, "NRD REBLUR");
+}
+
+fn render_mode_combo(ui: &mut egui::Ui, mode: &mut RenderMode) {
+    ui.selectable_value(mode, RenderMode::Auto, "Auto");
+    ui.selectable_value(mode, RenderMode::Vpt, "VPT");
+    ui.selectable_value(mode, RenderMode::Rt, "RT");
+}
+
+fn rt_debug_combo(ui: &mut egui::Ui, debug_view: &mut RtDebugView) {
+    for (view, label) in RT_DEBUG_OPTIONS {
+        ui.selectable_value(debug_view, *view, *label);
+    }
 }
 
 fn restir_di_debug_combo(ui: &mut egui::Ui, debug_view: &mut RestirDiDebugView) {
@@ -623,6 +718,14 @@ fn denoiser_label(mode: VptDenoiserMode) -> &'static str {
     }
 }
 
+fn render_mode_label(mode: RenderMode) -> &'static str {
+    match mode {
+        RenderMode::Auto => "Auto",
+        RenderMode::Vpt => "VPT",
+        RenderMode::Rt => "RT",
+    }
+}
+
 fn lighting_debug_label(debug_view: LightingDebugView) -> &'static str {
     match debug_view {
         LightingDebugView::Final => "Final",
@@ -661,6 +764,13 @@ fn vpt_debug_label(debug_view: VptDebugView) -> &'static str {
         .unwrap_or("Unknown")
 }
 
+fn rt_debug_label(debug_view: RtDebugView) -> &'static str {
+    RT_DEBUG_OPTIONS
+        .iter()
+        .find_map(|(view, label)| (*view == debug_view).then_some(*label))
+        .unwrap_or("Unknown")
+}
+
 fn format_vec3(label: &str, value: glam::Vec3) -> String {
     format!("{label} {:>7.2} {:>7.2} {:>7.2}", value.x, value.y, value.z)
 }
@@ -693,11 +803,22 @@ const VPT_DEBUG_OPTIONS: &[(VptDebugView, &str)] = &[
     (VptDebugView::NrdValidation, "NRD Validation"),
 ];
 
+const RT_DEBUG_OPTIONS: &[(RtDebugView, &str)] = &[
+    (RtDebugView::Off, "Off"),
+    (RtDebugView::Surface, "Surface"),
+    (RtDebugView::HitDistance, "Hit Distance"),
+    (RtDebugView::HistoryValid, "History Valid"),
+    (RtDebugView::DirectReservoir, "Direct Reservoir"),
+    (RtDebugView::IndirectReservoir, "Indirect Reservoir"),
+    (RtDebugView::Temporal, "Temporal"),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
     use crate::render::restir_di::RestirDiSettings;
+    use crate::render::rt_settings::{RtDebugView, RtSettings};
     use crate::render::scene_ubo::{LightingSettings, VptDebugView};
 
     #[test]
@@ -712,6 +833,178 @@ mod tests {
         assert_eq!(clamp_denoiser_atrous_iterations(0), 0);
         assert_eq!(clamp_denoiser_atrous_iterations(3), 3);
         assert_eq!(clamp_denoiser_atrous_iterations(99), 5);
+    }
+
+    #[test]
+    fn editor_rt_history_length_control_clamps_to_runtime_range() {
+        assert_eq!(clamp_rt_history_length(0), 1);
+        assert_eq!(clamp_rt_history_length(20), 20);
+        assert_eq!(clamp_rt_history_length(128), 64);
+    }
+
+    #[test]
+    fn editor_rt_spatial_sample_control_clamps_to_runtime_range() {
+        assert_eq!(clamp_rt_spatial_samples(0), 0);
+        assert_eq!(clamp_rt_spatial_samples(4), 4);
+        assert_eq!(clamp_rt_spatial_samples(128), 8);
+    }
+
+    #[test]
+    fn rt_temporal_threshold_sanitizer_restores_invalid_values_to_defaults() {
+        let mut settings = RtSettings {
+            normal_threshold: f32::NAN,
+            depth_threshold: -1.0,
+            ..RtSettings::default()
+        };
+
+        sanitize_rt_temporal_thresholds(&mut settings);
+
+        assert_eq!(
+            settings.normal_threshold,
+            RtSettings::default().normal_threshold
+        );
+        assert_eq!(
+            settings.depth_threshold,
+            RtSettings::default().depth_threshold
+        );
+    }
+
+    #[test]
+    fn rt_debug_options_cover_every_runtime_debug_view() {
+        let views: Vec<RtDebugView> = RT_DEBUG_OPTIONS.iter().map(|(view, _)| *view).collect();
+
+        assert_eq!(
+            views,
+            vec![
+                RtDebugView::Off,
+                RtDebugView::Surface,
+                RtDebugView::HitDistance,
+                RtDebugView::HistoryValid,
+                RtDebugView::DirectReservoir,
+                RtDebugView::IndirectReservoir,
+                RtDebugView::Temporal,
+            ]
+        );
+        assert_eq!(
+            rt_debug_label(RtDebugView::DirectReservoir),
+            "Direct Reservoir"
+        );
+    }
+
+    #[test]
+    fn editor_frame_state_carries_mutable_rt_settings() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let frame_state = source
+            .split("pub struct EditorUiFrameState")
+            .nth(1)
+            .expect("EditorUiFrameState should exist")
+            .split("impl Default for EditorUi")
+            .next()
+            .expect("EditorUiFrameState should end before EditorUi impls");
+
+        assert!(frame_state.contains("pub rt: &'a mut RtSettings"));
+    }
+
+    #[test]
+    fn render_panel_exposes_backend_selection_and_rt_temporal_controls() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let render_panel = source
+            .split("fn show_render_panel")
+            .nth(1)
+            .expect("render panel should exist")
+            .split("fn show_restir_panel")
+            .next()
+            .expect("render panel should end before sampling panel");
+
+        for token in [
+            "render_mode_combo(ui, &mut lighting.render_mode)",
+            "RT Temporal",
+            "rt.temporal_denoise_enabled",
+            "rt.history_length",
+            "rt.normal_threshold",
+            "rt.depth_threshold",
+            "sanitize_rt_temporal_thresholds(rt)",
+        ] {
+            assert!(render_panel.contains(token), "render panel missing {token}");
+        }
+    }
+
+    #[test]
+    fn top_bar_and_console_report_requested_backend_and_rt_state() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        let top_bar = source
+            .split("fn show_top_bar")
+            .nth(1)
+            .expect("top bar should exist")
+            .split("fn show_left_rail")
+            .next()
+            .expect("top bar should end before left rail");
+        assert!(top_bar.contains("render_mode_label(lighting.render_mode)"));
+        assert!(!top_bar.contains("\"VPT Editor\""));
+
+        let console = source
+            .split("fn show_console")
+            .nth(1)
+            .expect("console should exist")
+            .split("fn show_viewport_overlay")
+            .next()
+            .expect("console should end before overlay");
+        for token in ["render_mode={}", "rt_di={}", "rt_gi={}", "rt_temporal={}"] {
+            assert!(console.contains(token), "console missing {token}");
+        }
+    }
+
+    #[test]
+    fn sampling_panel_exposes_rt_restir_controls() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let sampling_panel = source
+            .split("fn show_restir_panel")
+            .nth(1)
+            .expect("sampling panel should exist")
+            .split("fn show_debug_panel")
+            .next()
+            .expect("sampling panel should end before debug panel");
+
+        for token in [
+            "RT ReSTIR",
+            "rt.restir_di_enabled",
+            "rt.restir_di_spatial_enabled",
+            "rt.restir_di_spatial_sample_count",
+            "rt.restir_gi_enabled",
+            "clamp_rt_spatial_samples(rt.restir_di_spatial_sample_count)",
+        ] {
+            assert!(
+                sampling_panel.contains(token),
+                "sampling panel missing {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn debug_panel_exposes_independent_rt_debug_controls() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let debug_panel = source
+            .split("fn show_debug_panel")
+            .nth(1)
+            .expect("debug panel should exist")
+            .split("fn denoiser_combo")
+            .next()
+            .expect("debug panel should end before combo helpers");
+
+        for token in [
+            "RT Debug",
+            "debug_rt_view",
+            "rt.debug_view",
+            "rt_debug_combo(ui, &mut rt.debug_view)",
+        ] {
+            assert!(debug_panel.contains(token), "debug panel missing {token}");
+        }
+
+        assert!(
+            !debug_panel.contains("set_rt_debug_view"),
+            "RT debug should be independent direct RtSettings mutation in this phase"
+        );
     }
 
     #[test]

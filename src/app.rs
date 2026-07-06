@@ -381,6 +381,7 @@ impl RevolumetricApp {
                 ctx,
                 EditorUiFrameState {
                     lighting: &mut self.lighting_settings,
+                    rt: &mut self.rt_settings,
                     restir_di: &mut self.restir_di_settings,
                     area_restir: &mut self.area_restir_settings,
                     camera,
@@ -927,6 +928,20 @@ mod tests {
     fn current_elapsed_seconds_defaults_to_zero_without_time_resource() {
         let app = RevolumetricApp::new();
         assert_eq!(app.current_elapsed_seconds(), 0.0);
+    }
+
+    #[test]
+    fn app_passes_rt_settings_to_editor_ui_frame_state() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let build_egui_frame = source
+            .split("fn build_egui_frame")
+            .nth(1)
+            .expect("build_egui_frame should exist")
+            .split("#[cfg(target_os = \"android\")]")
+            .next()
+            .expect("desktop build_egui_frame should end before android variant");
+
+        assert!(build_egui_frame.contains("rt: &mut self.rt_settings"));
     }
 
     #[test]
