@@ -69,10 +69,10 @@ pub struct GpuRtSettings {
 impl Default for RtSettings {
     fn default() -> Self {
         Self {
-            restir_di_enabled: false,
-            restir_gi_enabled: false,
+            restir_di_enabled: true,
+            restir_gi_enabled: true,
             temporal_denoise_enabled: true,
-            restir_di_spatial_enabled: false,
+            restir_di_spatial_enabled: true,
             restir_di_spatial_sample_count: 4,
             history_length: 20,
             normal_threshold: 0.85,
@@ -326,13 +326,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rt_settings_defaults_keep_temporal_denoise_enabled_and_restir_disabled() {
+    fn rt_settings_defaults_enable_full_rt_restir_startup_profile() {
         let settings = RtSettings::default();
 
-        assert!(!settings.restir_di_enabled);
-        assert!(!settings.restir_gi_enabled);
+        assert!(settings.restir_di_enabled);
+        assert!(settings.restir_gi_enabled);
         assert!(settings.temporal_denoise_enabled);
-        assert!(!settings.restir_di_spatial_enabled);
+        assert!(settings.restir_di_spatial_enabled);
         assert_eq!(settings.restir_di_spatial_sample_count, 4);
         assert_eq!(settings.history_length, 20);
         assert_eq!(settings.normal_threshold, 0.85);
@@ -420,9 +420,10 @@ mod tests {
         );
 
         let uniforms = RtSettings::default().gpu_uniforms();
-        assert_eq!(uniforms.restir_di_enabled, 0);
+        assert_eq!(uniforms.restir_di_enabled, 1);
+        assert_eq!(uniforms.restir_gi_enabled, 1);
         assert_eq!(uniforms.temporal_denoise_enabled, 1);
-        assert_eq!(uniforms.restir_di_spatial_enabled, 0);
+        assert_eq!(uniforms.restir_di_spatial_enabled, 1);
         assert_eq!(uniforms.restir_di_spatial_sample_count, 4);
         assert_eq!(uniforms.debug_view, RtDebugView::Off.as_gpu_value());
     }

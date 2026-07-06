@@ -49,7 +49,10 @@ Use a staged rollout, not a single leap:
 3. ReSTIR-GI on the same RT backend.
 4. Optional spatial ReSTIR reuse only after temporal history and lighting are stable.
 
-Current implementation note: RT ReSTIR-DI spatial reuse is present as an opt-in setting and remains disabled by default. RT ReSTIR-GI currently uses temporal reuse only.
+Current implementation note: RT ReSTIR-DI spatial reuse is implemented and the
+default RT startup profile enables RT ReSTIR-DI, RT ReSTIR-DI spatial reuse, and
+RT ReSTIR-GI unless explicitly disabled by environment override or UI. RT
+ReSTIR-GI currently uses temporal reuse only.
 
 Reasoning:
 
@@ -132,7 +135,10 @@ Minimum viable behavior:
 - reuse reservoirs temporally
 - resolve direct lighting in the final lighting pass
 
-Spatial reuse should remain opt-in and disabled by default until temporal behavior is stable.
+The original rollout kept spatial reuse opt-in until temporal behavior was
+stable. Current startup defaults now enable RT ReSTIR-DI spatial reuse on the
+hardware RT backend, while environment overrides and UI controls can still
+disable it explicitly.
 
 ### ReSTIR-GI
 

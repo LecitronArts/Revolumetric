@@ -590,7 +590,11 @@ impl RtRestirDiPass {
 }
 ```
 
-Reuse the existing `GpuDirectLight`, `GpuRestirDiReservoir`, and `RestirDiSettings` CPU ABI. The initial plan deferred spatial reuse, but the current implementation includes RT ReSTIR-DI spatial reuse as an opt-in path that is disabled by default; keep it isolated from the temporal-only GI and final denoise path.
+Reuse the existing `GpuDirectLight`, `GpuRestirDiReservoir`, and
+`RestirDiSettings` CPU ABI. The initial plan deferred spatial reuse, but the
+current implementation includes RT ReSTIR-DI spatial reuse and the default RT
+startup profile enables it unless explicitly disabled; keep it isolated from the
+temporal-only GI and final denoise path.
 
 - [x] **Step 4: Run the focused tests to verify they pass**
 

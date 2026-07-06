@@ -109,11 +109,14 @@ mod tests {
         assert_contains_all(
             &readme,
             &[
+                "RT ReSTIR defaults are enabled on the hardware RT backend",
+                "`REVOLUMETRIC_RT_RESTIR_DI=on|off|1|0|true|false`: enables RT ReSTIR-DI direct-light reservoirs. Default is `on`.",
+                "`REVOLUMETRIC_RT_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables RT ReSTIR-DI spatial reservoir reuse after temporal history is valid. Default is `on`.",
+                "`REVOLUMETRIC_RT_RESTIR_GI=on|off|1|0|true|false`: enables RT ReSTIR-GI after RT surface generation.",
+                "RT path still does not enable NRD, SER, or path guiding. Default is `on`.",
                 "$env:REVOLUMETRIC_RENDER_MODE='rt'",
-                "$env:REVOLUMETRIC_RT_RESTIR_DI='on'",
-                "$env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL='on'",
-                "$env:REVOLUMETRIC_RT_RESTIR_GI='on'",
                 "$env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'",
+                "cargo run --features desktop --bin revolumetric # explicit RT ReSTIR default smoke",
                 "default auto backend smoke",
             ],
             "README RT validation smoke docs",

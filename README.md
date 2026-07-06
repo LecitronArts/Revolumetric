@@ -60,12 +60,15 @@ Rendering settings can be overridden through environment variables:
 
 Invalid rendering environment values emit parse warnings and keep the default for the invalid setting.
 
-Hardware RT settings are opt-in while the backend is being brought up:
+RT ReSTIR defaults are enabled on the hardware RT backend so the normal
+RT-capable startup path exercises the integrated direct-light, spatial reuse,
+and one-bounce indirect reservoir passes. These settings can still be disabled
+explicitly through environment overrides:
 
-- `REVOLUMETRIC_RT_RESTIR_DI=on|off|1|0|true|false`: enables RT ReSTIR-DI direct-light reservoirs. Default is `off`.
-- `REVOLUMETRIC_RT_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables RT ReSTIR-DI spatial reservoir reuse after temporal history is valid. Default is `off`.
+- `REVOLUMETRIC_RT_RESTIR_DI=on|off|1|0|true|false`: enables RT ReSTIR-DI direct-light reservoirs. Default is `on`.
+- `REVOLUMETRIC_RT_RESTIR_DI_SPATIAL=on|off|1|0|true|false`: enables RT ReSTIR-DI spatial reservoir reuse after temporal history is valid. Default is `on`.
 - `REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES=0..8`: spatial neighbor sample count for RT ReSTIR-DI. Default is `4`.
-- `REVOLUMETRIC_RT_RESTIR_GI=on|off|1|0|true|false`: enables RT ReSTIR-GI after RT surface generation. It traces a one-bounce hardware RT indirect sample, stores an indirect path-vertex reservoir with temporal reuse, and feeds the reservoir into the RT final lighting resolve. The RT path still does not enable NRD, SER, or path guiding. Default is `off`.
+- `REVOLUMETRIC_RT_RESTIR_GI=on|off|1|0|true|false`: enables RT ReSTIR-GI after RT surface generation. It traces a one-bounce hardware RT indirect sample, stores an indirect path-vertex reservoir with temporal reuse, and feeds the reservoir into the RT final lighting resolve. The RT path still does not enable NRD, SER, or path guiding. Default is `on`.
 - `REVOLUMETRIC_RT_TEMPORAL_DENOISE=on|off|1|0|true|false`: enables the RT temporal-only accumulation path. Default is `on`.
 - `REVOLUMETRIC_RT_TEMPORAL_HISTORY_LENGTH=1..64`: RT temporal and reservoir history budget. Default is `20`.
 - `REVOLUMETRIC_RT_TEMPORAL_NORMAL_THRESHOLD=0.0..1.0`: normal compatibility threshold for RT temporal/spatial reuse. Default is `0.85`.
@@ -117,7 +120,7 @@ Default VPT runtime flow:
 7. Postprocess applies exposure, ACES tonemap, and gamma, then writes LDR `rgba8`.
 8. Blit copies postprocess output to the swapchain.
 
-Opt-in hardware RT flow:
+Default hardware RT flow on RT-capable devices:
 
 1. UCVH and RT acceleration structures are updated.
 2. RT surface generation traces primary rays and writes surface attributes plus motion guides.
@@ -142,15 +145,9 @@ Validation matrix for this MVP:
 .\run\validate-visual-baseline.ps1 -Rt
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 $env:REVOLUMETRIC_RENDER_MODE='rt'
-$env:REVOLUMETRIC_RT_RESTIR_DI='on'
-$env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL='on'
-$env:REVOLUMETRIC_RT_RESTIR_GI='on'
 $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'
-cargo run --features desktop --bin revolumetric
+cargo run --features desktop --bin revolumetric # explicit RT ReSTIR default smoke
 Remove-Item Env:\REVOLUMETRIC_RENDER_MODE
-Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI
-Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI_SPATIAL
-Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI
 Remove-Item Env:\REVOLUMETRIC_EXIT_AFTER_FRAMES
 $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'
 cargo run --features desktop --bin revolumetric # default auto backend smoke
