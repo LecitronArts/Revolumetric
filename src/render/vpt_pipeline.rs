@@ -1582,6 +1582,10 @@ impl VptRuntimePipeline {
                             .restir_di_spatial_sample_count,
                         rt_restir_gi_enabled: inputs.rt_settings.restir_gi_enabled,
                         rt_temporal_denoise_enabled: inputs.rt_settings.temporal_denoise_enabled,
+                        rt_frame_rendered: false,
+                        rt_restir_di_rendered: false,
+                        rt_restir_gi_rendered: false,
+                        rt_resolve_ready: false,
                         restir_di_enabled: inputs.restir_di_enabled,
                         restir_di_temporal_enabled,
                         restir_di_spatial_enabled,
@@ -2340,6 +2344,31 @@ mod tests {
             capture_effective_denoiser_mode_name(settings, false),
             VptDenoiserMode::Off.as_config_value()
         );
+    }
+
+    #[test]
+    fn vpt_capture_metadata_marks_active_rt_passes_false() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let capture = source
+            .split("pending_capture = Some(CaptureMetadata")
+            .nth(1)
+            .expect("VPT capture metadata should exist")
+            .split("tracing::info!")
+            .next()
+            .expect("capture metadata should end before tracing");
+        let compact = crate::render::source_checks::compact(capture);
+
+        for token in [
+            "rt_frame_rendered:false",
+            "rt_restir_di_rendered:false",
+            "rt_restir_gi_rendered:false",
+            "rt_resolve_ready:false",
+        ] {
+            assert!(
+                compact.contains(token),
+                "VPT capture metadata missing inactive RT token {token}"
+            );
+        }
     }
 
     #[test]

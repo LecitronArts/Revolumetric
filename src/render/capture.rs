@@ -42,6 +42,10 @@ pub struct CaptureMetadata {
     pub rt_restir_di_spatial_sample_count: u32,
     pub rt_restir_gi_enabled: bool,
     pub rt_temporal_denoise_enabled: bool,
+    pub rt_frame_rendered: bool,
+    pub rt_restir_di_rendered: bool,
+    pub rt_restir_gi_rendered: bool,
+    pub rt_resolve_ready: bool,
     pub restir_di_enabled: bool,
     pub restir_di_temporal_enabled: bool,
     pub restir_di_spatial_enabled: bool,
@@ -126,6 +130,10 @@ impl CaptureMetadata {
                 "  \"rt_restir_di_spatial_sample_count\": {},\n",
                 "  \"rt_restir_gi_enabled\": {},\n",
                 "  \"rt_temporal_denoise_enabled\": {},\n",
+                "  \"rt_frame_rendered\": {},\n",
+                "  \"rt_restir_di_rendered\": {},\n",
+                "  \"rt_restir_gi_rendered\": {},\n",
+                "  \"rt_resolve_ready\": {},\n",
                 "  \"restir_di_enabled\": {},\n",
                 "  \"restir_di_temporal_enabled\": {},\n",
                 "  \"restir_di_spatial_enabled\": {},\n",
@@ -153,6 +161,10 @@ impl CaptureMetadata {
             self.rt_restir_di_spatial_sample_count,
             self.rt_restir_gi_enabled,
             self.rt_temporal_denoise_enabled,
+            self.rt_frame_rendered,
+            self.rt_restir_di_rendered,
+            self.rt_restir_gi_rendered,
+            self.rt_resolve_ready,
             self.restir_di_enabled,
             self.restir_di_temporal_enabled,
             self.restir_di_spatial_enabled,
@@ -457,6 +469,10 @@ mod tests {
             rt_restir_di_spatial_sample_count: 4,
             rt_restir_gi_enabled: true,
             rt_temporal_denoise_enabled: true,
+            rt_frame_rendered: true,
+            rt_restir_di_rendered: true,
+            rt_restir_gi_rendered: false,
+            rt_resolve_ready: true,
             restir_di_enabled: true,
             restir_di_temporal_enabled: true,
             restir_di_spatial_enabled: false,
@@ -482,6 +498,10 @@ mod tests {
         assert!(json.contains("\"rt_restir_di_spatial_sample_count\": 4"));
         assert!(json.contains("\"rt_restir_gi_enabled\": true"));
         assert!(json.contains("\"rt_temporal_denoise_enabled\": true"));
+        assert!(json.contains("\"rt_frame_rendered\": true"));
+        assert!(json.contains("\"rt_restir_di_rendered\": true"));
+        assert!(json.contains("\"rt_restir_gi_rendered\": false"));
+        assert!(json.contains("\"rt_resolve_ready\": true"));
         assert!(json.contains("\"restir_di_enabled\": true"));
         assert!(json.contains("\"area_restir_enabled\": true"));
         assert!(json.contains("\"vpt_debug_view\": \"final\""));

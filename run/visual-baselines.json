@@ -46,7 +46,11 @@
       "rtRestirDiSpatial": true,
       "rtRestirDiSpatialSamples": 4,
       "rtRestirGi": true,
-      "rtTemporalDenoise": true
+      "rtTemporalDenoise": true,
+      "expectedRtFrameRendered": true,
+      "expectedRtRestirDiRendered": true,
+      "expectedRtRestirGiRendered": true,
+      "expectedRtResolveReady": true
     }
   ]
 }

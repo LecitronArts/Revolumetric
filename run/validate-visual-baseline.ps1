@@ -8,6 +8,26 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+function Assert-MetadataBooleanField {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Metadata,
+        [Parameter(Mandatory = $true)]
+        [string]$FieldName,
+        [Parameter(Mandatory = $true)]
+        [object]$ExpectedValue
+    )
+
+    if (-not ($Metadata.PSObject.Properties.Name -contains $FieldName)) {
+        throw "capture metadata $FieldName was missing, expected $ExpectedValue."
+    }
+
+    $actualValue = $Metadata.PSObject.Properties[$FieldName].Value
+    if ([bool]$actualValue -ne [bool]$ExpectedValue) {
+        throw "capture metadata $FieldName was $actualValue, expected $ExpectedValue."
+    }
+}
+
 function Assert-CaptureMetadata {
     param(
         [Parameter(Mandatory = $true)]
@@ -56,6 +76,18 @@ function Assert-CaptureMetadata {
     }
     if ($null -ne $Case.rtTemporalDenoise -and [bool]$Metadata.rt_temporal_denoise_enabled -ne [bool]$Case.rtTemporalDenoise) {
         throw "capture metadata rt_temporal_denoise_enabled was $($Metadata.rt_temporal_denoise_enabled), expected $($Case.rtTemporalDenoise)."
+    }
+    if ($null -ne $Case.expectedRtFrameRendered) {
+        Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_frame_rendered" -ExpectedValue $Case.expectedRtFrameRendered
+    }
+    if ($null -ne $Case.expectedRtRestirDiRendered) {
+        Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_restir_di_rendered" -ExpectedValue $Case.expectedRtRestirDiRendered
+    }
+    if ($null -ne $Case.expectedRtRestirGiRendered) {
+        Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_restir_gi_rendered" -ExpectedValue $Case.expectedRtRestirGiRendered
+    }
+    if ($null -ne $Case.expectedRtResolveReady) {
+        Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_resolve_ready" -ExpectedValue $Case.expectedRtResolveReady
     }
 }
 

@@ -163,8 +163,9 @@ checks the PPM/metadata contract. It is a baseline health gate, not a final imag
 quality judgment. The default visual baseline run pins cases to VPT for
 cross-machine stability; `-Nrd` adds NRD-backed VPT captures, and `-Rt` runs the
 hardware RT capture case on RT-capable hardware. Capture metadata records
-`render_backend`, `render_mode`, and RT controls such as `rt_debug_view` so
-fallback output and hardware RT resolve output can be distinguished.
+`render_backend`, `render_mode`, RT controls such as `rt_debug_view`, and
+active RT frame/pass state so fallback output and hardware RT resolve output can
+be distinguished.
 
 ## Current Shape
 

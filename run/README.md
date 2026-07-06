@@ -53,9 +53,9 @@ The visual cases live in `run/visual-baselines.json`. The script captures PPM
 output and metadata, then validates dimensions, denoiser/debug metadata,
 `render_backend`, `render_mode`, and that the capture is not all-zero RGB. The
 default run avoids NRD and hardware RT for stable local/CI smoke coverage; `-Nrd`
-adds ReBLUR final and NRD validation debug captures, and `-Rt` adds the RT
-resolve capture case with RT metadata such as `rt_debug_view`. The `-Rt` path
-requires RT-capable hardware.
+adds ReBLUR final and NRD validation debug captures. `-Rt` adds the RT resolve
+capture case with RT metadata such as `rt_debug_view`.
+It also records active RT frame/pass state. The `-Rt` path requires RT-capable hardware.
 
 If an IDE launch environment does not inherit the Vulkan SDK `PATH`, set an
 explicit shader compiler path:

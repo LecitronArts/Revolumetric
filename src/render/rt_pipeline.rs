@@ -595,6 +595,7 @@ impl RtRuntimePipeline {
                             frame.frame_slot,
                             self.frame_state.resolve_initialized,
                         );
+                        rt_graph_rendered = true;
                         let mut capture_dependency = None;
                         let capture_frame = inputs
                             .capture
@@ -666,6 +667,10 @@ impl RtRuntimePipeline {
                                 rt_temporal_denoise_enabled: inputs
                                     .rt_settings
                                     .temporal_denoise_enabled,
+                                rt_frame_rendered: rt_graph_rendered,
+                                rt_restir_di_rendered,
+                                rt_restir_gi_rendered,
+                                rt_resolve_ready: true,
                                 restir_di_enabled: false,
                                 restir_di_temporal_enabled: false,
                                 restir_di_spatial_enabled: false,
@@ -696,7 +701,6 @@ impl RtRuntimePipeline {
                             frame,
                             capture_dependency,
                         )?;
-                        rt_graph_rendered = true;
                     } else {
                         tracing::warn!("skipping RT surface trace without UCVH GPU descriptors");
                         add_swapchain_clear_present_pass(&mut graph, frame)?;
@@ -1394,6 +1398,42 @@ mod tests {
                 "RT capture path missing compact token {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_pipeline_capture_metadata_records_active_rt_passes() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let record = source
+            .split("pub fn record_and_execute_frame")
+            .nth(1)
+            .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+            .split("pub fn destroy")
+            .next()
+            .expect("record_and_execute_frame should end before destroy");
+        let compact = crate::render::source_checks::compact(record);
+
+        for token in [
+            "rt_frame_rendered:rt_graph_rendered",
+            "rt_restir_di_rendered",
+            "rt_restir_gi_rendered",
+            "rt_resolve_ready:true",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT capture metadata missing active pass token {token}"
+            );
+        }
+
+        let mark_rendered = compact
+            .find("rt_graph_rendered=true")
+            .expect("RT graph should be marked rendered once resolve is registered");
+        let metadata = compact
+            .find("pending_capture=Some(CaptureMetadata{")
+            .expect("RT capture metadata should be populated");
+        assert!(
+            mark_rendered < metadata,
+            "RT capture metadata must read rt_graph_rendered after it is marked true"
+        );
     }
 
     #[test]
