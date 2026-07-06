@@ -3,7 +3,7 @@
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 use crate::render::restir_di::{RestirDiDebugView, RestirDiSettings};
 use crate::render::rt_capabilities::RenderBackend;
-use crate::render::rt_pipeline::RtFrameStatus;
+use crate::render::rt_pipeline::{RtFrameSkipReason, RtFrameStatus};
 use crate::render::rt_settings::{RtDebugView, RtSettings};
 use crate::render::runtime::RenderRuntimeStatus;
 use crate::render::scene_ubo::{
@@ -118,6 +118,10 @@ impl EditorUi {
                     ui.label(format!(
                         "rt_frame {}",
                         rt_frame_status_label(runtime_status)
+                    ));
+                    ui.label(format!(
+                        "rt_reason {}",
+                        rt_frame_skip_reason_label(runtime_status)
                     ));
                     ui.separator();
                     ui.label(format!("{} x {}", viewport_extent[0], viewport_extent[1]));
@@ -241,6 +245,10 @@ impl EditorUi {
                     ui.monospace(format!(
                         "rt_frame={}",
                         rt_frame_status_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_skip_reason={}",
+                        rt_frame_skip_reason_label(runtime_status)
                     ));
                     ui.monospace(format!(
                         "rt_surface={}",
@@ -535,6 +543,10 @@ fn show_render_panel(
     ui.horizontal(|ui| {
         ui.label("RT frame");
         ui.monospace(rt_frame_status_label(runtime_status));
+    });
+    ui.horizontal(|ui| {
+        ui.label("RT reason");
+        ui.monospace(rt_frame_skip_reason_label(runtime_status));
     });
     ui.horizontal_wrapped(|ui| {
         ui.label("RT ready");
@@ -867,6 +879,25 @@ fn rt_frame_status_label(status: Option<RenderRuntimeStatus>) -> &'static str {
     }
 }
 
+fn rt_frame_skip_reason_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    let Some(status) = status else {
+        return "pending";
+    };
+    let Some(frame_status) = status.rt_frame_status else {
+        return "inactive";
+    };
+    match frame_status.skip_reason {
+        None => "none",
+        Some(RtFrameSkipReason::UcvhUploadPending) => "ucvh_upload_pending",
+        Some(RtFrameSkipReason::CpuUcvhSceneMissing) => "cpu_ucvh_missing",
+        Some(RtFrameSkipReason::AccelerationStructureLoaderMissing) => "as_loader_missing",
+        Some(RtFrameSkipReason::AccelerationStructureRebuildFailed) => "as_rebuild_failed",
+        Some(RtFrameSkipReason::AccelerationStructureMissing) => "as_missing",
+        Some(RtFrameSkipReason::UcvhGpuDescriptorsMissing) => "ucvh_gpu_missing",
+        Some(RtFrameSkipReason::RequiredPassesMissing) => "required_passes_missing",
+    }
+}
+
 fn rt_frame_bool_label(
     status: Option<RenderRuntimeStatus>,
     select: fn(RtFrameStatus) -> bool,
@@ -1009,7 +1040,7 @@ mod tests {
     use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
     use crate::render::restir_di::RestirDiSettings;
     use crate::render::rt_capabilities::RenderBackend;
-    use crate::render::rt_pipeline::RtFrameStatus;
+    use crate::render::rt_pipeline::{RtFrameSkipReason, RtFrameStatus};
     use crate::render::rt_settings::{RtDebugView, RtSettings};
     use crate::render::runtime::RenderRuntimeStatus;
     use crate::render::scene_ubo::{LightingSettings, VptDebugView};
@@ -1161,6 +1192,7 @@ mod tests {
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
+                skip_reason: None,
             }),
         };
 
@@ -1176,6 +1208,59 @@ mod tests {
         assert_eq!(rt_frame_restir_gi_history_label(Some(ready)), "false");
         assert_eq!(rt_frame_resolve_label(Some(inactive)), "unknown");
         assert_eq!(rt_frame_surface_label(None), "unknown");
+    }
+
+    #[test]
+    fn rt_frame_skip_reason_labels_cover_pending_inactive_none_and_reasons() {
+        let inactive = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: true,
+            rt_frame_status: None,
+        };
+        let ready = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+            rt_frame_status: Some(RtFrameStatus::default()),
+        };
+
+        assert_eq!(rt_frame_skip_reason_label(None), "pending");
+        assert_eq!(rt_frame_skip_reason_label(Some(inactive)), "inactive");
+        assert_eq!(rt_frame_skip_reason_label(Some(ready)), "none");
+
+        for (reason, label) in [
+            (RtFrameSkipReason::UcvhUploadPending, "ucvh_upload_pending"),
+            (RtFrameSkipReason::CpuUcvhSceneMissing, "cpu_ucvh_missing"),
+            (
+                RtFrameSkipReason::AccelerationStructureLoaderMissing,
+                "as_loader_missing",
+            ),
+            (
+                RtFrameSkipReason::AccelerationStructureRebuildFailed,
+                "as_rebuild_failed",
+            ),
+            (
+                RtFrameSkipReason::AccelerationStructureMissing,
+                "as_missing",
+            ),
+            (
+                RtFrameSkipReason::UcvhGpuDescriptorsMissing,
+                "ucvh_gpu_missing",
+            ),
+            (
+                RtFrameSkipReason::RequiredPassesMissing,
+                "required_passes_missing",
+            ),
+        ] {
+            let status = RenderRuntimeStatus {
+                actual_backend: RenderBackend::Rt,
+                rt_supported: true,
+                rt_frame_status: Some(RtFrameStatus {
+                    skip_reason: Some(reason),
+                    ..RtFrameStatus::default()
+                }),
+            };
+            assert_eq!(rt_frame_skip_reason_label(Some(status)), label);
+        }
     }
 
     #[test]
@@ -1331,6 +1416,10 @@ mod tests {
             top_bar.contains("rt_frame_status_label(runtime_status)"),
             "top bar must expose RT frame status"
         );
+        assert!(
+            top_bar.contains("rt_frame_skip_reason_label(runtime_status)"),
+            "top bar must expose RT frame skip reason"
+        );
 
         let render_panel = source
             .split("fn show_render_panel")
@@ -1347,6 +1436,8 @@ mod tests {
             "rt_frame_resolve_label(runtime_status)",
             "rt_frame_restir_di_history_label(runtime_status)",
             "rt_frame_restir_gi_history_label(runtime_status)",
+            "RT reason",
+            "rt_frame_skip_reason_label(runtime_status)",
         ] {
             assert!(render_panel.contains(token), "render panel missing {token}");
         }
@@ -1366,6 +1457,7 @@ mod tests {
             "rt_resolve={}",
             "rt_di_history={}",
             "rt_gi_history={}",
+            "rt_skip_reason={}",
         ] {
             assert!(console.contains(token), "console missing {token}");
         }

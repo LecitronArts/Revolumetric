@@ -51,6 +51,17 @@ pub struct RtFrameInputs<'a> {
     pub external_history_reset_generation: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtFrameSkipReason {
+    UcvhUploadPending,
+    CpuUcvhSceneMissing,
+    AccelerationStructureLoaderMissing,
+    AccelerationStructureRebuildFailed,
+    AccelerationStructureMissing,
+    UcvhGpuDescriptorsMissing,
+    RequiredPassesMissing,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RtFrameStatus {
     pub frame_resources_ready: bool,
@@ -60,6 +71,7 @@ pub struct RtFrameStatus {
     pub direct_lighting_ready: bool,
     pub temporal_ready: bool,
     pub resolve_ready: bool,
+    pub skip_reason: Option<RtFrameSkipReason>,
 }
 
 #[derive(Default)]
@@ -70,6 +82,7 @@ pub struct RtPipelineFrameState {
     pub direct_lighting_initialized: bool,
     pub temporal_initialized: bool,
     pub resolve_initialized: bool,
+    pub skip_reason: Option<RtFrameSkipReason>,
     pub history_reset_generation: u32,
     pub as_rebuild_generation: u32,
     last_scene_key: Option<[u32; RT_SCENE_KEY_WORDS]>,
@@ -87,6 +100,7 @@ impl RtPipelineFrameState {
         self.direct_lighting_initialized = false;
         self.temporal_initialized = false;
         self.resolve_initialized = false;
+        self.skip_reason = None;
         self.previous_view_proj = None;
         self.previous_resolution = None;
     }
@@ -149,6 +163,7 @@ impl RtRuntimePipeline {
             direct_lighting_ready: self.frame_state.direct_lighting_initialized,
             temporal_ready: self.frame_state.temporal_initialized,
             resolve_ready: self.frame_state.resolve_initialized,
+            skip_reason: self.frame_state.skip_reason,
         }
     }
 
@@ -259,6 +274,7 @@ impl RtRuntimePipeline {
             self.frame_state.last_scene_key = Some(scene_key);
         }
 
+        let mut skip_reason = None;
         let as_rebuilt = if inputs.ucvh_ready {
             if let Some(ucvh) = inputs.ucvh {
                 if let Some(acceleration_structure_loader) =
@@ -284,6 +300,9 @@ impl RtRuntimePipeline {
                             rebuilt
                         }
                         Err(error) => {
+                            skip_reason.get_or_insert(
+                                RtFrameSkipReason::AccelerationStructureRebuildFailed,
+                            );
                             tracing::error!(
                                 %error,
                                 "failed to rebuild RT scene acceleration structures"
@@ -292,15 +311,19 @@ impl RtRuntimePipeline {
                         }
                     }
                 } else {
+                    skip_reason
+                        .get_or_insert(RtFrameSkipReason::AccelerationStructureLoaderMissing);
                     tracing::warn!(
                         "skipping RT scene AS rebuild without acceleration structure loader"
                     );
                     false
                 }
             } else {
+                skip_reason.get_or_insert(RtFrameSkipReason::CpuUcvhSceneMissing);
                 false
             }
         } else {
+            skip_reason.get_or_insert(RtFrameSkipReason::UcvhUploadPending);
             tracing::warn!("rendering RT fallback output until UCVH data is ready");
             false
         };
@@ -702,16 +725,19 @@ impl RtRuntimePipeline {
                             capture_dependency,
                         )?;
                     } else {
+                        skip_reason.get_or_insert(RtFrameSkipReason::UcvhGpuDescriptorsMissing);
                         tracing::warn!("skipping RT surface trace without UCVH GPU descriptors");
                         add_swapchain_clear_present_pass(&mut graph, frame)?;
                     }
                 }
                 _ => {
+                    skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureMissing);
                     tracing::warn!("skipping RT surface trace without built TLAS and AABB buffer");
                     add_swapchain_clear_present_pass(&mut graph, frame)?;
                 }
             }
         } else {
+            skip_reason.get_or_insert(RtFrameSkipReason::RequiredPassesMissing);
             tracing::warn!(
                 rt_surface = self.rt_surface_pass.is_some(),
                 rt_direct_lighting = self.rt_direct_lighting_pass.is_some(),
@@ -734,6 +760,7 @@ impl RtRuntimePipeline {
         self.frame_state.direct_lighting_initialized = rt_graph_rendered;
         self.frame_state.temporal_initialized = rt_graph_rendered;
         self.frame_state.resolve_initialized = rt_graph_rendered;
+        self.frame_state.skip_reason = if rt_graph_rendered { None } else { skip_reason };
 
         Ok(VptFrameRecordResult {
             pending_capture,
@@ -1317,8 +1344,30 @@ mod tests {
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
+                skip_reason: None,
             }
         );
+    }
+
+    #[test]
+    fn rt_pipeline_frame_status_snapshots_skip_reason() {
+        let mut pipeline = RtRuntimePipeline::new();
+        pipeline.frame_state.skip_reason = Some(RtFrameSkipReason::UcvhUploadPending);
+
+        assert_eq!(
+            pipeline.frame_status().skip_reason,
+            Some(RtFrameSkipReason::UcvhUploadPending)
+        );
+    }
+
+    #[test]
+    fn rt_pipeline_history_reset_clears_skip_reason() {
+        let mut pipeline = RtRuntimePipeline::new();
+        pipeline.frame_state.skip_reason = Some(RtFrameSkipReason::RequiredPassesMissing);
+
+        pipeline.reset_history(7);
+
+        assert_eq!(pipeline.frame_status().skip_reason, None);
     }
 
     #[test]
@@ -1335,6 +1384,52 @@ mod tests {
             compact.contains("frame_resources_ready:self.has_frame_resources()"),
             "RT frame status must report actual RT pass resource presence"
         );
+    }
+
+    #[test]
+    fn rt_pipeline_records_structured_skip_reasons_for_fallbacks() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let record = source
+            .split("pub fn record_and_execute_frame")
+            .nth(1)
+            .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+            .split("pub fn destroy")
+            .next()
+            .expect("record_and_execute_frame should end before destroy");
+        let compact = crate::render::source_checks::compact(record);
+
+        for token in [
+            "skip_reason.get_or_insert(RtFrameSkipReason::UcvhUploadPending)",
+            "skip_reason.get_or_insert(RtFrameSkipReason::CpuUcvhSceneMissing)",
+            "skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureLoaderMissing)",
+            "skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureRebuildFailed,);",
+            "skip_reason.get_or_insert(RtFrameSkipReason::RequiredPassesMissing)",
+            "skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureMissing)",
+            "skip_reason.get_or_insert(RtFrameSkipReason::UcvhGpuDescriptorsMissing)",
+            "self.frame_state.skip_reason=ifrt_graph_rendered{None}else{skip_reason};",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT pipeline missing structured skip reason token {token}"
+            );
+        }
+
+        let early_root_cause = compact
+            .find("skip_reason.get_or_insert(RtFrameSkipReason::UcvhUploadPending)")
+            .expect("RT pipeline should record UCVH upload pending as an early root cause");
+        let downstream_required_passes = compact
+            .find("skip_reason.get_or_insert(RtFrameSkipReason::RequiredPassesMissing)")
+            .expect("RT pipeline should record missing required passes");
+        let downstream_as_missing = compact
+            .find("skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureMissing)")
+            .expect("RT pipeline should record missing acceleration structures");
+        let downstream_gpu_descriptors = compact
+            .find("skip_reason.get_or_insert(RtFrameSkipReason::UcvhGpuDescriptorsMissing)")
+            .expect("RT pipeline should record missing UCVH GPU descriptors");
+
+        assert!(early_root_cause < downstream_required_passes);
+        assert!(early_root_cause < downstream_as_missing);
+        assert!(early_root_cause < downstream_gpu_descriptors);
     }
 
     #[test]
