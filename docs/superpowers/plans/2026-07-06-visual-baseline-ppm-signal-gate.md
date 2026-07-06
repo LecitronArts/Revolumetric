@@ -97,7 +97,7 @@ Keep the existing RT active metadata tokens unchanged.
 Run:
 
 ```powershell
-$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline_script_validates_captures_metadata_and_nonblank_ppm visual_baseline_manifest_covers_svgf_and_reblur_debug_cases
+$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline
 ```
 
 Expected result: both source-check tests fail because the script and manifest do not yet contain `Measure-PpmSignal`, `Assert-PpmSignal`, `expectedMinNonZeroPixelRatio`, or `expectedMinRgbRange`.
@@ -236,7 +236,7 @@ Assert-PpmSignal -PpmPath $ppmPath -Case $case
 Run:
 
 ```powershell
-$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline_script_validates_captures_metadata_and_nonblank_ppm visual_baseline_manifest_covers_svgf_and_reblur_debug_cases
+$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline
 ```
 
 Expected result: both focused source-check tests pass.
@@ -252,7 +252,7 @@ Run:
 
 ```powershell
 cargo fmt --check
-$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline_script_validates_captures_metadata_and_nonblank_ppm visual_baseline_manifest_covers_svgf_and_reblur_debug_cases
+$env:REVOLUMETRIC_SHADER_COMPILE='skip'; cargo test --lib visual_baseline
 ```
 
 Expected result: formatting check passes and focused source-check tests pass.
