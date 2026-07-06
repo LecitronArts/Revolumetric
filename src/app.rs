@@ -374,6 +374,7 @@ impl RevolumetricApp {
         let window = self.window.as_ref()?;
         let egui_ctx = self.egui_ctx.as_ref()?;
         let egui_state = self.egui_state.as_mut()?;
+        let runtime_status = self.render_runtime.as_ref().map(RenderRuntime::status);
         let editor_ui = self.editor_ui.as_mut()?;
         let raw_input = egui_state.take_egui_input(window);
         let full_output = egui_ctx.run(raw_input, |ctx| {
@@ -384,6 +385,7 @@ impl RevolumetricApp {
                     rt: &mut self.rt_settings,
                     restir_di: &mut self.restir_di_settings,
                     area_restir: &mut self.area_restir_settings,
+                    runtime_status,
                     camera,
                     viewport_extent,
                     rendered_frames: self.rendered_frames,
@@ -942,6 +944,23 @@ mod tests {
             .expect("desktop build_egui_frame should end before android variant");
 
         assert!(build_egui_frame.contains("rt: &mut self.rt_settings"));
+    }
+
+    #[test]
+    fn app_passes_runtime_status_to_editor_ui_frame_state() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let build_egui_frame = source
+            .split("fn build_egui_frame")
+            .nth(1)
+            .expect("build_egui_frame should exist")
+            .split("#[cfg(target_os = \"android\")]")
+            .next()
+            .expect("desktop build_egui_frame should end before android variant");
+
+        assert!(build_egui_frame.contains(
+            "let runtime_status = self.render_runtime.as_ref().map(RenderRuntime::status);"
+        ));
+        assert!(build_egui_frame.contains("runtime_status,"));
     }
 
     #[test]

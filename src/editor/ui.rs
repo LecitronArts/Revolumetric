@@ -2,7 +2,9 @@
 
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
 use crate::render::restir_di::{RestirDiDebugView, RestirDiSettings};
+use crate::render::rt_capabilities::RenderBackend;
 use crate::render::rt_settings::{RtDebugView, RtSettings};
+use crate::render::runtime::RenderRuntimeStatus;
 use crate::render::scene_ubo::{
     LightingDebugView, LightingSettings, RenderMode, VptDebugView, VptDenoiserMode,
 };
@@ -29,6 +31,7 @@ pub struct EditorUiFrameState<'a> {
     pub rt: &'a mut RtSettings,
     pub restir_di: &'a mut RestirDiSettings,
     pub area_restir: &'a mut AreaRestirSettings,
+    pub runtime_status: Option<RenderRuntimeStatus>,
     pub camera: VptCameraFrame,
     pub viewport_extent: [u32; 2],
     pub rendered_frames: u64,
@@ -69,15 +72,22 @@ impl EditorUi {
             rt,
             restir_di,
             area_restir,
+            runtime_status,
             camera,
             viewport_extent,
             rendered_frames,
         } = frame;
 
-        self.show_top_bar(ctx, lighting, viewport_extent, rendered_frames);
+        self.show_top_bar(
+            ctx,
+            lighting,
+            runtime_status,
+            viewport_extent,
+            rendered_frames,
+        );
         self.show_left_rail(ctx, camera);
         self.show_inspector(ctx, lighting, rt, restir_di, area_restir);
-        self.show_console(ctx, lighting, rt, restir_di, area_restir);
+        self.show_console(ctx, lighting, runtime_status, rt, restir_di, area_restir);
         self.show_viewport_overlay(ctx, camera, lighting);
     }
 
@@ -85,6 +95,7 @@ impl EditorUi {
         &mut self,
         ctx: &egui::Context,
         lighting: &mut LightingSettings,
+        runtime_status: Option<RenderRuntimeStatus>,
         viewport_extent: [u32; 2],
         rendered_frames: u64,
     ) {
@@ -95,6 +106,14 @@ impl EditorUi {
                     ui.strong("REVOLUMETRIC");
                     ui.separator();
                     ui.label(format!("mode {}", render_mode_label(lighting.render_mode)));
+                    ui.label(format!(
+                        "actual {}",
+                        runtime_status_backend_label(runtime_status)
+                    ));
+                    ui.label(format!(
+                        "rt_supported {}",
+                        rt_supported_label(runtime_status)
+                    ));
                     ui.separator();
                     ui.label(format!("{} x {}", viewport_extent[0], viewport_extent[1]));
                     ui.label(format!("frame {rendered_frames}"));
@@ -188,6 +207,7 @@ impl EditorUi {
         &self,
         ctx: &egui::Context,
         lighting: &LightingSettings,
+        runtime_status: Option<RenderRuntimeStatus>,
         rt: &RtSettings,
         restir_di: &RestirDiSettings,
         area_restir: &AreaRestirSettings,
@@ -203,6 +223,14 @@ impl EditorUi {
                     ui.monospace(format!(
                         "render_mode={}",
                         render_mode_label(lighting.render_mode)
+                    ));
+                    ui.monospace(format!(
+                        "actual_backend={}",
+                        runtime_status_backend_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_supported={}",
+                        rt_supported_label(runtime_status)
                     ));
                     ui.monospace(format!("denoiser={}", lighting.denoiser_mode_name()));
                     ui.monospace(format!("rt_di={}", rt.restir_di_enabled));
@@ -726,6 +754,27 @@ fn render_mode_label(mode: RenderMode) -> &'static str {
     }
 }
 
+fn render_backend_label(backend: RenderBackend) -> &'static str {
+    match backend {
+        RenderBackend::Vpt => "VPT",
+        RenderBackend::Rt => "RT",
+    }
+}
+
+fn runtime_status_backend_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    status
+        .map(|status| render_backend_label(status.actual_backend))
+        .unwrap_or("pending")
+}
+
+fn rt_supported_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    match status {
+        Some(status) if status.rt_supported => "true",
+        Some(_) => "false",
+        None => "unknown",
+    }
+}
+
 fn lighting_debug_label(debug_view: LightingDebugView) -> &'static str {
     match debug_view {
         LightingDebugView::Final => "Final",
@@ -818,7 +867,9 @@ mod tests {
     use super::*;
     use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
     use crate::render::restir_di::RestirDiSettings;
+    use crate::render::rt_capabilities::RenderBackend;
     use crate::render::rt_settings::{RtDebugView, RtSettings};
+    use crate::render::runtime::RenderRuntimeStatus;
     use crate::render::scene_ubo::{LightingSettings, VptDebugView};
 
     #[test]
@@ -906,6 +957,40 @@ mod tests {
     }
 
     #[test]
+    fn editor_frame_state_carries_runtime_status() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let frame_state = source
+            .split("pub struct EditorUiFrameState")
+            .nth(1)
+            .expect("EditorUiFrameState should exist")
+            .split("impl Default for EditorUi")
+            .next()
+            .expect("EditorUiFrameState should end before EditorUi impls");
+
+        assert!(frame_state.contains("pub runtime_status: Option<RenderRuntimeStatus>"));
+    }
+
+    #[test]
+    fn runtime_status_labels_cover_backend_and_pending_states() {
+        let rt_status = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+        };
+        let vpt_status = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: false,
+        };
+
+        assert_eq!(render_backend_label(RenderBackend::Rt), "RT");
+        assert_eq!(render_backend_label(RenderBackend::Vpt), "VPT");
+        assert_eq!(runtime_status_backend_label(Some(rt_status)), "RT");
+        assert_eq!(runtime_status_backend_label(None), "pending");
+        assert_eq!(rt_supported_label(Some(rt_status)), "true");
+        assert_eq!(rt_supported_label(Some(vpt_status)), "false");
+        assert_eq!(rt_supported_label(None), "unknown");
+    }
+
+    #[test]
     fn render_panel_exposes_backend_selection_and_rt_temporal_controls() {
         let source = crate::render::source_checks::read_source("src/editor/ui.rs");
         let render_panel = source
@@ -951,6 +1036,43 @@ mod tests {
             .next()
             .expect("console should end before overlay");
         for token in ["render_mode={}", "rt_di={}", "rt_gi={}", "rt_temporal={}"] {
+            assert!(console.contains(token), "console missing {token}");
+        }
+    }
+
+    #[test]
+    fn top_bar_and_console_report_runtime_backend_status() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        let top_bar = source
+            .split("fn show_top_bar")
+            .nth(1)
+            .expect("top bar should exist")
+            .split("fn show_left_rail")
+            .next()
+            .expect("top bar should end before left rail");
+        for token in [
+            "runtime_status: Option<RenderRuntimeStatus>",
+            "runtime_status_backend_label(runtime_status)",
+            "rt_supported_label(runtime_status)",
+        ] {
+            assert!(top_bar.contains(token), "top bar missing {token}");
+        }
+
+        let console = source
+            .split("fn show_console")
+            .nth(1)
+            .expect("console should exist")
+            .split("fn show_viewport_overlay")
+            .next()
+            .expect("console should end before overlay");
+        for token in [
+            "runtime_status: Option<RenderRuntimeStatus>",
+            "actual_backend={}",
+            "rt_supported={}",
+            "runtime_status_backend_label(runtime_status)",
+            "rt_supported_label(runtime_status)",
+        ] {
             assert!(console.contains(token), "console missing {token}");
         }
     }

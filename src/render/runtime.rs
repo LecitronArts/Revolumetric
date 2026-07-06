@@ -48,9 +48,16 @@ pub struct RenderFrameOutcome {
     pub wrote_capture: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderRuntimeStatus {
+    pub actual_backend: RenderBackend,
+    pub rt_supported: bool,
+}
+
 pub struct RenderRuntime {
     renderer: RenderDevice,
     rt_capabilities: RtCapabilities,
+    requested_render_mode: RenderMode,
     render_backend: RenderBackend,
     last_render_backend: RenderBackend,
     rt_history_reset_generation: u32,
@@ -174,6 +181,7 @@ impl RenderRuntime {
         let mut runtime = Self {
             renderer,
             rt_capabilities,
+            requested_render_mode: settings.lighting.render_mode,
             render_backend,
             last_render_backend: render_backend,
             rt_history_reset_generation: 0,
@@ -206,6 +214,40 @@ impl RenderRuntime {
 
     pub fn rt_capabilities(&self) -> RtCapabilities {
         self.rt_capabilities
+    }
+
+    pub fn status(&self) -> RenderRuntimeStatus {
+        RenderRuntimeStatus {
+            actual_backend: self.render_backend,
+            rt_supported: self.rt_capabilities.supported(),
+        }
+    }
+
+    fn refresh_render_backend(&mut self, requested: RenderMode) {
+        let previous_requested = self.requested_render_mode;
+        let previous_backend = self.render_backend;
+        let resolved = resolve_render_backend(requested, self.rt_capabilities.supported());
+
+        if requested == RenderMode::Rt
+            && resolved == RenderBackend::Vpt
+            && previous_requested != RenderMode::Rt
+        {
+            tracing::warn!(
+                device = %self.renderer.physical_device_name(),
+                "requested RT backend but hardware support was unavailable; falling back to VPT"
+            );
+        }
+        if previous_requested != requested || previous_backend != resolved {
+            tracing::debug!(
+                requested = ?requested,
+                render_backend = ?resolved,
+                rt_supported = self.rt_capabilities.supported(),
+                "updated render backend selection"
+            );
+        }
+
+        self.requested_render_mode = requested;
+        self.render_backend = resolved;
     }
 
     pub fn ensure_passes(
@@ -261,6 +303,7 @@ impl RenderRuntime {
         restir_di_enabled: bool,
         area_restir_enabled: bool,
     ) -> Result<()> {
+        self.refresh_render_backend(settings.lighting.render_mode);
         self.ensure_passes(ucvh, settings, restir_di_enabled, area_restir_enabled);
         let extent = self.renderer.swapchain_extent();
         if let Some(scene_ubo) = self.scene_ubo.as_ref() {
@@ -298,6 +341,7 @@ impl RenderRuntime {
         let mut outcome = RenderFrameOutcome::default();
         let frame = self.renderer.begin_frame()?;
         outcome.began_frame = true;
+        self.refresh_render_backend(input.settings.lighting.render_mode);
 
         if self.last_render_backend != self.render_backend {
             self.rt_history_reset_generation = self.rt_history_reset_generation.wrapping_add(1);
@@ -657,7 +701,7 @@ mod tests {
     fn render_runtime_owns_gpu_resources_and_frame_orchestration() {
         let source = crate::render::source_checks::read_source("src/render/runtime.rs");
         let runtime_struct = source
-            .split("pub struct RenderRuntime")
+            .split("pub struct RenderRuntime {")
             .nth(1)
             .expect("RenderRuntime struct should exist")
             .split("impl RenderRuntime")
@@ -775,7 +819,7 @@ mod tests {
     fn render_runtime_routes_selected_rt_backend_to_rt_pipeline() {
         let source = crate::render::source_checks::read_source("src/render/runtime.rs");
         let runtime_struct = source
-            .split("pub struct RenderRuntime")
+            .split("pub struct RenderRuntime {")
             .nth(1)
             .expect("RenderRuntime struct should exist")
             .split("impl RenderRuntime")
@@ -851,5 +895,118 @@ mod tests {
         assert!(source.contains("history_reset_generation"));
         assert!(source.contains("as_rebuild_generation"));
         assert!(source.contains("rt_history_reset_generation"));
+    }
+
+    #[test]
+    fn render_runtime_status_exposes_backend_and_rt_support_for_editor() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let status_struct = source
+            .split("pub struct RenderRuntimeStatus")
+            .nth(1)
+            .expect("RenderRuntimeStatus should exist")
+            .split("pub struct RenderRuntime {")
+            .next()
+            .expect("RenderRuntimeStatus should be declared before RenderRuntime");
+
+        for token in [
+            "pub actual_backend: RenderBackend",
+            "pub rt_supported: bool",
+        ] {
+            assert!(
+                status_struct.contains(token),
+                "RenderRuntimeStatus missing {token}"
+            );
+        }
+
+        let runtime_impl = source
+            .split("impl RenderRuntime")
+            .nth(1)
+            .expect("RenderRuntime impl should exist");
+        for token in [
+            "pub fn status(&self) -> RenderRuntimeStatus",
+            "actual_backend: self.render_backend",
+            "rt_supported: self.rt_capabilities.supported()",
+        ] {
+            assert!(
+                runtime_impl.contains(token),
+                "RenderRuntime::status missing {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_frame_refreshes_backend_from_current_settings_before_pass_selection() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before UCVH helpers");
+        let compact = crate::render::source_checks::compact(render_frame);
+
+        let refresh = compact
+            .find("self.refresh_render_backend(input.settings.lighting.render_mode);")
+            .expect("render_frame must refresh backend from current frame settings");
+        let reset = compact
+            .find("ifself.last_render_backend!=self.render_backend{")
+            .expect("render_frame must retain backend-change history reset");
+        let ensure_passes = compact
+            .find("self.ensure_passes(")
+            .expect("render_frame must ensure passes");
+        let record = compact
+            .find("matchself.render_backend{")
+            .expect("render_frame must select pass recorder from refreshed backend");
+
+        assert!(refresh < reset);
+        assert!(refresh < ensure_passes);
+        assert!(refresh < record);
+    }
+
+    #[test]
+    fn resize_refreshes_backend_from_current_settings() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let resize_pipeline = source
+            .split("fn resize_pipeline_to_swapchain")
+            .nth(1)
+            .expect("resize_pipeline_to_swapchain should exist")
+            .split("pub fn render_frame")
+            .next()
+            .expect("resize helper should end before render_frame");
+        let compact = crate::render::source_checks::compact(resize_pipeline);
+
+        let refresh = compact
+            .find("self.refresh_render_backend(settings.lighting.render_mode);")
+            .expect("resize must refresh backend from current settings");
+        let ensure_passes = compact
+            .find("self.ensure_passes(")
+            .expect("resize must ensure passes");
+        let match_backend = compact
+            .find("matchself.render_backend{")
+            .expect("resize must branch on refreshed backend");
+
+        assert!(refresh < ensure_passes);
+        assert!(refresh < match_backend);
+    }
+
+    #[test]
+    fn render_runtime_has_backend_refresh_helper() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let runtime_impl = source
+            .split("impl RenderRuntime")
+            .nth(1)
+            .expect("RenderRuntime impl should exist");
+
+        for token in [
+            "fn refresh_render_backend(&mut self, requested: RenderMode)",
+            "resolve_render_backend(requested, self.rt_capabilities.supported())",
+            "self.render_backend = resolved",
+        ] {
+            assert!(
+                runtime_impl.contains(token),
+                "backend refresh helper missing {token}"
+            );
+        }
     }
 }
