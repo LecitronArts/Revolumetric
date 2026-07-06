@@ -86,7 +86,7 @@ impl EditorUi {
             rendered_frames,
         );
         self.show_left_rail(ctx, camera);
-        self.show_inspector(ctx, lighting, rt, restir_di, area_restir);
+        self.show_inspector(ctx, lighting, runtime_status, rt, restir_di, area_restir);
         self.show_console(ctx, lighting, runtime_status, rt, restir_di, area_restir);
         self.show_viewport_overlay(ctx, camera, lighting);
     }
@@ -173,6 +173,7 @@ impl EditorUi {
         &mut self,
         ctx: &egui::Context,
         lighting: &mut LightingSettings,
+        runtime_status: Option<RenderRuntimeStatus>,
         rt: &mut RtSettings,
         restir_di: &mut RestirDiSettings,
         area_restir: &mut AreaRestirSettings,
@@ -185,7 +186,7 @@ impl EditorUi {
                 ui.add_space(4.0);
                 match self.selected_panel {
                     EditorPanel::Scene => show_scene_panel(ui, lighting),
-                    EditorPanel::Render => show_render_panel(ui, lighting, rt),
+                    EditorPanel::Render => show_render_panel(ui, lighting, runtime_status, rt),
                     EditorPanel::Restir => {
                         show_restir_panel(
                             ui,
@@ -480,13 +481,27 @@ fn show_scene_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings) {
     }
 }
 
-fn show_render_panel(ui: &mut egui::Ui, lighting: &mut LightingSettings, rt: &mut RtSettings) {
+fn show_render_panel(
+    ui: &mut egui::Ui,
+    lighting: &mut LightingSettings,
+    runtime_status: Option<RenderRuntimeStatus>,
+    rt: &mut RtSettings,
+) {
     ui.label("Renderer");
     egui::ComboBox::from_id_salt("render_mode")
         .selected_text(render_mode_label(lighting.render_mode))
         .show_ui(ui, |ui| {
             render_mode_combo(ui, &mut lighting.render_mode);
         });
+    ui.horizontal(|ui| {
+        ui.label("Actual backend");
+        ui.monospace(runtime_status_backend_label(runtime_status));
+        ui.label("RT support");
+        ui.monospace(rt_supported_label(runtime_status));
+    });
+    if let Some(notice) = rt_backend_notice(lighting.render_mode, runtime_status) {
+        ui.colored_label(egui::Color32::YELLOW, notice);
+    }
 
     ui.separator();
     ui.label("VPT Path Tracing");
@@ -775,6 +790,20 @@ fn rt_supported_label(status: Option<RenderRuntimeStatus>) -> &'static str {
     }
 }
 
+fn rt_backend_notice(
+    requested: RenderMode,
+    status: Option<RenderRuntimeStatus>,
+) -> Option<&'static str> {
+    let status = status?;
+    if !status.rt_supported {
+        return Some("RT unsupported on this device");
+    }
+    if requested == RenderMode::Rt && status.actual_backend != RenderBackend::Rt {
+        return Some("RT requested; VPT backend is active");
+    }
+    None
+}
+
 fn lighting_debug_label(debug_view: LightingDebugView) -> &'static str {
     match debug_view {
         LightingDebugView::Final => "Final",
@@ -1012,6 +1041,54 @@ mod tests {
         ] {
             assert!(render_panel.contains(token), "render panel missing {token}");
         }
+    }
+
+    #[test]
+    fn render_panel_exposes_runtime_backend_status_and_rt_fallback_notice() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+        let render_panel = source
+            .split("fn show_render_panel")
+            .nth(1)
+            .expect("render panel should exist")
+            .split("fn show_restir_panel")
+            .next()
+            .expect("render panel should end before sampling panel");
+
+        for token in [
+            "runtime_status: Option<RenderRuntimeStatus>",
+            "runtime_status_backend_label(runtime_status)",
+            "rt_supported_label(runtime_status)",
+            "rt_backend_notice(lighting.render_mode, runtime_status)",
+        ] {
+            assert!(render_panel.contains(token), "render panel missing {token}");
+        }
+    }
+
+    #[test]
+    fn rt_backend_notice_reports_fallback_and_unsupported_states() {
+        let rt_active = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+        };
+        let rt_fallback = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: true,
+        };
+        let rt_unsupported = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: false,
+        };
+
+        assert_eq!(rt_backend_notice(RenderMode::Rt, Some(rt_active)), None);
+        assert_eq!(
+            rt_backend_notice(RenderMode::Rt, Some(rt_fallback)),
+            Some("RT requested; VPT backend is active")
+        );
+        assert_eq!(
+            rt_backend_notice(RenderMode::Auto, Some(rt_unsupported)),
+            Some("RT unsupported on this device")
+        );
+        assert_eq!(rt_backend_notice(RenderMode::Vpt, None), None);
     }
 
     #[test]
