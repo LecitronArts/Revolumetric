@@ -16,7 +16,7 @@ use crate::editor::fonts::{configure_editor_fonts, configure_editor_style};
 #[cfg(not(target_os = "android"))]
 use crate::editor::ui::{EditorUi, EditorUiFrameState};
 use crate::platform::input::InputState;
-use crate::scene::camera::update_fly_camera;
+use crate::scene::camera::{CameraPathConfig, apply_camera_path, update_fly_camera};
 use crate::scene::components::CameraRig;
 
 use crate::ecs::schedule::{Schedule, Stage};
@@ -103,6 +103,7 @@ struct RevolumetricApp {
     last_frame_time: Option<std::time::Instant>,
     rendered_frames: u64,
     exit_after_frames: Option<u64>,
+    camera_path: Option<CameraPathConfig>,
 }
 
 #[derive(Debug, Default)]
@@ -223,6 +224,7 @@ impl RevolumetricApp {
             last_frame_time: None,
             rendered_frames: 0,
             exit_after_frames: parse_exit_after_frames(),
+            camera_path: CameraPathConfig::from_env(),
         }
     }
 
@@ -261,6 +263,13 @@ impl RevolumetricApp {
     }
 
     fn update_camera(&mut self, dt: f32) {
+        if let Some(camera_path) = self.camera_path {
+            if let Some(rig) = self.world.resource_mut::<CameraRig>() {
+                apply_camera_path(rig, camera_path, self.rendered_frames);
+            }
+            return;
+        }
+
         // Clone InputState (it's Copy) to avoid borrow conflicts
         let input = match self.world.resource::<InputState>() {
             Some(input) => *input,
@@ -750,7 +759,7 @@ fn init_tracing() {
 mod tests {
     use super::*;
     use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
-    use crate::scene::camera::Camera;
+    use crate::scene::camera::{Camera, CameraPathConfig, CameraPathKind};
     use crate::scene::components::CameraRig;
     use crate::scene::light::DirectionalLight;
     use winit::event::{DeviceId, Touch, TouchPhase};
@@ -889,6 +898,37 @@ mod tests {
         assert!((camera.fov_y_radians - 1.1).abs() < 1e-6);
         assert!((camera.aperture_radius - 0.25).abs() < 1e-6);
         assert!((camera.focal_distance - 42.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn automatic_camera_path_overrides_manual_fly_input() {
+        let mut app = RevolumetricApp::new();
+        app.camera_path = Some(CameraPathConfig {
+            kind: CameraPathKind::Orbit,
+            center: glam::Vec3::new(64.0, 32.0, 64.0),
+            radius: 32.0,
+            height: 48.0,
+            period_frames: 4,
+        });
+        app.rendered_frames = 1;
+        app.world.insert_resource(CameraRig::default());
+        app.world.insert_resource(InputState {
+            move_forward: 1.0,
+            move_right: 1.0,
+            move_up: 1.0,
+            ..InputState::default()
+        });
+
+        app.update_camera(1.0);
+
+        let rig = app.world.resource::<CameraRig>().expect("rig should exist");
+        assert!((rig.camera.position - glam::Vec3::new(64.0, 48.0, 96.0)).length() < 1e-4);
+        assert!(
+            (rig.camera.forward
+                - (app.camera_path.unwrap().center - rig.camera.position).normalize())
+            .length()
+                < 1e-5
+        );
     }
 
     #[test]

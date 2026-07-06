@@ -22,7 +22,7 @@ StructuredBuffer<RtSurfacePixel> previous_surface_history;
 Texture2D<float4> current_radiance;
 
 bool reproject(float3 world_position, out float2 previous_uv) {
-    float4 previous_clip = mul(rt_history.previous_view_proj, float4(world_position, 1.0));
+    float4 previous_clip = mul(float4(world_position, 1.0), rt_history.previous_view_proj);
     if (previous_clip.w <= 1.0e-6) {
         previous_uv = float2(0.0);
         return false;
@@ -78,6 +78,12 @@ bool rt_surfaces_compatible(RtSurfacePixel current, RtSurfacePixel previous) {
     return position_delta <= max(1.0, depth_scale * rt_history.depth_threshold);
 }
 
+float3 rt_temporal_visualize_reuse(float3 current, float3 blended, float alpha, bool motion_history_valid) {
+    float history_weight = 1.0 - alpha;
+    float blend_delta = saturate(length(blended - current) * 4.0);
+    return saturate(float3(history_weight, blend_delta, motion_history_valid ? 1.0 : 0.0));
+}
+
 [shader("raygeneration")]
 void main() {
     uint3 launch_id = DispatchRaysIndex();
@@ -126,6 +132,11 @@ void main() {
         return;
     }
 
+    if (rt_history.debug_view == RT_DEBUG_VIEW_TEMPORAL && !history_valid) {
+        temporal_radiance[launch_id.xy] = float4(0.0, 0.0, motion_history_valid ? 1.0 : 0.0, 1.0);
+        return;
+    }
+
     if (!temporal_enabled || debug_bypass || !history_valid) {
         temporal_radiance[launch_id.xy] = float4(current, 1.0);
         return;
@@ -134,5 +145,12 @@ void main() {
     float3 history = previous_temporal_radiance.Load(int3(previous_pixel, 0)).rgb;
     float3 clamped_history = clamp(history, current - 0.25, current + 0.25);
     float alpha = bounded_history_alpha(rt_history.history_length);
-    temporal_radiance[launch_id.xy] = float4(lerp(clamped_history, current, alpha), 1.0);
+    float3 blended = lerp(clamped_history, current, alpha);
+    if (rt_history.debug_view == RT_DEBUG_VIEW_TEMPORAL) {
+        float3 temporal_debug = rt_temporal_visualize_reuse(current, blended, alpha, motion_history_valid);
+        temporal_radiance[launch_id.xy] = float4(temporal_debug, 1.0);
+        return;
+    }
+
+    temporal_radiance[launch_id.xy] = float4(blended, 1.0);
 }

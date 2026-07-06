@@ -627,6 +627,8 @@ impl RtRuntimePipeline {
                             rt_direct_lighting_outputs.current_radiance,
                             self.frame_state.temporal_initialized,
                         );
+                        rt_resolve
+                            .update_uniforms(frame.frame_slot, inputs.lighting_settings.exposure);
                         rt_resolve.update_input_descriptor(
                             renderer.device(),
                             frame.frame_slot,
@@ -869,6 +871,99 @@ impl RtRuntimePipeline {
             .destroy(device, allocator, acceleration_structure_loader);
     }
 
+    fn wait_idle_before_destroying_rt_pass(
+        renderer: &RenderDevice,
+        pass_name: &'static str,
+    ) -> bool {
+        if let Err(error) = renderer.wait_idle() {
+            tracing::error!(
+                %error,
+                pass = pass_name,
+                "failed to idle Vulkan device before destroying RT pass resources"
+            );
+            return false;
+        }
+        true
+    }
+
+    fn destroy_rt_surface_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_surface_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_surface") {
+            return false;
+        }
+        if let Some(pass) = self.rt_surface_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
+    fn destroy_rt_restir_di_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_restir_di_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_restir_di") {
+            return false;
+        }
+        if let Some(pass) = self.rt_restir_di_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
+    fn destroy_rt_restir_gi_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_restir_gi_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_restir_gi") {
+            return false;
+        }
+        if let Some(pass) = self.rt_restir_gi_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
+    fn destroy_rt_direct_lighting_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_direct_lighting_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_direct_lighting") {
+            return false;
+        }
+        if let Some(pass) = self.rt_direct_lighting_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
+    fn destroy_rt_temporal_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_temporal_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_temporal") {
+            return false;
+        }
+        if let Some(pass) = self.rt_temporal_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
+    fn destroy_rt_resolve_pass(&mut self, renderer: &RenderDevice) -> bool {
+        if self.rt_resolve_pass.is_none() {
+            return true;
+        }
+        if !Self::wait_idle_before_destroying_rt_pass(renderer, "rt_resolve") {
+            return false;
+        }
+        if let Some(pass) = self.rt_resolve_pass.take() {
+            pass.destroy(renderer.device(), renderer.allocator());
+        }
+        true
+    }
+
     fn ensure_rt_surface_pass(
         &mut self,
         renderer: &RenderDevice,
@@ -878,9 +973,7 @@ impl RtRuntimePipeline {
         height: u32,
     ) {
         let Some(ucvh_gpu) = ucvh_gpu else {
-            if let Some(pass) = self.rt_surface_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_rt_surface_pass(renderer);
             tracing::warn!("skipping RT surface pass creation without UCVH GPU descriptors");
             return;
         };
@@ -891,8 +984,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_surface_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_surface_pass(renderer) {
+            return;
         }
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
             tracing::error!("failed to create RT surface pass without KHR ray tracing loader");
@@ -936,8 +1029,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_temporal_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_temporal_pass(renderer) {
+            return;
         }
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
             tracing::error!("failed to create RT temporal pass without KHR ray tracing loader");
@@ -970,9 +1063,7 @@ impl RtRuntimePipeline {
         height: u32,
     ) {
         let Some(ucvh_gpu) = ucvh_gpu else {
-            if let Some(pass) = self.rt_direct_lighting_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_rt_direct_lighting_pass(renderer);
             return;
         };
         if self
@@ -982,8 +1073,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_direct_lighting_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_direct_lighting_pass(renderer) {
+            return;
         }
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
             tracing::error!(
@@ -1040,9 +1131,7 @@ impl RtRuntimePipeline {
         height: u32,
     ) {
         if !restir_di_enabled {
-            if let Some(pass) = self.rt_restir_di_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_rt_restir_di_pass(renderer);
             return;
         }
         if self
@@ -1052,8 +1141,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_restir_di_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_restir_di_pass(renderer) {
+            return;
         }
         let Some(ucvh) = ucvh else {
             tracing::warn!("skipping RT ReSTIR-DI pass creation without CPU UCVH scene");
@@ -1110,15 +1199,11 @@ impl RtRuntimePipeline {
         height: u32,
     ) {
         if !restir_gi_enabled {
-            if let Some(pass) = self.rt_restir_gi_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_rt_restir_gi_pass(renderer);
             return;
         }
         let Some(ucvh_gpu) = ucvh_gpu else {
-            if let Some(pass) = self.rt_restir_gi_pass.take() {
-                pass.destroy(renderer.device(), renderer.allocator());
-            }
+            let _ = self.destroy_rt_restir_gi_pass(renderer);
             tracing::warn!("skipping RT ReSTIR-GI pass creation without UCVH GPU descriptors");
             return;
         };
@@ -1129,8 +1214,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_restir_gi_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_restir_gi_pass(renderer) {
+            return;
         }
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
             tracing::error!("failed to create RT ReSTIR-GI pass without KHR ray tracing loader");
@@ -1195,8 +1280,8 @@ impl RtRuntimePipeline {
         {
             return;
         }
-        if let Some(pass) = self.rt_resolve_pass.take() {
-            pass.destroy(renderer.device(), renderer.allocator());
+        if !self.destroy_rt_resolve_pass(renderer) {
+            return;
         }
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
             tracing::error!("failed to create RT resolve pass without KHR ray tracing loader");
@@ -1965,6 +2050,7 @@ mod tests {
             "lethistory_uniforms=GpuRtHistoryUniforms{",
             "rt_temporal.update_history_uniforms(frame.frame_slot,&history_uniforms)",
             "rt_temporal.update_frame_descriptors(renderer.device(),frame.frame_slot,frame.frame_index,",
+            "rt_resolve.update_uniforms(frame.frame_slot,inputs.lighting_settings.exposure)",
             "rt_resolve.update_input_descriptor(renderer.device(),frame.frame_slot,",
         ] {
             assert!(
@@ -1983,6 +2069,9 @@ mod tests {
             .find("rt_temporal.register_graph(")
             .expect("RT temporal pass should be registered");
         let update_resolve = compact
+            .find("rt_resolve.update_uniforms(")
+            .expect("RT resolve uniforms should be refreshed");
+        let update_resolve_descriptor = compact
             .find("rt_resolve.update_input_descriptor(")
             .expect("RT resolve input descriptor should be refreshed");
         let register_resolve = compact
@@ -1992,7 +2081,8 @@ mod tests {
         assert!(update_history < register_temporal);
         assert!(update_temporal < register_temporal);
         assert!(register_temporal < update_resolve);
-        assert!(update_resolve < register_resolve);
+        assert!(update_resolve < update_resolve_descriptor);
+        assert!(update_resolve_descriptor < register_resolve);
     }
 
     #[test]
@@ -2095,6 +2185,36 @@ mod tests {
             wait < rebuild,
             "shared RT scene AS resources and AABB input buffers must not be mutated while older frames can still read them"
         );
+    }
+
+    #[test]
+    fn rt_pipeline_idles_before_destroying_hot_swapped_pass_resources() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT pipeline implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        assert!(
+            compact.contains("fnwait_idle_before_destroying_rt_pass(")
+                && compact.contains("renderer.wait_idle()"),
+            "RT pass hot-swap destruction must wait for submitted command buffers before destroying pipelines, descriptor-referenced buffers, or images"
+        );
+
+        for token in [
+            "self.destroy_rt_surface_pass(renderer)",
+            "self.destroy_rt_temporal_pass(renderer)",
+            "self.destroy_rt_direct_lighting_pass(renderer)",
+            "self.destroy_rt_restir_di_pass(renderer)",
+            "self.destroy_rt_restir_gi_pass(renderer)",
+            "self.destroy_rt_resolve_pass(renderer)",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT ensure-pass replacement/disable paths must use synchronized destruction helper {token}"
+            );
+        }
     }
 
     #[test]

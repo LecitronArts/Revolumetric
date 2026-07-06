@@ -33,8 +33,8 @@ float4 rt_surface_project_previous_pixel(uint2 pixel, float3 world_position) {
         return rt_surface_invalid_motion_history();
     }
 
-    float4 current_clip = mul(rt_history.current_view_proj, float4(world_position, 1.0));
-    float4 previous_clip = mul(rt_history.previous_view_proj, float4(world_position, 1.0));
+    float4 current_clip = mul(float4(world_position, 1.0), rt_history.current_view_proj);
+    float4 previous_clip = mul(float4(world_position, 1.0), rt_history.previous_view_proj);
     if (current_clip.w <= 1.0e-5 || previous_clip.w <= 1.0e-5) {
         return rt_surface_invalid_motion_history();
     }

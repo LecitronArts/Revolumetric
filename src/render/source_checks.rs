@@ -140,6 +140,35 @@ mod tests {
     }
 
     #[test]
+    fn rt_flythrough_script_sets_camera_path_and_capture_env() {
+        let script = read_source("tools/rt_flythrough_capture.ps1");
+
+        assert_contains_all(
+            &script,
+            &[
+                "REVOLUMETRIC_CAMERA_PATH",
+                "REVOLUMETRIC_CAMERA_PATH_CENTER",
+                "REVOLUMETRIC_CAMERA_PATH_RADIUS",
+                "REVOLUMETRIC_CAMERA_PATH_HEIGHT",
+                "REVOLUMETRIC_CAMERA_PATH_PERIOD_FRAMES",
+                "REVOLUMETRIC_RENDER_MODE",
+                "REVOLUMETRIC_EXIT_AFTER_FRAMES",
+                "REVOLUMETRIC_CAPTURE_FRAME",
+                "REVOLUMETRIC_CAPTURE_DIR",
+                "REVOLUMETRIC_CAPTURE_PREFIX",
+                "REVOLUMETRIC_RT_DEBUG_VIEW",
+                "SetEnvironmentVariable",
+                "cargo run --features desktop --bin revolumetric",
+                "[string]$Center = \"64,32,64\"",
+                "[double]$Radius = 40",
+                "[double]$Height = 36",
+                "$env:REVOLUMETRIC_CAMERA_PATH = \"gallery\"",
+            ],
+            "RT flythrough script",
+        );
+    }
+
+    #[test]
     fn visual_baseline_script_validates_captures_metadata_and_nonblank_ppm() {
         let script = read_source("run/validate-visual-baseline.ps1");
 
@@ -802,6 +831,7 @@ mod tests {
                 "current_surface_history[index] = surface;",
                 "rt_restir_reproject",
                 "rt_history.previous_view_proj",
+                "mul(float4(world_position, 1.0), rt_history.previous_view_proj)",
                 "rt_history.previous_resolution",
                 "rt_restir_surfaces_compatible",
                 "restir_di_reservoir_stream_weight",

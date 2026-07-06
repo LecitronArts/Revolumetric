@@ -1110,6 +1110,7 @@ mod shader_source_tests {
             "rt_restir_gi_generate_initial_reservoir(surface,indirect_surface,index,launch_id.xy)",
             "current_surface_history[index]=surface",
             "ConstantBuffer<RtHistoryUniforms>rt_history",
+            "mul(float4(world_position,1.0),rt_history.previous_view_proj)",
             "rt_history.normal_threshold",
             "rt_history.depth_threshold",
             "restir_gi.temporal_enabled",

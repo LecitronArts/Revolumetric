@@ -327,7 +327,8 @@ impl VoxelGenerator for SponzaGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scene::camera::Camera;
+    use crate::scene::camera::{Camera, CameraPathConfig, apply_camera_path};
+    use crate::scene::components::CameraRig;
     use crate::voxel::ucvh::UcvhConfig;
 
     #[test]
@@ -441,5 +442,39 @@ mod tests {
             SponzaGenerator::eval_voxel(entry).is_none(),
             "center ray should pass through open air at the entrance, got solid voxel at {entry:?}"
         );
+    }
+
+    #[test]
+    fn default_gallery_camera_path_stays_in_open_central_aisle() {
+        let config = CameraPathConfig::from_values(Some("gallery"), None, None, None, None)
+            .expect("gallery flythrough should be enabled");
+        let mut rig = CameraRig::default();
+        let step = (config.period_frames / 16).max(1);
+
+        for frame in (0..config.period_frames).step_by(step as usize) {
+            apply_camera_path(&mut rig, config, frame);
+            let position = rig.camera.position;
+
+            assert!(
+                position.x > 60.0 && position.x < 68.0,
+                "gallery camera should stay in the central aisle at frame {frame}, got {position:?}"
+            );
+            assert!(
+                position.z > 20.0 && position.z < 108.0,
+                "gallery camera should stay away from front/back walls at frame {frame}, got {position:?}"
+            );
+            assert!(
+                SponzaGenerator::eval_voxel(position).is_none(),
+                "gallery camera should not be inside geometry at frame {frame}, got {position:?}"
+            );
+
+            for distance in [2.0_f32, 8.0, 16.0, 24.0] {
+                let probe = position + rig.camera.forward * distance;
+                assert!(
+                    SponzaGenerator::eval_voxel(probe).is_none(),
+                    "gallery center view should not be immediately occluded at frame {frame}, distance {distance}, got solid voxel at {probe:?}"
+                );
+            }
+        }
     }
 }

@@ -1236,6 +1236,7 @@ mod shader_source_tests {
             "ConstantBuffer<RtHistoryUniforms>rt_history",
             "boolrt_restir_reproject(float3world_position,outfloat2previous_uv)",
             "rt_history.previous_view_proj",
+            "mul(float4(world_position,1.0),rt_history.previous_view_proj)",
             "boolrt_restir_previous_uv_inside(float2previous_uv)",
             "rt_history.previous_resolution",
             "previous_uv*float2(previous_extent)",

@@ -762,14 +762,23 @@ mod shader_source_tests {
             "boolrt_surface_history_reset_active()",
             "rt_history.flags",
             "float4rt_surface_project_previous_pixel(uint2pixel,float3world_position)",
-            "mul(rt_history.current_view_proj,float4(world_position,1.0))",
-            "mul(rt_history.previous_view_proj,float4(world_position,1.0))",
+            "mul(float4(world_position,1.0),rt_history.current_view_proj)",
+            "mul(float4(world_position,1.0),rt_history.previous_view_proj)",
             "float2motion_delta=previous_pixel-current_pixel",
             "surface.motion_history=rt_surface_project_previous_pixel(launch_id.xy,surface.position_depth.xyz)",
         ] {
             assert!(
                 compact.contains(token),
                 "RT surface raygen must write motion/history guide token {token}"
+            );
+        }
+        for forbidden in [
+            "mul(rt_history.current_view_proj,float4(world_position,1.0))",
+            "mul(rt_history.previous_view_proj,float4(world_position,1.0))",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "RT surface reprojection must use the same row-vector matrix convention as VPT; found {forbidden}"
             );
         }
         assert!(
@@ -1076,6 +1085,39 @@ mod shader_source_tests {
         assert!(
             !common.contains("pixel.material_id = payload.primitive_index"),
             "RT surface pixels must no longer report AABB primitive index as material id"
+        );
+    }
+
+    #[test]
+    fn rt_surface_intersection_reports_only_real_voxel_hits() {
+        let intersection = std::fs::read_to_string("assets/shaders/passes/rt_surface.rint.slang")
+            .expect("rt_surface.rint.slang should be readable");
+        let compact = crate::render::source_checks::compact(&intersection);
+
+        for token in [
+            "#include\"voxel_traverse.slang\"",
+            "[[vk::binding(4,0)]]ConstantBuffer<UcvhConfig>ucvh_config;",
+            "[[vk::binding(5,0)]]StructuredBuffer<NodeL0>hierarchy_l0;",
+            "[[vk::binding(10,0)]]StructuredBuffer<BrickOccupancy>brick_occupancy;",
+            "[[vk::binding(12,0)]]RWStructuredBuffer<uint>traversal_stats;",
+            "NodeL0node=hierarchy_l0[l0_idx];",
+            "brick_dda(",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT surface intersection shader must validate actual brick occupancy before ReportHit; missing {token}"
+            );
+        }
+
+        let brick_dda = compact
+            .find("brick_dda(")
+            .expect("intersection shader should run brick_dda before reporting a hit");
+        let report_hit = compact
+            .find("ReportHit(")
+            .expect("intersection shader should report real voxel hits");
+        assert!(
+            brick_dda < report_hit,
+            "RT surface intersection shader must not report the enclosing AABB before checking voxel occupancy"
         );
     }
 }

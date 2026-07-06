@@ -1,12 +1,22 @@
 use anyhow::{Context, Result};
 use ash::vk;
+use bytemuck::{Pod, Zeroable};
+use gpu_allocator::MemoryLocation;
 
 use crate::render::allocator::GpuAllocator;
+use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{RayTracingPipeline, ShaderBindingTable, create_shader_module};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct GpuRtResolveUniforms {
+    pub exposure: f32,
+    pub _pad0: [f32; 3],
+}
 
 pub struct RtResolvePass {
     ray_tracing_pipeline_loader: ash::khr::ray_tracing_pipeline::Device,
@@ -15,6 +25,7 @@ pub struct RtResolvePass {
     descriptor_set_layout: vk::DescriptorSetLayout,
     descriptor_pool: DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+    uniform_buffers: Vec<GpuBuffer>,
     pub output_image: GpuImage,
 }
 
@@ -33,10 +44,11 @@ pub struct RtResolveGraphOutputs {
 }
 
 impl RtResolvePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 2] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 3] {
         [
             DescriptorBindingSpec::ray_tracing(0, vk::DescriptorType::SAMPLED_IMAGE),
             DescriptorBindingSpec::ray_tracing(1, vk::DescriptorType::STORAGE_IMAGE),
+            DescriptorBindingSpec::ray_tracing(2, vk::DescriptorType::UNIFORM_BUFFER),
         ]
     }
 
@@ -59,6 +71,10 @@ impl RtResolvePass {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: frame_count as u32,
+                },
+                vk::DescriptorPoolSize {
+                    ty: vk::DescriptorType::UNIFORM_BUFFER,
                     descriptor_count: frame_count as u32,
                 },
             ],
@@ -87,9 +103,19 @@ impl RtResolvePass {
                 return Err(error);
             }
         };
+        let uniform_buffers = match create_uniform_buffers(device, allocator, frame_count) {
+            Ok(buffers) => buffers,
+            Err(error) => {
+                output_image.destroy(device, allocator);
+                descriptor_pool.destroy(device);
+                unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
+                return Err(error);
+            }
+        };
         let shader_module = match create_shader_module(device, info.raygen_spirv) {
             Ok(module) => module,
             Err(error) => {
+                destroy_buffers(uniform_buffers, device, allocator);
                 output_image.destroy(device, allocator);
                 descriptor_pool.destroy(device);
                 unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
@@ -107,6 +133,7 @@ impl RtResolvePass {
             Ok(pipeline) => pipeline,
             Err(error) => {
                 unsafe { device.destroy_shader_module(shader_module, None) };
+                destroy_buffers(uniform_buffers, device, allocator);
                 output_image.destroy(device, allocator);
                 descriptor_pool.destroy(device);
                 unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
@@ -125,6 +152,7 @@ impl RtResolvePass {
             Ok(table) => table,
             Err(error) => {
                 pipeline.destroy(device);
+                destroy_buffers(uniform_buffers, device, allocator);
                 output_image.destroy(device, allocator);
                 descriptor_pool.destroy(device);
                 unsafe { device.destroy_descriptor_set_layout(descriptor_set_layout, None) };
@@ -139,6 +167,7 @@ impl RtResolvePass {
             descriptor_set_layout,
             descriptor_pool,
             descriptor_sets,
+            uniform_buffers,
             output_image,
         })
     }
@@ -149,6 +178,19 @@ impl RtResolvePass {
 
     pub fn height(&self) -> u32 {
         self.output_image.extent.height
+    }
+
+    pub fn update_uniforms(&self, frame_slot: usize, exposure: f32) {
+        let exposure = if exposure.is_finite() && exposure >= 0.0 {
+            exposure
+        } else {
+            1.0
+        };
+        let uniforms = GpuRtResolveUniforms {
+            exposure,
+            _pad0: [0.0; 3],
+        };
+        write_mapped(self.uniform_buffers[frame_slot].mapped_ptr(), &uniforms);
     }
 
     pub fn update_input_descriptor(
@@ -163,6 +205,7 @@ impl RtResolvePass {
             descriptor_set,
             temporal_radiance,
             &self.output_image,
+            &self.uniform_buffers[frame_slot],
         );
     }
 
@@ -241,6 +284,7 @@ impl RtResolvePass {
     pub fn destroy(self, device: &ash::Device, allocator: &GpuAllocator) {
         self.shader_binding_table.destroy(device, allocator);
         self.pipeline.destroy(device);
+        destroy_buffers(self.uniform_buffers, device, allocator);
         self.output_image.destroy(device, allocator);
         self.descriptor_pool.destroy(device);
         unsafe { device.destroy_descriptor_set_layout(self.descriptor_set_layout, None) };
@@ -249,6 +293,31 @@ impl RtResolvePass {
     fn output_image_usage(&self) -> vk::ImageUsageFlags {
         vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC
     }
+}
+
+fn create_uniform_buffers(
+    device: &ash::Device,
+    allocator: &GpuAllocator,
+    frame_count: usize,
+) -> Result<Vec<GpuBuffer>> {
+    let mut buffers = Vec::with_capacity(frame_count);
+    for slot in 0..frame_count {
+        match GpuBuffer::new(
+            device,
+            allocator,
+            std::mem::size_of::<GpuRtResolveUniforms>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER,
+            MemoryLocation::CpuToGpu,
+            &format!("rt_resolve_uniforms_{slot}"),
+        ) {
+            Ok(buffer) => buffers.push(buffer),
+            Err(error) => {
+                destroy_buffers(buffers, device, allocator);
+                return Err(error);
+            }
+        }
+    }
+    Ok(buffers)
 }
 
 fn create_output_image(
@@ -277,6 +346,7 @@ fn write_input_descriptor(
     descriptor_set: vk::DescriptorSet,
     temporal_radiance: &GpuImage,
     output_image: &GpuImage,
+    uniform_buffer: &GpuBuffer,
 ) {
     let temporal_info = vk::DescriptorImageInfo::default()
         .image_view(temporal_radiance.view)
@@ -284,6 +354,10 @@ fn write_input_descriptor(
     let output_info = vk::DescriptorImageInfo::default()
         .image_view(output_image.view)
         .image_layout(vk::ImageLayout::GENERAL);
+    let uniform_info = vk::DescriptorBufferInfo::default()
+        .buffer(uniform_buffer.handle)
+        .offset(0)
+        .range(std::mem::size_of::<GpuRtResolveUniforms>() as u64);
     let writes = [
         vk::WriteDescriptorSet::default()
             .dst_set(descriptor_set)
@@ -295,8 +369,32 @@ fn write_input_descriptor(
             .dst_binding(1)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .image_info(std::slice::from_ref(&output_info)),
+        vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_set)
+            .dst_binding(2)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .buffer_info(std::slice::from_ref(&uniform_info)),
     ];
     unsafe { device.update_descriptor_sets(&writes, &[]) };
+}
+
+fn destroy_buffers(buffers: Vec<GpuBuffer>, device: &ash::Device, allocator: &GpuAllocator) {
+    for buffer in buffers {
+        buffer.destroy(device, allocator);
+    }
+}
+
+fn write_mapped<T: Copy>(mapped_ptr: Option<*mut u8>, value: &T) {
+    let Some(ptr) = mapped_ptr else {
+        return;
+    };
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            value as *const T as *const u8,
+            ptr,
+            std::mem::size_of::<T>(),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -316,7 +414,46 @@ mod shader_source_tests {
             vec![
                 (0, vk::DescriptorType::SAMPLED_IMAGE),
                 (1, vk::DescriptorType::STORAGE_IMAGE),
+                (2, vk::DescriptorType::UNIFORM_BUFFER),
             ]
+        );
+    }
+
+    #[test]
+    fn rt_resolve_uniform_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<super::GpuRtResolveUniforms>(), 16);
+        assert_eq!(
+            std::mem::offset_of!(super::GpuRtResolveUniforms, exposure),
+            0
+        );
+    }
+
+    #[test]
+    fn rt_resolve_shader_applies_display_transform() {
+        let shader = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_resolve.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&shader);
+
+        for token in [
+            "#include\"lighting_common.slang\"",
+            "structRtResolveUniforms{floatexposure;float3_pad0;};",
+            "ConstantBuffer<RtResolveUniforms>rt_resolve",
+            "float3hdr=max(temporal_radiance.Load(int3(launch_id.xy,0)).rgb*rt_resolve.exposure,float3(0.0));",
+            "float3mapped=aces_tonemap(hdr);",
+            "float3ldr=pow(mapped,float3(1.0/2.2));",
+            "resolved_output[launch_id.xy]=float4(ldr,1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT resolve must apply the same display transform as postprocess; missing {token}"
+            );
+        }
+        assert!(
+            !compact.contains(
+                "float3color=temporal_radiance.Load(int3(launch_id.xy,0)).rgb;resolved_output[launch_id.xy]=float4(color,1.0);"
+            ),
+            "RT resolve must not write linear HDR directly to an rgba8 display target"
         );
     }
 

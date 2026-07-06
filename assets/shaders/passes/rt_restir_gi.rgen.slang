@@ -47,7 +47,7 @@ bool rt_restir_gi_surface_valid(RtSurfacePixel surface) {
 }
 
 bool rt_restir_gi_reproject(float3 world_position, out float2 previous_uv) {
-    float4 previous_clip = mul(rt_history.previous_view_proj, float4(world_position, 1.0));
+    float4 previous_clip = mul(float4(world_position, 1.0), rt_history.previous_view_proj);
     if (previous_clip.w <= 1.0e-6) {
         previous_uv = float2(0.0);
         return false;

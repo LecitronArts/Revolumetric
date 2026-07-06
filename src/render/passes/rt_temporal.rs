@@ -624,6 +624,22 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn rt_temporal_reprojection_uses_uploaded_row_vector_matrix_convention() {
+        let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
+            .expect("rt_temporal.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&source);
+
+        assert!(
+            compact.contains("mul(float4(world_position,1.0),rt_history.previous_view_proj)"),
+            "RT temporal reprojection must match VPT's row-vector view-projection convention"
+        );
+        assert!(
+            !compact.contains("mul(rt_history.previous_view_proj,float4(world_position,1.0))"),
+            "RT temporal reprojection must not use the opposite matrix-vector convention"
+        );
+    }
+
+    #[test]
     fn rt_temporal_shader_is_driven_by_history_settings_not_fixed_blend() {
         let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
             .expect("rt_temporal.rgen.slang should be readable");
@@ -662,6 +678,29 @@ mod shader_source_tests {
             assert!(
                 compact.contains(token),
                 "RT temporal shader must include history rejection token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_temporal_debug_view_visualizes_history_reuse() {
+        let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
+            .expect("rt_temporal.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "if(rt_history.debug_view==RT_DEBUG_VIEW_TEMPORAL)",
+            "if(rt_history.debug_view==RT_DEBUG_VIEW_TEMPORAL&&!history_valid)",
+            "temporal_radiance[launch_id.xy]=float4(0.0,0.0,motion_history_valid?1.0:0.0,1.0);",
+            "float3temporal_debug=rt_temporal_visualize_reuse(",
+            "1.0-alpha",
+            "length(blended-current)",
+            "motion_history_valid?1.0:0.0",
+            "temporal_radiance[launch_id.xy]=float4(temporal_debug,1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT temporal debug view must expose history reuse token {token}"
             );
         }
     }
