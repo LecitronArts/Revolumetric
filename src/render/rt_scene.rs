@@ -732,9 +732,11 @@ impl RtSceneBackend {
             )
         };
 
-        let scene_changed = !(self.dirty_generation == dirty_generation
-            && self.brick_bounds == brick_bounds)
-            && !brick_bounds_acceleration_geometry_eq(&self.brick_bounds, &brick_bounds);
+        let exact_match =
+            self.dirty_generation == dirty_generation && self.brick_bounds == brick_bounds;
+        let geometry_match =
+            brick_bounds_acceleration_geometry_eq(&self.brick_bounds, &brick_bounds);
+        let scene_changed = !exact_match && !geometry_match;
 
         RtSceneRebuildState {
             dirty_generation,
