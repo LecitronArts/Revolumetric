@@ -68,6 +68,8 @@ pub struct RtFrameStatus {
     pub surface_ready: bool,
     pub restir_di_history_ready: bool,
     pub restir_gi_history_ready: bool,
+    pub restir_di_rendered: bool,
+    pub restir_gi_rendered: bool,
     pub direct_lighting_ready: bool,
     pub temporal_ready: bool,
     pub resolve_ready: bool,
@@ -79,6 +81,8 @@ pub struct RtPipelineFrameState {
     pub surface_initialized: bool,
     pub restir_di_history_initialized: bool,
     pub restir_gi_history_initialized: bool,
+    pub restir_di_rendered: bool,
+    pub restir_gi_rendered: bool,
     pub direct_lighting_initialized: bool,
     pub temporal_initialized: bool,
     pub resolve_initialized: bool,
@@ -97,6 +101,8 @@ impl RtPipelineFrameState {
         self.surface_initialized = false;
         self.restir_di_history_initialized = false;
         self.restir_gi_history_initialized = false;
+        self.restir_di_rendered = false;
+        self.restir_gi_rendered = false;
         self.direct_lighting_initialized = false;
         self.temporal_initialized = false;
         self.resolve_initialized = false;
@@ -160,6 +166,8 @@ impl RtRuntimePipeline {
             surface_ready: self.frame_state.surface_initialized,
             restir_di_history_ready: self.frame_state.restir_di_history_initialized,
             restir_gi_history_ready: self.frame_state.restir_gi_history_initialized,
+            restir_di_rendered: self.frame_state.restir_di_rendered,
+            restir_gi_rendered: self.frame_state.restir_gi_rendered,
             direct_lighting_ready: self.frame_state.direct_lighting_initialized,
             temporal_ready: self.frame_state.temporal_initialized,
             resolve_ready: self.frame_state.resolve_initialized,
@@ -757,6 +765,8 @@ impl RtRuntimePipeline {
         self.frame_state.surface_initialized = rt_graph_rendered;
         self.frame_state.restir_di_history_initialized = rt_graph_rendered && rt_restir_di_rendered;
         self.frame_state.restir_gi_history_initialized = rt_graph_rendered && rt_restir_gi_rendered;
+        self.frame_state.restir_di_rendered = rt_graph_rendered && rt_restir_di_rendered;
+        self.frame_state.restir_gi_rendered = rt_graph_rendered && rt_restir_gi_rendered;
         self.frame_state.direct_lighting_initialized = rt_graph_rendered;
         self.frame_state.temporal_initialized = rt_graph_rendered;
         self.frame_state.resolve_initialized = rt_graph_rendered;
@@ -1330,6 +1340,8 @@ mod tests {
         pipeline.frame_state.surface_initialized = true;
         pipeline.frame_state.restir_di_history_initialized = true;
         pipeline.frame_state.restir_gi_history_initialized = true;
+        pipeline.frame_state.restir_di_rendered = true;
+        pipeline.frame_state.restir_gi_rendered = true;
         pipeline.frame_state.direct_lighting_initialized = true;
         pipeline.frame_state.temporal_initialized = true;
         pipeline.frame_state.resolve_initialized = true;
@@ -1341,6 +1353,8 @@ mod tests {
                 surface_ready: true,
                 restir_di_history_ready: true,
                 restir_gi_history_ready: true,
+                restir_di_rendered: true,
+                restir_gi_rendered: true,
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
@@ -1368,6 +1382,19 @@ mod tests {
         pipeline.reset_history(7);
 
         assert_eq!(pipeline.frame_status().skip_reason, None);
+    }
+
+    #[test]
+    fn rt_pipeline_history_reset_clears_active_restir_pass_state() {
+        let mut pipeline = RtRuntimePipeline::new();
+        pipeline.frame_state.restir_di_rendered = true;
+        pipeline.frame_state.restir_gi_rendered = true;
+
+        pipeline.reset_history(7);
+
+        let status = pipeline.frame_status();
+        assert!(!status.restir_di_rendered);
+        assert!(!status.restir_gi_rendered);
     }
 
     #[test]
@@ -1430,6 +1457,33 @@ mod tests {
         assert!(early_root_cause < downstream_required_passes);
         assert!(early_root_cause < downstream_as_missing);
         assert!(early_root_cause < downstream_gpu_descriptors);
+    }
+
+    #[test]
+    fn rt_pipeline_records_active_restir_pass_state() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let record = source
+            .split("pub fn record_and_execute_frame")
+            .nth(1)
+            .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+            .split("pub fn destroy")
+            .next()
+            .expect("record_and_execute_frame should end before destroy");
+        let compact = crate::render::source_checks::compact(record);
+
+        for token in [
+            "letmutrt_restir_di_rendered=false;",
+            "letmutrt_restir_gi_rendered=false;",
+            "rt_restir_di_rendered=rt_restir_di_reservoir_resource.is_some();",
+            "rt_restir_gi_rendered=rt_restir_gi_reservoir_resource.is_some();",
+            "self.frame_state.restir_di_rendered=rt_graph_rendered&&rt_restir_di_rendered;",
+            "self.frame_state.restir_gi_rendered=rt_graph_rendered&&rt_restir_gi_rendered;",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT pipeline missing active RT ReSTIR pass state token {token}"
+            );
+        }
     }
 
     #[test]

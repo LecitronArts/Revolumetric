@@ -274,6 +274,14 @@ impl EditorUi {
                         "rt_gi_history={}",
                         rt_frame_restir_gi_history_label(runtime_status)
                     ));
+                    ui.monospace(format!(
+                        "rt_restir_di_pass={}",
+                        rt_frame_restir_di_pass_label(runtime_status)
+                    ));
+                    ui.monospace(format!(
+                        "rt_restir_gi_pass={}",
+                        rt_frame_restir_gi_pass_label(runtime_status)
+                    ));
                     ui.monospace(format!("denoiser={}", lighting.denoiser_mode_name()));
                     ui.monospace(format!("rt_di={}", rt.restir_di_enabled));
                     ui.monospace(format!("rt_gi={}", rt.restir_gi_enabled));
@@ -573,6 +581,14 @@ fn show_render_panel(
         ui.monospace(format!(
             "gi_history {}",
             rt_frame_restir_gi_history_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "di_pass {}",
+            rt_frame_restir_di_pass_label(runtime_status)
+        ));
+        ui.monospace(format!(
+            "gi_pass {}",
+            rt_frame_restir_gi_pass_label(runtime_status)
         ));
     });
     if let Some(notice) = rt_backend_notice(lighting.render_mode, runtime_status) {
@@ -933,6 +949,14 @@ fn rt_frame_restir_gi_history_label(status: Option<RenderRuntimeStatus>) -> &'st
     rt_frame_bool_label(status, |frame_status| frame_status.restir_gi_history_ready)
 }
 
+fn rt_frame_restir_di_pass_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.restir_di_rendered)
+}
+
+fn rt_frame_restir_gi_pass_label(status: Option<RenderRuntimeStatus>) -> &'static str {
+    rt_frame_bool_label(status, |frame_status| frame_status.restir_gi_rendered)
+}
+
 fn rt_backend_notice(
     requested: RenderMode,
     status: Option<RenderRuntimeStatus>,
@@ -1189,6 +1213,8 @@ mod tests {
                 surface_ready: true,
                 restir_di_history_ready: true,
                 restir_gi_history_ready: false,
+                restir_di_rendered: false,
+                restir_gi_rendered: false,
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
@@ -1261,6 +1287,30 @@ mod tests {
             };
             assert_eq!(rt_frame_skip_reason_label(Some(status)), label);
         }
+    }
+
+    #[test]
+    fn rt_frame_restir_active_pass_labels_cover_true_false_and_unknown() {
+        let inactive = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Vpt,
+            rt_supported: true,
+            rt_frame_status: None,
+        };
+        let active = RenderRuntimeStatus {
+            actual_backend: RenderBackend::Rt,
+            rt_supported: true,
+            rt_frame_status: Some(RtFrameStatus {
+                restir_di_rendered: true,
+                restir_gi_history_ready: true,
+                restir_gi_rendered: false,
+                ..RtFrameStatus::default()
+            }),
+        };
+
+        assert_eq!(rt_frame_restir_di_pass_label(Some(active)), "true");
+        assert_eq!(rt_frame_restir_gi_pass_label(Some(active)), "false");
+        assert_eq!(rt_frame_restir_di_pass_label(Some(inactive)), "unknown");
+        assert_eq!(rt_frame_restir_gi_pass_label(None), "unknown");
     }
 
     #[test]
@@ -1420,6 +1470,14 @@ mod tests {
             top_bar.contains("rt_frame_skip_reason_label(runtime_status)"),
             "top bar must expose RT frame skip reason"
         );
+        assert!(
+            !top_bar.contains("rt_frame_restir_di_pass_label(runtime_status)"),
+            "top bar must not expose RT ReSTIR-DI active pass status"
+        );
+        assert!(
+            !top_bar.contains("rt_frame_restir_gi_pass_label(runtime_status)"),
+            "top bar must not expose RT ReSTIR-GI active pass status"
+        );
 
         let render_panel = source
             .split("fn show_render_panel")
@@ -1436,6 +1494,8 @@ mod tests {
             "rt_frame_resolve_label(runtime_status)",
             "rt_frame_restir_di_history_label(runtime_status)",
             "rt_frame_restir_gi_history_label(runtime_status)",
+            "rt_frame_restir_di_pass_label(runtime_status)",
+            "rt_frame_restir_gi_pass_label(runtime_status)",
             "RT reason",
             "rt_frame_skip_reason_label(runtime_status)",
         ] {
@@ -1457,6 +1517,8 @@ mod tests {
             "rt_resolve={}",
             "rt_di_history={}",
             "rt_gi_history={}",
+            "rt_restir_di_pass={}",
+            "rt_restir_gi_pass={}",
             "rt_skip_reason={}",
         ] {
             assert!(console.contains(token), "console missing {token}");
