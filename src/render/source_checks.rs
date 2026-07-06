@@ -205,7 +205,12 @@ mod tests {
             &[
                 ".\\run\\validate-visual-baseline.ps1",
                 ".\\run\\validate-visual-baseline.ps1 -Nrd",
+                ".\\run\\validate-visual-baseline.ps1 -Rt",
                 "visual regression baseline",
+                "hardware RT capture",
+                "render_backend",
+                "render_mode",
+                "rt_debug_view",
             ],
             "README visual baseline docs",
         );
@@ -213,9 +218,13 @@ mod tests {
             &run_readme,
             &[
                 ".\\run\\validate-visual-baseline.ps1",
+                ".\\run\\validate-visual-baseline.ps1 -Rt",
                 "run/visual-baselines.json",
                 "PPM",
                 "metadata",
+                "requires RT-capable hardware",
+                "render_backend",
+                "RT metadata",
             ],
             "run README visual baseline docs",
         );

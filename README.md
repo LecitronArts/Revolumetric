@@ -139,6 +139,7 @@ Validation matrix for this MVP:
 .\run\validate-local.ps1 -StrictShaders -Nrd
 .\run\validate-visual-baseline.ps1
 .\run\validate-visual-baseline.ps1 -Nrd
+.\run\validate-visual-baseline.ps1 -Rt
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 $env:REVOLUMETRIC_RENDER_MODE='rt'
 $env:REVOLUMETRIC_RT_RESTIR_DI='on'
@@ -159,7 +160,11 @@ rg -n "REVOLUMETRIC_RENDER_MODE|REVOLUMETRIC_RT_RESTIR_DI|REVOLUMETRIC_RT_RESTIR
 
 The visual regression baseline wrapper captures deterministic smoke frames and
 checks the PPM/metadata contract. It is a baseline health gate, not a final image
-quality judgment.
+quality judgment. The default visual baseline run pins cases to VPT for
+cross-machine stability; `-Nrd` adds NRD-backed VPT captures, and `-Rt` runs the
+hardware RT capture case on RT-capable hardware. Capture metadata records
+`render_backend`, `render_mode`, and RT controls such as `rt_debug_view` so
+fallback output and hardware RT resolve output can be distinguished.
 
 ## Current Shape
 
