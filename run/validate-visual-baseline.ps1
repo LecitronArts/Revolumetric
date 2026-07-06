@@ -2,6 +2,7 @@ param(
     [string]$Manifest = (Join-Path $PSScriptRoot "visual-baselines.json"),
     [string]$OutputDir = "target\visual-baseline",
     [switch]$Nrd,
+    [switch]$Rt,
     [string]$NrdRoot = (Join-Path $PSScriptRoot "nrd")
 )
 
@@ -20,6 +21,12 @@ function Assert-CaptureMetadata {
     if ([int64]$Metadata.frame_index -ne $CaptureFrame) {
         throw "capture metadata frame_index was $($Metadata.frame_index), expected $CaptureFrame."
     }
+    if ($Case.expectedRenderBackend -and $Metadata.render_backend -ne $Case.expectedRenderBackend) {
+        throw "capture metadata render_backend was $($Metadata.render_backend), expected $($Case.expectedRenderBackend)."
+    }
+    if ($Case.renderMode -and $Metadata.render_mode -ne $Case.renderMode) {
+        throw "capture metadata render_mode was $($Metadata.render_mode), expected $($Case.renderMode)."
+    }
     if ($Metadata.vpt_debug_view -ne $Case.debugView) {
         throw "capture metadata vpt_debug_view was $($Metadata.vpt_debug_view), expected $($Case.debugView)."
     }
@@ -31,6 +38,24 @@ function Assert-CaptureMetadata {
     }
     if ([int]$Metadata.width -le 0 -or [int]$Metadata.height -le 0) {
         throw "capture metadata dimensions must be positive."
+    }
+    if ($Case.rtDebugView -and $Metadata.rt_debug_view -ne $Case.rtDebugView) {
+        throw "capture metadata rt_debug_view was $($Metadata.rt_debug_view), expected $($Case.rtDebugView)."
+    }
+    if ($null -ne $Case.rtRestirDi -and [bool]$Metadata.rt_restir_di_enabled -ne [bool]$Case.rtRestirDi) {
+        throw "capture metadata rt_restir_di_enabled was $($Metadata.rt_restir_di_enabled), expected $($Case.rtRestirDi)."
+    }
+    if ($null -ne $Case.rtRestirDiSpatial -and [bool]$Metadata.rt_restir_di_spatial_enabled -ne [bool]$Case.rtRestirDiSpatial) {
+        throw "capture metadata rt_restir_di_spatial_enabled was $($Metadata.rt_restir_di_spatial_enabled), expected $($Case.rtRestirDiSpatial)."
+    }
+    if ($null -ne $Case.rtRestirDiSpatialSamples -and [int]$Metadata.rt_restir_di_spatial_sample_count -ne [int]$Case.rtRestirDiSpatialSamples) {
+        throw "capture metadata rt_restir_di_spatial_sample_count was $($Metadata.rt_restir_di_spatial_sample_count), expected $($Case.rtRestirDiSpatialSamples)."
+    }
+    if ($null -ne $Case.rtRestirGi -and [bool]$Metadata.rt_restir_gi_enabled -ne [bool]$Case.rtRestirGi) {
+        throw "capture metadata rt_restir_gi_enabled was $($Metadata.rt_restir_gi_enabled), expected $($Case.rtRestirGi)."
+    }
+    if ($null -ne $Case.rtTemporalDenoise -and [bool]$Metadata.rt_temporal_denoise_enabled -ne [bool]$Case.rtTemporalDenoise) {
+        throw "capture metadata rt_temporal_denoise_enabled was $($Metadata.rt_temporal_denoise_enabled), expected $($Case.rtTemporalDenoise)."
     }
 }
 
@@ -127,8 +152,15 @@ foreach ($name in @(
     "REVOLUMETRIC_CAPTURE_FRAME",
     "REVOLUMETRIC_CAPTURE_DIR",
     "REVOLUMETRIC_CAPTURE_PREFIX",
+    "REVOLUMETRIC_RENDER_MODE",
     "REVOLUMETRIC_DENOISER",
     "REVOLUMETRIC_VPT_DEBUG_VIEW",
+    "REVOLUMETRIC_RT_DEBUG_VIEW",
+    "REVOLUMETRIC_RT_RESTIR_DI",
+    "REVOLUMETRIC_RT_RESTIR_DI_SPATIAL",
+    "REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES",
+    "REVOLUMETRIC_RT_RESTIR_GI",
+    "REVOLUMETRIC_RT_TEMPORAL_DENOISE",
     "REVOLUMETRIC_EXIT_AFTER_FRAMES",
     "REVOLUMETRIC_NRD_ROOT",
     "PATH"
@@ -145,6 +177,10 @@ try {
             Write-Host "skip visual baseline $($case.name): requires -Nrd"
             continue
         }
+        if ($case.requiresRt -and -not $Rt) {
+            Write-Host "skip visual baseline $($case.name): requires -Rt"
+            continue
+        }
 
         $caseOutputDir = Join-Path $OutputDir $case.name
         Remove-Item -LiteralPath $caseOutputDir -Recurse -Force -ErrorAction SilentlyContinue
@@ -154,11 +190,46 @@ try {
         $env:REVOLUMETRIC_CAPTURE_DIR = $caseOutputDir
         $env:REVOLUMETRIC_CAPTURE_PREFIX = $case.name
         $env:REVOLUMETRIC_EXIT_AFTER_FRAMES = "$frames"
+        if ($case.renderMode) {
+            $env:REVOLUMETRIC_RENDER_MODE = $case.renderMode
+        } else {
+            $env:REVOLUMETRIC_RENDER_MODE = "vpt"
+        }
         $env:REVOLUMETRIC_DENOISER = $case.denoiser
         if ($case.debugView -eq "final") {
             Remove-Item Env:\REVOLUMETRIC_VPT_DEBUG_VIEW -ErrorAction SilentlyContinue
         } else {
             $env:REVOLUMETRIC_VPT_DEBUG_VIEW = $case.debugView
+        }
+        if ($case.rtDebugView) {
+            $env:REVOLUMETRIC_RT_DEBUG_VIEW = $case.rtDebugView
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_DEBUG_VIEW -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtRestirDi) {
+            $env:REVOLUMETRIC_RT_RESTIR_DI = ([string]$case.rtRestirDi).ToLowerInvariant()
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtRestirDiSpatial) {
+            $env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL = ([string]$case.rtRestirDiSpatial).ToLowerInvariant()
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI_SPATIAL -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtRestirDiSpatialSamples) {
+            $env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES = "$($case.rtRestirDiSpatialSamples)"
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtRestirGi) {
+            $env:REVOLUMETRIC_RT_RESTIR_GI = ([string]$case.rtRestirGi).ToLowerInvariant()
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtTemporalDenoise) {
+            $env:REVOLUMETRIC_RT_TEMPORAL_DENOISE = ([string]$case.rtTemporalDenoise).ToLowerInvariant()
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_TEMPORAL_DENOISE -ErrorAction SilentlyContinue
         }
 
         Write-Host "==> visual baseline $($case.name)"

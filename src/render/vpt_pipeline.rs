@@ -45,9 +45,10 @@ use crate::render::passes::vpt_temporal::{
 use crate::render::resource::{AccessKind, QueueType};
 use crate::render::restir_di::RestirDiSettings;
 use crate::render::restir_di::build_direct_lights_from_ucvh;
+use crate::render::rt_settings::{RtDebugView, RtSettings};
 use crate::render::scene_ubo::{
-    LightingSettings, SceneUniformBuffer, SceneUniformInputs, VptDebugView, VptDenoiserMode,
-    build_scene_uniforms,
+    LightingSettings, RenderMode, SceneUniformBuffer, SceneUniformInputs, VptDebugView,
+    VptDenoiserMode, build_scene_uniforms,
 };
 use crate::render::traversal_stats::{VptTraversalStatsBuffer, VptTraversalStatsSnapshot};
 use crate::render::vpt_history::{
@@ -76,6 +77,7 @@ pub struct VptFrameInputs<'a> {
     pub sun_intensity: glam::Vec3,
     pub elapsed_seconds: f32,
     pub lighting_settings: LightingSettings,
+    pub rt_settings: RtSettings,
     pub restir_di_settings: RestirDiSettings,
     pub area_restir_settings: AreaRestirSettings,
     pub restir_di_enabled: bool,
@@ -1570,6 +1572,16 @@ impl VptRuntimePipeline {
                         source: "postprocess_output",
                         ppm_path: paths.ppm_path,
                         json_path: paths.json_path,
+                        render_backend: "vpt",
+                        render_mode: capture_render_mode_name(inputs.lighting_settings.render_mode),
+                        rt_debug_view: capture_rt_debug_view_name(inputs.rt_settings.debug_view),
+                        rt_restir_di_enabled: inputs.rt_settings.restir_di_enabled,
+                        rt_restir_di_spatial_enabled: inputs.rt_settings.restir_di_spatial_enabled,
+                        rt_restir_di_spatial_sample_count: inputs
+                            .rt_settings
+                            .restir_di_spatial_sample_count,
+                        rt_restir_gi_enabled: inputs.rt_settings.restir_gi_enabled,
+                        rt_temporal_denoise_enabled: inputs.rt_settings.temporal_denoise_enabled,
                         restir_di_enabled: inputs.restir_di_enabled,
                         restir_di_temporal_enabled,
                         restir_di_spatial_enabled,
@@ -2081,6 +2093,26 @@ fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
     }
 }
 
+fn capture_render_mode_name(render_mode: RenderMode) -> &'static str {
+    match render_mode {
+        RenderMode::Auto => "auto",
+        RenderMode::Vpt => "vpt",
+        RenderMode::Rt => "rt",
+    }
+}
+
+fn capture_rt_debug_view_name(debug_view: RtDebugView) -> &'static str {
+    match debug_view {
+        RtDebugView::Off => "off",
+        RtDebugView::Surface => "surface",
+        RtDebugView::HitDistance => "hit_distance",
+        RtDebugView::HistoryValid => "history_valid",
+        RtDebugView::DirectReservoir => "direct_reservoir",
+        RtDebugView::IndirectReservoir => "indirect_reservoir",
+        RtDebugView::Temporal => "temporal",
+    }
+}
+
 fn capture_effective_denoiser_mode_name(
     lighting_settings: LightingSettings,
     nrd_resolve_available: bool,
@@ -2114,6 +2146,23 @@ mod tests {
                 "matrix element mismatch: actual={actual} expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn capture_render_mode_name_uses_manifest_values() {
+        assert_eq!(capture_render_mode_name(RenderMode::Auto), "auto");
+        assert_eq!(capture_render_mode_name(RenderMode::Vpt), "vpt");
+        assert_eq!(capture_render_mode_name(RenderMode::Rt), "rt");
+    }
+
+    #[test]
+    fn capture_rt_debug_view_name_uses_env_values() {
+        assert_eq!(capture_rt_debug_view_name(RtDebugView::Off), "off");
+        assert_eq!(capture_rt_debug_view_name(RtDebugView::Surface), "surface");
+        assert_eq!(
+            capture_rt_debug_view_name(RtDebugView::DirectReservoir),
+            "direct_reservoir"
+        );
     }
 
     #[test]

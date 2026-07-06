@@ -492,6 +492,7 @@ impl RenderRuntime {
                     elapsed_seconds: input.elapsed_seconds,
                     lighting_settings: input.settings.lighting,
                     rt_settings: input.settings.rt,
+                    capture: self.capture.as_mut(),
                     ucvh_ready: self.ucvh_uploaded,
                     ucvh: input.ucvh.as_deref(),
                     ucvh_gpu: self.ucvh_gpu.as_ref(),
@@ -514,6 +515,7 @@ impl RenderRuntime {
                     sun_intensity: input.sun_intensity,
                     elapsed_seconds: input.elapsed_seconds,
                     lighting_settings: input.settings.lighting,
+                    rt_settings: input.settings.rt,
                     restir_di_settings: input.settings.restir_di,
                     area_restir_settings: input.settings.area_restir,
                     restir_di_enabled: input.restir_di_enabled,
@@ -888,6 +890,39 @@ mod tests {
         assert!(compact.contains("RenderBackend::Rt=>self.rt_pipeline.record_and_execute_frame("));
         assert!(
             compact.contains("RenderBackend::Vpt=>self.vpt_pipeline.record_and_execute_frame(")
+        );
+    }
+
+    #[test]
+    fn render_runtime_passes_capture_to_rt_and_vpt_pipelines() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before helpers");
+        let compact = crate::render::source_checks::compact(render_frame);
+        let rt_branch_start = compact
+            .find("RenderBackend::Rt=>")
+            .expect("render_frame must contain RT branch");
+        let vpt_branch_start = compact
+            .find("RenderBackend::Vpt=>")
+            .expect("render_frame must contain VPT branch");
+        let rt_branch = &compact[rt_branch_start..vpt_branch_start];
+        let vpt_branch = &compact[vpt_branch_start..];
+
+        assert!(
+            rt_branch.contains("RtFrameInputs{")
+                && rt_branch.contains("capture:self.capture.as_mut(),"),
+            "RT frame inputs must receive RenderCapture for RT resolve readback"
+        );
+        assert!(
+            vpt_branch.contains("VptFrameInputs{")
+                && vpt_branch.contains("rt_settings:input.settings.rt,")
+                && vpt_branch.contains("capture:self.capture.as_mut(),"),
+            "VPT frame inputs must receive RT settings and RenderCapture for fallback metadata"
         );
     }
 

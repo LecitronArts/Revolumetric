@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Record requested render mode, actual capture backend, and RT controls in visual baseline metadata, then validate those fields from the local baseline manifest/script.
+**Goal:** Record requested render mode, actual capture backend, and RT controls in visual baseline metadata, capture RT resolve output, then validate those fields from the local baseline manifest/script.
 
-**Architecture:** Keep the current VPT image capture path intact and extend its metadata contract. Thread `RuntimeSettings.rt` into `VptFrameInputs` so VPT fallback captures can still record requested RT controls. Update the baseline manifest and PowerShell validator to set and assert RT case fields without claiming hardware RT image readback is implemented.
+**Architecture:** Keep the current VPT image capture path intact and extend its metadata contract. Thread `RuntimeSettings.rt` into `VptFrameInputs` so VPT fallback captures can still record requested RT controls. Pass `RenderCapture` into `RtFrameInputs`, copy `rt_resolve_outputs.output` to readback through a transfer pass, and return RT capture metadata. Update the baseline manifest and PowerShell validator to pin default VPT cases and gate RT visual capture behind `-Rt`.
 
 **Tech Stack:** Rust renderer modules, Rust unit/source-contract tests, PowerShell validation script, JSON visual baseline manifest, Cargo test/clippy/fmt.
 
@@ -14,10 +14,11 @@
 
 - Modify `src/render/capture.rs`: add capture metadata fields and serialization test assertions.
 - Modify `src/render/vpt_pipeline.rs`: add `RtSettings` to `VptFrameInputs`, add render-mode/RT-debug name helpers, populate metadata fields, and add helper tests.
-- Modify `src/render/runtime.rs`: pass `input.settings.rt` into VPT frame inputs and update source-contract tests.
+- Modify `src/render/rt_pipeline.rs`: add `RenderCapture` to `RtFrameInputs`, queue `capture_rt_resolve`, and return RT metadata.
+- Modify `src/render/runtime.rs`: pass capture and `input.settings.rt` into pipeline frame inputs and update source-contract tests.
 - Modify `src/render/source_checks.rs`: add source-contract checks for RT baseline manifest and validation script support.
-- Modify `run/visual-baselines.json`: add one RT fallback contract case.
-- Modify `run/validate-visual-baseline.ps1`: preserve/set/restore RT env vars and assert optional metadata fields.
+- Modify `run/visual-baselines.json`: pin VPT cases and add one hardware-gated RT capture case.
+- Modify `run/validate-visual-baseline.ps1`: preserve/set/restore RT env vars, gate RT cases behind `-Rt`, and assert optional metadata fields.
 
 ---
 
@@ -235,7 +236,103 @@ Expected: PASS.
 
 ---
 
-### Task 3: Visual Baseline Manifest And Script Contract
+### Task 3: RT Resolve Capture Readback
+
+**Files:**
+- Modify: `src/render/rt_pipeline.rs`
+- Modify: `src/render/runtime.rs`
+
+- [ ] **Step 1: Write failing source-contract tests**
+
+In `src/render/rt_pipeline.rs`, add `rt_pipeline_queues_capture_from_resolve_output`:
+
+```rust
+#[test]
+fn rt_pipeline_queues_capture_from_resolve_output() {
+    let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+    let frame_inputs = source
+        .split("pub struct RtFrameInputs")
+        .nth(1)
+        .expect("RtFrameInputs should exist")
+        .split("pub struct RtPipelineFrameState")
+        .next()
+        .expect("RtFrameInputs should end before frame state");
+    assert!(frame_inputs.contains("capture: Option<&'a mut RenderCapture>"));
+
+    let record = source
+        .split("pub fn record_and_execute_frame")
+        .nth(1)
+        .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+        .split("pub fn destroy")
+        .next()
+        .expect("record_and_execute_frame should end before destroy");
+    let compact = crate::render::source_checks::compact(record);
+
+    for token in [
+        "letmutpending_capture=None;",
+        "inputs.capture.as_ref().is_some_and(|capture|capture.should_capture(frame.frame_index))",
+        "capture.ensure_readback(",
+        "graph.add_pass(\"capture_rt_resolve\",QueueType::Transfer,|builder|{",
+        "cmd_copy_image_to_buffer(",
+        "source:\"rt_resolve_output\"",
+        "render_backend:\"rt\"",
+        "pending_capture=Some(CaptureMetadata{",
+        "pending_capture,",
+    ] {
+        assert!(compact.contains(token), "RT capture path missing {token}");
+    }
+}
+```
+
+In `src/render/runtime.rs`, add `render_runtime_passes_capture_to_rt_and_vpt_pipelines` requiring both `RtFrameInputs` and `VptFrameInputs` to receive capture.
+
+- [ ] **Step 2: Run tests to verify RED**
+
+Run:
+
+```powershell
+$env:REVOLUMETRIC_SHADER_COMPILE='skip'
+cargo test --lib rt_pipeline_queues_capture_from_resolve_output
+cargo test --lib render_runtime_passes_capture_to_rt_and_vpt_pipelines
+```
+
+Expected: FAIL because `RtFrameInputs` has no capture field and RT record returns `pending_capture: None`.
+
+- [ ] **Step 3: Implement RT resolve readback**
+
+Add capture imports and field:
+
+```rust
+use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
+
+pub capture: Option<&'a mut RenderCapture>,
+```
+
+In `RtRuntimePipeline::record_and_execute_frame`, create `let mut pending_capture = None;`, detect `capture.should_capture(frame.frame_index)` after `rt_resolve.register_graph`, queue a `capture_rt_resolve` transfer pass that copies `rt_resolve_outputs.output` to the readback buffer, fill `CaptureMetadata` with `source: "rt_resolve_output"` and `render_backend: "rt"`, and return `pending_capture`.
+
+In `RenderRuntime::render_frame`, pass:
+
+```rust
+capture: self.capture.as_mut(),
+```
+
+to the RT frame inputs.
+
+- [ ] **Step 4: Run tests to verify GREEN**
+
+Run:
+
+```powershell
+$env:REVOLUMETRIC_SHADER_COMPILE='skip'
+cargo test --lib rt_pipeline_queues_capture_from_resolve_output
+cargo test --lib render_runtime_passes_capture_to_rt_and_vpt_pipelines
+```
+
+Expected: PASS.
+
+---
+
+### Task 4: Visual Baseline Manifest And Script Contract
 
 **Files:**
 - Modify: `src/render/source_checks.rs`
@@ -247,6 +344,8 @@ Expected: PASS.
 In `visual_baseline_script_validates_captures_metadata_and_nonblank_ppm`, add tokens:
 
 ```rust
+"[switch]$Rt",
+"requiresRt",
 "REVOLUMETRIC_RENDER_MODE",
 "REVOLUMETRIC_RT_DEBUG_VIEW",
 "REVOLUMETRIC_RT_RESTIR_DI",
@@ -269,7 +368,8 @@ In `visual_baseline_manifest_covers_svgf_and_reblur_debug_cases`, add tokens:
 ```rust
 "\"name\": \"rt_surface_debug\"",
 "\"renderMode\": \"rt\"",
-"\"expectedRenderBackend\": \"vpt\"",
+"\"requiresRt\": true",
+"\"expectedRenderBackend\": \"rt\"",
 "\"rtDebugView\": \"surface\"",
 "\"rtRestirDi\": true",
 "\"rtRestirDiSpatial\": true",
@@ -300,8 +400,9 @@ Append a case after `reblur_nrd_validation`:
   "denoiser": "svgf",
   "debugView": "final",
   "requiresNrd": false,
+  "requiresRt": true,
   "expectedEffectiveDenoiser": "svgf",
-  "expectedRenderBackend": "vpt",
+  "expectedRenderBackend": "rt",
   "rtDebugView": "surface",
   "rtRestirDi": true,
   "rtRestirDiSpatial": true,
@@ -313,12 +414,13 @@ Append a case after `reblur_nrd_validation`:
 
 - [ ] **Step 4: Update PowerShell env and metadata validation**
 
-In `$previousEnv`, include the RT env vars listed in Task 3 Step 1.
+In `$previousEnv`, include the RT env vars listed in Task 4 Step 1.
 
 In each case setup, set optional fields:
 
 ```powershell
-if ($case.renderMode) { $env:REVOLUMETRIC_RENDER_MODE = $case.renderMode } else { Remove-Item Env:\REVOLUMETRIC_RENDER_MODE -ErrorAction SilentlyContinue }
+if ($case.requiresRt -and -not $Rt) { Write-Host "skip visual baseline $($case.name): requires -Rt"; continue }
+if ($case.renderMode) { $env:REVOLUMETRIC_RENDER_MODE = $case.renderMode } else { $env:REVOLUMETRIC_RENDER_MODE = "vpt" }
 if ($case.rtDebugView) { $env:REVOLUMETRIC_RT_DEBUG_VIEW = $case.rtDebugView } else { Remove-Item Env:\REVOLUMETRIC_RT_DEBUG_VIEW -ErrorAction SilentlyContinue }
 if ($null -ne $case.rtRestirDi) { $env:REVOLUMETRIC_RT_RESTIR_DI = $case.rtRestirDi.ToString().ToLowerInvariant() } else { Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI -ErrorAction SilentlyContinue }
 if ($null -ne $case.rtRestirDiSpatial) { $env:REVOLUMETRIC_RT_RESTIR_DI_SPATIAL = $case.rtRestirDiSpatial.ToString().ToLowerInvariant() } else { Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_DI_SPATIAL -ErrorAction SilentlyContinue }
@@ -369,7 +471,7 @@ Expected: PASS.
 
 ---
 
-### Task 4: Full Verification And Commit
+### Task 5: Full Verification And Commit
 
 **Files:**
 - Verify all changed files.

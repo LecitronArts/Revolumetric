@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use ash::vk;
 
 use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
+use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
 use crate::render::device::RenderDevice;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
@@ -24,9 +25,10 @@ use crate::render::rt_history::{
     RT_HISTORY_FLAG_LIGHTS_INVALIDATED, RT_HISTORY_FLAG_RESIZE, RT_HISTORY_FLAG_SCENE_INVALIDATED,
 };
 use crate::render::rt_scene::RtSceneBackend;
-use crate::render::rt_settings::RtSettings;
+use crate::render::rt_settings::{RtDebugView, RtSettings};
 use crate::render::scene_ubo::{
-    LightingSettings, SceneUniformBuffer, SceneUniformInputs, build_scene_uniforms,
+    LightingSettings, RenderMode, SceneUniformBuffer, SceneUniformInputs, VptDebugView,
+    build_scene_uniforms,
 };
 use crate::render::vpt_pipeline::{VptCameraFrame, VptFrameRecordResult};
 use crate::voxel::gpu_upload::UcvhGpuResources;
@@ -42,6 +44,7 @@ pub struct RtFrameInputs<'a> {
     pub elapsed_seconds: f32,
     pub lighting_settings: LightingSettings,
     pub rt_settings: RtSettings,
+    pub capture: Option<&'a mut RenderCapture>,
     pub ucvh_ready: bool,
     pub ucvh: Option<&'a Ucvh>,
     pub ucvh_gpu: Option<&'a UcvhGpuResources>,
@@ -211,9 +214,10 @@ impl RtRuntimePipeline {
         frame: &FrameContext,
         #[cfg(not(target_os = "android"))] _egui_renderer: Option<&mut EguiRenderer>,
         #[cfg(not(target_os = "android"))] _egui_frame: Option<&EguiFrame>,
-        inputs: RtFrameInputs<'_>,
+        mut inputs: RtFrameInputs<'_>,
     ) -> Result<VptFrameRecordResult> {
         let mut graph = RenderGraph::new();
+        let mut pending_capture = None;
         if inputs.external_history_reset_generation > self.frame_state.history_reset_generation {
             self.frame_state
                 .reset_history(inputs.external_history_reset_generation);
@@ -568,12 +572,106 @@ impl RtRuntimePipeline {
                             frame.frame_slot,
                             self.frame_state.resolve_initialized,
                         );
+                        let mut capture_dependency = None;
+                        let capture_frame = inputs
+                            .capture
+                            .as_ref()
+                            .is_some_and(|capture| capture.should_capture(frame.frame_index));
+                        if capture_frame && let Some(capture) = inputs.capture.as_deref_mut() {
+                            let output_image = rt_resolve.output_image.handle;
+                            let output_extent = rt_resolve.output_image.extent;
+                            let readback = capture.ensure_readback(
+                                renderer.device(),
+                                renderer.allocator(),
+                                output_extent.width,
+                                output_extent.height,
+                            )?;
+                            let readback_buffer = readback.handle;
+                            let readback_size = readback.size;
+                            let readback_usage = readback.usage;
+                            let readback_resource = graph.import_buffer_with_access(
+                                readback_buffer,
+                                readback_size,
+                                readback_usage,
+                                AccessKind::Undefined,
+                            );
+                            let capture_writes = graph.add_pass(
+                                "capture_rt_resolve",
+                                QueueType::Transfer,
+                                |builder| {
+                                    builder.read_as(
+                                        rt_resolve_outputs.output,
+                                        AccessKind::TransferRead,
+                                    );
+                                    builder.write_as(readback_resource, AccessKind::TransferWrite);
+                                    Box::new(move |ctx| {
+                                        cmd_copy_image_to_buffer(
+                                            ctx.device,
+                                            ctx.command_buffer,
+                                            output_image,
+                                            output_extent,
+                                            readback_buffer,
+                                        );
+                                    })
+                                },
+                            );
+                            capture_dependency = Some(capture_writes[0]);
+                            let paths = capture.config().paths_for_frame(frame.frame_index);
+                            pending_capture = Some(CaptureMetadata {
+                                frame_index: frame.frame_index,
+                                vpt_sample_index: 0,
+                                width: output_extent.width,
+                                height: output_extent.height,
+                                source: "rt_resolve_output",
+                                ppm_path: paths.ppm_path,
+                                json_path: paths.json_path,
+                                render_backend: "rt",
+                                render_mode: capture_render_mode_name(
+                                    inputs.lighting_settings.render_mode,
+                                ),
+                                rt_debug_view: capture_rt_debug_view_name(
+                                    inputs.rt_settings.debug_view,
+                                ),
+                                rt_restir_di_enabled: inputs.rt_settings.restir_di_enabled,
+                                rt_restir_di_spatial_enabled: inputs
+                                    .rt_settings
+                                    .restir_di_spatial_enabled,
+                                rt_restir_di_spatial_sample_count: inputs
+                                    .rt_settings
+                                    .restir_di_spatial_sample_count,
+                                rt_restir_gi_enabled: inputs.rt_settings.restir_gi_enabled,
+                                rt_temporal_denoise_enabled: inputs
+                                    .rt_settings
+                                    .temporal_denoise_enabled,
+                                restir_di_enabled: false,
+                                restir_di_temporal_enabled: false,
+                                restir_di_spatial_enabled: false,
+                                area_restir_enabled: false,
+                                area_restir_temporal_enabled: false,
+                                area_restir_spatial_enabled: false,
+                                vpt_debug_view: capture_vpt_debug_view_name(
+                                    inputs.lighting_settings.vpt_debug_view,
+                                ),
+                                denoiser_enabled: inputs.lighting_settings.denoiser_enabled(),
+                                denoiser_mode: inputs.lighting_settings.denoiser_mode_name(),
+                                effective_denoiser_mode: inputs
+                                    .lighting_settings
+                                    .effective_denoiser_mode_name(),
+                            });
+                            tracing::info!(
+                                frame_index = frame.frame_index,
+                                width = output_extent.width,
+                                height = output_extent.height,
+                                "queued RT resolve capture"
+                            );
+                        }
                         add_blit_to_swapchain_pass(
                             &mut graph,
                             rt_resolve_outputs.output,
                             rt_resolve.output_image.handle,
                             rt_resolve.output_image.extent,
                             frame,
+                            capture_dependency,
                         )?;
                         rt_graph_rendered = true;
                     } else {
@@ -611,7 +709,7 @@ impl RtRuntimePipeline {
         self.frame_state.resolve_initialized = rt_graph_rendered;
 
         Ok(VptFrameRecordResult {
-            pending_capture: None,
+            pending_capture,
             submitted_fence: frame.in_flight_fence,
             rendered_vpt: false,
             traversal_stats_requested: false,
@@ -1028,12 +1126,63 @@ impl RtRuntimePipeline {
     }
 }
 
+fn capture_render_mode_name(render_mode: RenderMode) -> &'static str {
+    match render_mode {
+        RenderMode::Auto => "auto",
+        RenderMode::Vpt => "vpt",
+        RenderMode::Rt => "rt",
+    }
+}
+
+fn capture_rt_debug_view_name(debug_view: RtDebugView) -> &'static str {
+    match debug_view {
+        RtDebugView::Off => "off",
+        RtDebugView::Surface => "surface",
+        RtDebugView::HitDistance => "hit_distance",
+        RtDebugView::HistoryValid => "history_valid",
+        RtDebugView::DirectReservoir => "direct_reservoir",
+        RtDebugView::IndirectReservoir => "indirect_reservoir",
+        RtDebugView::Temporal => "temporal",
+    }
+}
+
+fn capture_vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
+    match debug_view {
+        VptDebugView::Final => "final",
+        VptDebugView::Raw => "raw",
+        VptDebugView::Temporal => "temporal",
+        VptDebugView::Variance => "variance",
+        VptDebugView::HistoryValid => "history_valid",
+        VptDebugView::Motion => "motion",
+        VptDebugView::Normal => "normal",
+        VptDebugView::Depth => "depth",
+        VptDebugView::ReservoirWeight => "reservoir_weight",
+        VptDebugView::Direct => "direct",
+        VptDebugView::Indirect => "indirect",
+        VptDebugView::AreaSubpixel => "area_subpixel",
+        VptDebugView::AreaLens => "area_lens",
+        VptDebugView::AreaWeight => "area_weight",
+        VptDebugView::AreaHistoryValid => "area_history_valid",
+        VptDebugView::AreaRejection => "area_rejection",
+        VptDebugView::AreaJacobian => "area_jacobian",
+        VptDebugView::VoxelBrick => "voxel_brick",
+        VptDebugView::VoxelLocal => "voxel_local",
+        VptDebugView::VoxelHit => "voxel_hit",
+        VptDebugView::NrdNormalRoughness => "nrd_normal_roughness",
+        VptDebugView::NrdViewZ => "nrd_viewz",
+        VptDebugView::NrdMotion => "nrd_motion",
+        VptDebugView::NrdMotionZ => "nrd_motion_z",
+        VptDebugView::NrdValidation => "nrd_validation",
+    }
+}
+
 fn add_blit_to_swapchain_pass<'a>(
     graph: &mut RenderGraph<'a>,
     src_resource: crate::render::resource::ResourceHandle,
     src_image: vk::Image,
     src_extent: vk::Extent3D,
     frame: &'a FrameContext,
+    capture_dependency: Option<crate::render::resource::ResourceHandle>,
 ) -> Result<()> {
     let swapchain = graph.import_image_with_access(
         frame.swapchain_image,
@@ -1045,6 +1194,9 @@ fn add_blit_to_swapchain_pass<'a>(
     );
     graph.add_pass("blit_to_swapchain", QueueType::Graphics, |builder| {
         builder.read_as(src_resource, AccessKind::TransferRead);
+        if let Some(capture_dependency) = capture_dependency {
+            builder.depend_on(capture_dependency);
+        }
         builder.write_as(swapchain, AccessKind::TransferWrite);
         builder.finish_as(swapchain, AccessKind::Present);
         Box::new(move |ctx| {
@@ -1130,6 +1282,48 @@ mod tests {
         assert!(surface < direct_lighting);
         assert!(direct_lighting < temporal);
         assert!(temporal < resolve);
+    }
+
+    #[test]
+    fn rt_pipeline_queues_capture_from_resolve_output() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let frame_inputs = source
+            .split("pub struct RtFrameInputs")
+            .nth(1)
+            .expect("RtFrameInputs should exist")
+            .split("pub struct RtPipelineFrameState")
+            .next()
+            .expect("RtFrameInputs should end before frame state");
+        assert!(
+            frame_inputs.contains("capture: Option<&'a mut RenderCapture>"),
+            "RT frame inputs must carry RenderCapture for RT resolve readback"
+        );
+
+        let record = source
+            .split("pub fn record_and_execute_frame")
+            .nth(1)
+            .expect("RtRuntimePipeline::record_and_execute_frame should exist")
+            .split("pub fn destroy")
+            .next()
+            .expect("record_and_execute_frame should end before destroy");
+        let compact = crate::render::source_checks::compact(record);
+
+        for token in [
+            "letmutpending_capture=None;",
+            "inputs.capture.as_ref().is_some_and(|capture|capture.should_capture(frame.frame_index))",
+            "capture.ensure_readback(",
+            "graph.add_pass(\"capture_rt_resolve\",QueueType::Transfer,|builder|{",
+            "cmd_copy_image_to_buffer(",
+            "source:\"rt_resolve_output\"",
+            "render_backend:\"rt\"",
+            "pending_capture=Some(CaptureMetadata{",
+            "pending_capture,",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT capture path missing compact token {token}"
+            );
+        }
     }
 
     #[test]

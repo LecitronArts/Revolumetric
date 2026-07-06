@@ -34,6 +34,14 @@ pub struct CaptureMetadata {
     pub source: &'static str,
     pub ppm_path: PathBuf,
     pub json_path: PathBuf,
+    pub render_backend: &'static str,
+    pub render_mode: &'static str,
+    pub rt_debug_view: &'static str,
+    pub rt_restir_di_enabled: bool,
+    pub rt_restir_di_spatial_enabled: bool,
+    pub rt_restir_di_spatial_sample_count: u32,
+    pub rt_restir_gi_enabled: bool,
+    pub rt_temporal_denoise_enabled: bool,
     pub restir_di_enabled: bool,
     pub restir_di_temporal_enabled: bool,
     pub restir_di_spatial_enabled: bool,
@@ -110,6 +118,14 @@ impl CaptureMetadata {
                 "  \"source\": \"{}\",\n",
                 "  \"ppm_path\": \"{}\",\n",
                 "  \"json_path\": \"{}\",\n",
+                "  \"render_backend\": \"{}\",\n",
+                "  \"render_mode\": \"{}\",\n",
+                "  \"rt_debug_view\": \"{}\",\n",
+                "  \"rt_restir_di_enabled\": {},\n",
+                "  \"rt_restir_di_spatial_enabled\": {},\n",
+                "  \"rt_restir_di_spatial_sample_count\": {},\n",
+                "  \"rt_restir_gi_enabled\": {},\n",
+                "  \"rt_temporal_denoise_enabled\": {},\n",
                 "  \"restir_di_enabled\": {},\n",
                 "  \"restir_di_temporal_enabled\": {},\n",
                 "  \"restir_di_spatial_enabled\": {},\n",
@@ -129,6 +145,14 @@ impl CaptureMetadata {
             json_escape(self.source),
             json_escape_path(&self.ppm_path),
             json_escape_path(&self.json_path),
+            json_escape(self.render_backend),
+            json_escape(self.render_mode),
+            json_escape(self.rt_debug_view),
+            self.rt_restir_di_enabled,
+            self.rt_restir_di_spatial_enabled,
+            self.rt_restir_di_spatial_sample_count,
+            self.rt_restir_gi_enabled,
+            self.rt_temporal_denoise_enabled,
             self.restir_di_enabled,
             self.restir_di_temporal_enabled,
             self.restir_di_spatial_enabled,
@@ -425,6 +449,14 @@ mod tests {
             source: "postprocess_output",
             ppm_path: PathBuf::from("target/captures/restir_000007.ppm"),
             json_path: PathBuf::from("target/captures/restir_000007.json"),
+            render_backend: "vpt",
+            render_mode: "rt",
+            rt_debug_view: "surface",
+            rt_restir_di_enabled: true,
+            rt_restir_di_spatial_enabled: true,
+            rt_restir_di_spatial_sample_count: 4,
+            rt_restir_gi_enabled: true,
+            rt_temporal_denoise_enabled: true,
             restir_di_enabled: true,
             restir_di_temporal_enabled: true,
             restir_di_spatial_enabled: false,
@@ -442,6 +474,14 @@ mod tests {
         assert!(json.contains("\"frame_index\": 7"));
         assert!(json.contains("\"vpt_sample_index\": 3"));
         assert!(json.contains("\"source\": \"postprocess_output\""));
+        assert!(json.contains("\"render_backend\": \"vpt\""));
+        assert!(json.contains("\"render_mode\": \"rt\""));
+        assert!(json.contains("\"rt_debug_view\": \"surface\""));
+        assert!(json.contains("\"rt_restir_di_enabled\": true"));
+        assert!(json.contains("\"rt_restir_di_spatial_enabled\": true"));
+        assert!(json.contains("\"rt_restir_di_spatial_sample_count\": 4"));
+        assert!(json.contains("\"rt_restir_gi_enabled\": true"));
+        assert!(json.contains("\"rt_temporal_denoise_enabled\": true"));
         assert!(json.contains("\"restir_di_enabled\": true"));
         assert!(json.contains("\"area_restir_enabled\": true"));
         assert!(json.contains("\"vpt_debug_view\": \"final\""));

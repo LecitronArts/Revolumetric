@@ -2,11 +2,9 @@
 
 ## Goal
 
-Extend the visual baseline contract so captures can identify the requested render mode, actual backend, and RT controls. This makes automated capture output distinguish VPT fallback from hardware RT and records the RT feature state that produced a baseline.
+Extend the visual baseline contract so captures can identify the requested render mode, actual backend, and RT controls. Add RT resolve readback so hardware RT frames can write the same PPM/JSON capture artifacts as the VPT postprocess path.
 
-The current implementation only captures the VPT postprocess image. Hardware RT frames still return `pending_capture: None`, so this design does not claim full RT image readback support. It prepares metadata, manifest, script validation, and source-contract tests for the next RT readback step.
-
-## Current Facts
+## Starting Facts Before This Slice
 
 - `src/render/capture.rs` writes metadata for frame index, dimensions, paths, VPT ReSTIR state, VPT debug view, and denoiser state.
 - `src/render/vpt_pipeline.rs` copies the VPT postprocess image into `RenderCapture` and creates `CaptureMetadata`.
@@ -20,7 +18,7 @@ Use an explicit capture metadata contract rather than inferring backend state fr
 
 `CaptureMetadata` gains these fields:
 
-- `render_backend`: actual backend that produced the captured image, initially `vpt` for VPT capture output.
+- `render_backend`: actual backend that produced the captured image, `vpt` for VPT postprocess output and `rt` for RT resolve output.
 - `render_mode`: requested render mode from `LightingSettings`, such as `auto`, `vpt`, or `rt`.
 - `rt_debug_view`: RT debug view name from `RtSettings`.
 - `rt_restir_di_enabled`
@@ -29,22 +27,25 @@ Use an explicit capture metadata contract rather than inferring backend state fr
 - `rt_restir_gi_enabled`
 - `rt_temporal_denoise_enabled`
 
-The VPT pipeline receives `RtSettings` in `VptFrameInputs` so VPT fallback captures can record the RT controls that were requested alongside the actual backend. This matters when `REVOLUMETRIC_RENDER_MODE=rt` falls back to VPT on unsupported hardware.
+The VPT pipeline receives `RtSettings` in `VptFrameInputs` so VPT fallback captures can record the RT controls that were requested alongside the actual backend.
+
+The RT pipeline receives `RenderCapture` in `RtFrameInputs`. After `rt_resolve.register_graph`, it registers a `capture_rt_resolve` transfer pass that copies `rt_resolve_outputs.output` into the capture readback buffer, then returns `CaptureMetadata` with `source: "rt_resolve_output"` and `render_backend: "rt"`. The blit pass depends on the capture pass when capture is queued, matching the ordering used by the VPT postprocess capture path.
 
 ## Manifest And Script Contract
 
-`run/visual-baselines.json` gains an RT-oriented case named `rt_surface_debug` with:
+`run/visual-baselines.json` pins the existing VPT/NRD cases to `renderMode: "vpt"` so default `auto` cannot route them to RT on RT-capable machines.
+
+The manifest also gains a hardware-gated RT case named `rt_surface_debug` with:
 
 - `renderMode`: `rt`
-- `expectedRenderBackend`: `vpt`
+- `requiresRt`: `true`
+- `expectedRenderBackend`: `rt`
 - `rtDebugView`: `surface`
 - `rtRestirDi`: `true`
 - `rtRestirDiSpatial`: `true`
 - `rtRestirDiSpatialSamples`: `4`
 - `rtRestirGi`: `true`
 - `rtTemporalDenoise`: `true`
-
-The first RT contract case intentionally expects `vpt` as the captured backend because the current readback path is VPT-only. This records the fallback behavior without requiring RT hardware on CI. A future RT readback task can add a hardware-gated case with `expectedRenderBackend: "rt"` after `RtRuntimePipeline` emits capture metadata and copies the RT resolve image to readback.
 
 `run/validate-visual-baseline.ps1` will preserve, set, and restore the relevant RT env vars:
 
@@ -56,20 +57,22 @@ The first RT contract case intentionally expects `vpt` as the captured backend b
 - `REVOLUMETRIC_RT_RESTIR_GI`
 - `REVOLUMETRIC_RT_TEMPORAL_DENOISE`
 
-The script validates optional manifest fields only when present, so existing VPT/NRD cases keep working.
+The script validates optional manifest fields only when present. It skips `requiresRt` cases unless invoked with `-Rt`, keeping the default local baseline path stable on machines without RT hardware while allowing explicit RT capture validation where supported.
 
 ## Tests
 
 Tests are source-contract and serialization tests because full GPU capture execution depends on runtime hardware and shader state.
 
 - `capture.rs` verifies `CaptureMetadata::to_json()` emits all backend and RT fields.
-- `source_checks.rs` verifies the visual baseline manifest contains the RT contract case.
-- `source_checks.rs` verifies the validation script stores/restores RT env vars, sets them from manifest case fields, and checks metadata fields.
-- `runtime.rs` or `vpt_pipeline.rs` source-contract tests verify `RuntimeSettings.rt` is threaded into `VptFrameInputs`.
+- `source_checks.rs` verifies the visual baseline manifest pins VPT cases and contains the hardware-gated RT contract case.
+- `source_checks.rs` verifies the validation script stores/restores RT env vars, sets them from manifest case fields, gates RT cases behind `-Rt`, and checks metadata fields.
+- `vpt_pipeline.rs` source-contract/helper tests verify `RuntimeSettings.rt` is threaded into `VptFrameInputs` and serialized with stable manifest values.
+- `rt_pipeline.rs` source-contract tests verify `RtFrameInputs` carries capture, `capture_rt_resolve` copies resolve output, and `pending_capture` returns RT metadata.
+- `runtime.rs` source-contract tests verify `RenderRuntime` passes capture into both RT and VPT pipeline inputs.
 
 ## Boundaries
 
-This design does not implement RT resolve readback. The required follow-up is to add `capture: Option<&mut RenderCapture>` to `RtFrameInputs`, copy `rt_resolve_outputs.output` into the readback buffer after resolve, and return `CaptureMetadata` with `render_backend: "rt"`. That work needs graph dependency review and should be tested separately.
+This design adds capture readback for RT resolve output. It does not add perceptual image comparison, golden-image diff thresholds, or automatic hardware detection. The RT visual baseline case is explicit and hardware-gated by `-Rt`; without that flag, the script skips it.
 
 ## Approval
 

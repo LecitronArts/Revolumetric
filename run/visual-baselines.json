@@ -4,24 +4,49 @@
   "cases": [
     {
       "name": "svgf_final",
+      "renderMode": "vpt",
       "denoiser": "svgf",
       "debugView": "final",
       "requiresNrd": false,
+      "requiresRt": false,
+      "expectedRenderBackend": "vpt",
       "expectedEffectiveDenoiser": "svgf"
     },
     {
       "name": "reblur_final",
+      "renderMode": "vpt",
       "denoiser": "reblur",
       "debugView": "final",
       "requiresNrd": true,
+      "requiresRt": false,
+      "expectedRenderBackend": "vpt",
       "expectedEffectiveDenoiser": "reblur"
     },
     {
       "name": "reblur_nrd_validation",
+      "renderMode": "vpt",
       "denoiser": "reblur",
       "debugView": "nrd_validation",
       "requiresNrd": true,
+      "requiresRt": false,
+      "expectedRenderBackend": "vpt",
       "expectedEffectiveDenoiser": "reblur"
+    },
+    {
+      "name": "rt_surface_debug",
+      "renderMode": "rt",
+      "denoiser": "svgf",
+      "debugView": "final",
+      "requiresNrd": false,
+      "requiresRt": true,
+      "expectedRenderBackend": "rt",
+      "expectedEffectiveDenoiser": "svgf",
+      "rtDebugView": "surface",
+      "rtRestirDi": true,
+      "rtRestirDiSpatial": true,
+      "rtRestirDiSpatialSamples": 4,
+      "rtRestirGi": true,
+      "rtTemporalDenoise": true
     }
   ]
 }
