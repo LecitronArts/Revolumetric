@@ -72,8 +72,8 @@ fn rt_pipeline_records_active_restir_pass_state() {
     let compact = crate::render::source_checks::compact(record);
 
     for token in [
-        "letrt_restir_di_rendered=false;",
-        "letrt_restir_gi_rendered=false;",
+        "letmutrt_restir_di_rendered=false;",
+        "letmutrt_restir_gi_rendered=false;",
         "rt_restir_di_rendered=rt_restir_di_reservoir_resource.is_some();",
         "rt_restir_gi_rendered=rt_restir_gi_reservoir_resource.is_some();",
         "self.frame_state.restir_di_rendered=rt_graph_rendered&&rt_restir_di_rendered;",
