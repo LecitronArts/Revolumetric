@@ -21,6 +21,13 @@ StructuredBuffer<RtSurfacePixel> previous_surface_history;
 [[vk::binding(6, 0)]]
 Texture2D<float4> current_radiance;
 
+static const int2 rt_temporal_history_tap_offsets[4] = {
+    int2(0, 0),
+    int2(1, 0),
+    int2(0, 1),
+    int2(1, 1),
+};
+
 bool reproject(float3 world_position, out float2 previous_uv) {
     float4 previous_clip = mul(float4(world_position, 1.0), rt_history.previous_view_proj);
     if (previous_clip.w <= 1.0e-6) {
@@ -37,7 +44,14 @@ bool rt_temporal_debug_bypasses_history(uint debug_view) {
     return debug_view == RT_DEBUG_VIEW_SURFACE
         || debug_view == RT_DEBUG_VIEW_HIT_DISTANCE
         || debug_view == RT_DEBUG_VIEW_DIRECT_RESERVOIR
-        || debug_view == RT_DEBUG_VIEW_INDIRECT_RESERVOIR;
+        || debug_view == RT_DEBUG_VIEW_INDIRECT_RESERVOIR
+        || debug_view == RT_DEBUG_VIEW_GI_TEMPORAL
+        || debug_view == RT_DEBUG_VIEW_GI_SPATIAL
+        || debug_view == RT_DEBUG_VIEW_GI_INDIRECT
+        || debug_view == RT_DEBUG_VIEW_DIRECT
+        || debug_view == RT_DEBUG_VIEW_SKY_INDIRECT
+        || debug_view == RT_DEBUG_VIEW_GI_REASON
+        || debug_view == RT_DEBUG_VIEW_MOTION;
 }
 
 bool previous_uv_inside(float2 previous_uv) {
@@ -45,6 +59,20 @@ bool previous_uv_inside(float2 previous_uv) {
         && previous_uv.x < 1.0
         && previous_uv.y >= 0.0
         && previous_uv.y < 1.0;
+}
+
+float rt_temporal_history_tap_weight(uint tap, float2 history_fraction) {
+    int2 offset = rt_temporal_history_tap_offsets[tap];
+    float wx = offset.x == 0 ? 1.0 - history_fraction.x : history_fraction.x;
+    float wy = offset.y == 0 ? 1.0 - history_fraction.y : history_fraction.y;
+    return wx * wy;
+}
+
+bool rt_temporal_history_tap_inside(int2 previous_pixel, uint2 extent) {
+    return previous_pixel.x >= 0
+        && previous_pixel.y >= 0
+        && previous_pixel.x < int(extent.x)
+        && previous_pixel.y < int(extent.y);
 }
 
 float bounded_history_alpha(uint history_length) {
@@ -74,14 +102,19 @@ bool rt_surfaces_compatible(RtSurfacePixel current, RtSurfacePixel previous) {
     }
 
     float position_delta = distance(current.position_depth.xyz, previous.position_depth.xyz);
-    float depth_scale = max(current.position_depth.w, 1.0);
-    return position_delta <= max(1.0, depth_scale * rt_history.depth_threshold);
+    return position_delta <= rt_history_position_threshold(current.position_depth.w, rt_history.depth_threshold);
 }
 
 float3 rt_temporal_visualize_reuse(float3 current, float3 blended, float alpha, bool motion_history_valid) {
     float history_weight = 1.0 - alpha;
     float blend_delta = saturate(length(blended - current) * 4.0);
     return saturate(float3(history_weight, blend_delta, motion_history_valid ? 1.0 : 0.0));
+}
+
+float3 rt_temporal_visualize_motion(float4 motion) {
+    bool motion_valid = motion.w > 0.0;
+    float2 encoded_delta = motion_valid ? motion.xy * 0.05 + 0.5 : float2(0.5, 0.5);
+    return float3(encoded_delta, motion_valid ? 1.0 : 0.0);
 }
 
 [shader("raygeneration")]
@@ -111,20 +144,41 @@ void main() {
         && motion_history_valid
         && previous_pixel_valid;
     float3 current = current_radiance.Load(int3(launch_id.xy, 0)).rgb;
-    uint2 previous_pixel = uint2(0u, 0u);
-    uint previous_index = 0u;
+    float3 history = float3(0.0);
+    float history_weight_sum = 0.0;
     bool history_valid = false;
 
+    if (rt_history.debug_view == RT_DEBUG_VIEW_MOTION) {
+        temporal_radiance[launch_id.xy] = float4(rt_temporal_visualize_motion(surface.motion_history), 1.0);
+        return;
+    }
+
     if (base_history_valid) {
-        uint2 previous_max_pixel = previous_extent - uint2(1u, 1u);
-        previous_pixel = uint2(clamp(
-            previous_pixel_f,
-            float2(0.0),
-            float2(previous_max_pixel)
-        ));
-        previous_index = previous_pixel.y * previous_extent.x + previous_pixel.x;
-        RtSurfacePixel previous_surface = previous_surface_history[previous_index];
-        history_valid = rt_surfaces_compatible(surface, previous_surface);
+        float2 previous_sample = previous_pixel_f - float2(0.5);
+        int2 previous_base_pixel = int2(floor(previous_sample));
+        float2 history_fraction = saturate(previous_sample - float2(previous_base_pixel));
+        for (uint tap = 0u; tap < 4u; tap++) {
+            float tap_weight = rt_temporal_history_tap_weight(tap, history_fraction);
+            if (tap_weight <= 0.0) {
+                continue;
+            }
+            int2 tap_pixel_i = previous_base_pixel + rt_temporal_history_tap_offsets[tap];
+            if (!rt_temporal_history_tap_inside(tap_pixel_i, previous_extent)) {
+                continue;
+            }
+            uint2 previous_pixel = uint2(tap_pixel_i);
+            uint previous_index = previous_pixel.y * previous_extent.x + previous_pixel.x;
+            RtSurfacePixel previous_surface = previous_surface_history[previous_index];
+            if (!rt_surfaces_compatible(surface, previous_surface)) {
+                continue;
+            }
+            history += previous_temporal_radiance.Load(int3(previous_pixel, 0)).rgb * tap_weight;
+            history_weight_sum += tap_weight;
+        }
+        history_valid = history_weight_sum > 0.0;
+        if (history_valid) {
+            history /= history_weight_sum;
+        }
     }
 
     if (rt_history.debug_view == RT_DEBUG_VIEW_HISTORY_VALID) {
@@ -142,7 +196,6 @@ void main() {
         return;
     }
 
-    float3 history = previous_temporal_radiance.Load(int3(previous_pixel, 0)).rgb;
     float3 clamped_history = clamp(history, current - 0.25, current + 0.25);
     float alpha = bounded_history_alpha(rt_history.history_length);
     float3 blended = lerp(clamped_history, current, alpha);

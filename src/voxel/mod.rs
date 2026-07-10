@@ -5,5 +5,8 @@ pub mod gpu_upload;
 pub mod material;
 pub mod morton;
 pub mod occupancy;
+pub mod sparse_index;
 pub mod sponza_generator;
+pub mod teardown_zip_loader;
 pub mod ucvh;
+pub mod vox_loader;

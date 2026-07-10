@@ -74,6 +74,12 @@ function Assert-CaptureMetadata {
     if ($null -ne $Case.rtRestirGi -and [bool]$Metadata.rt_restir_gi_enabled -ne [bool]$Case.rtRestirGi) {
         throw "capture metadata rt_restir_gi_enabled was $($Metadata.rt_restir_gi_enabled), expected $($Case.rtRestirGi)."
     }
+    if ($null -ne $Case.rtRestirGiSpatial -and [bool]$Metadata.rt_restir_gi_spatial_enabled -ne [bool]$Case.rtRestirGiSpatial) {
+        throw "capture metadata rt_restir_gi_spatial_enabled was $($Metadata.rt_restir_gi_spatial_enabled), expected $($Case.rtRestirGiSpatial)."
+    }
+    if ($null -ne $Case.rtRestirGiSpatialSamples -and [int]$Metadata.rt_restir_gi_spatial_sample_count -ne [int]$Case.rtRestirGiSpatialSamples) {
+        throw "capture metadata rt_restir_gi_spatial_sample_count was $($Metadata.rt_restir_gi_spatial_sample_count), expected $($Case.rtRestirGiSpatialSamples)."
+    }
     if ($null -ne $Case.rtTemporalDenoise -and [bool]$Metadata.rt_temporal_denoise_enabled -ne [bool]$Case.rtTemporalDenoise) {
         throw "capture metadata rt_temporal_denoise_enabled was $($Metadata.rt_temporal_denoise_enabled), expected $($Case.rtTemporalDenoise)."
     }
@@ -86,8 +92,26 @@ function Assert-CaptureMetadata {
     if ($null -ne $Case.expectedRtRestirGiRendered) {
         Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_restir_gi_rendered" -ExpectedValue $Case.expectedRtRestirGiRendered
     }
+    if ($null -ne $Case.expectedRtRestirGiSpatialRendered) {
+        Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_restir_gi_spatial_rendered" -ExpectedValue $Case.expectedRtRestirGiSpatialRendered
+    }
     if ($null -ne $Case.expectedRtResolveReady) {
         Assert-MetadataBooleanField -Metadata $Metadata -FieldName "rt_resolve_ready" -ExpectedValue $Case.expectedRtResolveReady
+    }
+    if ($Case.cameraPath -and $Metadata.cameraPath -ne $Case.cameraPath) {
+        throw "capture metadata cameraPath was $($Metadata.cameraPath), expected $($Case.cameraPath)."
+    }
+    if ($Case.cameraPathCenter -and $Metadata.cameraPathCenter -ne $Case.cameraPathCenter) {
+        throw "capture metadata cameraPathCenter was $($Metadata.cameraPathCenter), expected $($Case.cameraPathCenter)."
+    }
+    if ($null -ne $Case.cameraPathRadius -and [double]$Metadata.cameraPathRadius -ne [double]$Case.cameraPathRadius) {
+        throw "capture metadata cameraPathRadius was $($Metadata.cameraPathRadius), expected $($Case.cameraPathRadius)."
+    }
+    if ($null -ne $Case.cameraPathHeight -and [double]$Metadata.cameraPathHeight -ne [double]$Case.cameraPathHeight) {
+        throw "capture metadata cameraPathHeight was $($Metadata.cameraPathHeight), expected $($Case.cameraPathHeight)."
+    }
+    if ($null -ne $Case.cameraPathPeriodFrames -and [int64]$Metadata.cameraPathPeriodFrames -ne [int64]$Case.cameraPathPeriodFrames) {
+        throw "capture metadata cameraPathPeriodFrames was $($Metadata.cameraPathPeriodFrames), expected $($Case.cameraPathPeriodFrames)."
     }
 }
 
@@ -181,6 +205,13 @@ function Measure-PpmSignal {
     }
 
     $nonZeroPixels = 0
+    $redPixels = 0
+    $greenPixels = 0
+    $bluePixels = 0
+    $cyanPixels = 0
+    $magentaPixels = 0
+    $yellowPixels = 0
+    $whitePixels = 0
     $minRgb = 255
     $maxRgb = 0
     for ($i = $header.DataOffset; $i -lt $pixelEnd; $i += 3) {
@@ -189,6 +220,27 @@ function Measure-PpmSignal {
         $b = [int]$bytes[$i + 2]
         if ($r -ne 0 -or $g -ne 0 -or $b -ne 0) {
             $nonZeroPixels++
+        }
+        if ($r -gt 0 -and $g -eq 0 -and $b -eq 0) {
+            $redPixels++
+        }
+        if ($r -eq 0 -and $g -gt 0 -and $b -eq 0) {
+            $greenPixels++
+        }
+        if ($r -eq 0 -and $g -eq 0 -and $b -gt 0) {
+            $bluePixels++
+        }
+        if ($r -eq 0 -and $g -gt 0 -and $b -gt 0) {
+            $cyanPixels++
+        }
+        if ($r -gt 0 -and $g -eq 0 -and $b -gt 0) {
+            $magentaPixels++
+        }
+        if ($r -gt 0 -and $g -gt 0 -and $b -eq 0) {
+            $yellowPixels++
+        }
+        if ($r -gt 0 -and $r -eq $g -and $g -eq $b) {
+            $whitePixels++
         }
         $minRgb = [Math]::Min($minRgb, [Math]::Min($r, [Math]::Min($g, $b)))
         $maxRgb = [Math]::Max($maxRgb, [Math]::Max($r, [Math]::Max($g, $b)))
@@ -201,6 +253,44 @@ function Measure-PpmSignal {
         MinRgb = $minRgb
         MaxRgb = $maxRgb
         RgbRange = $maxRgb - $minRgb
+        ColorPixelRatios = [PSCustomObject]@{
+            red = [double]$redPixels / [double]$pixelCount
+            green = [double]$greenPixels / [double]$pixelCount
+            blue = [double]$bluePixels / [double]$pixelCount
+            cyan = [double]$cyanPixels / [double]$pixelCount
+            magenta = [double]$magentaPixels / [double]$pixelCount
+            yellow = [double]$yellowPixels / [double]$pixelCount
+            white = [double]$whitePixels / [double]$pixelCount
+        }
+    }
+}
+
+function Assert-PpmColorRatios {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Signal,
+        [Parameter(Mandatory = $true)]
+        [object]$Case
+    )
+
+    if (-not (Test-CaseProperty -Case $Case -FieldName "expectedMaxColorPixelRatios")) {
+        return
+    }
+    if ($null -eq $Case.expectedMaxColorPixelRatios) {
+        throw "PPM signal threshold expectedMaxColorPixelRatios was null for $($Case.name)."
+    }
+
+    foreach ($expected in $Case.expectedMaxColorPixelRatios.PSObject.Properties) {
+        $colorName = $expected.Name
+        if (-not ($Signal.ColorPixelRatios.PSObject.Properties.Name -contains $colorName)) {
+            throw "PPM signal threshold expectedMaxColorPixelRatios used unsupported color $colorName for $($Case.name)."
+        }
+
+        $actualRatio = [double]$Signal.ColorPixelRatios.PSObject.Properties[$colorName].Value
+        $maxRatio = [double]$expected.Value
+        if ($actualRatio -gt $maxRatio) {
+            throw "PPM $colorName pixel ratio $actualRatio exceeded expected maximum $maxRatio for $($Case.name)."
+        }
     }
 }
 
@@ -234,6 +324,7 @@ function Assert-PpmSignal {
             throw "PPM RGB range $($signal.RgbRange) was below expected minimum $minRange for $($Case.name)."
         }
     }
+    Assert-PpmColorRatios -Signal $signal -Case $Case
 }
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -250,6 +341,7 @@ $previousEnv = @{}
 foreach ($name in @(
     "REVOLUMETRIC_SHADER_COMPILE",
     "REVOLUMETRIC_CAPTURE_FRAME",
+    "REVOLUMETRIC_CAPTURE_FRAMES",
     "REVOLUMETRIC_CAPTURE_DIR",
     "REVOLUMETRIC_CAPTURE_PREFIX",
     "REVOLUMETRIC_RENDER_MODE",
@@ -260,7 +352,14 @@ foreach ($name in @(
     "REVOLUMETRIC_RT_RESTIR_DI_SPATIAL",
     "REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES",
     "REVOLUMETRIC_RT_RESTIR_GI",
+    "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL",
+    "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES",
     "REVOLUMETRIC_RT_TEMPORAL_DENOISE",
+    "REVOLUMETRIC_CAMERA_PATH",
+    "REVOLUMETRIC_CAMERA_PATH_CENTER",
+    "REVOLUMETRIC_CAMERA_PATH_RADIUS",
+    "REVOLUMETRIC_CAMERA_PATH_HEIGHT",
+    "REVOLUMETRIC_CAMERA_PATH_PERIOD_FRAMES",
     "REVOLUMETRIC_EXIT_AFTER_FRAMES",
     "REVOLUMETRIC_NRD_ROOT",
     "PATH"
@@ -287,6 +386,7 @@ try {
         New-Item -ItemType Directory -Force $caseOutputDir | Out-Null
 
         $env:REVOLUMETRIC_CAPTURE_FRAME = "$captureFrame"
+        Remove-Item Env:\REVOLUMETRIC_CAPTURE_FRAMES -ErrorAction SilentlyContinue
         $env:REVOLUMETRIC_CAPTURE_DIR = $caseOutputDir
         $env:REVOLUMETRIC_CAPTURE_PREFIX = $case.name
         $env:REVOLUMETRIC_EXIT_AFTER_FRAMES = "$frames"
@@ -326,10 +426,45 @@ try {
         } else {
             Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI -ErrorAction SilentlyContinue
         }
+        if ($null -ne $case.rtRestirGiSpatial) {
+            $env:REVOLUMETRIC_RT_RESTIR_GI_SPATIAL = ([string]$case.rtRestirGiSpatial).ToLowerInvariant()
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI_SPATIAL -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.rtRestirGiSpatialSamples) {
+            $env:REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES = "$($case.rtRestirGiSpatialSamples)"
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES -ErrorAction SilentlyContinue
+        }
         if ($null -ne $case.rtTemporalDenoise) {
             $env:REVOLUMETRIC_RT_TEMPORAL_DENOISE = ([string]$case.rtTemporalDenoise).ToLowerInvariant()
         } else {
             Remove-Item Env:\REVOLUMETRIC_RT_TEMPORAL_DENOISE -ErrorAction SilentlyContinue
+        }
+        if ($case.cameraPath) {
+            $env:REVOLUMETRIC_CAMERA_PATH = $case.cameraPath
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_CAMERA_PATH -ErrorAction SilentlyContinue
+        }
+        if ($case.cameraPathCenter) {
+            $env:REVOLUMETRIC_CAMERA_PATH_CENTER = $case.cameraPathCenter
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_CAMERA_PATH_CENTER -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.cameraPathRadius) {
+            $env:REVOLUMETRIC_CAMERA_PATH_RADIUS = "$($case.cameraPathRadius)"
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_CAMERA_PATH_RADIUS -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.cameraPathHeight) {
+            $env:REVOLUMETRIC_CAMERA_PATH_HEIGHT = "$($case.cameraPathHeight)"
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_CAMERA_PATH_HEIGHT -ErrorAction SilentlyContinue
+        }
+        if ($null -ne $case.cameraPathPeriodFrames) {
+            $env:REVOLUMETRIC_CAMERA_PATH_PERIOD_FRAMES = "$($case.cameraPathPeriodFrames)"
+        } else {
+            Remove-Item Env:\REVOLUMETRIC_CAMERA_PATH_PERIOD_FRAMES -ErrorAction SilentlyContinue
         }
 
         Write-Host "==> visual baseline $($case.name)"

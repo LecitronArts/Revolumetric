@@ -4,7 +4,9 @@ use ash::vk;
 use crate::render::allocator::GpuAllocator;
 use crate::render::area_restir::AreaRestirSettings;
 use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
-use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
+use crate::render::capture::{
+    CaptureCameraPathMetadata, CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer,
+};
 use crate::render::device::RenderDevice;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
@@ -42,7 +44,7 @@ use crate::render::passes::vpt_surface::{
 use crate::render::passes::vpt_temporal::{
     VptTemporalGraphInputs, VptTemporalPass, VptTemporalPassCreateInfo, VptTemporalPassResizeInfo,
 };
-use crate::render::resource::{AccessKind, QueueType};
+use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::RestirDiSettings;
 use crate::render::restir_di::build_direct_lights_from_ucvh;
 use crate::render::rt_settings::{RtDebugView, RtSettings};
@@ -73,6 +75,7 @@ pub struct VptCameraFrame {
 pub struct VptFrameInputs<'a> {
     pub scene_ubo: &'a SceneUniformBuffer,
     pub camera: VptCameraFrame,
+    pub camera_path: CaptureCameraPathMetadata,
     pub sun_direction: glam::Vec3,
     pub sun_intensity: glam::Vec3,
     pub elapsed_seconds: f32,
@@ -1026,6 +1029,13 @@ impl VptRuntimePipeline {
     ) -> Result<VptFrameRecordResult> {
         let mut graph = RenderGraph::new();
         self.ensure_render_graph_transients(renderer, inputs.scene_ubo.frame_count());
+        #[cfg(not(target_os = "android"))]
+        let mut egui_renderer = egui_renderer;
+        #[cfg(not(target_os = "android"))]
+        let has_egui_overlay =
+            egui_renderer.is_some() && egui_frame.is_some_and(|frame| !frame.is_empty());
+        #[cfg(target_os = "android")]
+        let has_egui_overlay = false;
         let mut pending_capture = None;
         let mut rendered_vpt = false;
         let mut vpt_accumulation_written = false;
@@ -1514,11 +1524,6 @@ impl VptRuntimePipeline {
                 let dst_image = frame.swapchain_image;
                 let dst_extent = frame.swapchain_extent;
                 let dep_handle = postprocess_outputs.output;
-                #[cfg(not(target_os = "android"))]
-                let has_egui_overlay =
-                    egui_renderer.is_some() && egui_frame.is_some_and(|frame| !frame.is_empty());
-                #[cfg(target_os = "android")]
-                let has_egui_overlay = false;
                 let mut capture_dependency = None;
                 let capture_frame = inputs
                     .capture
@@ -1581,10 +1586,18 @@ impl VptRuntimePipeline {
                             .rt_settings
                             .restir_di_spatial_sample_count,
                         rt_restir_gi_enabled: inputs.rt_settings.restir_gi_enabled,
+                        rt_restir_gi_initial_candidate_count: inputs
+                            .rt_settings
+                            .restir_gi_initial_candidate_count,
+                        rt_restir_gi_spatial_enabled: inputs.rt_settings.restir_gi_spatial_enabled,
+                        rt_restir_gi_spatial_sample_count: inputs
+                            .rt_settings
+                            .restir_gi_spatial_sample_count,
                         rt_temporal_denoise_enabled: inputs.rt_settings.temporal_denoise_enabled,
                         rt_frame_rendered: false,
                         rt_restir_di_rendered: false,
                         rt_restir_gi_rendered: false,
+                        rt_restir_gi_spatial_rendered: false,
                         rt_resolve_ready: false,
                         restir_di_enabled: inputs.restir_di_enabled,
                         restir_di_temporal_enabled,
@@ -1598,6 +1611,7 @@ impl VptRuntimePipeline {
                         denoiser_enabled: inputs.lighting_settings.denoiser_enabled(),
                         denoiser_mode: inputs.lighting_settings.denoiser_mode_name(),
                         effective_denoiser_mode: actual_effective_denoiser_mode_name,
+                        camera_path: inputs.camera_path.clone(),
                     });
                     tracing::info!(
                         frame_index = frame.frame_index,
@@ -1656,25 +1670,19 @@ impl VptRuntimePipeline {
                 #[cfg(not(target_os = "android"))]
                 if has_egui_overlay {
                     let swapchain_after_blit = blit_writes[0];
-                    if let (Some(egui_renderer), Some(egui_frame)) = (egui_renderer, egui_frame) {
-                        graph.add_pass("egui_overlay", QueueType::Graphics, |builder| {
-                            builder
-                                .write_as(swapchain_after_blit, AccessKind::ColorAttachmentWrite);
-                            builder.finish_as(swapchain_after_blit, AccessKind::Present);
-                            Box::new(move |_ctx| {
-                                if let Err(error) =
-                                    egui_renderer.record(renderer, frame, egui_frame)
-                                {
-                                    tracing::error!(%error, "failed to record egui overlay");
-                                }
-                            })
-                        });
-                    }
+                    add_egui_overlay_present_pass(
+                        &mut graph,
+                        renderer,
+                        frame,
+                        egui_renderer.take(),
+                        egui_frame,
+                        swapchain_after_blit,
+                    );
                 }
             } else {
                 self.frame_state.vpt_sample_index = 0;
                 self.frame_state.last_vpt_camera_key = None;
-                tracing::warn!(
+                tracing::debug!(
                     vpt_ready = self.vpt_pass.is_some(),
                     vpt_nrd_confidence_ready = self.vpt_nrd_confidence_pass.is_some(),
                     vpt_nrd_frontend_ready = self.vpt_nrd_frontend_pass.is_some(),
@@ -1687,20 +1695,26 @@ impl VptRuntimePipeline {
                 );
             }
         } else {
-            tracing::warn!("skipping UCVH render passes until GPU upload succeeds");
+            tracing::debug!("skipping UCVH render passes until GPU upload succeeds");
         }
 
         if !graph.has_final_access(AccessKind::Present) {
-            tracing::warn!(
+            tracing::debug!(
                 "render graph produced no presentable output; clearing swapchain fallback"
             );
-            add_swapchain_clear_present_pass(
-                &mut graph,
-                frame.swapchain_image,
-                frame.swapchain_extent,
-                frame.swapchain_format,
-                frame.swapchain_image_layout,
-            )?;
+            let swapchain_after_clear =
+                add_swapchain_clear_present_pass(&mut graph, frame, has_egui_overlay)?;
+            #[cfg(not(target_os = "android"))]
+            if has_egui_overlay {
+                add_egui_overlay_present_pass(
+                    &mut graph,
+                    renderer,
+                    frame,
+                    egui_renderer.take(),
+                    egui_frame,
+                    swapchain_after_clear,
+                );
+            }
         }
         let transients = self
             .render_graph_transients
@@ -2025,29 +2039,51 @@ fn swapchain_access_from_layout(layout: vk::ImageLayout) -> Result<AccessKind> {
         .with_context(|| format!("unsupported tracked swapchain image layout: {layout:?}"))
 }
 
-fn add_swapchain_clear_present_pass(
-    graph: &mut RenderGraph<'_>,
-    dst_image: vk::Image,
-    dst_extent: vk::Extent2D,
-    dst_format: vk::Format,
-    current_layout: vk::ImageLayout,
-) -> Result<()> {
-    let current_access = swapchain_access_from_layout(current_layout)?;
+#[cfg(not(target_os = "android"))]
+fn add_egui_overlay_present_pass<'a>(
+    graph: &mut RenderGraph<'a>,
+    renderer: &'a RenderDevice,
+    frame: &'a FrameContext,
+    egui_renderer: Option<&'a mut EguiRenderer>,
+    egui_frame: Option<&'a EguiFrame>,
+    swapchain_after_write: ResourceHandle,
+) {
+    if let (Some(egui_renderer), Some(egui_frame)) = (egui_renderer, egui_frame) {
+        graph.add_pass("egui_overlay", QueueType::Graphics, |builder| {
+            builder.write_as(swapchain_after_write, AccessKind::ColorAttachmentWrite);
+            builder.finish_as(swapchain_after_write, AccessKind::Present);
+            Box::new(move |_ctx| {
+                if let Err(error) = egui_renderer.record(renderer, frame, egui_frame) {
+                    tracing::error!(%error, "failed to record egui overlay");
+                }
+            })
+        });
+    }
+}
+
+fn add_swapchain_clear_present_pass<'a>(
+    graph: &mut RenderGraph<'a>,
+    frame: &'a FrameContext,
+    has_egui_overlay: bool,
+) -> Result<ResourceHandle> {
+    let current_access = swapchain_access_from_layout(frame.swapchain_image_layout)?;
     let swapchain = graph.import_image_with_access(
-        dst_image,
-        dst_extent.width,
-        dst_extent.height,
-        dst_format,
-        vk::ImageUsageFlags::TRANSFER_DST,
+        frame.swapchain_image,
+        frame.swapchain_extent.width,
+        frame.swapchain_extent.height,
+        frame.swapchain_format,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
         current_access,
     );
 
-    graph.add_pass("clear_swapchain", QueueType::Graphics, |builder| {
+    let clear_writes = graph.add_pass("clear_swapchain", QueueType::Graphics, |builder| {
         builder.write_as(swapchain, AccessKind::TransferWrite);
-        builder.finish_as(swapchain, AccessKind::Present);
+        if !has_egui_overlay {
+            builder.finish_as(swapchain, AccessKind::Present);
+        }
         Box::new(move |ctx| {
             let color = vk::ClearColorValue {
-                float32: [0.015, 0.018, 0.022, 1.0],
+                float32: [0.16, 0.18, 0.2, 1.0],
             };
             let range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -2056,7 +2092,7 @@ fn add_swapchain_clear_present_pass(
             unsafe {
                 ctx.device.cmd_clear_color_image(
                     ctx.command_buffer,
-                    dst_image,
+                    frame.swapchain_image,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     &color,
                     std::slice::from_ref(&range),
@@ -2064,7 +2100,7 @@ fn add_swapchain_clear_present_pass(
             }
         })
     });
-    Ok(())
+    Ok(clear_writes[0])
 }
 
 fn vpt_debug_view_name(debug_view: VptDebugView) -> &'static str {
@@ -2111,9 +2147,16 @@ fn capture_rt_debug_view_name(debug_view: RtDebugView) -> &'static str {
         RtDebugView::Surface => "surface",
         RtDebugView::HitDistance => "hit_distance",
         RtDebugView::HistoryValid => "history_valid",
+        RtDebugView::Motion => "motion",
+        RtDebugView::Direct => "direct",
+        RtDebugView::SkyIndirect => "sky_indirect",
         RtDebugView::DirectReservoir => "direct_reservoir",
         RtDebugView::IndirectReservoir => "indirect_reservoir",
         RtDebugView::Temporal => "temporal",
+        RtDebugView::GiTemporal => "gi_temporal",
+        RtDebugView::GiSpatial => "gi_spatial",
+        RtDebugView::GiIndirect => "gi_indirect",
+        RtDebugView::GiReason => "gi_reason",
     }
 }
 
@@ -2167,6 +2210,11 @@ mod tests {
             capture_rt_debug_view_name(RtDebugView::DirectReservoir),
             "direct_reservoir"
         );
+        assert_eq!(
+            capture_rt_debug_view_name(RtDebugView::GiReason),
+            "gi_reason"
+        );
+        assert_eq!(capture_rt_debug_view_name(RtDebugView::Motion), "motion");
     }
 
     #[test]
@@ -2600,6 +2648,49 @@ mod tests {
                 ),
             "resize must refresh an existing Area ReSTIR pass even when the pass is temporarily disabled"
         );
+    }
+
+    #[test]
+    fn vpt_clear_fallback_uses_visible_loading_background_not_black() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let clear_fallback = source
+            .split("fn add_swapchain_clear_present_pass")
+            .nth(1)
+            .expect("VPT clear fallback should exist")
+            .split("fn vpt_debug_view_name")
+            .next()
+            .expect("VPT clear fallback should end before debug name helper");
+
+        assert!(
+            clear_fallback.contains("float32: [0.16, 0.18, 0.2, 1.0]"),
+            "VPT pending frames should use an obviously visible loading background instead of a near-black frame"
+        );
+        assert!(
+            !clear_fallback.contains("float32: [0.0, 0.0, 0.0, 1.0]"),
+            "VPT pending frames must not clear the swapchain to pure black"
+        );
+    }
+
+    #[test]
+    fn vpt_clear_fallback_preserves_egui_overlay_during_startup_loading() {
+        let source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("VPT implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        for token in [
+            "fnadd_egui_overlay_present_pass<'a>(",
+            "add_swapchain_clear_present_pass(&mutgraph,frame,has_egui_overlay)?",
+            "ifhas_egui_overlay{add_egui_overlay_present_pass(&mutgraph,renderer,frame,egui_renderer.take(),egui_frame,swapchain_after_clear,);}",
+            "if!has_egui_overlay{builder.finish_as(swapchain,AccessKind::Present);}",
+        ] {
+            assert!(
+                compact.contains(token),
+                "VPT fallback must keep editor UI visible while startup UCVH data is pending; missing {token}"
+            );
+        }
     }
 
     #[test]

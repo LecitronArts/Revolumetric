@@ -17,6 +17,20 @@ static const uint RT_DEBUG_VIEW_HISTORY_VALID = 3u;
 static const uint RT_DEBUG_VIEW_DIRECT_RESERVOIR = 4u;
 static const uint RT_DEBUG_VIEW_INDIRECT_RESERVOIR = 5u;
 static const uint RT_DEBUG_VIEW_TEMPORAL = 6u;
+static const uint RT_DEBUG_VIEW_GI_TEMPORAL = 7u;
+static const uint RT_DEBUG_VIEW_GI_SPATIAL = 8u;
+static const uint RT_DEBUG_VIEW_GI_INDIRECT = 9u;
+static const uint RT_DEBUG_VIEW_DIRECT = 10u;
+static const uint RT_DEBUG_VIEW_SKY_INDIRECT = 11u;
+static const uint RT_DEBUG_VIEW_GI_REASON = 12u;
+static const uint RT_DEBUG_VIEW_MOTION = 13u;
+
+static const float RT_HISTORY_POSITION_EPSILON = 0.05;
+
+float rt_history_position_threshold(float linear_depth, float depth_threshold) {
+    float depth_scale = max(linear_depth, 1.0);
+    return max(RT_HISTORY_POSITION_EPSILON, depth_scale * depth_threshold);
+}
 
 struct RtHistoryUniforms {
     float4x4 current_view_proj;
@@ -52,4 +66,5 @@ struct RtSurfacePixel {
     uint hit_kind;
     uint brick_id;
     uint3 local;
+    float4 emissive_radiance;
 };

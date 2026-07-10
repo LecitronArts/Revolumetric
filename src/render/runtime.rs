@@ -2,7 +2,7 @@ use anyhow::Result;
 use winit::window::Window;
 
 use crate::render::area_restir::AreaRestirSettings;
-use crate::render::capture::RenderCapture;
+use crate::render::capture::{CaptureCameraPathMetadata, RenderCapture};
 use crate::render::device::RenderDevice;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
@@ -15,8 +15,27 @@ use crate::render::scene_ubo::{LightingSettings, RenderMode, SceneUniformBuffer}
 use crate::render::vpt_pipeline::{
     UcvhFrameChanges, VptCameraFrame, VptFrameInputs, VptRuntimePipeline,
 };
-use crate::voxel::gpu_upload::UcvhGpuResources;
+use crate::voxel::gpu_upload::{
+    INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES, UcvhGpuResources, UcvhInitialUploadProgress,
+};
 use crate::voxel::ucvh::Ucvh;
+
+const MAX_AUTO_RT_UCVH_BRICKS: u32 = 100_000;
+
+fn frame_render_backend(
+    requested: RenderMode,
+    rt_supported: bool,
+    ucvh_brick_count: Option<u32>,
+) -> RenderBackend {
+    let resolved = resolve_render_backend(requested, rt_supported);
+    if requested == RenderMode::Auto
+        && resolved == RenderBackend::Rt
+        && ucvh_brick_count.is_none_or(|count| count > MAX_AUTO_RT_UCVH_BRICKS)
+    {
+        return RenderBackend::Vpt;
+    }
+    resolved
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSettings {
@@ -28,6 +47,7 @@ pub struct RuntimeSettings {
 
 pub struct RenderFrameInput<'a> {
     pub camera: VptCameraFrame,
+    pub camera_path: CaptureCameraPathMetadata,
     pub sun_direction: glam::Vec3,
     pub sun_intensity: glam::Vec3,
     pub elapsed_seconds: f32,
@@ -66,6 +86,7 @@ pub struct RenderRuntime {
     capture: Option<RenderCapture>,
     scene_ubo: Option<SceneUniformBuffer>,
     ucvh_gpu: Option<UcvhGpuResources>,
+    ucvh_initial_upload: UcvhInitialUploadProgress,
     ucvh_uploaded: bool,
     rt_pipeline: RtRuntimePipeline,
     vpt_pipeline: VptRuntimePipeline,
@@ -77,8 +98,11 @@ impl RenderRuntime {
     pub fn new(window: &Window, settings: RuntimeSettings, ucvh: Option<&Ucvh>) -> Result<Self> {
         let renderer = RenderDevice::new(window)?;
         let rt_capabilities = renderer.rt_capabilities();
-        let render_backend =
-            resolve_render_backend(settings.lighting.render_mode, rt_capabilities.supported());
+        let render_backend = frame_render_backend(
+            settings.lighting.render_mode,
+            rt_capabilities.supported(),
+            ucvh.map(|ucvh| ucvh.pool.allocated_count()),
+        );
 
         if settings.lighting.render_mode == RenderMode::Rt && render_backend == RenderBackend::Vpt {
             tracing::warn!(
@@ -190,6 +214,7 @@ impl RenderRuntime {
             capture,
             scene_ubo,
             ucvh_gpu,
+            ucvh_initial_upload: UcvhInitialUploadProgress::default(),
             ucvh_uploaded: false,
             rt_pipeline: RtRuntimePipeline::new(),
             vpt_pipeline: VptRuntimePipeline::new(),
@@ -227,10 +252,21 @@ impl RenderRuntime {
         }
     }
 
-    fn refresh_render_backend(&mut self, requested: RenderMode) {
+    #[cfg(not(target_os = "android"))]
+    pub fn egui_font_texture_ready(&self) -> bool {
+        self.egui_renderer
+            .as_ref()
+            .is_some_and(EguiRenderer::font_texture_ready)
+    }
+
+    fn refresh_render_backend(&mut self, requested: RenderMode, ucvh_brick_count: Option<u32>) {
         let previous_requested = self.requested_render_mode;
         let previous_backend = self.render_backend;
-        let resolved = resolve_render_backend(requested, self.rt_capabilities.supported());
+        let resolved = frame_render_backend(
+            requested,
+            self.rt_capabilities.supported(),
+            ucvh_brick_count,
+        );
 
         if requested == RenderMode::Rt
             && resolved == RenderBackend::Vpt
@@ -239,6 +275,18 @@ impl RenderRuntime {
             tracing::warn!(
                 device = %self.renderer.physical_device_name(),
                 "requested RT backend but hardware support was unavailable; falling back to VPT"
+            );
+        }
+        if requested == RenderMode::Auto
+            && self.rt_capabilities.supported()
+            && resolved == RenderBackend::Vpt
+            && ucvh_brick_count.is_some_and(|count| count > MAX_AUTO_RT_UCVH_BRICKS)
+            && previous_backend != RenderBackend::Vpt
+        {
+            tracing::warn!(
+                bricks = ucvh_brick_count.unwrap_or_default(),
+                max_auto_rt_bricks = MAX_AUTO_RT_UCVH_BRICKS,
+                "large UCVH scene is using VPT in Auto mode to avoid startup RT acceleration-structure stall"
             );
         }
         if previous_requested != requested || previous_backend != resolved {
@@ -252,6 +300,26 @@ impl RenderRuntime {
 
         self.requested_render_mode = requested;
         self.render_backend = resolved;
+    }
+
+    fn ensure_ucvh_gpu_resources(&mut self, ucvh: Option<&Ucvh>) {
+        if self.ucvh_gpu.is_some() {
+            return;
+        }
+        let Some(ucvh) = ucvh else {
+            return;
+        };
+        match UcvhGpuResources::new(self.renderer.device(), self.renderer.allocator(), ucvh) {
+            Ok(gpu) => {
+                self.ucvh_gpu = Some(gpu);
+                self.ucvh_initial_upload = UcvhInitialUploadProgress::default();
+                self.ucvh_uploaded = false;
+                tracing::info!("created UCVH GPU resources");
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to create UCVH GPU resources");
+            }
+        }
     }
 
     pub fn ensure_passes(
@@ -307,13 +375,15 @@ impl RenderRuntime {
         restir_di_enabled: bool,
         area_restir_enabled: bool,
     ) -> Result<()> {
-        self.refresh_render_backend(settings.lighting.render_mode);
-        self.ensure_passes(ucvh, settings, restir_di_enabled, area_restir_enabled);
+        self.refresh_render_backend(
+            settings.lighting.render_mode,
+            ucvh.map(|ucvh| ucvh.pool.allocated_count()),
+        );
         let extent = self.renderer.swapchain_extent();
         let Some(scene_ubo) = self.scene_ubo.take() else {
             return Ok(());
         };
-        let result = {
+        let result: Result<()> = {
             let scene_ubo = &scene_ubo;
             (|| {
                 self.resize_rt_pipeline_to_swapchain(scene_ubo, extent.width, extent.height)?;
@@ -329,7 +399,9 @@ impl RenderRuntime {
             })()
         };
         self.scene_ubo = Some(scene_ubo);
-        result
+        result?;
+        self.ensure_passes(ucvh, settings, restir_di_enabled, area_restir_enabled);
+        Ok(())
     }
 
     fn resize_rt_pipeline_to_swapchain(
@@ -381,7 +453,14 @@ impl RenderRuntime {
         let mut outcome = RenderFrameOutcome::default();
         let frame = self.renderer.begin_frame()?;
         outcome.began_frame = true;
-        self.refresh_render_backend(input.settings.lighting.render_mode);
+        self.refresh_render_backend(
+            input.settings.lighting.render_mode,
+            input
+                .ucvh
+                .as_deref()
+                .map(|ucvh| ucvh.pool.allocated_count()),
+        );
+        self.ensure_ucvh_gpu_resources(input.ucvh.as_deref());
 
         if self.last_render_backend != self.render_backend {
             self.rt_history_reset_generation = self.rt_history_reset_generation.wrapping_add(1);
@@ -413,11 +492,26 @@ impl RenderRuntime {
 
         if !self.ucvh_uploaded {
             if let (Some(ucvh), Some(gpu)) = (input.ucvh.as_deref_mut(), &self.ucvh_gpu) {
-                match gpu.upload_all(self.renderer.device(), frame.command_buffer, ucvh) {
-                    Ok(()) => {
-                        self.ucvh_uploaded = true;
-                        outcome.uploaded_ucvh = true;
-                        tracing::info!("uploaded UCVH data to GPU");
+                match gpu.upload_initial_incremental(
+                    self.renderer.device(),
+                    frame.command_buffer,
+                    ucvh,
+                    &mut self.ucvh_initial_upload,
+                    INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES,
+                ) {
+                    Ok(upload) => {
+                        if upload.bytes_uploaded > 0 {
+                            tracing::debug!(
+                                bytes = upload.bytes_uploaded,
+                                completed = upload.completed,
+                                "advanced initial UCVH GPU upload"
+                            );
+                        }
+                        if upload.completed {
+                            self.ucvh_uploaded = true;
+                            outcome.uploaded_ucvh = true;
+                            tracing::info!("uploaded UCVH data to GPU");
+                        }
                     }
                     Err(error) => {
                         tracing::error!(%error, "failed to upload UCVH data to GPU");
@@ -491,6 +585,7 @@ impl RenderRuntime {
                 RtFrameInputs {
                     scene_ubo,
                     camera: input.camera,
+                    camera_path: input.camera_path.clone(),
                     sun_direction: input.sun_direction,
                     sun_intensity: input.sun_intensity,
                     elapsed_seconds: input.elapsed_seconds,
@@ -515,6 +610,7 @@ impl RenderRuntime {
                 VptFrameInputs {
                     scene_ubo,
                     camera: input.camera,
+                    camera_path: input.camera_path,
                     sun_direction: input.sun_direction,
                     sun_intensity: input.sun_intensity,
                     elapsed_seconds: input.elapsed_seconds,
@@ -717,6 +813,9 @@ mod tests {
             Some("surface"),
             Some("off"),
             Some("4"),
+            Some("6"),
+            Some("off"),
+            Some("3"),
         );
 
         assert!(parsed.settings.restir_di_enabled);
@@ -724,6 +823,9 @@ mod tests {
         assert!(parsed.settings.temporal_denoise_enabled);
         assert!(!parsed.settings.restir_di_spatial_enabled);
         assert_eq!(parsed.settings.restir_di_spatial_sample_count, 4);
+        assert_eq!(parsed.settings.restir_gi_initial_candidate_count, 6);
+        assert!(!parsed.settings.restir_gi_spatial_enabled);
+        assert_eq!(parsed.settings.restir_gi_spatial_sample_count, 3);
         assert_eq!(parsed.settings.history_length, 32);
         assert_eq!(parsed.settings.normal_threshold, 0.85);
         assert_eq!(parsed.settings.depth_threshold, 0.02);
@@ -736,6 +838,26 @@ mod tests {
         assert_eq!(
             resolve_render_backend(crate::render::scene_ubo::RenderMode::Rt, false),
             RenderBackend::Vpt
+        );
+    }
+
+    #[test]
+    fn auto_backend_routes_large_ucvh_scenes_to_vpt_to_avoid_startup_rt_as_stall() {
+        assert_eq!(
+            frame_render_backend(RenderMode::Auto, true, Some(405_563)),
+            RenderBackend::Vpt
+        );
+        assert_eq!(
+            frame_render_backend(RenderMode::Auto, true, Some(4_096)),
+            RenderBackend::Rt
+        );
+        assert_eq!(
+            frame_render_backend(RenderMode::Auto, true, None),
+            RenderBackend::Vpt
+        );
+        assert_eq!(
+            frame_render_backend(RenderMode::Rt, true, Some(405_563)),
+            RenderBackend::Rt
         );
     }
 
@@ -766,6 +888,11 @@ mod tests {
             );
         }
 
+        assert!(
+            runtime_struct.contains("ucvh_initial_upload"),
+            "RenderRuntime must retain initial UCVH upload progress across frames"
+        );
+
         let render_frame = source
             .split("pub fn render_frame")
             .nth(1)
@@ -775,7 +902,7 @@ mod tests {
             .expect("render_frame should end before UCVH helpers");
         for token in [
             ".begin_frame(",
-            ".upload_all(",
+            ".upload_initial_incremental(",
             ".upload_motion_guide(",
             ".record_and_execute_frame(",
             ".end_frame(",
@@ -787,6 +914,10 @@ mod tests {
                 "RenderRuntime::render_frame must own frame orchestration call {token}"
             );
         }
+        assert!(
+            !render_frame.contains(".upload_all("),
+            "RenderRuntime::render_frame must not block a startup frame with the whole Vintessa upload"
+        );
 
         let runtime_drop = source
             .split("impl Drop for RenderRuntime")
@@ -964,6 +1095,27 @@ mod tests {
     }
 
     #[test]
+    fn render_runtime_can_create_ucvh_gpu_resources_after_async_scene_load() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let render_frame = source
+            .split("pub fn render_frame")
+            .nth(1)
+            .expect("RenderRuntime::render_frame should exist")
+            .split("fn snapshot_ucvh_frame_changes")
+            .next()
+            .expect("render_frame should end before UCVH helpers");
+
+        assert!(
+            source.contains("fn ensure_ucvh_gpu_resources"),
+            "RenderRuntime needs a lazy UCVH GPU resource path for background scene loading"
+        );
+        assert!(
+            render_frame.contains("self.ensure_ucvh_gpu_resources("),
+            "render_frame should create UCVH GPU resources when the async scene becomes available"
+        );
+    }
+
+    #[test]
     fn runtime_resets_rt_history_when_backend_or_scene_generation_changes() {
         let source = crate::render::source_checks::read_source("src/render/runtime.rs");
 
@@ -1035,7 +1187,7 @@ mod tests {
         let compact = crate::render::source_checks::compact(render_frame);
 
         let refresh = compact
-            .find("self.refresh_render_backend(input.settings.lighting.render_mode);")
+            .find("self.refresh_render_backend(input.settings.lighting.render_mode,input.ucvh.as_deref().map(|ucvh|ucvh.pool.allocated_count()),);")
             .expect("render_frame must refresh backend from current frame settings");
         let reset = compact
             .find("ifself.last_render_backend!=self.render_backend{")
@@ -1065,7 +1217,7 @@ mod tests {
         let compact = crate::render::source_checks::compact(resize_pipeline);
 
         let refresh = compact
-            .find("self.refresh_render_backend(settings.lighting.render_mode);")
+            .find("self.refresh_render_backend(settings.lighting.render_mode,ucvh.map(|ucvh|ucvh.pool.allocated_count()),);")
             .expect("resize must refresh backend from current settings");
         let ensure_passes = compact
             .find("self.ensure_passes(")
@@ -1077,11 +1229,16 @@ mod tests {
             .find("self.resize_vpt_pipeline_to_swapchain(")
             .expect("resize must route VPT resources through refreshed backend state");
 
-        assert!(refresh < ensure_passes);
         assert!(refresh < rt_resize);
         assert!(refresh < vpt_resize);
-        assert!(ensure_passes < rt_resize);
-        assert!(ensure_passes < vpt_resize);
+        assert!(
+            rt_resize < ensure_passes,
+            "resize must resize existing RT resources before ensuring passes so size changes do not recreate-and-resize the same pass in one turn"
+        );
+        assert!(
+            vpt_resize < ensure_passes,
+            "resize must resize existing VPT resources before ensuring passes so size changes do not recreate-and-resize the same pass in one turn"
+        );
     }
 
     #[test]
@@ -1093,8 +1250,8 @@ mod tests {
             .expect("RenderRuntime impl should exist");
 
         for token in [
-            "fn refresh_render_backend(&mut self, requested: RenderMode)",
-            "resolve_render_backend(requested, self.rt_capabilities.supported())",
+            "fn refresh_render_backend(&mut self, requested: RenderMode, ucvh_brick_count: Option<u32>)",
+            "frame_render_backend(",
             "self.render_backend = resolved",
         ] {
             assert!(

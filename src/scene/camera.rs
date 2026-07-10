@@ -105,6 +105,30 @@ impl CameraPathConfig {
                 .unwrap_or(Self::DEFAULT_PERIOD_FRAMES),
         })
     }
+
+    pub fn path_name(self) -> &'static str {
+        match self.kind {
+            CameraPathKind::Orbit => "orbit",
+            CameraPathKind::Gallery => "gallery",
+        }
+    }
+
+    pub fn center_csv(self) -> String {
+        format!(
+            "{},{},{}",
+            format_compact_f32(self.center.x),
+            format_compact_f32(self.center.y),
+            format_compact_f32(self.center.z)
+        )
+    }
+}
+
+fn format_compact_f32(value: f32) -> String {
+    if value.fract() == 0.0 {
+        format!("{}", value as i32)
+    } else {
+        format!("{value}")
+    }
 }
 
 pub fn apply_camera_path(rig: &mut CameraRig, config: CameraPathConfig, frame_index: u64) {

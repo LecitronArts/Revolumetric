@@ -15,6 +15,7 @@ const RGBA8_BYTES_PER_PIXEL: u64 = 4;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureConfig {
     pub target_frame: Option<u64>,
+    pub target_frames: Vec<u64>,
     pub output_dir: PathBuf,
     pub prefix: String,
 }
@@ -25,7 +26,28 @@ pub struct CapturePaths {
     pub json_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureCameraPathMetadata {
+    pub path: String,
+    pub center: String,
+    pub radius: f32,
+    pub height: f32,
+    pub period_frames: u64,
+}
+
+impl Default for CaptureCameraPathMetadata {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            center: String::new(),
+            radius: 0.0,
+            height: 0.0,
+            period_frames: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct CaptureMetadata {
     pub frame_index: u64,
     pub vpt_sample_index: u32,
@@ -41,10 +63,14 @@ pub struct CaptureMetadata {
     pub rt_restir_di_spatial_enabled: bool,
     pub rt_restir_di_spatial_sample_count: u32,
     pub rt_restir_gi_enabled: bool,
+    pub rt_restir_gi_initial_candidate_count: u32,
+    pub rt_restir_gi_spatial_enabled: bool,
+    pub rt_restir_gi_spatial_sample_count: u32,
     pub rt_temporal_denoise_enabled: bool,
     pub rt_frame_rendered: bool,
     pub rt_restir_di_rendered: bool,
     pub rt_restir_gi_rendered: bool,
+    pub rt_restir_gi_spatial_rendered: bool,
     pub rt_resolve_ready: bool,
     pub restir_di_enabled: bool,
     pub restir_di_temporal_enabled: bool,
@@ -56,6 +82,7 @@ pub struct CaptureMetadata {
     pub denoiser_enabled: bool,
     pub denoiser_mode: &'static str,
     pub effective_denoiser_mode: &'static str,
+    pub camera_path: CaptureCameraPathMetadata,
 }
 
 pub struct RenderCapture {
@@ -67,13 +94,20 @@ pub struct RenderCapture {
 impl CaptureConfig {
     pub fn from_env() -> Result<Option<Self>> {
         let frame = std::env::var("REVOLUMETRIC_CAPTURE_FRAME").ok();
-        if frame.is_none() {
+        let frames = std::env::var("REVOLUMETRIC_CAPTURE_FRAMES").ok();
+        if frame.is_none() && frames.is_none() {
             return Ok(None);
         }
         let output_dir = std::env::var("REVOLUMETRIC_CAPTURE_DIR").ok();
         let prefix = std::env::var("REVOLUMETRIC_CAPTURE_PREFIX").ok();
 
-        Self::from_values(frame.as_deref(), output_dir.as_deref(), prefix.as_deref()).map(Some)
+        Self::from_values_with_frames(
+            frame.as_deref(),
+            frames.as_deref(),
+            output_dir.as_deref(),
+            prefix.as_deref(),
+        )
+        .map(Some)
     }
 
     pub fn from_values(
@@ -81,10 +115,28 @@ impl CaptureConfig {
         output_dir: Option<&str>,
         prefix: Option<&str>,
     ) -> Result<Self> {
-        let target_frame = match target_frame {
-            Some(value) => Some(parse_target_frame(value)?),
-            None => None,
-        };
+        Self::from_values_with_frames(target_frame, None, output_dir, prefix)
+    }
+
+    pub fn from_values_with_frames(
+        target_frame: Option<&str>,
+        target_frames: Option<&str>,
+        output_dir: Option<&str>,
+        prefix: Option<&str>,
+    ) -> Result<Self> {
+        let mut requested_frames = Vec::new();
+        if let Some(value) = target_frame {
+            requested_frames.push(parse_target_frame(value)?);
+        }
+        if let Some(value) = target_frames
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            requested_frames.extend(parse_target_frame_list(value)?);
+        }
+        requested_frames.sort_unstable();
+        requested_frames.dedup();
+        let target_frame = requested_frames.first().copied();
         let output_dir = output_dir
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -96,6 +148,7 @@ impl CaptureConfig {
 
         Ok(Self {
             target_frame,
+            target_frames: requested_frames,
             output_dir,
             prefix,
         })
@@ -129,10 +182,14 @@ impl CaptureMetadata {
                 "  \"rt_restir_di_spatial_enabled\": {},\n",
                 "  \"rt_restir_di_spatial_sample_count\": {},\n",
                 "  \"rt_restir_gi_enabled\": {},\n",
+                "  \"rt_restir_gi_initial_candidate_count\": {},\n",
+                "  \"rt_restir_gi_spatial_enabled\": {},\n",
+                "  \"rt_restir_gi_spatial_sample_count\": {},\n",
                 "  \"rt_temporal_denoise_enabled\": {},\n",
                 "  \"rt_frame_rendered\": {},\n",
                 "  \"rt_restir_di_rendered\": {},\n",
                 "  \"rt_restir_gi_rendered\": {},\n",
+                "  \"rt_restir_gi_spatial_rendered\": {},\n",
                 "  \"rt_resolve_ready\": {},\n",
                 "  \"restir_di_enabled\": {},\n",
                 "  \"restir_di_temporal_enabled\": {},\n",
@@ -143,7 +200,12 @@ impl CaptureMetadata {
                 "  \"vpt_debug_view\": \"{}\",\n",
                 "  \"denoiser_enabled\": {},\n",
                 "  \"denoiser_mode\": \"{}\",\n",
-                "  \"effective_denoiser_mode\": \"{}\"\n",
+                "  \"effective_denoiser_mode\": \"{}\",\n",
+                "  \"cameraPath\": \"{}\",\n",
+                "  \"cameraPathCenter\": \"{}\",\n",
+                "  \"cameraPathRadius\": {},\n",
+                "  \"cameraPathHeight\": {},\n",
+                "  \"cameraPathPeriodFrames\": {}\n",
                 "}}\n"
             ),
             self.frame_index,
@@ -160,10 +222,14 @@ impl CaptureMetadata {
             self.rt_restir_di_spatial_enabled,
             self.rt_restir_di_spatial_sample_count,
             self.rt_restir_gi_enabled,
+            self.rt_restir_gi_initial_candidate_count,
+            self.rt_restir_gi_spatial_enabled,
+            self.rt_restir_gi_spatial_sample_count,
             self.rt_temporal_denoise_enabled,
             self.rt_frame_rendered,
             self.rt_restir_di_rendered,
             self.rt_restir_gi_rendered,
+            self.rt_restir_gi_spatial_rendered,
             self.rt_resolve_ready,
             self.restir_di_enabled,
             self.restir_di_temporal_enabled,
@@ -174,7 +240,12 @@ impl CaptureMetadata {
             json_escape(self.vpt_debug_view),
             self.denoiser_enabled,
             json_escape(self.denoiser_mode),
-            json_escape(self.effective_denoiser_mode)
+            json_escape(self.effective_denoiser_mode),
+            json_escape(&self.camera_path.path),
+            json_escape(&self.camera_path.center),
+            self.camera_path.radius,
+            self.camera_path.height,
+            self.camera_path.period_frames
         )
     }
 }
@@ -197,7 +268,7 @@ impl RenderCapture {
     }
 
     pub fn should_capture(&self, frame_index: u64) -> bool {
-        self.config.target_frame == Some(frame_index)
+        self.config.target_frames.contains(&frame_index)
     }
 
     pub fn ensure_readback(
@@ -355,6 +426,28 @@ fn parse_target_frame(value: &str) -> Result<u64> {
         .with_context(|| "REVOLUMETRIC_CAPTURE_FRAME must be a non-negative integer")
 }
 
+fn parse_target_frame_list(value: &str) -> Result<Vec<u64>> {
+    let mut frames = Vec::new();
+    for token in value.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            bail!(
+                "REVOLUMETRIC_CAPTURE_FRAMES must be a comma-separated list of non-negative integers"
+            );
+        }
+        let frame = token.parse::<u64>().with_context(|| {
+            "REVOLUMETRIC_CAPTURE_FRAMES must be a comma-separated list of non-negative integers"
+        })?;
+        frames.push(frame);
+    }
+    if frames.is_empty() {
+        bail!(
+            "REVOLUMETRIC_CAPTURE_FRAMES must be a comma-separated list of non-negative integers"
+        );
+    }
+    Ok(frames)
+}
+
 fn sanitize_prefix(value: &str) -> String {
     value
         .trim()
@@ -416,8 +509,28 @@ mod tests {
         .expect("valid capture config should parse");
 
         assert_eq!(config.target_frame, Some(42));
+        assert_eq!(config.target_frames, vec![42]);
         assert_eq!(config.output_dir, PathBuf::from("target/debug-captures"));
         assert_eq!(config.prefix, "restir_on");
+    }
+
+    #[test]
+    fn capture_config_parses_multiple_capture_frames_for_flythrough() {
+        let config = CaptureConfig::from_values_with_frames(
+            Some("8"),
+            Some("2, 8, 16"),
+            Some("target/flythrough-captures"),
+            Some("rt_dynamic"),
+        )
+        .expect("valid multi-frame capture config should parse");
+        let capture = RenderCapture::new(config.clone());
+
+        assert_eq!(config.target_frame, Some(2));
+        assert_eq!(config.target_frames, vec![2, 8, 16]);
+        assert!(capture.should_capture(2));
+        assert!(capture.should_capture(8));
+        assert!(capture.should_capture(16));
+        assert!(!capture.should_capture(15));
     }
 
     #[test]
@@ -429,6 +542,16 @@ mod tests {
                 .to_string()
                 .contains("REVOLUMETRIC_CAPTURE_FRAME must be a non-negative integer")
         );
+    }
+
+    #[test]
+    fn capture_config_rejects_invalid_capture_frame_list() {
+        let error =
+            CaptureConfig::from_values_with_frames(None, Some("2, soon"), None, None).unwrap_err();
+
+        assert!(error.to_string().contains(
+            "REVOLUMETRIC_CAPTURE_FRAMES must be a comma-separated list of non-negative integers"
+        ));
     }
 
     #[test]
@@ -468,10 +591,14 @@ mod tests {
             rt_restir_di_spatial_enabled: true,
             rt_restir_di_spatial_sample_count: 4,
             rt_restir_gi_enabled: true,
+            rt_restir_gi_initial_candidate_count: 6,
+            rt_restir_gi_spatial_enabled: true,
+            rt_restir_gi_spatial_sample_count: 3,
             rt_temporal_denoise_enabled: true,
             rt_frame_rendered: true,
             rt_restir_di_rendered: true,
             rt_restir_gi_rendered: false,
+            rt_restir_gi_spatial_rendered: true,
             rt_resolve_ready: true,
             restir_di_enabled: true,
             restir_di_temporal_enabled: true,
@@ -483,6 +610,13 @@ mod tests {
             denoiser_enabled: true,
             denoiser_mode: "relax",
             effective_denoiser_mode: "svgf",
+            camera_path: CaptureCameraPathMetadata {
+                path: "gallery".to_owned(),
+                center: "64,32,64".to_owned(),
+                radius: 40.0,
+                height: 36.0,
+                period_frames: 240,
+            },
         };
 
         let json = metadata.to_json();
@@ -497,10 +631,14 @@ mod tests {
         assert!(json.contains("\"rt_restir_di_spatial_enabled\": true"));
         assert!(json.contains("\"rt_restir_di_spatial_sample_count\": 4"));
         assert!(json.contains("\"rt_restir_gi_enabled\": true"));
+        assert!(json.contains("\"rt_restir_gi_initial_candidate_count\": 6"));
+        assert!(json.contains("\"rt_restir_gi_spatial_enabled\": true"));
+        assert!(json.contains("\"rt_restir_gi_spatial_sample_count\": 3"));
         assert!(json.contains("\"rt_temporal_denoise_enabled\": true"));
         assert!(json.contains("\"rt_frame_rendered\": true"));
         assert!(json.contains("\"rt_restir_di_rendered\": true"));
         assert!(json.contains("\"rt_restir_gi_rendered\": false"));
+        assert!(json.contains("\"rt_restir_gi_spatial_rendered\": true"));
         assert!(json.contains("\"rt_resolve_ready\": true"));
         assert!(json.contains("\"restir_di_enabled\": true"));
         assert!(json.contains("\"area_restir_enabled\": true"));
@@ -508,5 +646,81 @@ mod tests {
         assert!(json.contains("\"denoiser_enabled\": true"));
         assert!(json.contains("\"denoiser_mode\": \"relax\""));
         assert!(json.contains("\"effective_denoiser_mode\": \"svgf\""));
+        assert!(json.contains("\"cameraPath\": \"gallery\""));
+        assert!(json.contains("\"cameraPathCenter\": \"64,32,64\""));
+        assert!(json.contains("\"cameraPathRadius\": 40"));
+        assert!(json.contains("\"cameraPathHeight\": 36"));
+        assert!(json.contains("\"cameraPathPeriodFrames\": 240"));
+    }
+
+    #[test]
+    fn capture_metadata_source_records_rt_restir_gi_initial_candidate_count() {
+        let capture = crate::render::source_checks::read_source("src/render/capture.rs");
+        let capture_impl = capture
+            .split("#[cfg(test)]")
+            .next()
+            .expect("capture implementation should precede tests");
+        let rt_pipeline = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let rt_pipeline_compact = crate::render::source_checks::compact(&rt_pipeline);
+
+        for token in [
+            "pub rt_restir_gi_initial_candidate_count: u32",
+            "\"  \\\"rt_restir_gi_initial_candidate_count\\\": {},\\n\"",
+            "self.rt_restir_gi_initial_candidate_count",
+        ] {
+            assert!(
+                capture_impl.contains(token),
+                "capture metadata must serialize RT ReSTIR-GI initial candidate count with {token}"
+            );
+        }
+
+        assert!(
+            rt_pipeline_compact.contains(
+                "rt_restir_gi_initial_candidate_count:inputs.rt_settings.restir_gi_initial_candidate_count"
+            ),
+            "RT capture metadata must be populated from RtSettings"
+        );
+    }
+
+    #[test]
+    fn capture_metadata_source_records_rt_restir_gi_spatial_controls() {
+        let capture = crate::render::source_checks::read_source("src/render/capture.rs");
+        let capture_impl = capture
+            .split("#[cfg(test)]")
+            .next()
+            .expect("capture implementation should precede tests");
+        let rt_pipeline = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let vpt_pipeline = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+
+        for token in [
+            "pub rt_restir_gi_spatial_enabled: bool",
+            "pub rt_restir_gi_spatial_sample_count: u32",
+            "pub rt_restir_gi_spatial_rendered: bool",
+            "\"  \\\"rt_restir_gi_spatial_enabled\\\": {},\\n\"",
+            "\"  \\\"rt_restir_gi_spatial_sample_count\\\": {},\\n\"",
+            "\"  \\\"rt_restir_gi_spatial_rendered\\\": {},\\n\"",
+            "self.rt_restir_gi_spatial_enabled",
+            "self.rt_restir_gi_spatial_sample_count",
+            "self.rt_restir_gi_spatial_rendered",
+        ] {
+            assert!(
+                capture_impl.contains(token),
+                "capture metadata must serialize RT ReSTIR-GI spatial controls with {token}"
+            );
+        }
+
+        for source in [rt_pipeline, vpt_pipeline] {
+            let compact = crate::render::source_checks::compact(&source);
+            for token in [
+                "rt_restir_gi_spatial_enabled:inputs.rt_settings.restir_gi_spatial_enabled",
+                "rt_restir_gi_spatial_sample_count:inputs.rt_settings.restir_gi_spatial_sample_count",
+                "rt_restir_gi_spatial_rendered",
+            ] {
+                assert!(
+                    compact.contains(token),
+                    "capture metadata must be populated from RtSettings with {token}"
+                );
+            }
+        }
     }
 }

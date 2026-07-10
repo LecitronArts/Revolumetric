@@ -110,9 +110,13 @@ fn material_common_declares_deterministic_roughness_helpers() {
 
     for token in [
         "static const float MATERIAL_ROUGHNESS[8]",
+        "static const uint MATERIAL_RGB555_FLAG = 0x8000u;",
+        "float3 material_rgb555_albedo(uint material_id)",
         "float material_roughness(uint material_id)",
         "float material_cell_roughness(VoxelCell cell)",
         "float material_emissive_luminance(VoxelCell cell)",
+        "return material_rgb555_albedo(material_id);",
+        "return 0.92;",
         "return MATERIAL_ROUGHNESS[min(material_id, 7u)]",
         "return material_roughness(voxel_material(cell));",
         "return dot(material_emissive(cell), float3(0.2126, 0.7152, 0.0722));",
@@ -2798,8 +2802,9 @@ fn app_records_egui_overlay_only_after_postprocess_capture_and_swapchain_blit() 
         "let postprocess_outputs = postprocess.register_graph(",
         "graph.add_pass(\"capture_postprocess\"",
         "graph.add_pass(\"blit_to_swapchain\"",
+        "fn add_egui_overlay_present_pass",
         "graph.add_pass(\"egui_overlay\"",
-        "builder.finish_as(swapchain_after_blit, AccessKind::Present);",
+        "builder.finish_as(swapchain_after_write, AccessKind::Present);",
     ] {
         assert!(pipeline.contains(token), "VPT pipeline missing {token}");
     }
@@ -2812,9 +2817,21 @@ fn app_records_egui_overlay_only_after_postprocess_capture_and_swapchain_blit() 
     );
     assert!(
         compact_pipeline.contains(
-            "letswapchain_after_blit=blit_writes[0];iflet(Some(egui_renderer),Some(egui_frame))=(egui_renderer,egui_frame){graph.add_pass(\"egui_overlay\",QueueType::Graphics,|builder|{builder.write_as(swapchain_after_blit,AccessKind::ColorAttachmentWrite);builder.finish_as(swapchain_after_blit,AccessKind::Present);"
+            "letswapchain_after_blit=blit_writes[0];add_egui_overlay_present_pass(&mutgraph,renderer,frame,egui_renderer.take(),egui_frame,swapchain_after_blit,);"
         ),
-        "egui overlay must draw onto the swapchain after blit and must not feed postprocess or capture"
+        "egui overlay must be appended after the swapchain blit and must not feed postprocess or capture"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "fnadd_egui_overlay_present_pass<'a>(graph:&mutRenderGraph<'a>,renderer:&'aRenderDevice,frame:&'aFrameContext,egui_renderer:Option<&'amutEguiRenderer>,egui_frame:Option<&'aEguiFrame>,swapchain_after_write:ResourceHandle,)"
+        ),
+        "egui overlay present helper must keep swapchain writes/present ownership explicit"
+    );
+    assert!(
+        compact_pipeline.contains(
+            "graph.add_pass(\"egui_overlay\",QueueType::Graphics,|builder|{builder.write_as(swapchain_after_write,AccessKind::ColorAttachmentWrite);builder.finish_as(swapchain_after_write,AccessKind::Present);"
+        ),
+        "egui overlay helper must draw onto the latest swapchain write and present it"
     );
 
     let postprocess_idx = pipeline
@@ -2826,13 +2843,13 @@ fn app_records_egui_overlay_only_after_postprocess_capture_and_swapchain_blit() 
     let blit_idx = pipeline
         .find("graph.add_pass(\"blit_to_swapchain\"")
         .expect("blit graph should exist");
-    let egui_idx = pipeline
-        .find("graph.add_pass(\"egui_overlay\"")
-        .expect("egui overlay graph should exist");
+    let egui_call_idx = pipeline
+        .find("add_egui_overlay_present_pass(\n                        &mut graph")
+        .expect("egui overlay call after blit should exist");
 
     assert!(postprocess_idx < capture_idx);
     assert!(capture_idx < blit_idx);
-    assert!(blit_idx < egui_idx);
+    assert!(blit_idx < egui_call_idx);
 }
 
 #[test]
@@ -3284,7 +3301,7 @@ fn vpt_analytic_sun_samples_solar_disk_for_soft_shadow_edges() {
 }
 
 #[test]
-fn vpt_analytic_sun_normalizes_by_solar_disk_solid_angle() {
+fn vpt_analytic_sun_treats_sun_intensity_as_total_irradiance() {
     let vpt = std::fs::read_to_string("assets/shaders/passes/vpt.slang")
         .expect("vpt shader should be readable");
     let lighting_common = std::fs::read_to_string("assets/shaders/shared/lighting_common.slang")
@@ -3296,53 +3313,57 @@ fn vpt_analytic_sun_normalizes_by_solar_disk_solid_angle() {
     let readme = std::fs::read_to_string("README.md").expect("README should be readable");
 
     for token in [
-        "float sun_pdf = sun_direction_pdf(scene);",
-        "if (sun_pdf <= 0.0)",
-        "return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term / sun_pdf;",
+        "float3 sun_dir = sample_sun_direction(scene, rng_state);",
+        "float sun_term = max(dot(hit.normal, sun_dir), 0.0);",
+        "return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term;",
     ] {
         assert!(
             vpt.contains(token),
-            "VPT analytic sun must normalize the sampled solar disk with its pdf; missing token {token}"
+            "VPT analytic sun must treat sun_intensity as total irradiance independent of disk radius; missing token {token}"
         );
     }
-    for token in [
-        "float sun_disk_solid_angle(SceneUniforms scene)",
-        "float sun_direction_pdf(SceneUniforms scene)",
-        "if (sun_radius <= 0.0)",
-        "return 0.0;",
-        "return max(LIGHTING_TWO_PI * (1.0 - cos(sun_radius)), 1.0e-8);",
-        "return solid_angle > 0.0 ? 1.0 / solid_angle : 0.0;",
-    ] {
+    assert!(
+        !vpt.contains("scene.sun_intensity * sun_term / sun_pdf"),
+        "VPT analytic sun must not make total brightness depend on sun disk solid angle"
+    );
+    for forbidden in ["sun_disk_solid_angle", "sun_direction_pdf"] {
         assert!(
-            lighting_common.contains(token),
-            "shared lighting helpers must expose finite solar disk normalization; missing token {token}"
+            !lighting_common.contains(forbidden),
+            "shared lighting helpers should not retain unused finite-sun solid-angle normalization when sun_intensity is total irradiance; found {forbidden}"
         );
     }
     assert!(
         lighting_common.contains(
-            "float3 finite_sun_irradiance = scene.sun_intensity * ground_ndotl * sun_disk_solid_angle(scene);"
+            "float3 sun_irradiance = scene.sun_intensity * ground_ndotl;"
         ) && lighting_common.contains(
-            "float3 sunlit_ground = scene.ground_color * (1.0 + LIGHTING_INV_PI * finite_sun_irradiance);"
+            "float3 sunlit_ground = scene.ground_color * (1.0 + LIGHTING_INV_PI * sun_irradiance);"
         ),
-        "sky miss ground lighting must use the same finite-disk radiance scale as direct sun instead of treating sun_intensity as directional irradiance"
+        "sky miss ground lighting must use sun_intensity as total irradiance instead of multiplying by disk solid angle"
     );
     assert!(
         !lighting_common
             .contains("scene.ground_color * (1.0 + scene.sun_intensity * ground_ndotl)"),
         "sky miss path must not retain the legacy directional-irradiance ground boost"
     );
+    assert!(
+        !lighting_common
+            .contains("scene.sun_intensity * ground_ndotl * sun_disk_solid_angle(scene)"),
+        "sky miss ground lighting must not scale total irradiance by angular radius"
+    );
 
     assert!(
-        scene_light.contains("Solar-disk radiance used by the VPT finite sun estimator."),
-        "DirectionalLight::intensity must document that VPT consumes solar-disk radiance, not legacy directional irradiance"
+        scene_light.contains("Total solar irradiance used by VPT/RT finite sun estimators."),
+        "DirectionalLight::intensity must document total irradiance semantics"
     );
     assert!(
-        scene_ubo.contains("solar-disk radiance for VPT finite sun estimator"),
-        "GpuSceneUniforms::sun_intensity must document the finite-disk radiance semantic"
+        scene_ubo.contains("total solar irradiance / legacy directional-light strength"),
+        "GpuSceneUniforms::sun_intensity must document total irradiance semantics"
     );
     assert!(
-        readme.contains("The default sun intensity is interpreted as solar-disk radiance"),
-        "README must tell users that finite sun disk direct lighting uses radiance/pdf semantics"
+        readme.contains(
+            "Sun intensity is interpreted as total irradiance / legacy directional-light strength"
+        ),
+        "README must tell users angular radius affects softness rather than total brightness"
     );
 
     assert!(

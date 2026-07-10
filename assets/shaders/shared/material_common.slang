@@ -5,12 +5,12 @@
 
 static const float3 MATERIAL_ALBEDO[8] = {
     float3(0.7, 0.7, 0.7),       // 0: default
-    float3(0.65, 0.63, 0.60),    // 1: stone
+    float3(0.94, 0.94, 0.90),    // 1: checker white / light stone
     float3(0.70, 0.20, 0.20),    // 2: red cloth
     float3(0.20, 0.70, 0.20),    // 3: green cloth
     float3(0.35, 0.42, 0.65),    // 4: blue
     float3(0.55, 0.40, 0.30),    // 5: brick
-    float3(0.40, 0.37, 0.34),    // 6: dark stone
+    float3(0.03, 0.03, 0.03),    // 6: checker black / dark stone
     float3(0.45, 0.30, 0.18),    // 7: wood
 };
 
@@ -25,11 +25,33 @@ static const float MATERIAL_ROUGHNESS[8] = {
     0.72, // 7: wood
 };
 
+static const uint MATERIAL_RGB555_FLAG = 0x8000u;
+static const uint MATERIAL_RGB555_MASK = 0x7FFFu;
+
+bool material_is_encoded_color(uint material_id) {
+    return (material_id & MATERIAL_RGB555_FLAG) != 0u;
+}
+
+float3 material_rgb555_albedo(uint material_id) {
+    uint rgb = material_id & MATERIAL_RGB555_MASK;
+    return float3(
+        float((rgb >> 10u) & 31u) / 31.0,
+        float((rgb >> 5u) & 31u) / 31.0,
+        float(rgb & 31u) / 31.0
+    );
+}
+
 float3 material_albedo(uint material_id) {
+    if (material_is_encoded_color(material_id)) {
+        return material_rgb555_albedo(material_id);
+    }
     return MATERIAL_ALBEDO[min(material_id, 7u)];
 }
 
 float material_roughness(uint material_id) {
+    if (material_is_encoded_color(material_id)) {
+        return 0.92;
+    }
     return MATERIAL_ROUGHNESS[min(material_id, 7u)];
 }
 

@@ -706,6 +706,28 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn rt_temporal_motion_debug_view_encodes_reprojection_delta() {
+        let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
+            .expect("rt_temporal.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "float3rt_temporal_visualize_motion(float4motion)",
+            "motion.xy",
+            "motion.w>0.0",
+            "float2encoded_delta=motion_valid?motion.xy*0.05+0.5:float2(0.5,0.5)",
+            "returnfloat3(encoded_delta,motion_valid?1.0:0.0)",
+            "if(rt_history.debug_view==RT_DEBUG_VIEW_MOTION)",
+            "temporal_radiance[launch_id.xy]=float4(rt_temporal_visualize_motion(surface.motion_history),1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT temporal motion debug view must expose reprojection delta with {token}"
+            );
+        }
+    }
+
+    #[test]
     fn rt_temporal_consumes_surface_motion_history_for_previous_pixel_lookup() {
         let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
             .expect("rt_temporal.rgen.slang should be readable");
@@ -717,7 +739,7 @@ mod shader_source_tests {
             "boolprevious_pixel_valid=valid_resolution&&previous_pixel_f.x>=0.0",
             "&&motion_history_valid",
             "&&previous_pixel_valid",
-            "uint2previous_pixel=uint2(0u,0u)",
+            "uint2previous_pixel=uint2(tap_pixel_i)",
             "previous_index=previous_pixel.y*previous_extent.x+previous_pixel.x",
         ] {
             assert!(
@@ -725,6 +747,34 @@ mod shader_source_tests {
                 "RT temporal must consume surface motion history token {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_temporal_samples_fractional_reprojection_without_upper_left_floor_bias() {
+        let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
+            .expect("rt_temporal.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "staticconstint2rt_temporal_history_tap_offsets[4]",
+            "float2previous_sample=previous_pixel_f-float2(0.5)",
+            "int2previous_base_pixel=int2(floor(previous_sample))",
+            "float2history_fraction=saturate(previous_sample-float2(previous_base_pixel))",
+            "floatrt_temporal_history_tap_weight(uinttap,float2history_fraction)",
+            "history_weight_sum+=tap_weight",
+            "history/=history_weight_sum",
+            "history_valid=history_weight_sum>0.0",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT temporal reprojection must bilinearly sample fractional history and avoid upper-left floor bias with {token}"
+            );
+        }
+
+        assert!(
+            !compact.contains("previous_pixel=uint2(clamp(previous_pixel_f"),
+            "RT temporal must not truncate fractional previous pixels directly, which biases history toward the upper-left"
+        );
     }
 
     #[test]
@@ -751,6 +801,37 @@ mod shader_source_tests {
                 "RT temporal shader must use previous surface metadata token {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_temporal_history_compatibility_uses_strict_rt_position_threshold() {
+        let source = std::fs::read_to_string("assets/shaders/passes/rt_temporal.rgen.slang")
+            .expect("rt_temporal.rgen.slang should be readable");
+        let common = std::fs::read_to_string("assets/shaders/shared/rt_history_common.slang")
+            .expect("rt_history_common.slang should be readable");
+        let compact = crate::render::source_checks::compact(&source);
+        let common_compact = crate::render::source_checks::compact(&common);
+
+        assert!(
+            common_compact.contains("staticconstfloatRT_HISTORY_POSITION_EPSILON=0.05"),
+            "RT history compatibility must use a sub-voxel epsilon instead of a one-voxel floor"
+        );
+        assert!(
+            common_compact.contains(
+                "floatrt_history_position_threshold(floatlinear_depth,floatdepth_threshold)"
+            ),
+            "RT history compatibility threshold should be shared across temporal and reservoir reuse"
+        );
+        assert!(
+            compact.contains(
+                "position_delta<=rt_history_position_threshold(current.position_depth.w,rt_history.depth_threshold)"
+            ),
+            "RT temporal must compare surface positions against the strict shared history threshold"
+        );
+        assert!(
+            !compact.contains("position_delta<=max(1.0,depth_scale*rt_history.depth_threshold)"),
+            "RT temporal must not keep accepting up to a full voxel of mismatched history"
+        );
     }
 
     #[test]

@@ -623,17 +623,11 @@ pub fn collect_occupied_brick_bounds(ucvh: &Ucvh) -> Vec<RtBrickBounds> {
 fn collect_occupied_brick_bounds_with_sample_count(ucvh: &Ucvh) -> (Vec<RtBrickBounds>, u32) {
     let mut bounds = Vec::new();
     let mut sampled_bricks = 0u32;
-    let grid = ucvh.config.brick_grid_size;
 
-    for z in 0..grid.z {
-        for y in 0..grid.y {
-            for x in 0..grid.x {
-                sampled_bricks = sampled_bricks.saturating_add(1);
-                let brick_coord = UVec3::new(x, y, z);
-                if let Some(bound) = collect_brick_bound(ucvh, brick_coord) {
-                    bounds.push(bound);
-                };
-            }
+    for brick_coord in ucvh.allocated_brick_positions() {
+        sampled_bricks = sampled_bricks.saturating_add(1);
+        if let Some(bound) = collect_brick_bound(ucvh, brick_coord) {
+            bounds.push(bound);
         }
     }
 
@@ -673,7 +667,7 @@ fn collect_occupied_brick_bounds_in_regions(
 
 fn collect_brick_bound(ucvh: &Ucvh, brick_coord: UVec3) -> Option<RtBrickBounds> {
     let brick_id = ucvh.brick_id_at(brick_coord)?;
-    if !brick_contains_solid_voxel(ucvh, brick_coord) {
+    if ucvh.pool.occupancy(brick_id).is_empty() {
         return None;
     }
 
@@ -684,20 +678,6 @@ fn collect_brick_bound(ucvh: &Ucvh, brick_coord: UVec3) -> Option<RtBrickBounds>
         max: (brick_coord + UVec3::ONE).as_vec3() * 8.0,
         generation: ucvh.brick_generation(brick_id).unwrap_or_default(),
     })
-}
-
-fn brick_contains_solid_voxel(ucvh: &Ucvh, brick_coord: UVec3) -> bool {
-    let base = brick_coord * 8u32;
-    for z in 0..8 {
-        for y in 0..8 {
-            for x in 0..8 {
-                if !ucvh.get_voxel(base + UVec3::new(x, y, z)).is_air() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 impl RtSceneBackend {
@@ -1093,7 +1073,10 @@ mod tests {
 
         let mut backend = RtSceneBackend::default();
         assert!(backend.rebuild(&ucvh));
-        assert_eq!(backend.last_rebuild_sampled_bricks, 64);
+        assert_eq!(
+            backend.last_rebuild_sampled_bricks, 2,
+            "initial RT scene rebuild must sample allocated bricks, not every brick-grid coordinate"
+        );
 
         assert!(ucvh.set_voxel(UVec3::new(9, 0, 0), VoxelCell::new(3, 0, [0; 3])));
         ucvh.rebuild_hierarchy();
@@ -1109,6 +1092,45 @@ mod tests {
                 .brick_bounds
                 .iter()
                 .any(|bounds| bounds.brick_coord == UVec3::new(1, 0, 0))
+        );
+    }
+
+    #[test]
+    fn scene_backend_initial_rebuild_samples_only_allocated_bricks_in_sparse_large_world() {
+        let mut ucvh = Ucvh::new(UcvhConfig::with_brick_capacity(
+            UVec3::new(2048, 768, 2048),
+            64,
+        ));
+        assert!(ucvh.set_voxel(UVec3::new(0, 0, 0), VoxelCell::new(2, 0, [0; 3])));
+        assert!(ucvh.set_voxel(UVec3::new(2040, 760, 2040), VoxelCell::new(4, 0, [0; 3])));
+
+        let mut backend = RtSceneBackend::default();
+        assert!(backend.rebuild(&ucvh));
+
+        assert_eq!(
+            backend.last_rebuild_sampled_bricks, 2,
+            "initial RT scene rebuild must not scan every brick-grid coordinate for sparse Teardown maps"
+        );
+        assert_eq!(backend.brick_bounds.len(), 2);
+    }
+
+    #[test]
+    fn scene_backend_collects_brick_bounds_from_brick_occupancy_not_voxel_queries() {
+        let source = crate::render::source_checks::read_source("src/render/rt_scene.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT scene implementation should precede tests");
+        let compact = crate::render::source_checks::compact(implementation);
+
+        assert!(
+            compact.contains("ucvh.pool.occupancy(brick_id).is_empty()"),
+            "RT scene brick bound collection should use the brick occupancy bitset"
+        );
+        assert!(
+            !compact.contains("fnbrick_contains_solid_voxel")
+                && !compact.contains("ucvh.get_voxel(base+UVec3::new(x,y,z))"),
+            "RT scene startup must not query all 512 voxels for every allocated brick"
         );
     }
 

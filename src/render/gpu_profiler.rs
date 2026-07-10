@@ -88,10 +88,19 @@ pub enum GpuProfileScope {
     VptNrdResolve = 14,
     Postprocess = 15,
     BlitToSwapchain = 16,
+    RtAccelerationStructures = 17,
+    RtSurface = 18,
+    RtRestirDi = 19,
+    RtRestirDiSpatial = 20,
+    RtRestirGi = 21,
+    RtRestirGiSpatial = 22,
+    RtDirectLighting = 23,
+    RtTemporal = 24,
+    RtResolve = 25,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 17;
+    pub const COUNT: usize = 26;
     pub const ALL: [Self; Self::COUNT] = [
         Self::VptSurfaceBootstrap,
         Self::VptSurfaceSelected,
@@ -110,6 +119,15 @@ impl GpuProfileScope {
         Self::VptNrdResolve,
         Self::Postprocess,
         Self::BlitToSwapchain,
+        Self::RtAccelerationStructures,
+        Self::RtSurface,
+        Self::RtRestirDi,
+        Self::RtRestirDiSpatial,
+        Self::RtRestirGi,
+        Self::RtRestirGiSpatial,
+        Self::RtDirectLighting,
+        Self::RtTemporal,
+        Self::RtResolve,
     ];
 
     pub fn log_name(self) -> &'static str {
@@ -131,6 +149,15 @@ impl GpuProfileScope {
             Self::VptNrdResolve => "VptNrdResolve",
             Self::Postprocess => "Postprocess",
             Self::BlitToSwapchain => "Blit",
+            Self::RtAccelerationStructures => "RtAccelerationStructures",
+            Self::RtSurface => "RtSurface",
+            Self::RtRestirDi => "RtRestirDi",
+            Self::RtRestirDiSpatial => "RtRestirDiSpatial",
+            Self::RtRestirGi => "RtRestirGi",
+            Self::RtRestirGiSpatial => "RtRestirGiSpatial",
+            Self::RtDirectLighting => "RtDirectLighting",
+            Self::RtTemporal => "RtTemporal",
+            Self::RtResolve => "RtResolve",
         }
     }
 
@@ -153,6 +180,15 @@ impl GpuProfileScope {
             Self::VptNrdResolve => "vpt_nrd_resolve_ms",
             Self::Postprocess => "postprocess_ms",
             Self::BlitToSwapchain => "blit_to_swapchain_ms",
+            Self::RtAccelerationStructures => "rt_acceleration_structures_ms",
+            Self::RtSurface => "rt_surface_ms",
+            Self::RtRestirDi => "rt_restir_di_ms",
+            Self::RtRestirDiSpatial => "rt_restir_di_spatial_ms",
+            Self::RtRestirGi => "rt_restir_gi_ms",
+            Self::RtRestirGiSpatial => "rt_restir_gi_spatial_ms",
+            Self::RtDirectLighting => "rt_direct_lighting_ms",
+            Self::RtTemporal => "rt_temporal_ms",
+            Self::RtResolve => "rt_resolve_ms",
         }
     }
 
@@ -175,6 +211,17 @@ impl GpuProfileScope {
             | Self::VptNrdResolve
             | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
             Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
+            Self::RtAccelerationStructures => {
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+            }
+            Self::RtSurface
+            | Self::RtRestirDi
+            | Self::RtRestirDiSpatial
+            | Self::RtRestirGi
+            | Self::RtRestirGiSpatial
+            | Self::RtDirectLighting
+            | Self::RtTemporal
+            | Self::RtResolve => vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
         }
     }
 }
@@ -688,7 +735,7 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 17);
+        assert_eq!(GpuProfileScope::COUNT, 26);
         assert_eq!(names[0], "VptSurfaceBootstrap");
         assert_eq!(names[1], "VptSurfaceSelected");
         assert_eq!(names[2], "Vpt");
@@ -706,6 +753,15 @@ mod tests {
         assert_eq!(names[14], "VptNrdResolve");
         assert_eq!(names[15], "Postprocess");
         assert_eq!(names[16], "Blit");
+        assert_eq!(names[17], "RtAccelerationStructures");
+        assert_eq!(names[18], "RtSurface");
+        assert_eq!(names[19], "RtRestirDi");
+        assert_eq!(names[20], "RtRestirDiSpatial");
+        assert_eq!(names[21], "RtRestirGi");
+        assert_eq!(names[22], "RtRestirGiSpatial");
+        assert_eq!(names[23], "RtDirectLighting");
+        assert_eq!(names[24], "RtTemporal");
+        assert_eq!(names[25], "RtResolve");
         assert_eq!(columns[0], "vpt_surface_bootstrap_ms");
         assert_eq!(columns[1], "vpt_surface_selected_ms");
         assert_eq!(columns[2], "vpt_ms");
@@ -723,6 +779,15 @@ mod tests {
         assert_eq!(columns[14], "vpt_nrd_resolve_ms");
         assert_eq!(columns[15], "postprocess_ms");
         assert_eq!(columns[16], "blit_to_swapchain_ms");
+        assert_eq!(columns[17], "rt_acceleration_structures_ms");
+        assert_eq!(columns[18], "rt_surface_ms");
+        assert_eq!(columns[19], "rt_restir_di_ms");
+        assert_eq!(columns[20], "rt_restir_di_spatial_ms");
+        assert_eq!(columns[21], "rt_restir_gi_ms");
+        assert_eq!(columns[22], "rt_restir_gi_spatial_ms");
+        assert_eq!(columns[23], "rt_direct_lighting_ms");
+        assert_eq!(columns[24], "rt_temporal_ms");
+        assert_eq!(columns[25], "rt_resolve_ms");
     }
 
     #[test]
@@ -754,6 +819,25 @@ mod tests {
             GpuProfileScope::BlitToSwapchain.timestamp_stage(),
             vk::PipelineStageFlags::TRANSFER
         );
+        assert_eq!(
+            GpuProfileScope::RtAccelerationStructures.timestamp_stage(),
+            vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+        );
+        for scope in [
+            GpuProfileScope::RtSurface,
+            GpuProfileScope::RtRestirDi,
+            GpuProfileScope::RtRestirDiSpatial,
+            GpuProfileScope::RtRestirGi,
+            GpuProfileScope::RtRestirGiSpatial,
+            GpuProfileScope::RtDirectLighting,
+            GpuProfileScope::RtTemporal,
+            GpuProfileScope::RtResolve,
+        ] {
+            assert_eq!(
+                scope.timestamp_stage(),
+                vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR
+            );
+        }
     }
 
     #[test]
@@ -888,11 +972,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,vpt_nrd_resolve_ms,postprocess_ms,blit_to_swapchain_ms,total_ms"
+            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,vpt_nrd_resolve_ms,postprocess_ms,blit_to_swapchain_ms,rt_acceleration_structures_ms,rt_surface_ms,rt_restir_di_ms,rt_restir_di_spatial_ms,rt_restir_gi_ms,rt_restir_gi_spatial_ms,rt_direct_lighting_ms,rt_temporal_ms,rt_resolve_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,2.5000"
+            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,2.5000"
         );
     }
 

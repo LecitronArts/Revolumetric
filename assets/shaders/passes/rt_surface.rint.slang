@@ -65,6 +65,8 @@ void main() {
         }
 
         RtSurfaceIntersectionAttributes attributes;
+        attributes.brick_id = node.brick_id;
+        attributes.packed_local_normal = rt_surface_pack_local_normal(hit_local, hit_normal);
         attributes.object_position = ray_origin + ray_direction * hit_t;
         attributes.object_normal = hit_normal;
         ReportHit(hit_t, RT_SURFACE_HIT_KIND_VOXEL, attributes);

@@ -946,6 +946,26 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn rt_surface_primary_ray_uses_pixel_center_contract_without_extra_half_pixel() {
+        let raygen = std::fs::read_to_string("assets/shaders/passes/rt_surface.rgen.slang")
+            .expect("rt_surface.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        assert!(
+            compact.contains(
+                "scene_primary_ray_from_area_sample(scene_ubo,float2(launch_id.xy),float2(0.5,0.5))"
+            ),
+            "RT surface must use the same pixel-center sampling contract as VPT and compute_pixel_to_ray"
+        );
+        assert!(
+            !compact.contains(
+                "scene_primary_ray_from_area_sample(scene_ubo,float2(launch_id.xy)+float2(0.5,0.5),"
+            ),
+            "adding another half-pixel shifts surface hits down-right and makes history appear to drift upper-left"
+        );
+    }
+
+    #[test]
     fn rt_surface_miss_and_hit_shaders_fill_payload() {
         let common = std::fs::read_to_string("assets/shaders/shared/rt_surface_common.slang")
             .expect("rt_surface common shader should be readable");
@@ -1053,33 +1073,69 @@ mod shader_source_tests {
     }
 
     #[test]
-    fn rt_surface_closest_hit_traverses_real_voxel_materials() {
+    fn rt_surface_closest_hit_uses_intersection_identity_without_retracing_ucvh() {
         let closest_hit = std::fs::read_to_string("assets/shaders/passes/rt_surface.rchit.slang")
             .expect("rt_surface.rchit.slang should be readable");
         let common = std::fs::read_to_string("assets/shaders/shared/rt_surface_common.slang")
             .expect("rt_surface common shader should be readable");
+        let intersection = std::fs::read_to_string("assets/shaders/passes/rt_surface.rint.slang")
+            .expect("rt_surface.rint.slang should be readable");
+        let compact_common = crate::render::source_checks::compact(&common);
+        let compact_closest_hit = crate::render::source_checks::compact(&closest_hit);
+        let compact_intersection = crate::render::source_checks::compact(&intersection);
 
         for token in [
-            "voxel_traverse.slang",
             "material_common.slang",
-            "HitResult hit = trace_primary_ray(",
-            "ucvh_config",
-            "hierarchy_l0",
-            "hierarchy_l4",
-            "brick_occupancy",
             "brick_materials",
-            "traversal_stats",
-            "false",
             "payload.hit_kind = RT_SURFACE_HIT_KIND_VOXEL",
-            "payload.material_id = voxel_material(hit.cell)",
-            "payload.roughness = material_cell_roughness(hit.cell)",
-            "payload.albedo = material_cell_albedo(hit.cell)",
-            "payload.brick_id = hit.brick_id",
-            "payload.local = hit.local",
+            "payload.material_id = voxel_material(cell)",
+            "payload.roughness = material_cell_roughness(cell)",
+            "payload.albedo = material_cell_albedo(cell)",
+            "payload.brick_id = brick_id",
+            "payload.local = local",
         ] {
             assert!(
                 closest_hit.contains(token),
-                "RT surface closest-hit shader must derive voxel payload data with {token}"
+                "RT surface closest-hit shader must derive payload data directly from the reported voxel identity with {token}"
+            );
+        }
+        for token in [
+            "uintbrick_id=attributes.brick_id;",
+            "uint3local=rt_surface_unpack_local(attributes.packed_local_normal);",
+            "float3hit_normal=rt_surface_unpack_axis_normal(attributes.packed_local_normal);",
+            "VoxelCellcell=brick_materials[brick_id*512u+morton_encode(local)];",
+        ] {
+            assert!(
+                compact_closest_hit.contains(token),
+                "RT surface closest-hit shader must consume compact intersection identity token {token}"
+            );
+        }
+        assert!(
+            !closest_hit.contains("trace_primary_ray(")
+                && !closest_hit.contains("voxel_traverse.slang")
+                && !closest_hit.contains("hierarchy_l0")
+                && !closest_hit.contains("brick_occupancy"),
+            "RT surface closest-hit must not traverse the UCVH after the intersection shader already found the voxel"
+        );
+        for token in [
+            "uintbrick_id;",
+            "uintpacked_local_normal;",
+            "uintrt_surface_pack_local_normal(uint3local,float3normal)",
+            "uint3rt_surface_unpack_local(uintpacked)",
+            "float3rt_surface_unpack_axis_normal(uintpacked)",
+        ] {
+            assert!(
+                compact_common.contains(token),
+                "RT surface hit attributes must expose compact voxel identity token {token}"
+            );
+        }
+        for token in [
+            "attributes.brick_id=node.brick_id;",
+            "attributes.packed_local_normal=rt_surface_pack_local_normal(hit_local,hit_normal);",
+        ] {
+            assert!(
+                compact_intersection.contains(token),
+                "RT surface intersection shader must report compact voxel identity token {token}"
             );
         }
         assert!(

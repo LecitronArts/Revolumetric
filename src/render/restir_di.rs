@@ -232,35 +232,30 @@ pub fn build_direct_lights_for_test(
 
 pub fn build_direct_lights_from_ucvh(ucvh: &Ucvh, max_lights: usize) -> Vec<GpuDirectLight> {
     let mut emissive_voxels = Vec::new();
-    let grid = ucvh.config.brick_grid_size;
     let materials = ucvh.pool.material_pool();
 
-    for z in 0..grid.z {
-        for y in 0..grid.y {
-            for x in 0..grid.x {
-                let brick_pos = glam::UVec3::new(x, y, z);
-                let node = ucvh.hierarchy.get_l0(brick_pos);
-                if node.flags & 1 == 0 || node.brick_id == u32::MAX {
-                    continue;
-                }
+    for brick_pos in ucvh.allocated_brick_positions() {
+        let Some(brick_id) = ucvh.brick_id_at(brick_pos) else {
+            continue;
+        };
+        if ucvh.pool.occupancy(brick_id).is_empty() {
+            continue;
+        }
 
-                let base = node.brick_id as usize * BRICK_VOLUME;
-                for morton_index in 0..BRICK_VOLUME {
-                    let cell = materials[base + morton_index];
-                    if cell.emissive == [0; 3] {
-                        continue;
-                    }
-
-                    let (lx, ly, lz) = crate::voxel::morton::decode(morton_index as u32);
-                    let world =
-                        brick_pos * crate::voxel::brick::BRICK_EDGE + glam::UVec3::new(lx, ly, lz);
-                    emissive_voxels.push(EmissiveVoxelForTest {
-                        brick_id: node.brick_id,
-                        world_position: [world.x as f32, world.y as f32, world.z as f32],
-                        emissive: cell.emissive,
-                    });
-                }
+        let base = brick_id as usize * BRICK_VOLUME;
+        for morton_index in 0..BRICK_VOLUME {
+            let cell = materials[base + morton_index];
+            if cell.emissive == [0; 3] {
+                continue;
             }
+
+            let (lx, ly, lz) = crate::voxel::morton::decode(morton_index as u32);
+            let world = brick_pos * crate::voxel::brick::BRICK_EDGE + glam::UVec3::new(lx, ly, lz);
+            emissive_voxels.push(EmissiveVoxelForTest {
+                brick_id,
+                world_position: [world.x as f32, world.y as f32, world.z as f32],
+                emissive: cell.emissive,
+            });
         }
     }
 
@@ -693,6 +688,27 @@ mod tests {
                 .iter()
                 .any(|light| light.normal_type[3] == 1.0 && light.color_power[3] > 0.0),
             "sponza emissive voxels should produce at least one emissive direct-light cluster"
+        );
+    }
+
+    #[test]
+    fn direct_light_extraction_uses_allocated_bricks_not_full_sparse_grid() {
+        let source = crate::render::source_checks::read_source("src/render/restir_di.rs");
+        let body = source
+            .split("pub fn build_direct_lights_from_ucvh")
+            .nth(1)
+            .expect("build_direct_lights_from_ucvh should exist")
+            .split("fn build_direct_lights_from_emissive_iter")
+            .next()
+            .expect("build_direct_lights_from_ucvh should end before helper");
+
+        assert!(
+            body.contains("allocated_brick_positions"),
+            "Vintessa-scale sparse worlds must not scan every brick-grid coordinate when extracting emissive lights"
+        );
+        assert!(
+            !body.contains("0..grid.z"),
+            "direct-light extraction must not retain the old full-grid z/y/x traversal"
         );
     }
 }

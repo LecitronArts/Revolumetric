@@ -168,17 +168,13 @@ bool analytic_sun_visible_from_hit(HitResult hit, SceneUniforms scene, float3 su
 }
 
 float3 analytic_sun_direct(HitResult hit, SceneUniforms scene, inout uint rng_state) {
-    float sun_pdf = sun_direction_pdf(scene);
-    if (sun_pdf <= 0.0) {
-        return float3(0.0);
-    }
     float3 sun_dir = sample_sun_direction(scene, rng_state);
     float sun_term = max(dot(hit.normal, sun_dir), 0.0);
     if (sun_term <= 0.0 || !analytic_sun_visible_from_hit(hit, scene, sun_dir)) {
         return float3(0.0);
     }
     float3 albedo = material_cell_albedo(hit.cell);
-    return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term / sun_pdf;
+    return albedo * LIGHTING_INV_PI * scene.sun_intensity * sun_term;
 }
 
 VptTraceSample empty_vpt_trace_sample() {

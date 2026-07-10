@@ -15,9 +15,41 @@ struct RtAabb {
 };
 
 struct RtSurfaceIntersectionAttributes {
+    uint brick_id;
+    uint packed_local_normal;
     float3 object_position;
     float3 object_normal;
 };
+
+uint rt_surface_axis_normal_code(float3 normal) {
+    if (normal.x < -0.5) return 0u;
+    if (normal.x > 0.5) return 1u;
+    if (normal.y < -0.5) return 2u;
+    if (normal.y > 0.5) return 3u;
+    if (normal.z < -0.5) return 4u;
+    return 5u;
+}
+
+uint rt_surface_pack_local_normal(uint3 local, float3 normal) {
+    uint packed_local = (local.x & 7u)
+                      | ((local.y & 7u) << 3u)
+                      | ((local.z & 7u) << 6u);
+    return packed_local | (rt_surface_axis_normal_code(normal) << 9u);
+}
+
+uint3 rt_surface_unpack_local(uint packed) {
+    return uint3(packed & 7u, (packed >> 3u) & 7u, (packed >> 6u) & 7u);
+}
+
+float3 rt_surface_unpack_axis_normal(uint packed) {
+    uint code = (packed >> 9u) & 7u;
+    if (code == 0u) return float3(-1.0, 0.0, 0.0);
+    if (code == 1u) return float3(1.0, 0.0, 0.0);
+    if (code == 2u) return float3(0.0, -1.0, 0.0);
+    if (code == 3u) return float3(0.0, 1.0, 0.0);
+    if (code == 4u) return float3(0.0, 0.0, -1.0);
+    return float3(0.0, 0.0, 1.0);
+}
 
 struct RtSurfacePayload {
     uint hit_kind;
@@ -32,6 +64,7 @@ struct RtSurfacePayload {
     uint brick_id;
     uint3 local;
     float3 ray_direction;
+    float3 emissive_radiance;
 };
 
 float3 rt_aabb_min(RtAabb aabb) {
@@ -95,6 +128,7 @@ RtSurfacePayload make_rt_surface_payload(float3 ray_direction) {
     payload.brick_id = 0xffffffffu;
     payload.local = uint3(0u);
     payload.ray_direction = ray_direction;
+    payload.emissive_radiance = float3(0.0);
     return payload;
 }
 
@@ -118,5 +152,6 @@ RtSurfacePixel surface_pixel_from_payload(RtSurfacePayload payload) {
     pixel.hit_kind = payload.hit_kind;
     pixel.brick_id = payload.brick_id;
     pixel.local = payload.local;
+    pixel.emissive_radiance = float4(payload.emissive_radiance, 0.0);
     return pixel;
 }

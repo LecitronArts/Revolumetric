@@ -360,6 +360,10 @@ pub fn clamp_rt_spatial_samples(value: u32) -> u32 {
     value.clamp(0, 8)
 }
 
+pub fn clamp_rt_gi_initial_candidates(value: u32) -> u32 {
+    value.clamp(1, 16)
+}
+
 pub fn sanitize_rt_temporal_thresholds(settings: &mut RtSettings) {
     let defaults = RtSettings::default();
     if !settings.normal_threshold.is_finite()
@@ -720,6 +724,18 @@ fn show_restir_panel(
     );
     rt.restir_di_spatial_sample_count = clamp_rt_spatial_samples(rt.restir_di_spatial_sample_count);
     ui.checkbox(&mut rt.restir_gi_enabled, "Enable RT ReSTIR-GI");
+    ui.add(
+        egui::Slider::new(&mut rt.restir_gi_initial_candidate_count, 1..=16)
+            .text("GI initial candidates"),
+    );
+    rt.restir_gi_initial_candidate_count =
+        clamp_rt_gi_initial_candidates(rt.restir_gi_initial_candidate_count);
+    ui.checkbox(&mut rt.restir_gi_spatial_enabled, "RT GI spatial reuse");
+    ui.add(
+        egui::Slider::new(&mut rt.restir_gi_spatial_sample_count, 0..=8)
+            .text("RT GI spatial samples"),
+    );
+    rt.restir_gi_spatial_sample_count = clamp_rt_spatial_samples(rt.restir_gi_spatial_sample_count);
 }
 
 fn show_debug_panel(
@@ -1053,9 +1069,16 @@ const RT_DEBUG_OPTIONS: &[(RtDebugView, &str)] = &[
     (RtDebugView::Surface, "Surface"),
     (RtDebugView::HitDistance, "Hit Distance"),
     (RtDebugView::HistoryValid, "History Valid"),
+    (RtDebugView::Motion, "Motion"),
+    (RtDebugView::Direct, "Direct"),
+    (RtDebugView::SkyIndirect, "Sky Indirect"),
     (RtDebugView::DirectReservoir, "Direct Reservoir"),
     (RtDebugView::IndirectReservoir, "Indirect Reservoir"),
+    (RtDebugView::GiIndirect, "GI Indirect"),
+    (RtDebugView::GiReason, "GI Reason"),
     (RtDebugView::Temporal, "Temporal"),
+    (RtDebugView::GiTemporal, "GI Temporal"),
+    (RtDebugView::GiSpatial, "GI Spatial"),
 ];
 
 #[cfg(test)]
@@ -1128,14 +1151,66 @@ mod tests {
                 RtDebugView::Surface,
                 RtDebugView::HitDistance,
                 RtDebugView::HistoryValid,
+                RtDebugView::Motion,
+                RtDebugView::Direct,
+                RtDebugView::SkyIndirect,
                 RtDebugView::DirectReservoir,
                 RtDebugView::IndirectReservoir,
+                RtDebugView::GiIndirect,
+                RtDebugView::GiReason,
                 RtDebugView::Temporal,
+                RtDebugView::GiTemporal,
+                RtDebugView::GiSpatial,
             ]
         );
         assert_eq!(
             rt_debug_label(RtDebugView::DirectReservoir),
             "Direct Reservoir"
+        );
+    }
+
+    #[test]
+    fn rt_debug_options_expose_direct_component_views() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        for token in [
+            "(RtDebugView::Direct, \"Direct\")",
+            "(RtDebugView::SkyIndirect, \"Sky Indirect\")",
+        ] {
+            assert!(
+                source.contains(token),
+                "RT debug combo must expose direct component debug view {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_debug_options_expose_gi_indirect_contribution_view() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        assert!(
+            source.contains("(RtDebugView::GiIndirect, \"GI Indirect\")"),
+            "RT debug combo must expose resolved GI indirect contribution as GI Indirect"
+        );
+    }
+
+    #[test]
+    fn rt_debug_options_expose_gi_reason_view() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        assert!(
+            source.contains("(RtDebugView::GiReason, \"GI Reason\")"),
+            "RT debug combo must expose GI Reason for diagnosing missing indirect light"
+        );
+    }
+
+    #[test]
+    fn rt_debug_options_expose_motion_view() {
+        let source = crate::render::source_checks::read_source("src/editor/ui.rs");
+
+        assert!(
+            source.contains("(RtDebugView::Motion, \"Motion\")"),
+            "RT debug combo must expose Motion for diagnosing temporal reprojection drift"
         );
     }
 
@@ -1215,6 +1290,7 @@ mod tests {
                 restir_gi_history_ready: false,
                 restir_di_rendered: false,
                 restir_gi_rendered: false,
+                restir_gi_spatial_rendered: false,
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
@@ -1542,7 +1618,11 @@ mod tests {
             "rt.restir_di_spatial_enabled",
             "rt.restir_di_spatial_sample_count",
             "rt.restir_gi_enabled",
+            "rt.restir_gi_initial_candidate_count",
+            "rt.restir_gi_spatial_enabled",
+            "rt.restir_gi_spatial_sample_count",
             "clamp_rt_spatial_samples(rt.restir_di_spatial_sample_count)",
+            "clamp_rt_spatial_samples(rt.restir_gi_spatial_sample_count)",
         ] {
             assert!(
                 sampling_panel.contains(token),

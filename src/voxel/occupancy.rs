@@ -80,6 +80,36 @@ impl CascadedOccupancy {
         }
     }
 
+    pub fn rebuild_from_occupied_l0_positions(
+        &mut self,
+        occupied_positions: impl IntoIterator<Item = UVec3>,
+    ) {
+        for level in &mut self.levels {
+            level.fill(NodeLN::zeroed());
+        }
+
+        for mut child_pos in occupied_positions {
+            for target_idx in 0..4 {
+                let parent_pos = child_pos / 2;
+                let parent_dim = self.dims[target_idx + 1];
+                if parent_pos.x >= parent_dim.x
+                    || parent_pos.y >= parent_dim.y
+                    || parent_pos.z >= parent_dim.z
+                {
+                    break;
+                }
+
+                let child_bit =
+                    (child_pos.x & 1) | ((child_pos.y & 1) << 1) | ((child_pos.z & 1) << 2);
+                let parent_index = Self::flat_index(parent_pos, parent_dim);
+                let parent = &mut self.levels[target_idx][parent_index];
+                parent.child_mask |= 1 << child_bit;
+                parent.flags = 1;
+                child_pos = parent_pos;
+            }
+        }
+    }
+
     fn rebuild_l1_from_l0(&mut self) {
         let child_dim = self.dims[0];
         let parent_dim = self.dims[1];

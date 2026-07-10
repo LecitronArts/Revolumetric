@@ -25,6 +25,13 @@ RWStructuredBuffer<RtSurfacePixel> current_surface_history;
 [[vk::binding(7, 0)]]
 ConstantBuffer<RtHistoryUniforms> rt_history;
 
+static const int2 rt_restir_temporal_tap_offsets[4] = {
+    int2(0, 0),
+    int2(1, 0),
+    int2(0, 1),
+    int2(1, 1),
+};
+
 uint hash_u32(uint x) {
     x ^= x >> 16;
     x *= 0x7feb352du;
@@ -87,6 +94,20 @@ bool rt_restir_previous_uv_inside(float2 previous_uv) {
         && previous_uv.y < 1.0;
 }
 
+float rt_restir_temporal_tap_weight(uint tap, float2 history_fraction) {
+    int2 offset = rt_restir_temporal_tap_offsets[tap];
+    float wx = offset.x == 0 ? 1.0 - history_fraction.x : history_fraction.x;
+    float wy = offset.y == 0 ? 1.0 - history_fraction.y : history_fraction.y;
+    return wx * wy;
+}
+
+bool rt_restir_temporal_tap_inside(int2 previous_pixel, uint2 extent) {
+    return previous_pixel.x >= 0
+        && previous_pixel.y >= 0
+        && previous_pixel.x < int(extent.x)
+        && previous_pixel.y < int(extent.y);
+}
+
 bool rt_restir_surfaces_compatible(RtSurfacePixel current, RtSurfacePixel previous) {
     if (!rt_restir_surface_valid(current) || !rt_restir_surface_valid(previous)) {
         return false;
@@ -99,8 +120,7 @@ bool rt_restir_surfaces_compatible(RtSurfacePixel current, RtSurfacePixel previo
         return false;
     }
     float position_delta = distance(current.position_depth.xyz, previous.position_depth.xyz);
-    float depth_scale = max(current.position_depth.w, 1.0);
-    return position_delta <= max(1.0, depth_scale * rt_history.depth_threshold);
+    return position_delta <= rt_history_position_threshold(current.position_depth.w, rt_history.depth_threshold);
 }
 
 RestirDiReservoir rt_restir_generate_initial_reservoir(
@@ -115,6 +135,7 @@ RestirDiReservoir rt_restir_generate_initial_reservoir(
     );
     uint candidate_count = clamp(restir.initial_candidate_count, 1u, min(restir.light_count, 16u));
     float weight_sum = 0.0;
+    float3 surface_view_dir = normalize(-surface.view_direction_background.xyz);
 
     for (uint candidate = 0u; candidate < candidate_count; candidate++) {
         uint light_id = sample_direct_light_id(rand01(rng_state));
@@ -134,6 +155,7 @@ RestirDiReservoir rt_restir_generate_initial_reservoir(
             surface.position_depth,
             surface.normal_roughness,
             surface.albedo_material,
+            surface_view_dir,
             light,
             sampled_position
         );
@@ -189,30 +211,14 @@ RestirDiReservoir rt_restir_temporal_reuse(
         return reservoir;
     }
 
-    uint2 previous_extent = rt_history.previous_resolution;
-    uint2 previous_max_pixel = previous_extent - uint2(1u, 1u);
-    uint2 previous_pixel = uint2(clamp(
-        previous_uv * float2(previous_extent),
-        float2(0.0),
-        float2(previous_max_pixel)
-    ));
-    uint previous_index = previous_pixel.y * previous_extent.x + previous_pixel.x;
-    RtSurfacePixel previous_surface = previous_surface_history[previous_index];
-    if (!rt_restir_surfaces_compatible(surface, previous_surface)) {
-        return reservoir;
-    }
-
-    RestirDiReservoir history_reservoir = history_reservoirs[previous_index];
-    if (!restir_di_is_valid_reservoir(history_reservoir)) {
-        return reservoir;
-    }
-
     uint history_m_limit = max(restir.history_length, 1u);
+    float3 surface_view_dir = normalize(-surface.view_direction_background.xyz);
     uint current_m = min(reservoir.sample_count_m, history_m_limit);
     float current_target_pdf = restir_di_target_pdf_for_reservoir(
         surface.position_depth,
         surface.normal_roughness,
         surface.albedo_material,
+        surface_view_dir,
         reservoir
     );
     float current_weight = restir_di_reservoir_stream_weight(
@@ -223,24 +229,77 @@ RestirDiReservoir rt_restir_temporal_reuse(
     float selected_target_pdf = current_target_pdf;
 
     uint remaining_m = history_m_limit - min(current_m, history_m_limit);
-    uint capped_history_m = min(history_reservoir.sample_count_m, remaining_m);
-    float history_target_pdf = restir_di_target_pdf_for_reservoir(
-        surface.position_depth,
-        surface.normal_roughness,
-        surface.albedo_material,
-        history_reservoir
-    );
-    float history_weight = restir_di_reservoir_stream_weight(
-        history_target_pdf,
-        history_reservoir,
-        capped_history_m
-    );
+    RestirDiReservoir selected_history = invalid_reservoir();
+    float selected_history_target_pdf = 0.0;
+    uint capped_history_m = 0u;
+    float history_tap_weight_sum = 0.0;
+    float history_tap_selection_sum = 0.0;
+    uint rng_state = hash_u32(index * 1973u ^ restir.frame_index);
+
+    if (remaining_m > 0u) {
+        uint2 previous_extent = rt_history.previous_resolution;
+        float2 previous_sample = previous_uv * float2(previous_extent) - float2(0.5);
+        int2 previous_base_pixel = int2(floor(previous_sample));
+        float2 history_fraction = saturate(previous_sample - float2(previous_base_pixel));
+        for (uint tap = 0u; tap < 4u; tap++) {
+            float tap_weight = rt_restir_temporal_tap_weight(tap, history_fraction);
+            if (tap_weight <= 0.0) {
+                continue;
+            }
+
+            int2 tap_pixel_i = previous_base_pixel + rt_restir_temporal_tap_offsets[tap];
+            if (!rt_restir_temporal_tap_inside(tap_pixel_i, previous_extent)) {
+                continue;
+            }
+
+            uint2 previous_pixel = uint2(tap_pixel_i);
+            uint previous_index = previous_pixel.y * previous_extent.x + previous_pixel.x;
+            RtSurfacePixel previous_surface = previous_surface_history[previous_index];
+            if (!rt_restir_surfaces_compatible(surface, previous_surface)) {
+                continue;
+            }
+
+            RestirDiReservoir history_candidate = history_reservoirs[previous_index];
+            if (!restir_di_is_valid_reservoir(history_candidate)) {
+                continue;
+            }
+
+            uint candidate_m = min(history_candidate.sample_count_m, remaining_m);
+            float candidate_target_pdf = restir_di_target_pdf_for_reservoir(
+                surface.position_depth,
+                surface.normal_roughness,
+                surface.albedo_material,
+                surface_view_dir,
+                history_candidate
+            );
+            float candidate_stream_weight = restir_di_reservoir_stream_weight(
+                candidate_target_pdf,
+                history_candidate,
+                candidate_m
+            );
+            float history_candidate_weight = candidate_stream_weight * tap_weight;
+            if (history_candidate_weight <= 0.0) {
+                continue;
+            }
+
+            history_tap_weight_sum += history_candidate_weight;
+            float next_selection_sum = history_tap_selection_sum + history_candidate_weight;
+            if (rand01(rng_state) * max(next_selection_sum, 1.0e-4) <= history_candidate_weight) {
+                selected_history = history_reservoirs[previous_index];
+                selected_history_target_pdf = candidate_target_pdf;
+                capped_history_m = candidate_m;
+            }
+            history_tap_selection_sum = next_selection_sum;
+        }
+    }
+
+    float history_target_pdf = selected_history_target_pdf;
+    float history_weight = history_tap_weight_sum;
     float combined_weight_sum = current_weight + history_weight;
 
-    uint rng_state = hash_u32(index * 1973u);
     if (history_weight > 0.0
         && rand01(rng_state) * max(combined_weight_sum, 1.0e-4) <= history_weight) {
-        reservoir = history_reservoir;
+        reservoir = selected_history;
         reservoir.target_pdf = history_target_pdf;
         selected_target_pdf = history_target_pdf;
     }
@@ -274,10 +333,12 @@ void main() {
     }
 
     if (reservoir.sample_light_id != 0xffffffffu && reservoir.sample_count_m > 0u && reservoir.target_pdf <= 0.0) {
+        float3 surface_view_dir = normalize(-surface.view_direction_background.xyz);
         reservoir.target_pdf = restir_di_target_pdf_for_reservoir(
             surface.position_depth,
             surface.normal_roughness,
             surface.albedo_material,
+            surface_view_dir,
             reservoir
         );
     }

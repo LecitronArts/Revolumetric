@@ -52,6 +52,7 @@ pub struct GpuRtSurfacePixel {
     pub hit_kind: u32,
     pub brick_id: u32,
     pub local: [u32; 3],
+    pub emissive_radiance: [f32; 4],
 }
 
 #[cfg(test)]
@@ -113,7 +114,7 @@ mod tests {
 
     #[test]
     fn rt_surface_pixel_layout_is_stable() {
-        assert_eq!(std::mem::size_of::<GpuRtSurfacePixel>(), 112);
+        assert_eq!(std::mem::size_of::<GpuRtSurfacePixel>(), 128);
         assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, position_depth), 0);
         assert_eq!(
             std::mem::offset_of!(GpuRtSurfacePixel, view_direction_background),
@@ -126,6 +127,10 @@ mod tests {
         assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, hit_kind), 92);
         assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, brick_id), 96);
         assert_eq!(std::mem::offset_of!(GpuRtSurfacePixel, local), 100);
+        assert_eq!(
+            std::mem::offset_of!(GpuRtSurfacePixel, emissive_radiance),
+            112
+        );
     }
 
     #[test]
@@ -158,11 +163,76 @@ mod tests {
             "uint hit_kind",
             "uint brick_id",
             "uint3 local",
+            "float4 emissive_radiance",
         ] {
             assert!(
                 source.contains(token),
                 "RT history shader missing token {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_temporal_bypasses_history_for_gi_indirect_debug_view() {
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_temporal.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&temporal);
+
+        assert!(
+            compact.contains("debug_view==RT_DEBUG_VIEW_GI_INDIRECT"),
+            "RT GI indirect contribution debug view must bypass temporal history"
+        );
+    }
+
+    #[test]
+    fn rt_temporal_bypasses_history_for_direct_component_debug_views() {
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_temporal.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&temporal);
+
+        for token in [
+            "debug_view==RT_DEBUG_VIEW_DIRECT",
+            "debug_view==RT_DEBUG_VIEW_SKY_INDIRECT",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT direct component debug view must bypass temporal history with {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_temporal_bypasses_history_for_gi_reason_debug_view() {
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_temporal.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&temporal);
+
+        assert!(
+            compact.contains("debug_view==RT_DEBUG_VIEW_GI_REASON"),
+            "RT GI Reason debug view must bypass temporal history"
+        );
+    }
+
+    #[test]
+    fn rt_temporal_bypasses_history_for_motion_debug_view() {
+        let history_common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/rt_history_common.slang",
+        );
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_temporal.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&temporal);
+
+        assert!(
+            history_common.contains("RT_DEBUG_VIEW_MOTION = 13u"),
+            "RT motion debug view must be part of the shared RT debug ABI"
+        );
+        assert!(
+            compact.contains("debug_view==RT_DEBUG_VIEW_MOTION"),
+            "RT motion debug view must bypass temporal history accumulation"
+        );
     }
 }

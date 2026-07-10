@@ -1256,6 +1256,92 @@ mod shader_source_tests {
     }
 
     #[test]
+    fn rt_restir_di_temporal_samples_fractional_reprojection_without_upper_left_bias() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "staticconstint2rt_restir_temporal_tap_offsets[4]",
+            "float2previous_sample=previous_uv*float2(previous_extent)-float2(0.5)",
+            "int2previous_base_pixel=int2(floor(previous_sample))",
+            "float2history_fraction=saturate(previous_sample-float2(previous_base_pixel))",
+            "floatrt_restir_temporal_tap_weight(uinttap,float2history_fraction)",
+            "boolrt_restir_temporal_tap_inside(int2previous_pixel,uint2extent)",
+            "floathistory_tap_weight_sum=0.0",
+            "selected_history=history_reservoirs[previous_index]",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT ReSTIR-DI temporal reservoir reuse must sample fractional reprojection without upper-left bias; missing {token}"
+            );
+        }
+
+        assert!(
+            !compact
+                .contains("uint2previous_pixel=uint2(clamp(previous_uv*float2(previous_extent)"),
+            "RT ReSTIR-DI temporal reservoir reuse must not truncate fractional previous pixels directly"
+        );
+    }
+
+    #[test]
+    fn rt_restir_di_temporal_weights_fractional_history_taps_by_reservoir_stream_weight() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "floatcandidate_stream_weight=restir_di_reservoir_stream_weight(",
+            "floathistory_candidate_weight=candidate_stream_weight*tap_weight",
+            "if(history_candidate_weight<=0.0){continue;}",
+            "history_tap_weight_sum+=history_candidate_weight",
+            "floatnext_selection_sum=history_tap_selection_sum+history_candidate_weight",
+            "rand01(rng_state)*max(next_selection_sum,1.0e-4)<=history_candidate_weight",
+            "floathistory_weight=history_tap_weight_sum",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT ReSTIR-DI temporal reservoir taps must be weighted by both bilinear tap and reservoir stream weight; missing {token}"
+            );
+        }
+
+        assert!(
+            !compact.contains("history_tap_weight_sum+=tap_weight"),
+            "RT ReSTIR-DI temporal reuse must not ignore reservoir stream weight when summing history taps"
+        );
+        assert!(
+            !compact.contains("floatnext_selection_sum=history_tap_selection_sum+tap_weight"),
+            "RT ReSTIR-DI temporal reuse must not select history taps by bilinear weight alone"
+        );
+    }
+
+    #[test]
+    fn rt_restir_di_history_compatibility_uses_strict_rt_position_threshold() {
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di.rgen.slang",
+        );
+        let spatial = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di_spatial.rgen.slang",
+        );
+
+        for (name, source) in [("temporal", temporal), ("spatial", spatial)] {
+            let compact = crate::render::source_checks::compact(&source);
+
+            assert!(
+                compact.contains("position_delta<=rt_history_position_threshold("),
+                "RT ReSTIR-DI {name} reuse must use the shared strict position threshold"
+            );
+            assert!(
+                !compact
+                    .contains("position_delta<=max(1.0,depth_scale*rt_history.depth_threshold)"),
+                "RT ReSTIR-DI {name} reuse must not accept a full voxel of mismatched history"
+            );
+        }
+    }
+
+    #[test]
     fn rt_restir_di_pass_spatial_stage_uses_temporal_intermediate() {
         let source = crate::render::source_checks::read_source("src/render/passes/rt_restir_di.rs");
         let implementation = source
@@ -1366,5 +1452,56 @@ mod shader_source_tests {
                 "RT ReSTIR-DI spatial shader missing {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_restir_di_target_pdfs_use_rt_view_and_roughness_aware_brdf() {
+        let common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/restir_di_common.slang",
+        );
+        let temporal = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di.rgen.slang",
+        );
+        let spatial = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_restir_di_spatial.rgen.slang",
+        );
+        let compact_common = crate::render::source_checks::compact(&common);
+        let compact_temporal = crate::render::source_checks::compact(&temporal);
+        let compact_spatial = crate::render::source_checks::compact(&spatial);
+
+        for token in [
+            "float3restir_di_direct_brdf(float3surface_normal,float3albedo,floatroughness,float3view_dir,float3light_dir)",
+            "floatrestir_di_direct_brdf_luma(float3surface_normal,float3albedo,floatroughness,float3view_dir,float3light_dir)",
+            "returnlight_power*restir_di_direct_brdf_luma(surface_normal,albedo,roughness,view_dir,light_dir)*light_term;",
+            "returnlight_power*restir_di_direct_brdf_luma(surface_normal,albedo,roughness,view_dir,light_dir)*light_term*attenuation;",
+            "floatrestir_di_target_pdf_for_light_sample(float4surface_position_depth,float4surface_normal_roughness,float4surface_albedo_material,float3surface_view_dir,DirectLightlight,float3light_sample_position)",
+            "floatrestir_di_target_pdf_for_reservoir(float4surface_position_depth,float4surface_normal_roughness,float4surface_albedo_material,float3surface_view_dir,RestirDiReservoirreservoir)",
+        ] {
+            assert!(
+                compact_common.contains(token),
+                "RT ReSTIR-DI target PDFs must use the same material/view direct BRDF measure as resolve; missing {token}"
+            );
+        }
+
+        for (name, compact_shader) in [
+            ("temporal", compact_temporal.as_str()),
+            ("spatial", compact_spatial.as_str()),
+        ] {
+            assert!(
+                compact_shader.contains(
+                    "float3surface_view_dir=normalize(-surface.view_direction_background.xyz);"
+                ),
+                "RT ReSTIR-DI {name} shader must derive the target PDF view vector from the RT surface"
+            );
+            assert!(
+                compact_shader.contains("restir_di_target_pdf_for_reservoir(surface.position_depth,surface.normal_roughness,surface.albedo_material,surface_view_dir,"),
+                "RT ReSTIR-DI {name} shader must pass the RT view vector when reweighting reservoirs"
+            );
+        }
+
+        assert!(
+            compact_temporal.contains("restir_di_target_pdf_for_light_sample(surface.position_depth,surface.normal_roughness,surface.albedo_material,surface_view_dir,light,sampled_position)"),
+            "RT ReSTIR-DI initial candidate generation must pass the RT view vector into target PDF evaluation"
+        );
     }
 }

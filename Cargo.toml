@@ -20,14 +20,17 @@ glam = { version = "0.30", features = ["bytemuck", "serde"] }
 gpu-allocator = { version = "0.28", features = ["vulkan"] }
 hecs = "0.11"
 parking_lot = "0.12"
+png = "0.17"
 raw-window-handle = "0.6"
 revolumetric-nrd = { path = "crates/revolumetric-nrd" }
+roxmltree = "0.21.1"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 winit = { version = "0.30", features = ["android-native-activity"] }
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 egui = { version = "0.30.0", features = ["bytemuck"] }

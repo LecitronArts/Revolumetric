@@ -2,7 +2,9 @@ use anyhow::{Context, Result, anyhow};
 use ash::vk;
 
 use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
-use crate::render::capture::{CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer};
+use crate::render::capture::{
+    CaptureCameraPathMetadata, CaptureMetadata, RenderCapture, cmd_copy_image_to_buffer,
+};
 use crate::render::device::RenderDevice;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
@@ -16,7 +18,7 @@ use crate::render::passes::rt_direct_lighting::{
 use crate::render::passes::rt_resolve::{RtResolveCreateInfo, RtResolvePass};
 use crate::render::passes::rt_restir_di::{RtRestirDiCreateInfo, RtRestirDiPass};
 use crate::render::passes::rt_restir_gi::{
-    RtRestirGiCreateInfo, RtRestirGiPass, RtRestirGiShaders,
+    RtRestirGiCreateInfo, RtRestirGiFrameSettings, RtRestirGiPass, RtRestirGiShaders,
 };
 use crate::render::passes::rt_surface::{RtSurfaceCreateInfo, RtSurfacePass, RtSurfaceShaders};
 use crate::render::passes::rt_temporal::{RtTemporalCreateInfo, RtTemporalPass};
@@ -36,11 +38,12 @@ use crate::render::vpt_pipeline::{VptCameraFrame, VptFrameRecordResult};
 use crate::voxel::gpu_upload::UcvhGpuResources;
 use crate::voxel::ucvh::Ucvh;
 
-const RT_SCENE_KEY_WORDS: usize = 19;
+const RT_SCENE_KEY_WORDS: usize = 22;
 
 pub struct RtFrameInputs<'a> {
     pub scene_ubo: &'a SceneUniformBuffer,
     pub camera: VptCameraFrame,
+    pub camera_path: CaptureCameraPathMetadata,
     pub sun_direction: glam::Vec3,
     pub sun_intensity: glam::Vec3,
     pub elapsed_seconds: f32,
@@ -72,6 +75,7 @@ pub struct RtFrameStatus {
     pub restir_gi_history_ready: bool,
     pub restir_di_rendered: bool,
     pub restir_gi_rendered: bool,
+    pub restir_gi_spatial_rendered: bool,
     pub direct_lighting_ready: bool,
     pub temporal_ready: bool,
     pub resolve_ready: bool,
@@ -85,6 +89,7 @@ pub struct RtPipelineFrameState {
     pub restir_gi_history_initialized: bool,
     pub restir_di_rendered: bool,
     pub restir_gi_rendered: bool,
+    pub restir_gi_spatial_rendered: bool,
     pub direct_lighting_initialized: bool,
     pub temporal_initialized: bool,
     pub resolve_initialized: bool,
@@ -105,6 +110,7 @@ impl RtPipelineFrameState {
         self.restir_gi_history_initialized = false;
         self.restir_di_rendered = false;
         self.restir_gi_rendered = false;
+        self.restir_gi_spatial_rendered = false;
         self.direct_lighting_initialized = false;
         self.temporal_initialized = false;
         self.resolve_initialized = false;
@@ -170,6 +176,7 @@ impl RtRuntimePipeline {
             restir_gi_history_ready: self.frame_state.restir_gi_history_initialized,
             restir_di_rendered: self.frame_state.restir_di_rendered,
             restir_gi_rendered: self.frame_state.restir_gi_rendered,
+            restir_gi_spatial_rendered: self.frame_state.restir_gi_spatial_rendered,
             direct_lighting_ready: self.frame_state.direct_lighting_initialized,
             temporal_ready: self.frame_state.temporal_initialized,
             resolve_ready: self.frame_state.resolve_initialized,
@@ -221,30 +228,34 @@ impl RtRuntimePipeline {
     pub fn resize(
         &mut self,
         renderer: &RenderDevice,
-        _scene_ubo: &SceneUniformBuffer,
+        scene_ubo: &SceneUniformBuffer,
         width: u32,
         height: u32,
     ) -> Result<()> {
         renderer.wait_idle()?;
+        let frame_count = scene_ubo.frame_count();
+        if self.rt_restir_di_pass.is_some() && !self.destroy_rt_restir_di_pass(renderer) {
+            return Err(anyhow!("failed to destroy RT ReSTIR-DI pass before resize"));
+        }
+        if self.rt_restir_gi_pass.is_some() && !self.destroy_rt_restir_gi_pass(renderer) {
+            return Err(anyhow!("failed to destroy RT ReSTIR-GI pass before resize"));
+        }
         if let Some(pass) = &mut self.rt_surface_pass {
             pass.resize_images(renderer.device(), renderer.allocator(), width, height)
                 .context("failed to resize RT surface image")?;
-        }
-        if let Some(pass) = &mut self.rt_restir_di_pass {
-            pass.resize_buffers(renderer.device(), renderer.allocator(), width, height)
-                .context("failed to resize RT ReSTIR-DI reservoirs")?;
-        }
-        if let Some(pass) = &mut self.rt_restir_gi_pass {
-            pass.resize_buffers(renderer.device(), renderer.allocator(), width, height)
-                .context("failed to resize RT ReSTIR-GI reservoirs")?;
         }
         if let Some(pass) = &mut self.rt_direct_lighting_pass {
             pass.resize_images(renderer.device(), renderer.allocator(), width, height)
                 .context("failed to resize RT direct-lighting image")?;
         }
-        if let Some(pass) = &mut self.rt_temporal_pass {
-            pass.resize_images(renderer.device(), renderer.allocator(), width, height)
-                .context("failed to resize RT temporal image")?;
+        if self.rt_temporal_pass.is_some() {
+            if !self.destroy_rt_temporal_pass(renderer) {
+                return Err(anyhow!("failed to destroy RT temporal pass before resize"));
+            }
+            self.ensure_rt_temporal_pass(renderer, frame_count, width, height);
+            if self.rt_temporal_pass.is_none() {
+                return Err(anyhow!("failed to recreate RT temporal pass after resize"));
+            }
         }
         if let Some(pass) = &mut self.rt_resolve_pass {
             pass.resize_images(renderer.device(), renderer.allocator(), width, height)
@@ -339,7 +350,7 @@ impl RtRuntimePipeline {
             }
         } else {
             skip_reason.get_or_insert(RtFrameSkipReason::UcvhUploadPending);
-            tracing::warn!("rendering RT fallback output until UCVH data is ready");
+            tracing::debug!("rendering RT fallback output until UCVH data is ready");
             false
         };
 
@@ -430,6 +441,7 @@ impl RtRuntimePipeline {
         let mut rt_graph_rendered = false;
         let mut rt_restir_di_rendered = false;
         let mut rt_restir_gi_rendered = false;
+        let mut rt_restir_gi_spatial_rendered = false;
         if let (Some(rt_surface), Some(rt_direct_lighting), Some(rt_temporal), Some(rt_resolve)) = (
             &self.rt_surface_pass,
             &self.rt_direct_lighting_pass,
@@ -550,15 +562,28 @@ impl RtRuntimePipeline {
                                     );
                                     rt_restir_gi.update_uniforms(
                                         frame.frame_slot,
-                                        inputs.rt_settings,
-                                        frame.frame_index,
-                                        self.frame_state.restir_gi_history_initialized,
+                                        RtRestirGiFrameSettings {
+                                            rt_settings: inputs.rt_settings,
+                                            frame_index: frame.frame_index,
+                                            history_initialized: self
+                                                .frame_state
+                                                .restir_gi_history_initialized,
+                                            sun_direction: inputs.sun_direction,
+                                            sun_intensity: inputs.sun_intensity,
+                                            sun_angular_radius: inputs
+                                                .lighting_settings
+                                                .sun_angular_radius,
+                                        },
                                     );
                                     rt_restir_gi.update_frame_descriptors(
                                         renderer.device(),
                                         frame.frame_slot,
                                         frame.frame_index,
                                         rt_surface.surface_buffer(),
+                                        inputs.rt_settings.restir_gi_spatial_enabled
+                                            && inputs.rt_settings.restir_gi_spatial_sample_count
+                                                > 0
+                                            && self.frame_state.restir_gi_history_initialized,
                                     );
                                     let rt_restir_gi_reservoir_buffer =
                                         rt_restir_gi.output_reservoir_buffer(frame.frame_slot);
@@ -568,7 +593,12 @@ impl RtRuntimePipeline {
                                         frame.frame_index,
                                         rt_surface_outputs.surface,
                                         self.frame_state.restir_gi_history_initialized,
+                                        inputs.rt_settings.restir_gi_spatial_enabled
+                                            && inputs.rt_settings.restir_gi_spatial_sample_count
+                                                > 0,
                                     );
+                                    rt_restir_gi_spatial_rendered =
+                                        rt_restir_gi_outputs.spatial_rendered;
                                     (
                                         Some(rt_restir_gi_outputs.reservoirs),
                                         Some(rt_restir_gi_reservoir_buffer),
@@ -592,6 +622,7 @@ impl RtRuntimePipeline {
                                 restir_di_active,
                                 restir_gi_active,
                                 shadows_enabled: inputs.lighting_settings.shadows_enabled,
+                                frame_index: frame.frame_index as u32,
                                 sun_direction: inputs.sun_direction,
                                 sun_intensity: inputs.sun_intensity,
                                 sun_angular_radius: inputs.lighting_settings.sun_angular_radius,
@@ -709,12 +740,22 @@ impl RtRuntimePipeline {
                                     .rt_settings
                                     .restir_di_spatial_sample_count,
                                 rt_restir_gi_enabled: inputs.rt_settings.restir_gi_enabled,
+                                rt_restir_gi_initial_candidate_count: inputs
+                                    .rt_settings
+                                    .restir_gi_initial_candidate_count,
+                                rt_restir_gi_spatial_enabled: inputs
+                                    .rt_settings
+                                    .restir_gi_spatial_enabled,
+                                rt_restir_gi_spatial_sample_count: inputs
+                                    .rt_settings
+                                    .restir_gi_spatial_sample_count,
                                 rt_temporal_denoise_enabled: inputs
                                     .rt_settings
                                     .temporal_denoise_enabled,
                                 rt_frame_rendered: rt_graph_rendered,
                                 rt_restir_di_rendered,
                                 rt_restir_gi_rendered,
+                                rt_restir_gi_spatial_rendered,
                                 rt_resolve_ready: true,
                                 restir_di_enabled: false,
                                 restir_di_temporal_enabled: false,
@@ -730,6 +771,7 @@ impl RtRuntimePipeline {
                                 effective_denoiser_mode: inputs
                                     .lighting_settings
                                     .effective_denoiser_mode_name(),
+                                camera_path: inputs.camera_path.clone(),
                             });
                             tracing::info!(
                                 frame_index = frame.frame_index,
@@ -778,7 +820,7 @@ impl RtRuntimePipeline {
                 }
                 _ => {
                     skip_reason.get_or_insert(RtFrameSkipReason::AccelerationStructureMissing);
-                    tracing::warn!("skipping RT surface trace without built TLAS and AABB buffer");
+                    tracing::debug!("skipping RT surface trace without built TLAS and AABB buffer");
                     let swapchain_after_clear =
                         add_swapchain_clear_present_pass(&mut graph, frame, has_egui_overlay)?;
                     #[cfg(not(target_os = "android"))]
@@ -796,7 +838,7 @@ impl RtRuntimePipeline {
             }
         } else {
             skip_reason.get_or_insert(RtFrameSkipReason::RequiredPassesMissing);
-            tracing::warn!(
+            tracing::debug!(
                 rt_surface = self.rt_surface_pass.is_some(),
                 rt_direct_lighting = self.rt_direct_lighting_pass.is_some(),
                 rt_temporal = self.rt_temporal_pass.is_some(),
@@ -829,6 +871,8 @@ impl RtRuntimePipeline {
         self.frame_state.restir_gi_history_initialized = rt_graph_rendered && rt_restir_gi_rendered;
         self.frame_state.restir_di_rendered = rt_graph_rendered && rt_restir_di_rendered;
         self.frame_state.restir_gi_rendered = rt_graph_rendered && rt_restir_gi_rendered;
+        self.frame_state.restir_gi_spatial_rendered =
+            rt_graph_rendered && rt_restir_gi_spatial_rendered;
         self.frame_state.direct_lighting_initialized = rt_graph_rendered;
         self.frame_state.temporal_initialized = rt_graph_rendered;
         self.frame_state.resolve_initialized = rt_graph_rendered;
@@ -974,7 +1018,7 @@ impl RtRuntimePipeline {
     ) {
         let Some(ucvh_gpu) = ucvh_gpu else {
             let _ = self.destroy_rt_surface_pass(renderer);
-            tracing::warn!("skipping RT surface pass creation without UCVH GPU descriptors");
+            tracing::debug!("skipping RT surface pass creation without UCVH GPU descriptors");
             return;
         };
         if self
@@ -1145,7 +1189,7 @@ impl RtRuntimePipeline {
             return;
         }
         let Some(ucvh) = ucvh else {
-            tracing::warn!("skipping RT ReSTIR-DI pass creation without CPU UCVH scene");
+            tracing::debug!("skipping RT ReSTIR-DI pass creation without CPU UCVH scene");
             return;
         };
         let Some(ray_tracing_pipeline_loader) = renderer.ray_tracing_pipeline_loader() else {
@@ -1204,7 +1248,7 @@ impl RtRuntimePipeline {
         }
         let Some(ucvh_gpu) = ucvh_gpu else {
             let _ = self.destroy_rt_restir_gi_pass(renderer);
-            tracing::warn!("skipping RT ReSTIR-GI pass creation without UCVH GPU descriptors");
+            tracing::debug!("skipping RT ReSTIR-GI pass creation without UCVH GPU descriptors");
             return;
         };
         if self
@@ -1223,6 +1267,10 @@ impl RtRuntimePipeline {
         };
         let shaders = RtRestirGiShaders {
             raygen: include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rt_restir_gi.rgen.spv")),
+            spatial_raygen_spirv: include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/rt_restir_gi_spatial.rgen.spv"
+            )),
             miss: include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rt_restir_gi.rmiss.spv")),
             closest_hit: include_bytes!(concat!(
                 env!("OUT_DIR"),
@@ -1235,6 +1283,7 @@ impl RtRuntimePipeline {
         };
         if [
             shaders.raygen,
+            shaders.spatial_raygen_spirv,
             shaders.miss,
             shaders.closest_hit,
             shaders.intersection,
@@ -1327,6 +1376,9 @@ impl RtRuntimePipeline {
             rt_settings.temporal_denoise_enabled as u32,
             rt_settings.restir_di_spatial_enabled as u32,
             rt_settings.restir_di_spatial_sample_count,
+            rt_settings.restir_gi_initial_candidate_count,
+            rt_settings.restir_gi_spatial_enabled as u32,
+            rt_settings.restir_gi_spatial_sample_count,
             rt_settings.history_length,
             rt_settings.normal_threshold.to_bits(),
             rt_settings.depth_threshold.to_bits(),
@@ -1349,9 +1401,16 @@ fn capture_rt_debug_view_name(debug_view: RtDebugView) -> &'static str {
         RtDebugView::Surface => "surface",
         RtDebugView::HitDistance => "hit_distance",
         RtDebugView::HistoryValid => "history_valid",
+        RtDebugView::Motion => "motion",
+        RtDebugView::Direct => "direct",
+        RtDebugView::SkyIndirect => "sky_indirect",
         RtDebugView::DirectReservoir => "direct_reservoir",
         RtDebugView::IndirectReservoir => "indirect_reservoir",
         RtDebugView::Temporal => "temporal",
+        RtDebugView::GiTemporal => "gi_temporal",
+        RtDebugView::GiSpatial => "gi_spatial",
+        RtDebugView::GiIndirect => "gi_indirect",
+        RtDebugView::GiReason => "gi_reason",
     }
 }
 
@@ -1467,7 +1526,7 @@ fn add_swapchain_clear_present_pass<'a>(
         }
         Box::new(move |ctx| {
             let clear = vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
+                float32: [0.16, 0.18, 0.2, 1.0],
             };
             let range = vk::ImageSubresourceRange::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1515,6 +1574,7 @@ mod tests {
         pipeline.frame_state.restir_gi_history_initialized = true;
         pipeline.frame_state.restir_di_rendered = true;
         pipeline.frame_state.restir_gi_rendered = true;
+        pipeline.frame_state.restir_gi_spatial_rendered = true;
         pipeline.frame_state.direct_lighting_initialized = true;
         pipeline.frame_state.temporal_initialized = true;
         pipeline.frame_state.resolve_initialized = true;
@@ -1528,6 +1588,7 @@ mod tests {
                 restir_gi_history_ready: true,
                 restir_di_rendered: true,
                 restir_gi_rendered: true,
+                restir_gi_spatial_rendered: true,
                 direct_lighting_ready: true,
                 temporal_ready: true,
                 resolve_ready: true,
@@ -1562,12 +1623,14 @@ mod tests {
         let mut pipeline = RtRuntimePipeline::new();
         pipeline.frame_state.restir_di_rendered = true;
         pipeline.frame_state.restir_gi_rendered = true;
+        pipeline.frame_state.restir_gi_spatial_rendered = true;
 
         pipeline.reset_history(7);
 
         let status = pipeline.frame_status();
         assert!(!status.restir_di_rendered);
         assert!(!status.restir_gi_rendered);
+        assert!(!status.restir_gi_spatial_rendered);
     }
 
     #[test]
@@ -1647,10 +1710,13 @@ mod tests {
         for token in [
             "letmutrt_restir_di_rendered=false;",
             "letmutrt_restir_gi_rendered=false;",
+            "letmutrt_restir_gi_spatial_rendered=false;",
             "rt_restir_di_rendered=rt_restir_di_reservoir_resource.is_some();",
             "rt_restir_gi_rendered=rt_restir_gi_reservoir_resource.is_some();",
+            "rt_restir_gi_spatial_rendered=rt_restir_gi_outputs.spatial_rendered;",
             "self.frame_state.restir_di_rendered=rt_graph_rendered&&rt_restir_di_rendered;",
             "self.frame_state.restir_gi_rendered=rt_graph_rendered&&rt_restir_gi_rendered;",
+            "self.frame_state.restir_gi_spatial_rendered=rt_graph_rendered&&rt_restir_gi_spatial_rendered;",
         ] {
             assert!(
                 compact.contains(token),
@@ -1808,6 +1874,27 @@ mod tests {
     }
 
     #[test]
+    fn rt_clear_fallback_uses_visible_loading_background_not_black() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let clear_fallback = source
+            .split("fn add_swapchain_clear_present_pass")
+            .nth(1)
+            .expect("RT clear fallback should exist")
+            .split("fn add_blit_to_swapchain_pass")
+            .next()
+            .expect("RT clear fallback should end before blit helper");
+
+        assert!(
+            clear_fallback.contains("float32: [0.16, 0.18, 0.2, 1.0]"),
+            "RT pending frames should use an obviously visible loading background instead of a near-black frame"
+        );
+        assert!(
+            !clear_fallback.contains("float32: [0.0, 0.0, 0.0, 1.0]"),
+            "RT pending frames must not clear the swapchain to pure black"
+        );
+    }
+
+    #[test]
     fn rt_pipeline_capture_metadata_records_active_rt_passes() {
         let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
         let record = source
@@ -1823,6 +1910,7 @@ mod tests {
             "rt_frame_rendered:rt_graph_rendered",
             "rt_restir_di_rendered",
             "rt_restir_gi_rendered",
+            "rt_restir_gi_spatial_rendered",
             "rt_resolve_ready:true",
         ] {
             assert!(
@@ -1841,6 +1929,64 @@ mod tests {
             mark_rendered < metadata,
             "RT capture metadata must read rt_graph_rendered after it is marked true"
         );
+    }
+
+    #[test]
+    fn rt_pipeline_capture_debug_view_names_include_gi_indirect() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let vpt_source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+
+        for (name, source) in [("rt", source), ("vpt bridge", vpt_source)] {
+            assert!(
+                source.contains("RtDebugView::GiIndirect => \"gi_indirect\""),
+                "{name} capture metadata must name the GI indirect contribution debug view"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_pipeline_capture_debug_view_names_include_direct_component_views() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let vpt_source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+
+        for (view, name) in [
+            ("RtDebugView::Direct", "direct"),
+            ("RtDebugView::SkyIndirect", "sky_indirect"),
+        ] {
+            for (pipeline_name, source) in [("rt", &source), ("vpt bridge", &vpt_source)] {
+                let token = format!("{view} => \"{name}\"");
+                assert!(
+                    source.contains(&token),
+                    "{pipeline_name} capture metadata must name direct component debug view with {token}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rt_pipeline_capture_debug_view_names_include_gi_reason() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let vpt_source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+
+        for (pipeline_name, source) in [("rt", &source), ("vpt bridge", &vpt_source)] {
+            assert!(
+                source.contains("RtDebugView::GiReason => \"gi_reason\""),
+                "{pipeline_name} capture metadata must name GI Reason debug captures"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_pipeline_capture_debug_view_names_include_motion() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let vpt_source = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+
+        for (pipeline_name, source) in [("rt", &source), ("vpt bridge", &vpt_source)] {
+            assert!(
+                source.contains("RtDebugView::Motion => \"motion\""),
+                "{pipeline_name} capture metadata must name RT motion debug captures"
+            );
+        }
     }
 
     #[test]
@@ -1977,7 +2123,7 @@ mod tests {
             "rt_restir_gi.rgen.spv",
             "inputs.rt_settings.restir_gi_enabled",
             "rt_restir_gi.update_history_uniforms(",
-            "rt_restir_gi.update_uniforms(frame.frame_slot,inputs.rt_settings,frame.frame_index,self.frame_state.restir_gi_history_initialized,",
+            "rt_restir_gi.update_uniforms(frame.frame_slot,RtRestirGiFrameSettings{rt_settings:inputs.rt_settings,frame_index:frame.frame_index,history_initialized:self.frame_state.restir_gi_history_initialized,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
             "rt_restir_gi.update_frame_descriptors(",
             "rt_restir_gi.update_tlas_descriptor(renderer.device(),frame.frame_slot,tlas,)",
             "rt_restir_gi.update_aabb_descriptor(renderer.device(),frame.frame_slot,aabb_buffer,)",
@@ -1986,6 +2132,7 @@ mod tests {
             "rt_surface.surface_buffer()",
             "letrt_restir_gi_outputs=rt_restir_gi.register_graph(&mutgraph,frame.frame_slot,frame.frame_index,rt_surface_outputs.surface,self.frame_state.restir_gi_history_initialized,",
             "self.frame_state.restir_gi_history_initialized=rt_graph_rendered&&rt_restir_gi_rendered",
+            "self.frame_state.restir_gi_spatial_rendered=rt_graph_rendered&&rt_restir_gi_spatial_rendered",
         ] {
             assert!(
                 compact.contains(token),
@@ -2023,7 +2170,7 @@ mod tests {
             "letrt_restir_gi_reservoir_buffer=rt_restir_gi.output_reservoir_buffer(frame.frame_slot)",
             "Some(rt_restir_gi_outputs.reservoirs)",
             "Some(rt_restir_gi_reservoir_buffer)",
-            "rt_direct_lighting.update_uniforms(frame.frame_slot,RtDirectLightingFrameSettings{rt_settings:inputs.rt_settings,restir_di_active,restir_gi_active,shadows_enabled:inputs.lighting_settings.shadows_enabled,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
+            "rt_direct_lighting.update_uniforms(frame.frame_slot,RtDirectLightingFrameSettings{rt_settings:inputs.rt_settings,restir_di_active,restir_gi_active,shadows_enabled:inputs.lighting_settings.shadows_enabled,frame_index:frame.frame_indexasu32,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
             "rt_direct_lighting.update_frame_descriptors(renderer.device(),frame.frame_slot,rt_surface.surface_buffer(),rt_restir_di_reservoir_buffer,rt_restir_gi_reservoir_buffer,)",
             "rt_direct_lighting.register_graph(&mutgraph,frame.frame_slot,rt_surface_outputs.surface,rt_restir_di_reservoir_resource,rt_restir_gi_reservoir_resource,self.frame_state.direct_lighting_initialized,)",
         ] {
@@ -2130,6 +2277,45 @@ mod tests {
         );
 
         assert_ne!(base, changed);
+    }
+
+    #[test]
+    fn rt_scene_key_tracks_rt_restir_gi_initial_candidate_count() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let make_scene_key = source
+            .split("fn make_scene_key")
+            .nth(1)
+            .expect("make_scene_key should exist")
+            .split("fn capture_render_mode_name")
+            .next()
+            .expect("make_scene_key should precede capture helpers");
+
+        assert!(
+            make_scene_key.contains("rt_settings.restir_gi_initial_candidate_count"),
+            "RT scene key must reset history when RT ReSTIR-GI initial candidate count changes"
+        );
+    }
+
+    #[test]
+    fn rt_scene_key_tracks_rt_restir_gi_spatial_controls() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let make_scene_key = source
+            .split("fn make_scene_key")
+            .nth(1)
+            .expect("make_scene_key should exist")
+            .split("fn capture_render_mode_name")
+            .next()
+            .expect("make_scene_key should precede capture helpers");
+
+        for token in [
+            "rt_settings.restir_gi_spatial_enabled as u32",
+            "rt_settings.restir_gi_spatial_sample_count",
+        ] {
+            assert!(
+                make_scene_key.contains(token),
+                "RT scene key must reset history when RT ReSTIR-GI spatial settings change with {token}"
+            );
+        }
     }
 
     #[test]
@@ -2424,5 +2610,76 @@ mod tests {
                 "RT frame-resource helper missing {token}"
             );
         }
+    }
+
+    #[test]
+    fn rt_pipeline_resize_recreates_temporal_pass_instead_of_resizing_in_place() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let resize = source
+            .split("pub fn resize(")
+            .nth(1)
+            .expect("RtRuntimePipeline::resize should exist")
+            .split("pub fn record_and_execute_frame")
+            .next()
+            .expect("resize should end before record_and_execute_frame");
+        let compact = crate::render::source_checks::compact(resize);
+
+        assert!(
+            compact.contains("letframe_count=scene_ubo.frame_count();"),
+            "RT resize must derive frame_count from the active scene UBO before rebuilding temporal history resources"
+        );
+        assert!(
+            compact.contains("self.destroy_rt_temporal_pass(renderer)"),
+            "RT resize must release the old temporal pass before reallocating its full-resolution history images"
+        );
+        assert!(
+            compact.contains("self.ensure_rt_temporal_pass(renderer,frame_count,width,height);"),
+            "RT resize must rebuild the temporal pass after releasing the old one"
+        );
+        assert!(
+            !compact.contains("pass.resize_images(renderer.device(),renderer.allocator(),width,height).context(\"failedtoresizeRTtemporalimage\")?"),
+            "RT temporal resize must not reallocate full-resolution history images in place because that doubles peak memory during maximize"
+        );
+    }
+
+    #[test]
+    fn rt_pipeline_resize_recreates_optional_restir_passes_instead_of_resizing_in_place() {
+        let source = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let resize = source
+            .split("pub fn resize(")
+            .nth(1)
+            .expect("RtRuntimePipeline::resize should exist")
+            .split("pub fn record_and_execute_frame")
+            .next()
+            .expect("resize should end before record_and_execute_frame");
+        let compact = crate::render::source_checks::compact(resize);
+
+        let frame_count = compact
+            .find("letframe_count=scene_ubo.frame_count();")
+            .expect("resize must read the active scene UBO frame count");
+        let destroy_di = compact
+            .find("self.destroy_rt_restir_di_pass(renderer)")
+            .expect("resize must release RT ReSTIR-DI before allocating resized full-resolution resources");
+        let destroy_gi = compact
+            .find("self.destroy_rt_restir_gi_pass(renderer)")
+            .expect("resize must release RT ReSTIR-GI before allocating resized full-resolution resources");
+        let surface_resize = compact
+            .find("pass.resize_images(renderer.device(),renderer.allocator(),width,height)")
+            .expect("resize must still resize RT surface images");
+
+        assert!(frame_count < destroy_di);
+        assert!(frame_count < destroy_gi);
+        assert!(destroy_di < surface_resize);
+        assert!(destroy_gi < surface_resize);
+        assert!(
+            !compact
+                .contains("resize_buffers(renderer.device(),renderer.allocator(),width,height)"),
+            "RT resize must not allocate new optional ReSTIR reservoirs while old full-resolution reservoirs are still alive"
+        );
+        assert!(
+            !compact.contains("failedtoresizeRTReSTIR-DIreservoirs")
+                && !compact.contains("failedtoresizeRTReSTIR-GIreservoirs"),
+            "optional ReSTIR pass resize failures must not bubble to the app resize handler and exit"
+        );
     }
 }

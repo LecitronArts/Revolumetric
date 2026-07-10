@@ -70,8 +70,7 @@ bool rt_restir_spatial_surfaces_compatible(RtSurfacePixel center, RtSurfacePixel
     }
 
     float position_delta = distance(center.position_depth.xyz, neighbor.position_depth.xyz);
-    float depth_scale = max(center.position_depth.w, 1.0);
-    return position_delta <= max(1.0, depth_scale * rt_history.depth_threshold);
+    return position_delta <= rt_history_position_threshold(center.position_depth.w, rt_history.depth_threshold);
 }
 
 [shader("raygeneration")]
@@ -96,10 +95,12 @@ void main() {
     uint combined_m = restir_di_is_valid_reservoir(reservoir)
         ? min(reservoir.sample_count_m, spatial_m_limit)
         : 0u;
+    float3 surface_view_dir = normalize(-surface.view_direction_background.xyz);
     float center_target_pdf = restir_di_target_pdf_for_reservoir(
         surface.position_depth,
         surface.normal_roughness,
         surface.albedo_material,
+        surface_view_dir,
         reservoir
     );
     float combined_weight_sum = restir_di_reservoir_stream_weight(
@@ -139,6 +140,7 @@ void main() {
             surface.position_depth,
             surface.normal_roughness,
             surface.albedo_material,
+            surface_view_dir,
             neighbor
         );
         float neighbor_weight = restir_di_reservoir_stream_weight(

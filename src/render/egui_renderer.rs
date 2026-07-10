@@ -122,6 +122,10 @@ impl EguiRenderer {
         })
     }
 
+    pub fn font_texture_ready(&self) -> bool {
+        self.font_texture.is_some()
+    }
+
     pub fn record(
         &mut self,
         renderer: &RenderDevice,

@@ -64,7 +64,7 @@ void main() {
 
     ScenePrimaryRay primary_ray = scene_primary_ray_from_area_sample(
         scene_ubo,
-        float2(launch_id.xy) + float2(0.5, 0.5),
+        float2(launch_id.xy),
         float2(0.5, 0.5)
     );
 

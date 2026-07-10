@@ -37,7 +37,8 @@ pub struct GpuRtDirectLightingUniforms {
     pub width: u32,
     pub height: u32,
     pub shadows_enabled: u32,
-    pub _pad0: [u32; 2],
+    pub sun_sample_index: u32,
+    pub _pad0: u32,
     pub sky_color_sun_angular_radius: [f32; 4],
     pub ground_color_pad: [f32; 4],
     pub sun_direction_pad: [f32; 4],
@@ -74,6 +75,7 @@ pub struct RtDirectLightingFrameSettings {
     pub restir_di_active: bool,
     pub restir_gi_active: bool,
     pub shadows_enabled: bool,
+    pub frame_index: u32,
     pub sun_direction: glam::Vec3,
     pub sun_intensity: glam::Vec3,
     pub sun_angular_radius: f32,
@@ -306,7 +308,8 @@ impl RtDirectLightingPass {
             width: self.width(),
             height: self.height(),
             shadows_enabled: settings.shadows_enabled as u32,
-            _pad0: [0; 2],
+            sun_sample_index: settings.frame_index,
+            _pad0: 0,
             sky_color_sun_angular_radius: [0.4, 0.5, 0.7, settings.sun_angular_radius],
             ground_color_pad: [0.15, 0.1, 0.08, 0.0],
             sun_direction_pad: [
@@ -858,6 +861,10 @@ mod shader_source_tests {
             20
         );
         assert_eq!(
+            std::mem::offset_of!(super::GpuRtDirectLightingUniforms, sun_sample_index),
+            24
+        );
+        assert_eq!(
             std::mem::offset_of!(
                 super::GpuRtDirectLightingUniforms,
                 sky_color_sun_angular_radius
@@ -987,7 +994,7 @@ mod shader_source_tests {
             "rt_direct_resolve_reservoir(surface, reservoir, visible)",
             "StructuredBuffer<RestirGiReservoir> indirect_reservoirs",
             "rt_direct_resolve_indirect_reservoir(surface, indirect_reservoir)",
-            "current_radiance[launch_id.xy] = float4(sky_indirect + analytic_direct + direct + indirect, 1.0);",
+            "float4(primary_emissive + analytic_direct + direct + indirect, 1.0);",
         ] {
             assert!(
                 raygen.contains(token),
@@ -999,16 +1006,21 @@ mod shader_source_tests {
         for token in [
             "[shader(\"closesthit\")]",
             "inout RtShadowPayload",
-            "trace_any_hit_ray_skip_voxel",
-            "payload.skip_brick_id",
-            "payload.skip_local",
-            "payload.max_t",
+            "payload.occluded = 1u",
         ] {
             assert!(
                 closest_hit.contains(token),
                 "RT direct-lighting closest-hit shadow shader missing {token}"
             );
         }
+        assert!(
+            !closest_hit.contains("trace_any_hit_ray_skip_voxel")
+                && !closest_hit.contains("voxel_traverse.slang")
+                && !closest_hit.contains("hierarchy_l0")
+                && !closest_hit.contains("brick_occupancy"),
+            "RT direct-lighting closest-hit must not retrace the UCVH after intersection found a real voxel occluder"
+        );
+        let compact_intersection = crate::render::source_checks::compact(&intersection);
         for token in [
             "[shader(\"intersection\")]",
             "StructuredBuffer<RtAabb> rt_aabbs",
@@ -1019,25 +1031,35 @@ mod shader_source_tests {
                 "RT direct-lighting intersection shader missing {token}"
             );
         }
+        for token in [
+            "brick_dda(",
+            "NodeL0node=hierarchy_l0[l0_idx];",
+            "attributes.brick_id=node.brick_id;",
+            "attributes.packed_local_normal=rt_surface_pack_local_normal(hit_local,hit_normal);",
+        ] {
+            assert!(
+                compact_intersection.contains(token),
+                "RT direct-lighting intersection must report a real voxel occluder token {token}"
+            );
+        }
     }
 
     #[test]
-    fn rt_direct_lighting_primary_miss_uses_sky_ground_background() {
+    fn rt_direct_lighting_primary_miss_uses_sky_only_background() {
         let raygen = std::fs::read_to_string("assets/shaders/passes/rt_direct_lighting.rgen.slang")
             .expect("rt_direct_lighting.rgen.slang should be readable");
         let compact = crate::render::source_checks::compact(&raygen);
 
         for token in [
-            "float3rt_direct_background_color(RtSurfacePixelsurface)",
+            "float3rt_direct_primary_miss_background_color(RtSurfacePixelsurface)",
             "float3miss_dir=normalize(surface.view_direction_background.xyz);",
-            "floatground_ndotl=max(rt_direct.sun_direction_pad.y,0.0);",
-            "float3finite_sun_irradiance=rt_direct.sun_intensity_pad.rgb*ground_ndotl*rt_direct_sun_disk_solid_angle();",
-            "returnlerp(rt_direct_sunlit_ground_color(),rt_direct.sky_color_sun_angular_radius.rgb,t);",
-            "current_radiance[launch_id.xy]=float4(rt_direct_background_color(surface),1.0);",
+            "float3horizon_sky=rt_direct.sky_color_sun_angular_radius.rgb*0.72;",
+            "returnlerp(horizon_sky,rt_direct.sky_color_sun_angular_radius.rgb,t);",
+            "current_radiance[launch_id.xy]=float4(rt_direct_primary_miss_background_color(surface),1.0);",
         ] {
             assert!(
                 compact.contains(token),
-                "RT direct-lighting primary miss must resolve to scene background; missing {token}"
+                "RT direct-lighting primary miss must resolve to sky-only background; missing {token}"
             );
         }
         assert!(
@@ -1045,8 +1067,470 @@ mod shader_source_tests {
             "RT direct-lighting background must not infer miss ray direction from geometric normals"
         );
         assert!(
+            !compact.contains(
+                "current_radiance[launch_id.xy]=float4(rt_direct_background_color(surface),1.0);"
+            ),
+            "RT primary camera misses must not use the ground-colored environment path that creates a bottom rectangle"
+        );
+        assert!(
             !compact.contains("current_radiance[launch_id.xy]=float4(0.0,0.0,0.0,1.0);"),
             "RT direct-lighting must not turn primary miss pixels into a black bar"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_sun_intensity_is_total_irradiance_not_disk_radiance() {
+        let raygen = std::fs::read_to_string("assets/shaders/passes/rt_direct_lighting.rgen.slang")
+            .expect("rt_direct_lighting.rgen.slang should be readable");
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        for token in [
+            "float3sun_irradiance=rt_direct.sun_intensity_pad.rgb*ground_ndotl;",
+            "returnrt_direct.ground_color_pad.rgb*(1.0+RT_DIRECT_INV_PI*sun_irradiance);",
+            "float3direct_brdf=restir_di_direct_brdf(normal,surface.albedo_material.rgb,surface.normal_roughness.w,surface_view_dir,sun_dir);",
+            "returndirect_brdf*rt_direct.sun_intensity_pad.rgb*sun_term;",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT direct lighting must keep total sun brightness independent of angular radius; missing {token}"
+            );
+        }
+        for forbidden in [
+            "floatrt_direct_sun_disk_solid_angle()",
+            "rt_direct.sun_intensity_pad.rgb*ground_ndotl*rt_direct_sun_disk_solid_angle()",
+            "*rt_direct.sun_intensity_pad.rgb*sun_term*solid_angle",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "RT direct lighting must not scale total sun irradiance by disk solid angle; found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_direct_lighting_samples_finite_sun_disk_for_soft_shadow_edges() {
+        let raygen = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let pass =
+            crate::render::source_checks::read_source("src/render/passes/rt_direct_lighting.rs");
+        let pipeline = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+        let compact_raygen = crate::render::source_checks::compact(&raygen);
+        let compact_pass = crate::render::source_checks::compact(&pass);
+        let compact_pipeline = crate::render::source_checks::compact(&pipeline);
+
+        for token in [
+            "uintsun_sample_index;",
+            "pubsun_sample_index:u32",
+            "sun_sample_index:settings.frame_index",
+            "pubframe_index:u32",
+        ] {
+            assert!(
+                compact_pass.contains(token),
+                "RT direct-lighting uniforms must carry a per-frame sun sampling index; missing {token}"
+            );
+        }
+
+        for token in [
+            "uintrt_direct_sun_hash_u32(uintx)",
+            "floatrt_direct_sun_rand01(inoutuintrng_state)",
+            "uintrt_direct_sun_rng_seed(uint2pixel)",
+            "rt_direct.sun_sample_index*26699u",
+            "float3rt_direct_sample_sun_direction(inoutuintrng_state)",
+            "floatsun_radius=max(rt_direct.sky_color_sun_angular_radius.w,0.0);",
+            "floatcos_min=cos(sun_radius);",
+            "floatcos_theta=lerp(cos_min,1.0,rt_direct_sun_rand01(rng_state));",
+            "floatphi=6.28318530718*rt_direct_sun_rand01(rng_state);",
+            "float3sun_forward=normalize(rt_direct.sun_direction_pad.xyz);",
+            "returnnormalize(sun_right*(cos(phi)*sin_theta)+sun_up*(sin(phi)*sin_theta)+sun_forward*cos_theta);",
+            "float3rt_direct_analytic_sun_direct(RtSurfacePixelsurface,inoutuintrng_state)",
+            "float3sun_dir=rt_direct_sample_sun_direction(rng_state);",
+            "if(sun_term<=0.0||!rt_direct_sun_visible(surface,sun_dir)){returnfloat3(0.0);}",
+            "uintrng_state=rt_direct_sun_rng_seed(launch_id.xy);",
+            "float3analytic_direct=rt_direct_analytic_sun_direct(surface,rng_state);",
+        ] {
+            assert!(
+                compact_raygen.contains(token),
+                "RT analytic sun must sample the finite sun disk for soft shadow edges; missing {token}"
+            );
+        }
+
+        assert!(
+            !compact_raygen
+                .contains("float3analytic_direct=rt_direct_analytic_sun_direct(surface);"),
+            "RT analytic sun must not use a fixed center-direction shadow ray"
+        );
+        assert!(
+            compact_pipeline.contains("frame_index:frame.frame_indexasu32"),
+            "RT pipeline must pass frame_index into RT direct-lighting sun sampling"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_analytic_sun_adds_roughness_aware_specular_highlight() {
+        let common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/restir_di_common.slang",
+        );
+        let raygen = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact_common = crate::render::source_checks::compact(&common);
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        assert!(
+            compact_common.contains(
+                "float3restir_di_direct_brdf(float3surface_normal,float3albedo,floatroughness,float3view_dir,float3light_dir)"
+            ),
+            "RT analytic sun must share the direct BRDF helper with ReSTIR-DI target PDFs"
+        );
+
+        for token in [
+            "float3surface_view_dir=normalize(-surface.view_direction_background.xyz);",
+            "float3direct_brdf=restir_di_direct_brdf(normal,surface.albedo_material.rgb,surface.normal_roughness.w,surface_view_dir,sun_dir);",
+            "returndirect_brdf*rt_direct.sun_intensity_pad.rgb*sun_term;",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT analytic sun must use the shared material roughness and view direction BRDF for finite-sun highlights; missing {token}"
+            );
+        }
+
+        assert!(
+            !compact.contains(
+                "returnsurface.albedo_material.rgb*RT_LIGHTING_INV_PI*rt_direct.sun_intensity_pad.rgb*sun_term;"
+            ),
+            "RT analytic sun must not stay diffuse-only once finite sun highlight size is modeled"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_resolves_restir_di_with_shared_view_roughness_brdf() {
+        let raygen = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        for token in [
+            "float3surface_view_dir=normalize(-surface.view_direction_background.xyz);",
+            "float3direct_brdf=restir_di_direct_brdf(normal,surface.albedo_material.rgb,surface.normal_roughness.w,surface_view_dir,light_dir);",
+            "float3resolved_direct=direct_brdf*reservoir.sample_radiance.rgb*sun_term*selected_weight;",
+            "float3light_dir=normalize(reservoir.sample_position_pdf.xyz-surface.position_depth.xyz);",
+            "float3direct_brdf=restir_di_direct_brdf(normal,surface.albedo_material.rgb,surface.normal_roughness.w,surface_view_dir,light_dir);",
+            "float3resolved_direct=direct_brdf*reservoir.sample_radiance.rgb*geometry_term*selected_weight;",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT ReSTIR-DI resolve must use the same view/roughness-aware direct BRDF as analytic sun; missing {token}"
+            );
+        }
+
+        for forbidden in [
+            "albedo*RT_LIGHTING_INV_PI*reservoir.sample_radiance.rgb*sun_term*selected_weight",
+            "albedo*RT_LIGHTING_INV_PI*reservoir.sample_radiance.rgb*geometry_term*selected_weight",
+        ] {
+            assert!(
+                !compact.contains(forbidden),
+                "RT ReSTIR-DI resolve must not remain diffuse-only after finite-sun specular is modeled; found {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_direct_lighting_debug_views_show_surface_and_hit_distance_before_lighting() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "float3rt_direct_visualize_surface(RtSurfacePixelsurface)",
+            "if(!rt_direct_surface_valid(surface)){returnfloat3(0.0);}",
+            "returnsaturate(surface.albedo_material.rgb);",
+            "float3rt_direct_visualize_hit_distance(RtSurfacePixelsurface)",
+            "floatdepth=saturate(log2(surface.linear_depth+1.0)/12.0);",
+            "returnfloat3(depth);",
+            "if(rt_direct.debug_view==RT_DEBUG_VIEW_SURFACE){current_radiance[launch_id.xy]=float4(rt_direct_visualize_surface(surface),1.0);return;}",
+            "if(rt_direct.debug_view==RT_DEBUG_VIEW_HIT_DISTANCE){current_radiance[launch_id.xy]=float4(rt_direct_visualize_hit_distance(surface),1.0);return;}",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT surface/hit-distance debug views must expose raw surface data; missing {token}"
+            );
+        }
+
+        let surface_debug_index = compact
+            .find("if(rt_direct.debug_view==RT_DEBUG_VIEW_SURFACE)")
+            .expect("surface debug branch must exist");
+        let hit_distance_debug_index = compact
+            .find("if(rt_direct.debug_view==RT_DEBUG_VIEW_HIT_DISTANCE)")
+            .expect("hit-distance debug branch must exist");
+        let primary_miss_index = compact
+            .find("if(!rt_direct_surface_valid(surface)){current_radiance[launch_id.xy]=float4(rt_direct_primary_miss_background_color(surface),1.0);return;}")
+            .expect("primary miss branch must exist");
+        assert!(
+            surface_debug_index < primary_miss_index
+                && hit_distance_debug_index < primary_miss_index,
+            "Surface debug views must run before primary miss background shading"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_shader_visualizes_indirect_reservoir_debug_view() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "float3rt_direct_visualize_indirect_reservoir_invalid_reason(RestirGiReservoirreservoir)",
+            "if(reservoir.sample_count_m==0u){returnfloat3(1.0,0.0,0.0);}",
+            "if(!restir_gi_candidate_finite(reservoir.target_pdf)){returnfloat3(1.0,0.5,0.0);}",
+            "if(!restir_gi_candidate_finite(reservoir.weight_sum)){returnfloat3(1.0,1.0,0.0);}",
+            "if(!restir_gi_candidate_finite(reservoir.selected_weight)){returnfloat3(1.0,0.0,1.0);}",
+            "float3rt_direct_visualize_indirect_reservoir_weight(RestirGiReservoirreservoir)",
+            "if(!restir_gi_is_valid_reservoir(reservoir)){returnrt_direct_visualize_indirect_reservoir_invalid_reason(reservoir);}",
+            "min(reservoir.selected_weight,RESTIR_GI_MAX_SELECTED_WEIGHT)",
+            "reservoir.sample_count_m",
+            "rt_direct.debug_view==RT_DEBUG_VIEW_INDIRECT_RESERVOIR",
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_indirect_reservoir_weight(indirect_reservoir),1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT indirect reservoir debug view must expose GI reservoir state with {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_direct_lighting_shader_visualizes_resolved_gi_indirect_contribution() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "rt_direct.debug_view==RT_DEBUG_VIEW_GI_INDIRECT",
+            "current_radiance[launch_id.xy]=float4(rt_direct_resolve_indirect_reservoir(surface,indirect_reservoir),1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT direct lighting must expose resolved GI indirect contribution; missing {token}"
+            );
+        }
+
+        let gi_indirect_index = compact
+            .find("current_radiance[launch_id.xy]=float4(rt_direct_resolve_indirect_reservoir(surface,indirect_reservoir),1.0);")
+            .expect("GI indirect debug write must exist");
+        let primary_index = compact
+            .find("float3primary_emissive=rt_direct_primary_emissive(surface);")
+            .expect("primary emissive must stay in the final path");
+        assert!(
+            gi_indirect_index < primary_index,
+            "GI indirect debug view must return before primary/final lighting terms are added"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_shader_visualizes_gi_reason_debug_view() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "float3rt_direct_visualize_gi_reason(RtSurfacePixelsurface,RestirGiReservoirreservoir)",
+            "if(rt_direct.restir_gi_enabled==0u){returnfloat3(0.0,0.25,1.0);}",
+            "if(!restir_gi_is_valid_reservoir(reservoir)){returnrt_direct_visualize_indirect_reservoir_invalid_reason(reservoir);}",
+            "if(selected_weight<=0.0){returnfloat3(0.5,0.0,1.0);}",
+            "float3contribution=restir_gi_cosine_sample_contribution(surface.albedo_material.rgb,surface.position_depth.xyz,normal,reservoir);",
+            "float3resolved=contribution*selected_weight;",
+            "if(restir_gi_luma(resolved)<=1.0e-5){returnfloat3(0.0,0.35,0.35);}",
+            "returnrestir_gi_is_environment_sample(reservoir)?float3(0.0,0.85,1.0):float3(0.0,1.0,0.0);",
+            "rt_direct.debug_view==RT_DEBUG_VIEW_GI_REASON",
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_gi_reason(surface,indirect_reservoir),1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT GI Reason debug view must classify missing indirect light causes with {token}"
+            );
+        }
+        assert!(
+            !compact.contains("floatgeometry=restir_gi_is_environment_sample(reservoir)?restir_gi_environment_geometry_term(normal,reservoir):restir_gi_sample_geometry_term(surface.position_depth.xyz,normal,reservoir);"),
+            "RT GI Reason debug view must not classify cosine-sampled bounces with an extra geometry/pi term"
+        );
+        assert!(
+            !compact.contains("if(geometry<=0.0){returnfloat3(0.7,0.0,1.0);}"),
+            "RT GI Reason debug view must rely on cosine-sampled contribution visibility instead of the old geometry gate"
+        );
+
+        let reason_index = compact
+            .find("current_radiance[launch_id.xy]=float4(rt_direct_visualize_gi_reason(surface,indirect_reservoir),1.0);")
+            .expect("GI Reason debug write must exist");
+        let gi_indirect_index = compact
+            .find("current_radiance[launch_id.xy]=float4(rt_direct_resolve_indirect_reservoir(surface,indirect_reservoir),1.0);")
+            .expect("GI indirect debug write must exist");
+        assert!(
+            reason_index < gi_indirect_index,
+            "GI Reason debug view must return before resolved GI indirect contribution"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_shader_visualizes_direct_and_sky_indirect_components() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        for token in [
+            "if(rt_direct.debug_view==RT_DEBUG_VIEW_DIRECT)",
+            "current_radiance[launch_id.xy]=float4(analytic_direct+direct,1.0);",
+            "if(rt_direct.debug_view==RT_DEBUG_VIEW_SKY_INDIRECT)",
+            "current_radiance[launch_id.xy]=float4(sky_indirect,1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT direct lighting must expose direct/sky component debug output; missing {token}"
+            );
+        }
+
+        let sky_debug_index = compact
+            .find("current_radiance[launch_id.xy]=float4(sky_indirect,1.0);")
+            .expect("sky indirect debug write must exist");
+        let direct_debug_index = compact
+            .find("current_radiance[launch_id.xy]=float4(analytic_direct+direct,1.0);")
+            .expect("direct debug write must exist");
+        let indirect_index = compact
+            .find("float3indirect=rt_direct.restir_gi_enabled!=0u")
+            .expect("final path must still resolve GI indirect after debug views");
+        let primary_index = compact
+            .find("float3primary_emissive=rt_direct_primary_emissive(surface);")
+            .expect("primary emissive must stay in the final path");
+
+        assert!(
+            sky_debug_index < indirect_index && direct_debug_index < indirect_index,
+            "Direct/Sky debug views must return before GI indirect is added"
+        );
+        assert!(
+            direct_debug_index < primary_index && sky_debug_index < primary_index,
+            "Direct/Sky debug views must return before primary emissive is added"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_final_uses_sky_indirect_only_as_gi_fallback() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+
+        assert!(
+            compact.contains(
+                "float3indirect=rt_direct.restir_gi_enabled!=0u?rt_direct_resolve_indirect_reservoir(surface,indirect_reservoir):sky_indirect"
+            ),
+            "RT final lighting must not add the sky-normal fallback on top of active ReSTIR-GI"
+        );
+        assert!(
+            compact.contains("float4(primary_emissive+analytic_direct+direct+indirect,1.0)"),
+            "RT final lighting should add exactly one indirect term"
+        );
+        assert!(
+            !compact.contains(
+                "float4(primary_emissive+sky_indirect+analytic_direct+direct+indirect,1.0)"
+            ),
+            "RT final lighting must not double-count sky_indirect and GI indirect"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_clamps_resolved_gi_indirect_without_clamping_primary_emissive() {
+        let source = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/restir_gi_common.slang",
+        );
+        let compact = crate::render::source_checks::compact(&source);
+        let compact_common = crate::render::source_checks::compact(&common);
+
+        for token in [
+            "staticconstfloatRESTIR_GI_MAX_RESOLVED_RADIANCE_LUMA=64.0",
+            "float3restir_gi_clamp_radiance_luma(float3radiance,floatmax_luma)",
+        ] {
+            assert!(
+                compact_common.contains(token),
+                "RT final lighting must share the ReSTIR-GI firefly clamp; missing {token}"
+            );
+        }
+
+        for token in [
+            "float3contribution=restir_gi_cosine_sample_contribution(surface.albedo_material.rgb,surface.position_depth.xyz,normal,reservoir)",
+            "returnrestir_gi_clamp_radiance_luma(contribution*selected_weight,RESTIR_GI_MAX_RESOLVED_RADIANCE_LUMA)",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT final lighting must clamp resolved GI indirect fireflies; missing {token}"
+            );
+        }
+        assert!(
+            !compact.contains(
+                "float3resolved=albedo*RT_LIGHTING_INV_PI*reservoir.sample_radiance_pdf.rgb*geometry*selected_weight"
+            ),
+            "RT final GI resolve must not re-apply Lambertian cosine/pi after cosine-hemisphere sampling"
+        );
+
+        assert!(
+            compact.contains("float4(primary_emissive+analytic_direct+direct+indirect,1.0)"),
+            "primary emissive must stay outside the GI indirect firefly clamp"
+        );
+        assert!(
+            !compact.contains("restir_gi_clamp_radiance_luma(primary_emissive"),
+            "RT final lighting must not clamp primary emissive with the GI indirect firefly limiter"
+        );
+    }
+
+    #[test]
+    fn rt_direct_lighting_clamps_resolved_di_direct_without_clamping_primary_emissive() {
+        let common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/restir_di_common.slang",
+        );
+        let direct = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact_common = crate::render::source_checks::compact(&common);
+        let compact_direct = crate::render::source_checks::compact(&direct);
+
+        for token in [
+            "staticconstfloatRESTIR_DI_MAX_RESOLVED_RADIANCE_LUMA=96.0",
+            "floatrestir_di_luma(float3radiance)",
+            "float3restir_di_clamp_radiance_luma(float3radiance,floatmax_luma)",
+            "returnradiance*(max_luma/luma)",
+            "returnmax(radiance,float3(0.0))",
+        ] {
+            assert!(
+                compact_common.contains(token),
+                "RT ReSTIR-DI common helpers must clamp resolved direct fireflies; missing {token}"
+            );
+        }
+
+        for token in [
+            "float3resolved_direct=direct_brdf*reservoir.sample_radiance.rgb*sun_term*selected_weight",
+            "returnrestir_di_clamp_radiance_luma(resolved_direct,RESTIR_DI_MAX_RESOLVED_RADIANCE_LUMA)",
+            "float3resolved_direct=direct_brdf*reservoir.sample_radiance.rgb*geometry_term*selected_weight",
+        ] {
+            assert!(
+                compact_direct.contains(token),
+                "RT direct lighting must clamp resolved DI contribution before final accumulation; missing {token}"
+            );
+        }
+
+        assert!(
+            compact_direct.contains("float4(primary_emissive+analytic_direct+direct+indirect,1.0)"),
+            "primary emissive must stay outside the DI direct firefly clamp"
+        );
+        assert!(
+            !compact_direct.contains("restir_di_clamp_radiance_luma(primary_emissive"),
+            "RT final lighting must not clamp primary emissive with the DI direct firefly limiter"
         );
     }
 
@@ -1060,13 +1544,14 @@ mod shader_source_tests {
             "float3rt_direct_sample_sky_indirect(RtSurfacePixelsurface)",
             "float3sky_indirect=rt_direct_sample_sky_indirect(surface);",
             "boolrt_direct_sun_visible(RtSurfacePixelsurface,float3sun_dir)",
-            "float3rt_direct_analytic_sun_direct(RtSurfacePixelsurface)",
-            "float3analytic_direct=rt_direct_analytic_sun_direct(surface);",
-            "current_radiance[launch_id.xy]=float4(sky_indirect+analytic_direct+direct+indirect,1.0);",
+            "float3rt_direct_analytic_sun_direct(RtSurfacePixelsurface,inoutuintrng_state)",
+            "float3analytic_direct=rt_direct_analytic_sun_direct(surface,rng_state);",
+            "float3indirect=rt_direct.restir_gi_enabled!=0u?rt_direct_resolve_indirect_reservoir(surface,indirect_reservoir):sky_indirect;",
+            "current_radiance[launch_id.xy]=float4(primary_emissive+analytic_direct+direct+indirect,1.0);",
         ] {
             assert!(
                 compact.contains(token),
-                "RT final lighting must keep analytic sun and ambient lighting visible; missing {token}"
+                "RT final lighting must keep analytic sun and indirect fallback lighting visible; missing {token}"
             );
         }
         assert!(
@@ -1077,6 +1562,44 @@ mod shader_source_tests {
             !compact.contains("current_radiance[launch_id.xy]=float4(albedo+direct+indirect,1.0);"),
             "RT final lighting must not fall back to a flat unlit albedo image"
         );
+    }
+
+    #[test]
+    fn rt_direct_lighting_final_adds_primary_emissive_without_polluting_debug_views() {
+        let raygen = crate::render::source_checks::read_source(
+            "assets/shaders/passes/rt_direct_lighting.rgen.slang",
+        );
+        let compact = crate::render::source_checks::compact(&raygen);
+
+        for token in [
+            "float3rt_direct_primary_emissive(RtSurfacePixelsurface)",
+            "returnsurface.emissive_radiance.rgb;",
+            "float3primary_emissive=rt_direct_primary_emissive(surface);",
+            "current_radiance[launch_id.xy]=float4(primary_emissive+analytic_direct+direct+indirect,1.0);",
+        ] {
+            assert!(
+                compact.contains(token),
+                "RT final lighting must carry primary surface emissive into final radiance; missing {token}"
+            );
+        }
+
+        let primary_index = compact
+            .find("float3primary_emissive=rt_direct_primary_emissive(surface);")
+            .expect("primary emissive must be evaluated in the final shading path");
+        for debug_write in [
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_reservoir_weight(reservoir),1.0);return;",
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_indirect_reservoir_weight(indirect_reservoir),1.0);return;",
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_gi_temporal_reason(indirect_reservoir),1.0);return;",
+            "current_radiance[launch_id.xy]=float4(rt_direct_visualize_gi_spatial_reason(indirect_reservoir),1.0);return;",
+        ] {
+            let debug_index = compact
+                .find(debug_write)
+                .unwrap_or_else(|| panic!("missing debug write token {debug_write}"));
+            assert!(
+                debug_index < primary_index,
+                "RT debug view {debug_write} must return before primary emissive is added"
+            );
+        }
     }
 
     #[test]
@@ -1113,7 +1636,7 @@ mod shader_source_tests {
                 "RT sky indirect must not spend three visibility rays per final pixel; found {forbidden}"
             );
         }
-        for forbidden in ["rt_direct_rand01", "rt_direct.frame_index"] {
+        for forbidden in ["rt_direct_sky_rand01", "rt_direct.sky_sample_index"] {
             assert!(
                 !raygen.contains(forbidden),
                 "RT sky indirect must be stable in final output; found {forbidden}"

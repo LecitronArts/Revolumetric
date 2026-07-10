@@ -16,7 +16,7 @@ use crate::editor::fonts::{configure_editor_fonts, configure_editor_style};
 #[cfg(not(target_os = "android"))]
 use crate::editor::ui::{EditorUi, EditorUiFrameState};
 use crate::platform::input::InputState;
-use crate::scene::camera::{CameraPathConfig, apply_camera_path, update_fly_camera};
+use crate::scene::camera::{Camera, CameraPathConfig, apply_camera_path, update_fly_camera};
 use crate::scene::components::CameraRig;
 
 use crate::ecs::schedule::{Schedule, Stage};
@@ -24,6 +24,7 @@ use crate::ecs::world::World;
 use crate::platform::time::Time;
 use crate::platform::window::WindowDescriptor;
 use crate::render::area_restir::{AreaRestirDebugView, AreaRestirSettings};
+use crate::render::capture::CaptureCameraPathMetadata;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::EguiFrame;
 use crate::render::restir_di::RestirDiSettings;
@@ -34,13 +35,15 @@ use crate::render::vpt_pipeline::VptCameraFrame;
 use crate::scene::light::DirectionalLight;
 use crate::scene::systems;
 use crate::voxel::generator;
-use crate::voxel::ucvh::{Ucvh, UcvhConfig};
+use crate::voxel::ucvh::Ucvh;
+use crate::voxel::vox_loader::VoxTargetBounds;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 
 pub fn run() -> Result<()> {
     init_tracing();
 
     let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = RevolumetricApp::new();
     event_loop.run_app(&mut app)?;
@@ -80,6 +83,10 @@ fn parse_exit_after_frames() -> Option<u64> {
         .filter(|&frames| frames > 0)
 }
 
+const ACTIVE_REDRAW_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+const DEFAULT_SCENE_LOADING_REDRAW_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
 struct RevolumetricApp {
     world: World,
     schedule: Schedule,
@@ -98,12 +105,23 @@ struct RevolumetricApp {
     egui_state: Option<egui_winit::State>,
     #[cfg(not(target_os = "android"))]
     editor_ui: Option<EditorUi>,
+    #[cfg(not(target_os = "android"))]
+    pending_egui_textures_delta: egui::TexturesDelta,
     initialized: bool,
     touch_look: TouchLookState,
     last_frame_time: Option<std::time::Instant>,
     rendered_frames: u64,
     exit_after_frames: Option<u64>,
     camera_path: Option<CameraPathConfig>,
+    default_scene_target_bounds: Option<VoxTargetBounds>,
+    default_scene_load: Option<Receiver<DefaultSceneLoadMessage>>,
+    next_redraw_at: std::time::Instant,
+}
+
+struct DefaultSceneLoadMessage {
+    ucvh: Ucvh,
+    scene_result: generator::DefaultSceneLoadResult,
+    elapsed: std::time::Duration,
 }
 
 #[derive(Debug, Default)]
@@ -185,6 +203,60 @@ fn clear_input_for_inactive_window(
     }
 }
 
+fn camera_for_scene_bounds(bounds: Option<VoxTargetBounds>, world_size: glam::UVec3) -> Camera {
+    let bounds = bounds.unwrap_or_else(|| VoxTargetBounds {
+        min: glam::UVec3::ZERO,
+        max_exclusive: glam::UVec3::new(world_size.x.max(1), 1, world_size.z.max(1)),
+    });
+    let min = bounds.min.as_vec3();
+    let max = bounds.max_exclusive.as_vec3().max(min + glam::Vec3::ONE);
+    let extent = max - min;
+    let center = (min + max) * 0.5;
+    let horizontal_span = extent.x.max(extent.z);
+    let entry_depth = (extent.z * 0.25)
+        .clamp(48.0, 640.0)
+        .min((extent.z * 0.45).max(1.0));
+    let lookahead = (horizontal_span * 0.18)
+        .clamp(160.0, 512.0)
+        .min((extent.z - entry_depth).max(1.0));
+    let position_z = min.z + entry_depth;
+    let target = glam::Vec3::new(
+        center.x,
+        min.y + (extent.y * 0.35).clamp(24.0, 128.0),
+        (position_z + lookahead).min(max.z - 1.0),
+    );
+    let position = glam::Vec3::new(
+        center.x,
+        target.y + (extent.y * 0.22).clamp(24.0, 160.0),
+        position_z,
+    );
+    let to_target = target - position;
+    let focal_distance = to_target.length().max(1.0);
+    let forward = to_target.normalize_or_zero();
+
+    Camera {
+        position,
+        forward: if forward.length_squared() > 0.0 {
+            forward
+        } else {
+            glam::Vec3::Z
+        },
+        up: glam::Vec3::Y,
+        fov_y_radians: std::f32::consts::FRAC_PI_4,
+        aperture_radius: 0.0,
+        focal_distance,
+    }
+}
+
+fn align_fly_controller_to_camera(rig: &mut CameraRig) {
+    let forward = rig.camera.forward.normalize_or_zero();
+    if forward.length_squared() == 0.0 {
+        return;
+    }
+    rig.controller.pitch = forward.y.clamp(-1.0, 1.0).asin();
+    rig.controller.yaw = forward.x.atan2(forward.z);
+}
+
 impl RevolumetricApp {
     fn new() -> Self {
         let mut world = World::new();
@@ -219,12 +291,17 @@ impl RevolumetricApp {
             egui_state: None,
             #[cfg(not(target_os = "android"))]
             editor_ui: None,
+            #[cfg(not(target_os = "android"))]
+            pending_egui_textures_delta: egui::TexturesDelta::default(),
             initialized: false,
             touch_look: TouchLookState::default(),
             last_frame_time: None,
             rendered_frames: 0,
             exit_after_frames: parse_exit_after_frames(),
             camera_path: CameraPathConfig::from_env(),
+            default_scene_target_bounds: None,
+            default_scene_load: None,
+            next_redraw_at: std::time::Instant::now(),
         }
     }
 
@@ -262,6 +339,139 @@ impl RevolumetricApp {
         Ok(())
     }
 
+    fn redraw_interval(&self) -> std::time::Duration {
+        if self.default_scene_load.is_some() {
+            DEFAULT_SCENE_LOADING_REDRAW_INTERVAL
+        } else {
+            ACTIVE_REDRAW_INTERVAL
+        }
+    }
+
+    fn start_default_scene_load(&mut self) {
+        if self.ucvh.is_some() || self.default_scene_load.is_some() {
+            return;
+        }
+        let (sender, receiver) = mpsc::channel();
+        self.default_scene_load = Some(receiver);
+        std::thread::Builder::new()
+            .name("default-scene-loader".to_string())
+            .spawn(move || {
+                let start = std::time::Instant::now();
+                let mut ucvh = Ucvh::new(generator::default_scene_ucvh_config());
+                let scene_result = generator::generate_default_scene(&mut ucvh);
+                ucvh.rebuild_hierarchy();
+                let elapsed = start.elapsed();
+                let _ = sender.send(DefaultSceneLoadMessage {
+                    ucvh,
+                    scene_result,
+                    elapsed,
+                });
+            })
+            .expect("default scene loader thread should spawn");
+        tracing::info!("started default scene load on background thread");
+    }
+
+    fn poll_default_scene_load(&mut self) {
+        let Some(result) = self
+            .default_scene_load
+            .as_ref()
+            .map(|receiver| receiver.try_recv())
+        else {
+            return;
+        };
+        match result {
+            Ok(message) => {
+                self.default_scene_load = None;
+                self.apply_default_scene_load(message);
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.default_scene_load = None;
+                tracing::error!("default scene loader stopped before sending a scene");
+            }
+        }
+    }
+
+    fn apply_default_scene_load(&mut self, message: DefaultSceneLoadMessage) {
+        let scene_target_bounds = message
+            .scene_result
+            .teardown_zip_stats
+            .as_ref()
+            .and_then(|stats| stats.target_bounds)
+            .or_else(|| {
+                message
+                    .scene_result
+                    .vox_stats
+                    .as_ref()
+                    .and_then(|stats| stats.target_bounds)
+            });
+        self.log_default_scene_load(&message.scene_result, &message.ucvh, message.elapsed);
+        self.default_scene_target_bounds = scene_target_bounds;
+        self.ucvh = Some(message.ucvh);
+        if self.camera_path.is_none() {
+            let world_size = self
+                .ucvh
+                .as_ref()
+                .map(|ucvh| ucvh.config.world_size)
+                .unwrap_or(generator::DEFAULT_SCENE_WORLD_SIZE);
+            if let Some(rig) = self.world.resource_mut::<CameraRig>() {
+                rig.camera = camera_for_scene_bounds(self.default_scene_target_bounds, world_size);
+                align_fly_controller_to_camera(rig);
+            }
+        }
+    }
+
+    fn log_default_scene_load(
+        &self,
+        scene_result: &generator::DefaultSceneLoadResult,
+        ucvh: &Ucvh,
+        elapsed: std::time::Duration,
+    ) {
+        match scene_result.kind {
+            generator::DefaultSceneKind::TeardownZip => {
+                let default_stats = Default::default();
+                let stats = scene_result
+                    .teardown_zip_stats
+                    .as_ref()
+                    .unwrap_or(&default_stats);
+                tracing::info!(
+                    path = %generator::default_zip_map_path().display(),
+                    bricks = scene_result.brick_count,
+                    input_voxels = stats.input_voxels,
+                    written_voxels = stats.written_voxels,
+                    unique_written_voxels = stats.unique_written_voxels,
+                    total_voxels = ucvh.pool.allocated_count() as u64 * 512,
+                    elapsed_ms = elapsed.as_millis(),
+                    "loaded default teardown zip scene"
+                );
+            }
+            generator::DefaultSceneKind::VoxFile => {
+                let default_stats = Default::default();
+                let stats = scene_result.vox_stats.as_ref().unwrap_or(&default_stats);
+                tracing::info!(
+                    path = generator::DEFAULT_VOX_MAP_PATH,
+                    bricks = scene_result.brick_count,
+                    input_voxels = stats.input_voxels,
+                    written_voxels = stats.written_voxels,
+                    unique_written_voxels = stats.unique_written_voxels,
+                    total_voxels = ucvh.pool.allocated_count() as u64 * 512,
+                    elapsed_ms = elapsed.as_millis(),
+                    "loaded default vox scene"
+                );
+            }
+            generator::DefaultSceneKind::CheckerboardFallback => {
+                tracing::warn!(
+                    path = generator::DEFAULT_VOX_MAP_PATH,
+                    error = ?scene_result.vox_error,
+                    bricks = scene_result.brick_count,
+                    total_voxels = ucvh.pool.allocated_count() as u64 * 512,
+                    elapsed_ms = elapsed.as_millis(),
+                    "default vox scene unavailable; generated checkerboard fallback"
+                );
+            }
+        }
+    }
+
     fn update_camera(&mut self, dt: f32) {
         if let Some(camera_path) = self.camera_path {
             if let Some(rig) = self.world.resource_mut::<CameraRig>() {
@@ -279,6 +489,19 @@ impl RevolumetricApp {
         if let Some(rig) = self.world.resource_mut::<CameraRig>() {
             update_fly_camera(rig, input, dt);
         }
+    }
+
+    fn capture_camera_path_metadata(&self) -> CaptureCameraPathMetadata {
+        self.camera_path
+            .map_or_else(CaptureCameraPathMetadata::default, |path| {
+                CaptureCameraPathMetadata {
+                    path: path.path_name().to_owned(),
+                    center: path.center_csv(),
+                    radius: path.radius,
+                    height: path.height,
+                    period_frames: path.period_frames,
+                }
+            })
     }
 
     fn current_vpt_camera_frame(&self) -> VptCameraFrame {
@@ -305,10 +528,10 @@ impl RevolumetricApp {
     fn current_sun_light(&self) -> (glam::Vec3, glam::Vec3) {
         match self.world.resource::<DirectionalLight>() {
             Some(light) => (light.direction, light.intensity),
-            None => (
-                glam::Vec3::new(0.5, 1.0, 0.25).normalize(),
-                glam::Vec3::new(2.0, 1.5, 1.25),
-            ),
+            None => {
+                let light = DirectionalLight::default();
+                (light.direction, light.intensity)
+            }
         }
     }
 
@@ -354,9 +577,6 @@ impl RevolumetricApp {
             return UiInputCapture::default();
         };
         let response = egui_state.on_window_event(window, event);
-        if response.repaint && should_request_redraw_for_size(window.inner_size()) {
-            window.request_redraw();
-        }
         let Some(egui_ctx) = self.egui_ctx.as_ref() else {
             return UiInputCapture {
                 consumed: response.consumed,
@@ -402,12 +622,23 @@ impl RevolumetricApp {
             );
         });
         egui_state.handle_platform_output(window, full_output.platform_output);
+        let font_texture_ready = self
+            .render_runtime
+            .as_ref()
+            .is_some_and(RenderRuntime::egui_font_texture_ready);
+        let mut textures_delta = full_output.textures_delta;
+        if font_texture_ready {
+            self.pending_egui_textures_delta.clear();
+        } else {
+            self.pending_egui_textures_delta.append(textures_delta);
+            textures_delta = self.pending_egui_textures_delta.clone();
+        }
         let clipped_primitives =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
         Some(EguiFrame {
             clipped_primitives,
-            textures_delta: full_output.textures_delta,
+            textures_delta,
             pixels_per_point: full_output.pixels_per_point,
         })
     }
@@ -462,6 +693,7 @@ impl RevolumetricApp {
         let restir_di_enabled = self.restir_di_vpt_enabled();
         let area_restir_enabled = self.area_restir_vpt_enabled();
         let camera = self.current_vpt_camera_frame();
+        let camera_path = self.capture_camera_path_metadata();
         let viewport_extent = self
             .window
             .as_ref()
@@ -478,6 +710,7 @@ impl RevolumetricApp {
         if let Some(runtime) = self.render_runtime.as_mut() {
             runtime.render_frame(RenderFrameInput {
                 camera,
+                camera_path,
                 sun_direction,
                 sun_intensity,
                 elapsed_seconds,
@@ -561,19 +794,7 @@ impl ApplicationHandler for RevolumetricApp {
             self.lighting_settings.vpt_debug_view = vpt_debug_view;
         }
 
-        // Generate UCVH sponza demo scene
-        if self.ucvh.is_none() {
-            let config = UcvhConfig::new(glam::UVec3::splat(128));
-            let mut ucvh = Ucvh::new(config);
-            let brick_count = generator::generate_sponza_scene(&mut ucvh);
-            ucvh.rebuild_hierarchy();
-            tracing::info!(
-                bricks = brick_count,
-                total_voxels = ucvh.pool.allocated_count() as u64 * 512,
-                "generated sponza demo scene"
-            );
-            self.ucvh = Some(ucvh);
-        }
+        self.start_default_scene_load();
 
         let render_runtime =
             match RenderRuntime::new(&window, self.runtime_settings(), self.ucvh.as_ref()) {
@@ -597,6 +818,18 @@ impl ApplicationHandler for RevolumetricApp {
                 return;
             }
             self.initialized = true;
+            if self.camera_path.is_none() {
+                let world_size = self
+                    .ucvh
+                    .as_ref()
+                    .map(|ucvh| ucvh.config.world_size)
+                    .unwrap_or(generator::DEFAULT_SCENE_WORLD_SIZE);
+                if let Some(rig) = self.world.resource_mut::<CameraRig>() {
+                    rig.camera =
+                        camera_for_scene_bounds(self.default_scene_target_bounds, world_size);
+                    align_fly_controller_to_camera(rig);
+                }
+            }
         }
 
         tracing::info!(?window_id, "window created");
@@ -739,12 +972,18 @@ impl ApplicationHandler for RevolumetricApp {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_default_scene_load();
+        let now = std::time::Instant::now();
+        let redraw_interval = self.redraw_interval();
         if let Some(window) = &self.window
             && should_request_redraw_for_size(window.inner_size())
+            && now >= self.next_redraw_at
         {
             window.request_redraw();
+            self.next_redraw_at = now + redraw_interval;
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_redraw_at));
     }
 }
 
@@ -762,6 +1001,7 @@ mod tests {
     use crate::scene::camera::{Camera, CameraPathConfig, CameraPathKind};
     use crate::scene::components::CameraRig;
     use crate::scene::light::DirectionalLight;
+    use crate::voxel::vox_loader::VoxTargetBounds;
     use winit::event::{DeviceId, Touch, TouchPhase};
 
     fn touch_event(id: u64, phase: TouchPhase, x: f64, y: f64) -> Touch {
@@ -932,6 +1172,196 @@ mod tests {
     }
 
     #[test]
+    fn camera_for_default_scene_bounds_starts_near_the_loaded_map() {
+        let bounds = VoxTargetBounds {
+            min: glam::UVec3::new(4, 4, 4),
+            max_exclusive: glam::UVec3::new(1020, 128, 524),
+        };
+
+        let camera = camera_for_scene_bounds(Some(bounds), glam::UVec3::new(1024, 512, 1024));
+        let center = glam::Vec3::new(512.0, 66.0, 264.0);
+
+        assert!((camera.position.x - center.x).abs() < 1.0);
+        assert!(camera.position.y > bounds.min.y as f32);
+        assert!(camera.position.z > bounds.min.z as f32);
+        assert!(camera.position.z < center.z);
+        assert!(camera.forward.z > 0.6);
+        assert!(camera.forward.y < 0.0);
+        assert!(camera.focal_distance <= 800.0);
+    }
+
+    #[test]
+    fn camera_for_scene_bounds_uses_world_center_when_vox_bounds_are_missing() {
+        let camera = camera_for_scene_bounds(None, glam::UVec3::new(1024, 512, 1024));
+
+        assert!((camera.position.x - 512.0).abs() < 1.0);
+        assert!(camera.position.y > 0.0);
+        assert!(camera.position.z > 0.0);
+        assert!(camera.position.z <= 256.0);
+        assert!(camera.forward.z > 0.0);
+        assert!(camera.forward.y < 0.0);
+    }
+
+    #[test]
+    fn camera_for_vintessa_sized_bounds_starts_inside_loaded_map_not_front_cutaway() {
+        let bounds = VoxTargetBounds {
+            min: glam::UVec3::new(4, 4, 4),
+            max_exclusive: glam::UVec3::new(3850, 525, 2551),
+        };
+
+        let camera = camera_for_scene_bounds(Some(bounds), glam::UVec3::new(4096, 768, 3072));
+
+        assert!(
+            camera.focal_distance <= 800.0,
+            "initial camera should start near the playable map, not at a whole-map overview distance"
+        );
+        assert!(
+            camera.position.z > bounds.min.z as f32 + 256.0,
+            "initial camera must start beyond the imported terrain front edge instead of looking at its cutaway"
+        );
+        assert!(camera.position.z < 900.0);
+        assert!(camera.forward.z > 0.6);
+        assert!(camera.forward.y < 0.0);
+    }
+
+    #[test]
+    fn app_resumed_does_not_block_window_creation_on_default_scene_load() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let resumed = source
+            .split("fn resumed(&mut self")
+            .nth(1)
+            .expect("resumed should exist")
+            .split("fn window_event")
+            .next()
+            .expect("resumed should end before window_event");
+
+        assert!(
+            !resumed.contains("generate_default_scene("),
+            "window creation must not synchronously import Vintessa on the UI thread"
+        );
+        assert!(
+            resumed.contains("start_default_scene_load"),
+            "resumed should kick off an asynchronous default scene load"
+        );
+    }
+
+    #[test]
+    fn app_throttles_redraws_instead_of_busy_polling_during_startup() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let run = source
+            .split("pub fn run()")
+            .nth(1)
+            .expect("run should exist")
+            .split("#[cfg(target_os = \"android\")]")
+            .next()
+            .expect("desktop run should end before android run");
+        let about_to_wait = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .expect("about_to_wait should exist")
+            .split("fn init_tracing")
+            .next()
+            .expect("about_to_wait should end before init_tracing");
+        let process_egui = source
+            .split("fn process_egui_window_event")
+            .nth(1)
+            .expect("process_egui_window_event should exist")
+            .split("#[cfg(target_os = \"android\")]")
+            .next()
+            .expect("desktop process_egui_window_event should end before android variant");
+
+        assert!(
+            !run.contains("ControlFlow::Poll"),
+            "startup must not busy-poll while Vintessa is building on a background thread"
+        );
+        assert!(
+            about_to_wait.contains("set_control_flow(ControlFlow::WaitUntil"),
+            "about_to_wait should cap redraw cadence instead of requesting unbounded frames"
+        );
+        assert!(
+            about_to_wait.contains("now >= self.next_redraw_at")
+                && about_to_wait.contains("self.next_redraw_at = now + redraw_interval"),
+            "about_to_wait should request redraws only when the next paced frame is due"
+        );
+        assert!(
+            !process_egui.contains("request_redraw()"),
+            "egui repaint events must not bypass the paced redraw scheduler during startup"
+        );
+    }
+
+    #[test]
+    fn app_uses_slower_empty_scene_redraws_while_default_scene_is_loading() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let about_to_wait = source
+            .split("fn about_to_wait")
+            .nth(1)
+            .expect("about_to_wait should exist")
+            .split("fn init_tracing")
+            .next()
+            .expect("about_to_wait should end before init_tracing");
+
+        assert!(
+            source.contains("DEFAULT_SCENE_LOADING_REDRAW_INTERVAL"),
+            "app should define a slower redraw interval while the background Vintessa loader owns CPU"
+        );
+        assert!(
+            about_to_wait.contains("self.redraw_interval()"),
+            "about_to_wait should choose a startup-aware redraw interval instead of always using 16ms"
+        );
+    }
+
+    #[test]
+    fn app_buffers_egui_texture_delta_until_renderer_font_texture_is_ready() {
+        let source = crate::render::source_checks::read_source("src/app.rs");
+        let app_struct = source
+            .split("struct RevolumetricApp")
+            .nth(1)
+            .expect("app struct should exist")
+            .split("struct DefaultSceneLoadMessage")
+            .next()
+            .expect("app struct should end before default scene message");
+        let build_egui_frame = source
+            .split("fn build_egui_frame")
+            .nth(1)
+            .expect("build_egui_frame should exist")
+            .split("#[cfg(target_os = \"android\")]")
+            .next()
+            .expect("desktop build_egui_frame should end before android variant");
+
+        assert!(
+            app_struct.contains("pending_egui_textures_delta"),
+            "app should retain egui texture uploads while render passes are not ready"
+        );
+        assert!(
+            build_egui_frame.contains("egui_font_texture_ready"),
+            "app should keep replaying retained font texture deltas until the renderer confirms upload"
+        );
+    }
+
+    #[test]
+    fn startup_wait_paths_do_not_emit_warning_spam() {
+        let vpt = crate::render::source_checks::read_source("src/render/vpt_pipeline.rs");
+        let rt = crate::render::source_checks::read_source("src/render/rt_pipeline.rs");
+
+        for message in [
+            "skipping UCVH render passes until GPU upload succeeds",
+            "render graph produced no presentable output; clearing swapchain fallback",
+            "rendering RT fallback output until UCVH data is ready",
+            "skipping RT graph until required passes are initialized",
+            "skipping RT surface pass creation without UCVH GPU descriptors",
+            "skipping RT surface trace without built TLAS and AABB buffer",
+            "skipping RT ReSTIR-DI pass creation without CPU UCVH scene",
+            "skipping RT ReSTIR-GI pass creation without UCVH GPU descriptors",
+        ] {
+            let forbidden = format!("tracing::warn!(\"{message}");
+            assert!(
+                !vpt.contains(&forbidden) && !rt.contains(&forbidden),
+                "transient startup wait message should not warn every paced frame: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn current_vpt_camera_frame_falls_back_to_expected_defaults() {
         let app = RevolumetricApp::new();
         let camera = app.current_vpt_camera_frame();
@@ -961,9 +1391,10 @@ mod tests {
     fn current_sun_light_falls_back_to_expected_defaults() {
         let app = RevolumetricApp::new();
         let (direction, intensity) = app.current_sun_light();
+        let default_light = DirectionalLight::default();
 
-        assert!((direction - glam::Vec3::new(0.5, 1.0, 0.25).normalize()).length() < 1e-6);
-        assert_eq!(intensity, glam::Vec3::new(2.0, 1.5, 1.25));
+        assert!((direction - default_light.direction).length() < 1e-6);
+        assert_eq!(intensity, default_light.intensity);
     }
 
     #[test]

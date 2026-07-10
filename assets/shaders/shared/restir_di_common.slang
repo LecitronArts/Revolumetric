@@ -1,5 +1,7 @@
 static const float RESTIR_DI_MAX_SELECTED_WEIGHT = 64.0;
 static const float RESTIR_DI_MAX_STREAM_WEIGHT = 1.0e5;
+static const float RESTIR_DI_MAX_RESOLVED_RADIANCE_LUMA = 96.0;
+static const float RESTIR_DI_INV_PI = 0.31830988618;
 
 struct RestirDiUniforms {
     uint enabled;
@@ -40,6 +42,75 @@ float restir_di_albedo_luma(float3 albedo) {
     return max(dot(albedo, float3(0.2126, 0.7152, 0.0722)), 0.05);
 }
 
+float restir_di_luma(float3 radiance) {
+    return max(dot(max(radiance, float3(0.0)), float3(0.2126, 0.7152, 0.0722)), 0.0);
+}
+
+float restir_di_saturate_dot(float3 a, float3 b) {
+    return saturate(dot(a, b));
+}
+
+float restir_di_ggx_distribution(float ndoth, float roughness) {
+    float alpha = roughness * roughness;
+    float alpha2 = alpha * alpha;
+    float denom = ndoth * ndoth * (alpha2 - 1.0) + 1.0;
+    return alpha2 * RESTIR_DI_INV_PI / max(denom * denom, 1.0e-6);
+}
+
+float restir_di_smith_ggx_visibility(float ndotv, float ndotl, float roughness) {
+    float k = (roughness + 1.0) * (roughness + 1.0) * 0.125;
+    float gv = ndotv / max(ndotv * (1.0 - k) + k, 1.0e-5);
+    float gl = ndotl / max(ndotl * (1.0 - k) + k, 1.0e-5);
+    return (gv * gl) / max(4.0 * ndotv * ndotl, 1.0e-5);
+}
+
+float3 restir_di_fresnel_schlick(float vdoth, float3 f0) {
+    return f0 + (1.0 - f0) * pow(saturate(1.0 - vdoth), 5.0);
+}
+
+float3 restir_di_direct_brdf(
+    float3 surface_normal,
+    float3 albedo,
+    float roughness,
+    float3 view_dir,
+    float3 light_dir
+) {
+    float3 normal = normalize(surface_normal);
+    float3 view = normalize(view_dir);
+    float3 light = normalize(light_dir);
+    float ndotv = restir_di_saturate_dot(normal, view);
+    float ndotl = restir_di_saturate_dot(normal, light);
+    if (ndotv <= 0.0 || ndotl <= 0.0) {
+        return float3(0.0);
+    }
+
+    float3 diffuse_brdf = albedo * RESTIR_DI_INV_PI;
+    float3 half_sum = view + light;
+    if (dot(half_sum, half_sum) <= 1.0e-8) {
+        return diffuse_brdf;
+    }
+
+    float clamped_roughness = clamp(roughness, 0.08, 1.0);
+    float3 half_vector = normalize(half_sum);
+    float ndoth = restir_di_saturate_dot(normal, half_vector);
+    float vdoth = restir_di_saturate_dot(view, half_vector);
+    float distribution = restir_di_ggx_distribution(ndoth, clamped_roughness);
+    float visibility = restir_di_smith_ggx_visibility(ndotv, ndotl, clamped_roughness);
+    float3 f0 = float3(0.04);
+    float3 specular_brdf = restir_di_fresnel_schlick(vdoth, f0) * distribution * visibility;
+    return diffuse_brdf + specular_brdf;
+}
+
+float restir_di_direct_brdf_luma(
+    float3 surface_normal,
+    float3 albedo,
+    float roughness,
+    float3 view_dir,
+    float3 light_dir
+) {
+    return restir_di_luma(restir_di_direct_brdf(surface_normal, albedo, roughness, view_dir, light_dir));
+}
+
 float restir_di_emissive_distance_attenuation(float distance_sq) {
     return min(1.0, 8.0 / max(distance_sq, 1.0));
 }
@@ -63,6 +134,18 @@ float restir_di_sun_target_pdf(float3 surface_normal, float3 albedo, float3 ligh
     return light_power * albedo_luma * light_term;
 }
 
+float restir_di_sun_target_pdf(
+    float3 surface_normal,
+    float3 albedo,
+    float roughness,
+    float3 view_dir,
+    float3 light_dir,
+    float light_power
+) {
+    float light_term = max(dot(surface_normal, light_dir), 0.0);
+    return light_power * restir_di_direct_brdf_luma(surface_normal, albedo, roughness, view_dir, light_dir) * light_term;
+}
+
 float restir_di_emissive_target_pdf(
     float3 surface_position,
     float3 surface_normal,
@@ -79,6 +162,23 @@ float restir_di_emissive_target_pdf(
     return light_power * albedo_luma * light_term * attenuation;
 }
 
+float restir_di_emissive_target_pdf(
+    float3 surface_position,
+    float3 surface_normal,
+    float3 albedo,
+    float roughness,
+    float3 view_dir,
+    float3 light_position,
+    float light_power
+) {
+    float3 to_light = light_position - surface_position;
+    float distance_sq = max(dot(to_light, to_light), 1.0);
+    float3 light_dir = to_light * rsqrt(distance_sq);
+    float light_term = max(dot(surface_normal, light_dir), 0.0);
+    float attenuation = restir_di_emissive_distance_attenuation(distance_sq);
+    return light_power * restir_di_direct_brdf_luma(surface_normal, albedo, roughness, view_dir, light_dir) * light_term * attenuation;
+}
+
 float restir_di_emissive_geometry_term(
     float3 surface_position,
     float3 surface_normal,
@@ -93,6 +193,17 @@ float restir_di_emissive_geometry_term(
 
 bool restir_di_candidate_finite(float value) {
     return value == value && value > 0.0 && value < 1.0e20;
+}
+
+float3 restir_di_clamp_radiance_luma(float3 radiance, float max_luma) {
+    float luma = restir_di_luma(radiance);
+    if (!restir_di_candidate_finite(luma)) {
+        return float3(0.0);
+    }
+    if (luma > max_luma && luma > 1.0e-4) {
+        return radiance * (max_luma / luma);
+    }
+    return max(radiance, float3(0.0));
 }
 
 float restir_di_bounded_selected_weight(RestirDiReservoir reservoir) {
@@ -130,6 +241,40 @@ float restir_di_target_pdf_for_light(
     );
 }
 
+float restir_di_target_pdf_for_light(
+    float4 surface_position_depth,
+    float4 surface_normal_roughness,
+    float4 surface_albedo_material,
+    float3 surface_view_dir,
+    DirectLight light
+) {
+    float3 surface_normal = normalize(surface_normal_roughness.xyz);
+    float roughness = surface_normal_roughness.w;
+    float light_power = max(light.color_power.w, 0.0001);
+
+    if (light.normal_type.w == 0.0) {
+        float3 light_dir = normalize(light.position_radius.xyz);
+        return restir_di_sun_target_pdf(
+            surface_normal,
+            surface_albedo_material.rgb,
+            roughness,
+            surface_view_dir,
+            light_dir,
+            light_power
+        );
+    }
+
+    return restir_di_emissive_target_pdf(
+        surface_position_depth.xyz,
+        surface_normal,
+        surface_albedo_material.rgb,
+        roughness,
+        surface_view_dir,
+        light.position_radius.xyz,
+        light_power
+    );
+}
+
 float restir_di_target_pdf_for_light_sample(
     float4 surface_position_depth,
     float4 surface_normal_roughness,
@@ -151,6 +296,36 @@ float restir_di_target_pdf_for_light_sample(
         surface_position_depth.xyz,
         surface_normal,
         surface_albedo_material.rgb,
+        light_sample_position,
+        max(light.color_power.w, 0.0001)
+    );
+}
+
+float restir_di_target_pdf_for_light_sample(
+    float4 surface_position_depth,
+    float4 surface_normal_roughness,
+    float4 surface_albedo_material,
+    float3 surface_view_dir,
+    DirectLight light,
+    float3 light_sample_position
+) {
+    if (light.normal_type.w == 0.0) {
+        return restir_di_target_pdf_for_light(
+            surface_position_depth,
+            surface_normal_roughness,
+            surface_albedo_material,
+            surface_view_dir,
+            light
+        );
+    }
+
+    float3 surface_normal = normalize(surface_normal_roughness.xyz);
+    return restir_di_emissive_target_pdf(
+        surface_position_depth.xyz,
+        surface_normal,
+        surface_albedo_material.rgb,
+        surface_normal_roughness.w,
+        surface_view_dir,
         light_sample_position,
         max(light.color_power.w, 0.0001)
     );
@@ -183,6 +358,44 @@ float restir_di_target_pdf_for_reservoir(
         surface_position_depth.xyz,
         surface_normal,
         surface_albedo_material.rgb,
+        reservoir.sample_position_pdf.xyz,
+        light_power
+    );
+}
+
+float restir_di_target_pdf_for_reservoir(
+    float4 surface_position_depth,
+    float4 surface_normal_roughness,
+    float4 surface_albedo_material,
+    float3 surface_view_dir,
+    RestirDiReservoir reservoir
+) {
+    if (reservoir.sample_light_id == 0xffffffffu) {
+        return 0.0;
+    }
+
+    float3 surface_normal = normalize(surface_normal_roughness.xyz);
+    float roughness = surface_normal_roughness.w;
+    float light_power = max(reservoir.sample_radiance.w, 0.0001);
+
+    if (reservoir.sample_flags == 0u) {
+        float3 light_dir = normalize(reservoir.sample_position_pdf.xyz);
+        return restir_di_sun_target_pdf(
+            surface_normal,
+            surface_albedo_material.rgb,
+            roughness,
+            surface_view_dir,
+            light_dir,
+            light_power
+        );
+    }
+
+    return restir_di_emissive_target_pdf(
+        surface_position_depth.xyz,
+        surface_normal,
+        surface_albedo_material.rgb,
+        roughness,
+        surface_view_dir,
         reservoir.sample_position_pdf.xyz,
         light_power
     );

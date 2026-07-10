@@ -6,9 +6,16 @@ pub enum RtDebugView {
     Surface,
     HitDistance,
     HistoryValid,
+    Motion,
+    Direct,
+    SkyIndirect,
     DirectReservoir,
     IndirectReservoir,
     Temporal,
+    GiTemporal,
+    GiSpatial,
+    GiIndirect,
+    GiReason,
 }
 
 impl RtDebugView {
@@ -21,6 +28,13 @@ impl RtDebugView {
             Self::DirectReservoir => 4,
             Self::IndirectReservoir => 5,
             Self::Temporal => 6,
+            Self::GiTemporal => 7,
+            Self::GiSpatial => 8,
+            Self::GiIndirect => 9,
+            Self::Direct => 10,
+            Self::SkyIndirect => 11,
+            Self::GiReason => 12,
+            Self::Motion => 13,
         }
     }
 }
@@ -32,6 +46,9 @@ pub struct RtSettings {
     pub temporal_denoise_enabled: bool,
     pub restir_di_spatial_enabled: bool,
     pub restir_di_spatial_sample_count: u32,
+    pub restir_gi_initial_candidate_count: u32,
+    pub restir_gi_spatial_enabled: bool,
+    pub restir_gi_spatial_sample_count: u32,
     pub history_length: u32,
     pub normal_threshold: f32,
     pub depth_threshold: f32,
@@ -74,9 +91,12 @@ impl Default for RtSettings {
             temporal_denoise_enabled: true,
             restir_di_spatial_enabled: true,
             restir_di_spatial_sample_count: 4,
+            restir_gi_initial_candidate_count: 2,
+            restir_gi_spatial_enabled: true,
+            restir_gi_spatial_sample_count: 2,
             history_length: 20,
             normal_threshold: 0.85,
-            depth_threshold: 0.02,
+            depth_threshold: 0.003,
             debug_view: RtDebugView::Off,
         }
     }
@@ -106,6 +126,15 @@ impl RtSettings {
             std::env::var("REVOLUMETRIC_RT_RESTIR_DI_SPATIAL_SAMPLES")
                 .ok()
                 .as_deref(),
+            std::env::var("REVOLUMETRIC_RT_RESTIR_GI_INITIAL_CANDIDATES")
+                .ok()
+                .as_deref(),
+            std::env::var("REVOLUMETRIC_RT_RESTIR_GI_SPATIAL")
+                .ok()
+                .as_deref(),
+            std::env::var("REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -120,6 +149,9 @@ impl RtSettings {
         debug_view: Option<&str>,
         restir_di_spatial_enabled: Option<&str>,
         restir_di_spatial_samples: Option<&str>,
+        restir_gi_initial_candidates: Option<&str>,
+        restir_gi_spatial_enabled: Option<&str>,
+        restir_gi_spatial_samples: Option<&str>,
     ) -> RtSettingsParse {
         let mut settings = Self::default();
         let mut warnings = Vec::new();
@@ -179,6 +211,28 @@ impl RtSettings {
             0,
             8,
             &mut settings.restir_di_spatial_sample_count,
+            &mut warnings,
+        );
+        parse_u32_range(
+            "REVOLUMETRIC_RT_RESTIR_GI_INITIAL_CANDIDATES",
+            restir_gi_initial_candidates,
+            1,
+            16,
+            &mut settings.restir_gi_initial_candidate_count,
+            &mut warnings,
+        );
+        parse_bool(
+            "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL",
+            restir_gi_spatial_enabled,
+            &mut settings.restir_gi_spatial_enabled,
+            &mut warnings,
+        );
+        parse_u32_range(
+            "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES",
+            restir_gi_spatial_samples,
+            0,
+            8,
+            &mut settings.restir_gi_spatial_sample_count,
             &mut warnings,
         );
 
@@ -305,16 +359,32 @@ fn parse_debug_view(
         RtDebugView::HitDistance
     } else if trimmed.eq_ignore_ascii_case("history_valid") {
         RtDebugView::HistoryValid
+    } else if trimmed.eq_ignore_ascii_case("motion") {
+        RtDebugView::Motion
+    } else if trimmed.eq_ignore_ascii_case("direct") {
+        RtDebugView::Direct
+    } else if trimmed.eq_ignore_ascii_case("sky_indirect") {
+        RtDebugView::SkyIndirect
     } else if trimmed.eq_ignore_ascii_case("direct_reservoir") {
         RtDebugView::DirectReservoir
     } else if trimmed.eq_ignore_ascii_case("indirect_reservoir") {
         RtDebugView::IndirectReservoir
     } else if trimmed.eq_ignore_ascii_case("temporal") {
         RtDebugView::Temporal
+    } else if trimmed.eq_ignore_ascii_case("gi_temporal") {
+        RtDebugView::GiTemporal
+    } else if trimmed.eq_ignore_ascii_case("gi_spatial") {
+        RtDebugView::GiSpatial
+    } else if trimmed.eq_ignore_ascii_case("gi_indirect") {
+        RtDebugView::GiIndirect
+    } else if trimmed.eq_ignore_ascii_case("gi_reason")
+        || trimmed.eq_ignore_ascii_case("gi_validity")
+    {
+        RtDebugView::GiReason
     } else {
         warnings.push(RtSettingsParseWarning {
             variable: "REVOLUMETRIC_RT_DEBUG_VIEW",
-            expected: "off|final|surface|hit_distance|history_valid|direct_reservoir|indirect_reservoir|temporal",
+            expected: "off|final|surface|hit_distance|history_valid|motion|direct|sky_indirect|direct_reservoir|indirect_reservoir|temporal|gi_temporal|gi_spatial|gi_indirect|gi_reason|gi_validity",
             value: value.to_owned(),
         });
         *target
@@ -334,9 +404,12 @@ mod tests {
         assert!(settings.temporal_denoise_enabled);
         assert!(settings.restir_di_spatial_enabled);
         assert_eq!(settings.restir_di_spatial_sample_count, 4);
+        assert_eq!(settings.restir_gi_initial_candidate_count, 2);
+        assert!(settings.restir_gi_spatial_enabled);
+        assert_eq!(settings.restir_gi_spatial_sample_count, 2);
         assert_eq!(settings.history_length, 20);
         assert_eq!(settings.normal_threshold, 0.85);
-        assert_eq!(settings.depth_threshold, 0.02);
+        assert_eq!(settings.depth_threshold, 0.003);
         assert_eq!(settings.debug_view, RtDebugView::Off);
     }
 
@@ -352,6 +425,9 @@ mod tests {
             Some("surface"),
             Some("off"),
             Some("4"),
+            Some("6"),
+            Some("off"),
+            Some("3"),
         );
 
         assert!(parsed.settings.restir_di_enabled);
@@ -359,6 +435,9 @@ mod tests {
         assert!(parsed.settings.temporal_denoise_enabled);
         assert!(!parsed.settings.restir_di_spatial_enabled);
         assert_eq!(parsed.settings.restir_di_spatial_sample_count, 4);
+        assert_eq!(parsed.settings.restir_gi_initial_candidate_count, 6);
+        assert!(!parsed.settings.restir_gi_spatial_enabled);
+        assert_eq!(parsed.settings.restir_gi_spatial_sample_count, 3);
         assert_eq!(parsed.settings.history_length, 32);
         assert_eq!(parsed.settings.normal_threshold, 0.85);
         assert_eq!(parsed.settings.depth_threshold, 0.02);
@@ -378,11 +457,190 @@ mod tests {
             Some("direct_reservoir"),
             Some("on"),
             Some("8"),
+            Some("12"),
+            Some("on"),
+            Some("7"),
         );
 
         assert!(parsed.settings.restir_di_spatial_enabled);
         assert_eq!(parsed.settings.restir_di_spatial_sample_count, 8);
+        assert_eq!(parsed.settings.restir_gi_initial_candidate_count, 12);
+        assert!(parsed.settings.restir_gi_spatial_enabled);
+        assert_eq!(parsed.settings.restir_gi_spatial_sample_count, 7);
         assert!(parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn rt_settings_parse_gi_indirect_debug_view() {
+        let parsed = RtSettings::from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("gi_indirect"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(parsed.settings.debug_view.as_gpu_value(), 9);
+        assert!(
+            parsed.warnings.is_empty(),
+            "gi_indirect must be accepted without parse warnings: {:?}",
+            parsed.warnings
+        );
+
+        let rt_settings = crate::render::source_checks::read_source("src/render/rt_settings.rs");
+        assert!(
+            rt_settings.contains("GiIndirect"),
+            "RT settings must expose a GI indirect debug view variant"
+        );
+        assert!(
+            rt_settings.contains("gi_indirect"),
+            "RT settings parser must accept gi_indirect"
+        );
+
+        let history_common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/rt_history_common.slang",
+        );
+        assert!(
+            history_common.contains("RT_DEBUG_VIEW_GI_INDIRECT = 9u"),
+            "shared RT shader ABI must pin RT_DEBUG_VIEW_GI_INDIRECT to 9"
+        );
+    }
+
+    #[test]
+    fn rt_settings_parse_direct_component_debug_views() {
+        for (value, expected_view, expected_gpu_value, abi_token) in [
+            (
+                "direct",
+                RtDebugView::Direct,
+                10,
+                "RT_DEBUG_VIEW_DIRECT = 10u",
+            ),
+            (
+                "sky_indirect",
+                RtDebugView::SkyIndirect,
+                11,
+                "RT_DEBUG_VIEW_SKY_INDIRECT = 11u",
+            ),
+        ] {
+            let parsed = RtSettings::from_values(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(value),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert_eq!(parsed.settings.debug_view, expected_view);
+            assert_eq!(
+                parsed.settings.debug_view.as_gpu_value(),
+                expected_gpu_value
+            );
+            assert!(
+                parsed.warnings.is_empty(),
+                "{value} must be accepted without parse warnings: {:?}",
+                parsed.warnings
+            );
+
+            let history_common = crate::render::source_checks::read_source(
+                "assets/shaders/shared/rt_history_common.slang",
+            );
+            assert!(
+                history_common.contains(abi_token),
+                "shared RT shader ABI must pin {abi_token}"
+            );
+        }
+
+        let rt_settings = crate::render::source_checks::read_source("src/render/rt_settings.rs");
+        for token in ["Direct", "SkyIndirect", "direct", "sky_indirect"] {
+            assert!(
+                rt_settings.contains(token),
+                "RT settings parser must expose direct component debug token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_settings_parse_gi_reason_debug_view() {
+        for value in ["gi_reason", "gi_validity"] {
+            let parsed = RtSettings::from_values(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(value),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+
+            assert_eq!(parsed.settings.debug_view, RtDebugView::GiReason);
+            assert_eq!(parsed.settings.debug_view.as_gpu_value(), 12);
+            assert!(
+                parsed.warnings.is_empty(),
+                "{value} must be accepted without parse warnings: {:?}",
+                parsed.warnings
+            );
+        }
+
+        let history_common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/rt_history_common.slang",
+        );
+        assert!(
+            history_common.contains("RT_DEBUG_VIEW_GI_REASON = 12u"),
+            "shared RT shader ABI must pin RT_DEBUG_VIEW_GI_REASON to 12"
+        );
+    }
+
+    #[test]
+    fn rt_settings_parse_motion_debug_view() {
+        let parsed = RtSettings::from_values(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("motion"),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        assert_eq!(parsed.settings.debug_view, RtDebugView::Motion);
+        assert_eq!(parsed.settings.debug_view.as_gpu_value(), 13);
+        assert!(
+            parsed.warnings.is_empty(),
+            "motion must be accepted without parse warnings: {:?}",
+            parsed.warnings
+        );
+
+        let history_common = crate::render::source_checks::read_source(
+            "assets/shaders/shared/rt_history_common.slang",
+        );
+        assert!(
+            history_common.contains("RT_DEBUG_VIEW_MOTION = 13u"),
+            "shared RT shader ABI must pin RT_DEBUG_VIEW_MOTION to 13"
+        );
     }
 
     #[test]
@@ -397,10 +655,61 @@ mod tests {
             Some("heatmap"),
             Some("maybe"),
             Some("9"),
+            Some("0"),
+            Some("maybe"),
+            Some("9"),
         );
 
         assert_eq!(parsed.settings, RtSettings::default());
-        assert_eq!(parsed.warnings.len(), 9);
+        assert_eq!(parsed.warnings.len(), 12);
+    }
+
+    #[test]
+    fn rt_settings_source_exposes_rt_restir_gi_initial_candidate_count() {
+        let source = std::fs::read_to_string("src/render/rt_settings.rs")
+            .expect("rt_settings.rs should be readable");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT settings implementation should precede tests");
+
+        for token in [
+            "pub restir_gi_initial_candidate_count: u32",
+            "restir_gi_initial_candidate_count: 2",
+            "REVOLUMETRIC_RT_RESTIR_GI_INITIAL_CANDIDATES",
+            "&mut settings.restir_gi_initial_candidate_count",
+        ] {
+            assert!(
+                implementation.contains(token),
+                "RT settings must expose configurable RT ReSTIR-GI initial candidates with {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn rt_settings_source_exposes_rt_restir_gi_spatial_controls() {
+        let source = std::fs::read_to_string("src/render/rt_settings.rs")
+            .expect("rt_settings.rs should be readable");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("RT settings implementation should precede tests");
+
+        for token in [
+            "pub restir_gi_spatial_enabled: bool",
+            "pub restir_gi_spatial_sample_count: u32",
+            "restir_gi_spatial_enabled: true",
+            "restir_gi_spatial_sample_count: 2",
+            "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL",
+            "REVOLUMETRIC_RT_RESTIR_GI_SPATIAL_SAMPLES",
+            "&mut settings.restir_gi_spatial_enabled",
+            "&mut settings.restir_gi_spatial_sample_count",
+        ] {
+            assert!(
+                implementation.contains(token),
+                "RT settings must expose configurable RT ReSTIR-GI spatial reuse with {token}"
+            );
+        }
     }
 
     #[test]

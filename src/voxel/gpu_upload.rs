@@ -12,6 +12,8 @@ use crate::voxel::ucvh::{Ucvh, UcvhMotionEvent};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const UCVH_MOTION_EVENT_CAPACITY: usize = 64;
+pub const INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+const INITIAL_UCVH_UPLOAD_SEGMENT_COUNT: usize = 9;
 static MOTION_EVENT_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn capped_motion_event_upload_count(event_len: usize) -> usize {
@@ -21,6 +23,71 @@ fn capped_motion_event_upload_count(event_len: usize) -> usize {
 fn should_warn_motion_event_overflow(event_len: usize) -> bool {
     event_len > UCVH_MOTION_EVENT_CAPACITY
         && !MOTION_EVENT_OVERFLOW_WARNED.swap(true, Ordering::Relaxed)
+}
+
+fn initial_upload_brick_count(ucvh: &Ucvh) -> usize {
+    ucvh.pool.allocated_count() as usize
+}
+
+fn initial_occupancy_upload_slice(ucvh: &Ucvh) -> &[BrickOccupancy] {
+    &ucvh.pool.occupancy_pool()[..initial_upload_brick_count(ucvh)]
+}
+
+fn initial_material_upload_slice(ucvh: &Ucvh) -> &[VoxelCell] {
+    let voxel_count = initial_upload_brick_count(ucvh) * BRICK_VOLUME;
+    &ucvh.pool.material_pool()[..voxel_count]
+}
+
+fn initial_generation_upload_slice(ucvh: &Ucvh) -> &[u32] {
+    &ucvh.brick_generations()[..initial_upload_brick_count(ucvh)]
+}
+
+fn initial_device_pool_sizes(ucvh: &Ucvh) -> (usize, usize, usize) {
+    (
+        std::mem::size_of_val(initial_occupancy_upload_slice(ucvh)),
+        std::mem::size_of_val(initial_material_upload_slice(ucvh)),
+        std::mem::size_of_val(initial_generation_upload_slice(ucvh)),
+    )
+}
+
+fn initial_gpu_config(ucvh: &Ucvh) -> UcvhGpuConfig {
+    UcvhGpuConfig {
+        world_size: [
+            ucvh.config.world_size.x,
+            ucvh.config.world_size.y,
+            ucvh.config.world_size.z,
+            0,
+        ],
+        brick_grid_size: [
+            ucvh.config.brick_grid_size.x,
+            ucvh.config.brick_grid_size.y,
+            ucvh.config.brick_grid_size.z,
+            0,
+        ],
+        brick_capacity: ucvh.pool.capacity(),
+        allocated_bricks: ucvh.pool.allocated_count(),
+        _pad: [0; 2],
+    }
+}
+
+fn hierarchy_level_staging_offset(
+    hierarchy: &crate::voxel::occupancy::CascadedOccupancy,
+    level_index: usize,
+) -> u64 {
+    let l0_size = hierarchy.level0.len() * std::mem::size_of::<NodeL0>();
+    let preceding_ln_size = hierarchy.levels[..level_index]
+        .iter()
+        .map(|level| level.len() * std::mem::size_of::<NodeLN>())
+        .sum::<usize>();
+    (l0_size + preceding_ln_size) as u64
+}
+
+fn bounded_upload_chunk_len(remaining_bytes: usize, budget_bytes: usize) -> usize {
+    let chunk_len = remaining_bytes.min(budget_bytes);
+    if chunk_len == remaining_bytes {
+        return chunk_len;
+    }
+    chunk_len - (chunk_len % 4)
 }
 
 /// GPU-side config matching the shader UBO.
@@ -50,6 +117,27 @@ pub struct UcvhGpuResources {
     staging_config: GpuBuffer,
     staging_brick_generations: GpuBuffer,
     staging_motion_events: GpuBuffer,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UcvhInitialUploadProgress {
+    segment_index: usize,
+    segment_offset: usize,
+    completed: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct UcvhInitialUploadFrameResult {
+    pub completed: bool,
+    pub bytes_uploaded: usize,
+}
+
+struct InitialUploadSegment<'a> {
+    data: &'a [u8],
+    staging: &'a GpuBuffer,
+    destination: &'a GpuBuffer,
+    staging_base_offset: u64,
+    destination_base_offset: u64,
 }
 
 #[repr(C)]
@@ -99,10 +187,8 @@ impl UcvhGpuResources {
     }
 
     pub fn new(device: &ash::Device, allocator: &GpuAllocator, ucvh: &Ucvh) -> Result<Self> {
-        let cap = ucvh.pool.capacity() as usize;
-        let occ_size = cap * std::mem::size_of::<BrickOccupancy>();
-        let mat_size = cap * BRICK_VOLUME * std::mem::size_of::<VoxelCell>();
-        let generation_size = cap * std::mem::size_of::<u32>();
+        let (initial_occ_size, initial_mat_size, initial_generation_size) =
+            initial_device_pool_sizes(ucvh);
         let motion_event_size =
             UCVH_MOTION_EVENT_CAPACITY * std::mem::size_of::<GpuUcvhMotionEvent>();
 
@@ -121,7 +207,7 @@ impl UcvhGpuResources {
         let occupancy_buffer = GpuBuffer::new(
             device,
             allocator,
-            occ_size as u64,
+            initial_occ_size.max(16) as u64,
             ssbo_usage,
             MemoryLocation::GpuOnly,
             "ucvh_occupancy",
@@ -129,7 +215,7 @@ impl UcvhGpuResources {
         let material_buffer = GpuBuffer::new(
             device,
             allocator,
-            mat_size as u64,
+            initial_mat_size.max(16) as u64,
             ssbo_usage,
             MemoryLocation::GpuOnly,
             "ucvh_materials",
@@ -137,7 +223,7 @@ impl UcvhGpuResources {
         let brick_generation_buffer = GpuBuffer::new(
             device,
             allocator,
-            generation_size.max(16) as u64,
+            initial_generation_size.max(16) as u64,
             ssbo_usage,
             MemoryLocation::GpuOnly,
             "ucvh_brick_generations",
@@ -202,10 +288,11 @@ impl UcvhGpuResources {
 
         // Staging buffers (host-visible)
         let total_hierarchy = l0_size + ln_sizes.iter().sum::<usize>();
+
         let staging_occupancy = GpuBuffer::new(
             device,
             allocator,
-            occ_size as u64,
+            initial_occ_size.max(16) as u64,
             staging_usage,
             MemoryLocation::CpuToGpu,
             "staging_occupancy",
@@ -213,7 +300,7 @@ impl UcvhGpuResources {
         let staging_material = GpuBuffer::new(
             device,
             allocator,
-            mat_size as u64,
+            initial_mat_size.max(16) as u64,
             staging_usage,
             MemoryLocation::CpuToGpu,
             "staging_materials",
@@ -237,7 +324,7 @@ impl UcvhGpuResources {
         let staging_brick_generations = GpuBuffer::new(
             device,
             allocator,
-            generation_size.max(16) as u64,
+            initial_generation_size.max(16) as u64,
             staging_usage,
             MemoryLocation::CpuToGpu,
             "staging_brick_generations",
@@ -277,34 +364,18 @@ impl UcvhGpuResources {
         ucvh: &Ucvh,
     ) -> Result<()> {
         // Upload config
-        let gpu_config = UcvhGpuConfig {
-            world_size: [
-                ucvh.config.world_size.x,
-                ucvh.config.world_size.y,
-                ucvh.config.world_size.z,
-                0,
-            ],
-            brick_grid_size: [
-                ucvh.config.brick_grid_size.x,
-                ucvh.config.brick_grid_size.y,
-                ucvh.config.brick_grid_size.z,
-                0,
-            ],
-            brick_capacity: ucvh.pool.capacity(),
-            allocated_bricks: ucvh.pool.allocated_count(),
-            _pad: [0; 2],
-        };
+        let gpu_config = initial_gpu_config(ucvh);
         Self::copy_to_staging(&self.staging_config, bytes_of(&gpu_config))?;
 
         // Upload occupancy pool
-        let occ_bytes = cast_slice::<BrickOccupancy, u8>(ucvh.pool.occupancy_pool());
+        let occ_bytes = cast_slice::<BrickOccupancy, u8>(initial_occupancy_upload_slice(ucvh));
         Self::copy_to_staging(&self.staging_occupancy, occ_bytes)?;
 
         // Upload material pool
-        let mat_bytes = cast_slice::<VoxelCell, u8>(ucvh.pool.material_pool());
+        let mat_bytes = cast_slice::<VoxelCell, u8>(initial_material_upload_slice(ucvh));
         Self::copy_to_staging(&self.staging_material, mat_bytes)?;
 
-        let generation_bytes = cast_slice::<u32, u8>(ucvh.brick_generations());
+        let generation_bytes = cast_slice::<u32, u8>(initial_generation_upload_slice(ucvh));
         Self::copy_to_staging(&self.staging_brick_generations, generation_bytes)?;
 
         // Upload hierarchy
@@ -374,24 +445,174 @@ impl UcvhGpuResources {
             );
         }
 
-        // Buffer memory barrier: ensure transfers complete before shader reads
-        let barrier = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ);
-        unsafe {
-            device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER
-                    | vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
-                vk::DependencyFlags::empty(),
-                &[barrier],
-                &[],
-                &[],
-            );
-        }
+        Self::record_upload_barrier(device, cmd);
 
         Ok(())
+    }
+
+    pub(crate) fn upload_initial_incremental(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        ucvh: &Ucvh,
+        progress: &mut UcvhInitialUploadProgress,
+        budget_bytes: usize,
+    ) -> Result<UcvhInitialUploadFrameResult> {
+        if progress.completed {
+            return Ok(UcvhInitialUploadFrameResult {
+                completed: true,
+                bytes_uploaded: 0,
+            });
+        }
+
+        let mut remaining_budget = budget_bytes;
+        let mut bytes_uploaded = 0usize;
+
+        while remaining_budget > 0 && progress.segment_index < INITIAL_UCVH_UPLOAD_SEGMENT_COUNT {
+            let chunk_uploaded = if progress.segment_index == 0 {
+                let gpu_config = initial_gpu_config(ucvh);
+                let config_bytes = bytes_of(&gpu_config);
+                let segment = InitialUploadSegment {
+                    data: config_bytes,
+                    staging: &self.staging_config,
+                    destination: &self.config_buffer,
+                    staging_base_offset: 0,
+                    destination_base_offset: 0,
+                };
+                Self::upload_segment_chunk(
+                    device,
+                    cmd,
+                    &segment,
+                    progress.segment_offset,
+                    remaining_budget,
+                )?
+            } else {
+                let Some(segment) = self.initial_upload_segment(ucvh, progress.segment_index)
+                else {
+                    progress.segment_index += 1;
+                    progress.segment_offset = 0;
+                    continue;
+                };
+                Self::upload_segment_chunk(
+                    device,
+                    cmd,
+                    &segment,
+                    progress.segment_offset,
+                    remaining_budget,
+                )?
+            };
+
+            if chunk_uploaded == 0 {
+                break;
+            }
+            progress.segment_offset += chunk_uploaded;
+            remaining_budget -= chunk_uploaded;
+            bytes_uploaded += chunk_uploaded;
+
+            let segment_len = if progress.segment_index == 0 {
+                std::mem::size_of::<UcvhGpuConfig>()
+            } else {
+                self.initial_upload_segment(ucvh, progress.segment_index)
+                    .map(|segment| segment.data.len())
+                    .unwrap_or(0)
+            };
+            if progress.segment_offset >= segment_len {
+                progress.segment_index += 1;
+                progress.segment_offset = 0;
+            }
+        }
+
+        if bytes_uploaded > 0 {
+            Self::record_upload_barrier(device, cmd);
+        }
+
+        if progress.segment_index >= INITIAL_UCVH_UPLOAD_SEGMENT_COUNT {
+            progress.completed = true;
+        }
+
+        Ok(UcvhInitialUploadFrameResult {
+            completed: progress.completed,
+            bytes_uploaded,
+        })
+    }
+
+    fn initial_upload_segment<'a>(
+        &'a self,
+        ucvh: &'a Ucvh,
+        index: usize,
+    ) -> Option<InitialUploadSegment<'a>> {
+        let h = &ucvh.hierarchy;
+        match index {
+            1 => Some(InitialUploadSegment {
+                data: cast_slice::<BrickOccupancy, u8>(initial_occupancy_upload_slice(ucvh)),
+                staging: &self.staging_occupancy,
+                destination: &self.occupancy_buffer,
+                staging_base_offset: 0,
+                destination_base_offset: 0,
+            }),
+            2 => Some(InitialUploadSegment {
+                data: cast_slice::<VoxelCell, u8>(initial_material_upload_slice(ucvh)),
+                staging: &self.staging_material,
+                destination: &self.material_buffer,
+                staging_base_offset: 0,
+                destination_base_offset: 0,
+            }),
+            3 => Some(InitialUploadSegment {
+                data: cast_slice::<u32, u8>(initial_generation_upload_slice(ucvh)),
+                staging: &self.staging_brick_generations,
+                destination: &self.brick_generation_buffer,
+                staging_base_offset: 0,
+                destination_base_offset: 0,
+            }),
+            4 => Some(InitialUploadSegment {
+                data: cast_slice::<NodeL0, u8>(&h.level0),
+                staging: &self.staging_hierarchy,
+                destination: &self.hierarchy_l0_buffer,
+                staging_base_offset: 0,
+                destination_base_offset: 0,
+            }),
+            5..=8 => {
+                let level_index = index - 5;
+                Some(InitialUploadSegment {
+                    data: cast_slice::<NodeLN, u8>(&h.levels[level_index]),
+                    staging: &self.staging_hierarchy,
+                    destination: &self.hierarchy_ln_buffers[level_index],
+                    staging_base_offset: hierarchy_level_staging_offset(h, level_index),
+                    destination_base_offset: 0,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    fn upload_segment_chunk(
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        segment: &InitialUploadSegment<'_>,
+        segment_offset: usize,
+        budget_bytes: usize,
+    ) -> Result<usize> {
+        if segment_offset >= segment.data.len() {
+            return Ok(0);
+        }
+        let chunk_len = bounded_upload_chunk_len(segment.data.len() - segment_offset, budget_bytes);
+        if chunk_len == 0 {
+            return Ok(0);
+        }
+        let chunk = &segment.data[segment_offset..segment_offset + chunk_len];
+        let staging_offset = segment.staging_base_offset + segment_offset as u64;
+        let destination_offset = segment.destination_base_offset + segment_offset as u64;
+        Self::copy_to_staging_offset(segment.staging, chunk, staging_offset as usize)?;
+        Self::record_copy_region(
+            device,
+            cmd,
+            segment.staging,
+            segment.destination,
+            staging_offset,
+            destination_offset,
+            chunk_len as u64,
+        );
+        Ok(chunk_len)
     }
 
     pub fn upload_motion_guide(
@@ -401,7 +622,7 @@ impl UcvhGpuResources {
         ucvh: &Ucvh,
         motion_events: &[UcvhMotionEvent],
     ) -> Result<u32> {
-        let generation_bytes = cast_slice::<u32, u8>(ucvh.brick_generations());
+        let generation_bytes = cast_slice::<u32, u8>(initial_generation_upload_slice(ucvh));
         Self::copy_to_staging(&self.staging_brick_generations, generation_bytes)?;
         Self::record_copy(
             device,
@@ -433,6 +654,12 @@ impl UcvhGpuResources {
             event_bytes.len() as u64,
         );
 
+        Self::record_upload_barrier(device, cmd);
+
+        Ok(event_count as u32)
+    }
+
+    fn record_upload_barrier(device: &ash::Device, cmd: vk::CommandBuffer) {
         let barrier = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ);
@@ -448,8 +675,6 @@ impl UcvhGpuResources {
                 &[],
             );
         }
-
-        Ok(event_count as u32)
     }
 
     fn copy_to_staging(buffer: &GpuBuffer, data: &[u8]) -> Result<()> {
@@ -655,6 +880,79 @@ mod tests {
     }
 
     #[test]
+    fn initial_ucvh_upload_slices_are_limited_to_allocated_brick_prefix() {
+        let mut ucvh = Ucvh::new(crate::voxel::ucvh::UcvhConfig::with_brick_capacity(
+            glam::UVec3::new(2048, 768, 2048),
+            64,
+        ));
+        assert!(ucvh.set_voxel(glam::UVec3::new(0, 0, 0), VoxelCell::new(2, 0, [0; 3])));
+        assert!(ucvh.set_voxel(
+            glam::UVec3::new(2040, 760, 2040),
+            VoxelCell::new(3, 0, [0; 3])
+        ));
+
+        assert_eq!(initial_occupancy_upload_slice(&ucvh).len(), 2);
+        assert_eq!(initial_material_upload_slice(&ucvh).len(), 2 * BRICK_VOLUME);
+        assert_eq!(initial_generation_upload_slice(&ucvh).len(), 2);
+        assert_eq!(
+            initial_device_pool_sizes(&ucvh),
+            (
+                2 * std::mem::size_of::<BrickOccupancy>(),
+                2 * BRICK_VOLUME * std::mem::size_of::<VoxelCell>(),
+                2 * std::mem::size_of::<u32>(),
+            )
+        );
+    }
+
+    #[test]
+    fn gpu_resource_creation_sizes_pool_buffers_from_initial_allocated_bricks() {
+        let source = crate::render::source_checks::read_source("src/voxel/gpu_upload.rs");
+        let new_body = source
+            .split("pub fn new")
+            .nth(1)
+            .expect("UcvhGpuResources::new should exist")
+            .split("/// Upload all UCVH data")
+            .next()
+            .expect("new should end before upload_all docs");
+
+        assert!(
+            new_body.contains("initial_device_pool_sizes(ucvh)"),
+            "initial GPU pool buffers must be sized by allocated brick prefix, not brick capacity"
+        );
+    }
+
+    #[test]
+    fn initial_ucvh_upload_exposes_incremental_frame_budget() {
+        let source = crate::render::source_checks::read_source("src/voxel/gpu_upload.rs");
+        let implementation = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("implementation should precede tests");
+
+        assert!(
+            implementation.contains("INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES"),
+            "initial UCVH upload must have a bounded per-frame byte budget"
+        );
+        assert!(
+            implementation.contains("pub(crate) fn upload_initial_incremental"),
+            "initial UCVH upload must be resumable across frames instead of one blocking upload"
+        );
+        assert!(
+            implementation.contains("UcvhInitialUploadProgress"),
+            "initial UCVH upload must retain progress between frames"
+        );
+    }
+
+    #[test]
+    fn initial_ucvh_upload_frame_budget_stays_below_unresponsive_frame_size() {
+        let budget = std::hint::black_box(INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES);
+        assert!(
+            budget <= 64 * 1024 * 1024,
+            "initial UCVH upload must not push hundreds of MB in one frame"
+        );
+    }
+
+    #[test]
     fn ucvh_upload_barriers_make_buffers_visible_to_compute_and_ray_tracing_shaders() {
         let source = crate::render::source_checks::read_source("src/voxel/gpu_upload.rs");
         let upload_all = source
@@ -672,14 +970,33 @@ mod tests {
             .next()
             .expect("upload_motion_guide should end before copy helpers");
 
-        for body in [upload_all, upload_motion] {
-            assert!(body.contains("PipelineStageFlags::COMPUTE_SHADER"));
+        let incremental_upload = source
+            .split("pub(crate) fn upload_initial_incremental")
+            .nth(1)
+            .expect("UcvhGpuResources::upload_initial_incremental should exist")
+            .split("pub fn upload_motion_guide")
+            .next()
+            .expect("upload_initial_incremental should end before upload_motion_guide");
+        let barrier_helper = source
+            .split("fn record_upload_barrier")
+            .nth(1)
+            .expect("record_upload_barrier should exist")
+            .split("fn copy_to_staging")
+            .next()
+            .expect("record_upload_barrier should end before copy helpers");
+
+        for body in [upload_all, incremental_upload, upload_motion] {
             assert!(
-                body.contains("PipelineStageFlags::RAY_TRACING_SHADER_KHR"),
-                "UCVH upload barriers must make copied buffers visible to RT shaders"
+                body.contains("record_upload_barrier"),
+                "each UCVH upload path must emit a transfer-to-shader barrier"
             );
-            assert!(body.contains("dst_access_mask(vk::AccessFlags::SHADER_READ)"));
         }
+        assert!(barrier_helper.contains("PipelineStageFlags::COMPUTE_SHADER"));
+        assert!(
+            barrier_helper.contains("PipelineStageFlags::RAY_TRACING_SHADER_KHR"),
+            "UCVH upload barriers must make copied buffers visible to RT shaders"
+        );
+        assert!(barrier_helper.contains("dst_access_mask(vk::AccessFlags::SHADER_READ)"));
     }
 
     #[test]

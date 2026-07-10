@@ -639,25 +639,25 @@ pub struct GpuSceneUniforms {
     pub _pad0: [u32; 2],             // 8B
     pub sun_direction: [f32; 3],     // 12B — normalized, world space, points TOWARD sun
     pub sun_angular_radius: f32,     // 4B
-    pub sun_intensity: [f32; 3],     // 12B - solar-disk radiance for VPT finite sun estimator
-    pub _pad2: f32,                  // 4B
-    pub sky_color: [f32; 3],         // 12B — hemisphere ambient upper
-    pub _pad3: f32,                  // 4B
-    pub ground_color: [f32; 3],      // 12B — hemisphere ambient lower
-    pub time: f32,                   // 4B
-    pub lighting_flags: u32,         // 4B
-    pub exposure: f32,               // 4B
-    pub render_mode: u32,            // 4B
-    pub vpt_sample_index: u32,       // 4B
-    pub vpt_max_bounces: u32,        // 4B
-    pub denoiser_flags: u32,         // 4B
+    pub sun_intensity: [f32; 3], // 12B - total solar irradiance / legacy directional-light strength
+    pub _pad2: f32,              // 4B
+    pub sky_color: [f32; 3],     // 12B — hemisphere ambient upper
+    pub _pad3: f32,              // 4B
+    pub ground_color: [f32; 3],  // 12B — hemisphere ambient lower
+    pub time: f32,               // 4B
+    pub lighting_flags: u32,     // 4B
+    pub exposure: f32,           // 4B
+    pub render_mode: u32,        // 4B
+    pub vpt_sample_index: u32,   // 4B
+    pub vpt_max_bounces: u32,    // 4B
+    pub denoiser_flags: u32,     // 4B
     pub denoiser_atrous_iterations: u32, // 4B
-    pub vpt_debug_view: u32,         // 4B
-    pub camera_right: [f32; 3],      // 12B
-    pub aperture_radius: f32,        // 4B
-    pub camera_up: [f32; 3],         // 12B
-    pub focal_distance: f32,         // 4B
-    pub camera_forward: [f32; 3],    // 12B
+    pub vpt_debug_view: u32,     // 4B
+    pub camera_right: [f32; 3],  // 12B
+    pub aperture_radius: f32,    // 4B
+    pub camera_up: [f32; 3],     // 12B
+    pub focal_distance: f32,     // 4B
+    pub camera_forward: [f32; 3], // 12B
     pub history_reset_generation: u32, // 4B
 }
 
