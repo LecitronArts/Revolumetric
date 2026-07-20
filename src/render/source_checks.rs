@@ -1041,7 +1041,7 @@ mod tests {
                 "current_reservoir_buffer",
                 "history_reservoir_buffer",
                 "RtRestirGiShaders",
-                "RayTracingPipeline::new_surface_pipeline",
+                "RayTracingPipeline::new_mixed_surface_pipeline",
                 "update_tlas_descriptor",
                 "update_aabb_descriptor",
                 "update_ucvh_descriptors",
@@ -1119,7 +1119,7 @@ mod tests {
                 "fallback_indirect_reservoirs",
                 "current_radiance",
                 "RtDirectLightingShaders",
-                "RayTracingPipeline::new_surface_pipeline",
+                "RayTracingPipeline::new_mixed_surface_pipeline",
                 "cmd_trace_rays",
                 "rt_direct_lighting",
                 "update_tlas_descriptor",
@@ -1175,12 +1175,7 @@ mod tests {
         );
         assert_contains_all(
             &closest_hit,
-            &[
-                "[shader(\"closesthit\")]",
-                "trace_any_hit_ray_skip_voxel",
-                "payload.skip_brick_id",
-                "payload.skip_local",
-            ],
+            &["[shader(\"closesthit\")]", "payload.occluded = 1u"],
             "RT direct-lighting shadow closest-hit shader",
         );
         assert_contains_all(

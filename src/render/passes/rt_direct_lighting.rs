@@ -6,9 +6,12 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
-use crate::render::pipeline::{RayTracingPipeline, ShaderBindingTable, create_shader_module};
+use crate::render::pipeline::{
+    RayTracingPipeline, RtHitGroupKind, RtShaderStageSpec, ShaderBindingTable, create_shader_module,
+};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_di::GpuRestirDiReservoir;
 use crate::render::restir_gi::GpuRestirGiReservoir;
@@ -19,13 +22,19 @@ pub(crate) const RT_DIRECT_LIGHTING_RAYGEN_SPV: &str = "rt_direct_lighting.rgen.
 pub(crate) const RT_DIRECT_LIGHTING_MISS_SPV: &str = "rt_direct_lighting.rmiss.spv";
 pub(crate) const RT_DIRECT_LIGHTING_CLOSEST_HIT_SPV: &str = "rt_direct_lighting.rchit.spv";
 pub(crate) const RT_DIRECT_LIGHTING_INTERSECTION_SPV: &str = "rt_direct_lighting.rint.spv";
+/// CompactExact triangle shadow closest-hit (hit group 1). Just marks shadow occluded.
+pub(crate) const RT_DIRECT_LIGHTING_COMPACT_EXACT_CLOSEST_HIT_SPV: &str =
+    "rt_compact_exact_shadow.rchit.spv";
 
 #[derive(Clone, Copy)]
 pub struct RtDirectLightingShaders<'a> {
     pub raygen: &'a [u8],
     pub miss: &'a [u8],
+    /// Reference DDA shadow closest-hit (hit group 0, procedural AABB).
     pub closest_hit: &'a [u8],
     pub intersection: &'a [u8],
+    /// CompactExact triangle shadow closest-hit (hit group 1, triangle BLAS).
+    pub compact_exact_closest_hit: &'a [u8],
 }
 
 #[repr(C)]
@@ -226,17 +235,52 @@ impl RtDirectLightingPass {
                 return Err(error);
             }
         };
-        let pipeline = match RayTracingPipeline::new_surface_pipeline(
-            device,
-            info.ray_tracing_pipeline_loader,
-            shader_modules.raygen,
-            shader_modules.miss,
-            shader_modules.closest_hit,
-            shader_modules.intersection,
-            c"main",
-            &[descriptor_set_layout],
-            &[],
-        ) {
+        let pipeline = match {
+            let stages = [
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::RAYGEN_KHR,
+                    module: shader_modules.raygen,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::MISS_KHR,
+                    module: shader_modules.miss,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    module: shader_modules.closest_hit,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::INTERSECTION_KHR,
+                    module: shader_modules.intersection,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    module: shader_modules.compact_exact_closest_hit,
+                    entry_point: c"main",
+                },
+            ];
+            let hit_groups = [
+                RtHitGroupKind::Procedural {
+                    closest_hit_stage: 2,
+                    intersection_stage: 3,
+                },
+                RtHitGroupKind::Triangles {
+                    closest_hit_stage: 4,
+                },
+            ];
+            RayTracingPipeline::new_mixed_surface_pipeline(
+                device,
+                info.ray_tracing_pipeline_loader,
+                &stages,
+                &hit_groups,
+                &[descriptor_set_layout],
+                &[],
+            )
+        } {
             Ok(pipeline) => pipeline,
             Err(error) => {
                 shader_modules.destroy(device);
@@ -361,6 +405,21 @@ impl RtDirectLightingPass {
         }
     }
 
+    /// Write CompactExact page buffers. Direct-lighting shadow rays don't need face/page
+    /// data themselves, but keeping a consistent update path avoids stale descriptors if
+    /// the shadow rchit is later extended.
+    pub fn update_rt_page_descriptors(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        face_buffer: &GpuBuffer,
+        page_record_buffer: &GpuBuffer,
+    ) {
+        let _ = (device, frame_slot, face_buffer, page_record_buffer);
+        // Shadow rchit doesn't read face/page records; method is a no-op placeholder
+        // keeping the call site uniform with the surface and GI passes.
+    }
+
     pub fn update_frame_descriptors(
         &self,
         device: &ash::Device,
@@ -388,6 +447,7 @@ impl RtDirectLightingPass {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register_graph<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -396,6 +456,7 @@ impl RtDirectLightingPass {
         direct_reservoirs: Option<ResourceHandle>,
         indirect_reservoirs: Option<ResourceHandle>,
         output_initialized: bool,
+        profiler: Option<&'a GpuProfiler>,
     ) -> RtDirectLightingGraphOutputs {
         let output = graph.import_image_with_access(
             self.current_radiance.handle,
@@ -434,30 +495,48 @@ impl RtDirectLightingPass {
                 builder.read_as(indirect_reservoirs, AccessKind::RayTracingShaderRead);
             }
             builder.write_as(output, AccessKind::RayTracingShaderWrite);
-            Box::new(move |ctx| unsafe {
-                ctx.device.cmd_bind_pipeline(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline,
-                );
-                ctx.device.cmd_bind_descriptor_sets(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline_layout,
-                    0,
-                    std::slice::from_ref(&descriptor_set),
-                    &[],
-                );
-                ray_tracing_pipeline_loader.cmd_trace_rays(
-                    ctx.command_buffer,
-                    &sbt_regions.raygen,
-                    &sbt_regions.miss,
-                    &sbt_regions.hit,
-                    &sbt_regions.callable,
-                    width,
-                    height,
-                    1,
-                );
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtDirectLighting,
+                    );
+                }
+                unsafe {
+                    ctx.device.cmd_bind_pipeline(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline,
+                    );
+                    ctx.device.cmd_bind_descriptor_sets(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline_layout,
+                        0,
+                        std::slice::from_ref(&descriptor_set),
+                        &[],
+                    );
+                    ray_tracing_pipeline_loader.cmd_trace_rays(
+                        ctx.command_buffer,
+                        &sbt_regions.raygen,
+                        &sbt_regions.miss,
+                        &sbt_regions.hit,
+                        &sbt_regions.callable,
+                        width,
+                        height,
+                        1,
+                    );
+                }
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtDirectLighting,
+                    );
+                }
             })
         });
 
@@ -528,11 +607,18 @@ struct RtDirectLightingShaderModules {
     miss: vk::ShaderModule,
     closest_hit: vk::ShaderModule,
     intersection: vk::ShaderModule,
+    compact_exact_closest_hit: vk::ShaderModule,
 }
 
 impl RtDirectLightingShaderModules {
     fn destroy(self, device: &ash::Device) {
-        for module in [self.raygen, self.miss, self.closest_hit, self.intersection] {
+        for module in [
+            self.raygen,
+            self.miss,
+            self.closest_hit,
+            self.intersection,
+            self.compact_exact_closest_hit,
+        ] {
             unsafe { device.destroy_shader_module(module, None) };
         }
     }
@@ -547,6 +633,10 @@ fn create_rt_direct_lighting_shader_modules(
         (RT_DIRECT_LIGHTING_MISS_SPV, shaders.miss),
         (RT_DIRECT_LIGHTING_CLOSEST_HIT_SPV, shaders.closest_hit),
         (RT_DIRECT_LIGHTING_INTERSECTION_SPV, shaders.intersection),
+        (
+            RT_DIRECT_LIGHTING_COMPACT_EXACT_CLOSEST_HIT_SPV,
+            shaders.compact_exact_closest_hit,
+        ),
     ];
     let mut modules = Vec::with_capacity(shader_specs.len());
     for (name, spirv) in shader_specs {
@@ -567,6 +657,7 @@ fn create_rt_direct_lighting_shader_modules(
         miss: modules[1],
         closest_hit: modules[2],
         intersection: modules[3],
+        compact_exact_closest_hit: modules[4],
     })
 }
 
@@ -921,7 +1012,8 @@ mod shader_source_tests {
             "rt_direct_lighting.rmiss.spv",
             "rt_direct_lighting.rchit.spv",
             "rt_direct_lighting.rint.spv",
-            "RayTracingPipeline::new_surface_pipeline",
+            "rt_compact_exact_shadow.rchit.spv",
+            "RayTracingPipeline::new_mixed_surface_pipeline",
             "WriteDescriptorSetAccelerationStructureKHR",
             "update_tlas_descriptor",
             "update_aabb_descriptor",

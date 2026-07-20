@@ -9,6 +9,7 @@ use crate::render::device::RenderDevice;
 #[cfg(not(target_os = "android"))]
 use crate::render::egui_renderer::{EguiFrame, EguiRenderer};
 use crate::render::frame::FrameContext;
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::passes::blit_to_swapchain;
 use crate::render::passes::rt_direct_lighting::{
@@ -54,6 +55,14 @@ pub struct RtFrameInputs<'a> {
     pub ucvh: Option<&'a Ucvh>,
     pub ucvh_gpu: Option<&'a UcvhGpuResources>,
     pub external_history_reset_generation: u32,
+    pub profiler: Option<&'a GpuProfiler>,
+    /// When Some, the rt_page_tlas TLAS handle overrides the legacy rt_scene TLAS for
+    /// all trace passes.  Set from RtPageTlasGpuResources::tlas_handle(frame_slot).
+    pub rt_page_tlas_handle: Option<ash::vk::AccelerationStructureKHR>,
+    /// When Some, face_buffer and page_record_buffer are written to descriptor bindings
+    /// for all three trace passes (surface 14/15, GI 18/19).
+    pub rt_page_face_buffer: Option<&'a crate::render::buffer::GpuBuffer>,
+    pub rt_page_record_buffer: Option<&'a crate::render::buffer::GpuBuffer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -311,14 +320,31 @@ impl RtRuntimePipeline {
                         .acceleration_structure_properties()
                         .min_acceleration_structure_scratch_offset_alignment
                         as vk::DeviceSize;
-                    match self.rt_scene.rebuild_gpu(
+                    if let Some(profiler) = inputs.profiler {
+                        profiler.begin_scope(
+                            renderer.device(),
+                            frame.command_buffer,
+                            frame.frame_slot,
+                            GpuProfileScope::RtAccelerationStructures,
+                        );
+                    }
+                    let rebuild_result = self.rt_scene.rebuild_gpu(
                         renderer.device(),
                         renderer.allocator(),
                         acceleration_structure_loader,
                         frame.command_buffer,
                         scratch_alignment,
                         ucvh,
-                    ) {
+                    );
+                    if let Some(profiler) = inputs.profiler {
+                        profiler.end_scope(
+                            renderer.device(),
+                            frame.command_buffer,
+                            frame.frame_slot,
+                            GpuProfileScope::RtAccelerationStructures,
+                        );
+                    }
+                    match rebuild_result {
                         Ok(()) => {
                             let rebuilt = self.rt_scene.build_generation
                                 != self.frame_state.as_rebuild_generation;
@@ -449,12 +475,17 @@ impl RtRuntimePipeline {
             &self.rt_resolve_pass,
         ) {
             match (self.rt_scene.tlas_handle(), self.rt_scene.aabb_buffer()) {
-                (Some(tlas), Some(aabb_buffer)) => {
+                (Some(legacy_tlas), Some(aabb_buffer)) => {
+                    // Prefer rt_page_tlas when available — it is the unified TLAS
+                    // containing both Reference (procedural) and CompactExact (triangle)
+                    // instances.  Fall back to the legacy rt_scene TLAS while Phase 4
+                    // page coverage is still ramping up.
+                    let active_tlas = inputs.rt_page_tlas_handle.unwrap_or(legacy_tlas);
                     if let Some(ucvh_gpu) = inputs.ucvh_gpu {
                         rt_surface.update_tlas_descriptor(
                             renderer.device(),
                             frame.frame_slot,
-                            tlas,
+                            active_tlas,
                         );
                         rt_surface.update_aabb_descriptor(
                             renderer.device(),
@@ -469,7 +500,7 @@ impl RtRuntimePipeline {
                         rt_direct_lighting.update_tlas_descriptor(
                             renderer.device(),
                             frame.frame_slot,
-                            tlas,
+                            active_tlas,
                         );
                         rt_direct_lighting.update_aabb_descriptor(
                             renderer.device(),
@@ -485,7 +516,7 @@ impl RtRuntimePipeline {
                             rt_restir_gi.update_tlas_descriptor(
                                 renderer.device(),
                                 frame.frame_slot,
-                                tlas,
+                                active_tlas,
                             );
                             rt_restir_gi.update_aabb_descriptor(
                                 renderer.device(),
@@ -498,12 +529,39 @@ impl RtRuntimePipeline {
                                 ucvh_gpu,
                             );
                         }
+                        // Write CompactExact page buffers when available.
+                        if let (Some(face_buf), Some(page_rec_buf)) = (
+                            inputs.rt_page_face_buffer,
+                            inputs.rt_page_record_buffer,
+                        ) {
+                            rt_surface.update_rt_page_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                face_buf,
+                                page_rec_buf,
+                            );
+                            rt_direct_lighting.update_rt_page_descriptors(
+                                renderer.device(),
+                                frame.frame_slot,
+                                face_buf,
+                                page_rec_buf,
+                            );
+                            if let Some(rt_restir_gi) = &self.rt_restir_gi_pass {
+                                rt_restir_gi.update_rt_page_descriptors(
+                                    renderer.device(),
+                                    frame.frame_slot,
+                                    face_buf,
+                                    page_rec_buf,
+                                );
+                            }
+                        }
                         rt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
                         rt_temporal.update_history_uniforms(frame.frame_slot, &history_uniforms);
                         let rt_surface_outputs = rt_surface.register_graph(
                             &mut graph,
                             frame.frame_slot,
                             self.frame_state.surface_initialized,
+                            inputs.profiler,
                         );
                         let (rt_restir_di_reservoir_resource, rt_restir_di_reservoir_buffer) =
                             if inputs.rt_settings.restir_di_enabled {
@@ -536,6 +594,7 @@ impl RtRuntimePipeline {
                                         inputs.rt_settings.restir_di_spatial_enabled
                                             && inputs.rt_settings.restir_di_spatial_sample_count
                                                 > 0,
+                                        inputs.profiler,
                                     );
                                     (
                                         Some(rt_restir_di_outputs.reservoirs),
@@ -596,6 +655,7 @@ impl RtRuntimePipeline {
                                         inputs.rt_settings.restir_gi_spatial_enabled
                                             && inputs.rt_settings.restir_gi_spatial_sample_count
                                                 > 0,
+                                        inputs.profiler,
                                     );
                                     rt_restir_gi_spatial_rendered =
                                         rt_restir_gi_outputs.spatial_rendered;
@@ -642,6 +702,7 @@ impl RtRuntimePipeline {
                             rt_restir_di_reservoir_resource,
                             rt_restir_gi_reservoir_resource,
                             self.frame_state.direct_lighting_initialized,
+                            inputs.profiler,
                         );
                         rt_temporal.update_frame_descriptors(
                             renderer.device(),
@@ -657,6 +718,7 @@ impl RtRuntimePipeline {
                             rt_surface_outputs.surface,
                             rt_direct_lighting_outputs.current_radiance,
                             self.frame_state.temporal_initialized,
+                            inputs.profiler,
                         );
                         rt_resolve
                             .update_uniforms(frame.frame_slot, inputs.lighting_settings.exposure);
@@ -670,6 +732,7 @@ impl RtRuntimePipeline {
                             rt_temporal_outputs.temporal_radiance,
                             frame.frame_slot,
                             self.frame_state.resolve_initialized,
+                            inputs.profiler,
                         );
                         rt_graph_rendered = true;
                         let mut capture_dependency = None;
@@ -1040,6 +1103,10 @@ impl RtRuntimePipeline {
             miss: include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rt_surface.rmiss.spv")),
             closest_hit: include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rt_surface.rchit.spv")),
             intersection: include_bytes!(concat!(env!("OUT_DIR"), "/shaders/rt_surface.rint.spv")),
+            compact_exact_closest_hit: include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/rt_compact_exact_surface.rchit.spv"
+            )),
         };
         match RtSurfacePass::new(
             renderer.device(),
@@ -1157,6 +1224,10 @@ impl RtRuntimePipeline {
                     miss: miss_spirv,
                     closest_hit: closest_hit_spirv,
                     intersection: intersection_spirv,
+                    compact_exact_closest_hit: include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/shaders/rt_compact_exact_shadow.rchit.spv"
+                    )),
                 },
             },
         ) {
@@ -1279,6 +1350,10 @@ impl RtRuntimePipeline {
             intersection: include_bytes!(concat!(
                 env!("OUT_DIR"),
                 "/shaders/rt_restir_gi.rint.spv"
+            )),
+            compact_exact_closest_hit: include_bytes!(concat!(
+                env!("OUT_DIR"),
+                "/shaders/rt_compact_exact_gi.rchit.spv"
             )),
         };
         if [
@@ -2125,7 +2200,7 @@ mod tests {
             "rt_restir_gi.update_history_uniforms(",
             "rt_restir_gi.update_uniforms(frame.frame_slot,RtRestirGiFrameSettings{rt_settings:inputs.rt_settings,frame_index:frame.frame_index,history_initialized:self.frame_state.restir_gi_history_initialized,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
             "rt_restir_gi.update_frame_descriptors(",
-            "rt_restir_gi.update_tlas_descriptor(renderer.device(),frame.frame_slot,tlas,)",
+            "rt_restir_gi.update_tlas_descriptor(renderer.device(),frame.frame_slot,active_tlas,)",
             "rt_restir_gi.update_aabb_descriptor(renderer.device(),frame.frame_slot,aabb_buffer,)",
             "rt_restir_gi.update_ucvh_descriptors(renderer.device(),frame.frame_slot,ucvh_gpu,)",
             "frame.frame_index",
@@ -2172,7 +2247,7 @@ mod tests {
             "Some(rt_restir_gi_reservoir_buffer)",
             "rt_direct_lighting.update_uniforms(frame.frame_slot,RtDirectLightingFrameSettings{rt_settings:inputs.rt_settings,restir_di_active,restir_gi_active,shadows_enabled:inputs.lighting_settings.shadows_enabled,frame_index:frame.frame_indexasu32,sun_direction:inputs.sun_direction,sun_intensity:inputs.sun_intensity,sun_angular_radius:inputs.lighting_settings.sun_angular_radius,},)",
             "rt_direct_lighting.update_frame_descriptors(renderer.device(),frame.frame_slot,rt_surface.surface_buffer(),rt_restir_di_reservoir_buffer,rt_restir_gi_reservoir_buffer,)",
-            "rt_direct_lighting.register_graph(&mutgraph,frame.frame_slot,rt_surface_outputs.surface,rt_restir_di_reservoir_resource,rt_restir_gi_reservoir_resource,self.frame_state.direct_lighting_initialized,)",
+            "rt_direct_lighting.register_graph(&mutgraph,frame.frame_slot,rt_surface_outputs.surface,rt_restir_di_reservoir_resource,rt_restir_gi_reservoir_resource,self.frame_state.direct_lighting_initialized,inputs.profiler,)",
         ] {
             assert!(
                 compact.contains(token),

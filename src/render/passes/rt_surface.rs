@@ -5,8 +5,11 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
-use crate::render::pipeline::{RayTracingPipeline, ShaderBindingTable, create_shader_module};
+use crate::render::pipeline::{
+    RayTracingPipeline, RtHitGroupKind, RtShaderStageSpec, ShaderBindingTable, create_shader_module,
+};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::rt_history::{GpuRtHistoryUniforms, GpuRtSurfacePixel};
 use crate::render::scene_ubo::{GpuSceneUniforms, SceneUniformBuffer};
@@ -17,13 +20,19 @@ pub(crate) const RT_SURFACE_RAYGEN_SPV: &str = "rt_surface.rgen.spv";
 pub(crate) const RT_SURFACE_MISS_SPV: &str = "rt_surface.rmiss.spv";
 pub(crate) const RT_SURFACE_CLOSEST_HIT_SPV: &str = "rt_surface.rchit.spv";
 pub(crate) const RT_SURFACE_INTERSECTION_SPV: &str = "rt_surface.rint.spv";
+/// CompactExact triangle closest-hit shader (hit group 1). Reads face_records + page_records.
+pub(crate) const RT_SURFACE_COMPACT_EXACT_CLOSEST_HIT_SPV: &str =
+    "rt_compact_exact_surface.rchit.spv";
 
 #[derive(Clone, Copy)]
 pub struct RtSurfaceShaders<'a> {
     pub raygen: &'a [u8],
     pub miss: &'a [u8],
+    /// Reference DDA closest-hit (hit group 0, procedural AABB).
     pub closest_hit: &'a [u8],
     pub intersection: &'a [u8],
+    /// CompactExact triangle closest-hit (hit group 1, triangle BLAS).
+    pub compact_exact_closest_hit: &'a [u8],
 }
 
 pub struct RtSurfaceCreateInfo<'a> {
@@ -55,7 +64,7 @@ pub struct RtSurfaceGraphOutputs {
 }
 
 impl RtSurfacePass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 14] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 16] {
         [
             DescriptorBindingSpec::ray_tracing(0, vk::DescriptorType::ACCELERATION_STRUCTURE_KHR),
             DescriptorBindingSpec::ray_tracing(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -71,6 +80,9 @@ impl RtSurfacePass {
             DescriptorBindingSpec::ray_tracing(11, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(12, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(13, vk::DescriptorType::UNIFORM_BUFFER),
+            // CompactExact page geometry buffers (rt_compact_exact_surface.rchit.slang)
+            DescriptorBindingSpec::ray_tracing(14, vk::DescriptorType::STORAGE_BUFFER), // face_records
+            DescriptorBindingSpec::ray_tracing(15, vk::DescriptorType::STORAGE_BUFFER), // page_records
         ]
     }
 
@@ -94,7 +106,7 @@ impl RtSurfacePass {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: (10 * frame_count) as u32,
+                    descriptor_count: (12 * frame_count) as u32,
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -167,17 +179,55 @@ impl RtSurfacePass {
                 return Err(error);
             }
         };
-        let pipeline = match RayTracingPipeline::new_surface_pipeline(
-            device,
-            ray_tracing_pipeline_loader,
-            shader_modules.raygen,
-            shader_modules.miss,
-            shader_modules.closest_hit,
-            shader_modules.intersection,
-            c"main",
-            &[descriptor_set_layout],
-            &[],
-        ) {
+        let pipeline = match {
+            // Five stages: raygen, miss, reference-DDA rchit, rint, compact-exact rchit.
+            // Hit group 0 (Reference/Procedural): uses stages 2+3.
+            // Hit group 1 (CompactExact/Triangles): uses stage 4 only.
+            let stages = [
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::RAYGEN_KHR,
+                    module: shader_modules.raygen,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::MISS_KHR,
+                    module: shader_modules.miss,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    module: shader_modules.closest_hit,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::INTERSECTION_KHR,
+                    module: shader_modules.intersection,
+                    entry_point: c"main",
+                },
+                RtShaderStageSpec {
+                    stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    module: shader_modules.compact_exact_closest_hit,
+                    entry_point: c"main",
+                },
+            ];
+            let hit_groups = [
+                RtHitGroupKind::Procedural {
+                    closest_hit_stage: 2,
+                    intersection_stage: 3,
+                },
+                RtHitGroupKind::Triangles {
+                    closest_hit_stage: 4,
+                },
+            ];
+            RayTracingPipeline::new_mixed_surface_pipeline(
+                device,
+                ray_tracing_pipeline_loader,
+                &stages,
+                &hit_groups,
+                &[descriptor_set_layout],
+                &[],
+            )
+        } {
             Ok(pipeline) => pipeline,
             Err(error) => {
                 shader_modules.destroy(device);
@@ -270,6 +320,32 @@ impl RtSurfacePass {
         }
     }
 
+    /// Write CompactExact page buffers to bindings 14 (face_records) and 15 (page_records).
+    /// Call once per frame slot whenever these buffers are valid (after initial GPU upload).
+    pub fn update_rt_page_descriptors(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        face_buffer: &GpuBuffer,
+        page_record_buffer: &GpuBuffer,
+    ) {
+        let Some(&descriptor_set) = self.descriptor_sets.get(frame_slot) else {
+            return;
+        };
+        for (binding, buffer) in [(14u32, face_buffer), (15u32, page_record_buffer)] {
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(buffer.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info));
+            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        }
+    }
+
     pub fn update_history_uniforms(&self, frame_slot: usize, uniforms: &GpuRtHistoryUniforms) {
         write_mapped(
             self.history_uniform_buffers[frame_slot].mapped_ptr(),
@@ -282,6 +358,7 @@ impl RtSurfacePass {
         graph: &mut RenderGraph<'a>,
         frame_slot: usize,
         surface_initialized: bool,
+        profiler: Option<&'a GpuProfiler>,
     ) -> RtSurfaceGraphOutputs {
         let surface_resource = graph.import_buffer_with_access(
             self.surface_buffer.handle,
@@ -313,6 +390,14 @@ impl RtSurfacePass {
             builder.write_as(surface_resource, AccessKind::RayTracingShaderWrite);
             Box::new(move |ctx| {
                 let _ = RT_SURFACE_SHADER;
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtSurface,
+                    );
+                }
                 unsafe {
                     ctx.device.cmd_bind_pipeline(
                         ctx.command_buffer,
@@ -336,6 +421,14 @@ impl RtSurfacePass {
                         width,
                         height,
                         1,
+                    );
+                }
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtSurface,
                     );
                 }
             })
@@ -376,11 +469,18 @@ struct RtSurfaceShaderModules {
     miss: vk::ShaderModule,
     closest_hit: vk::ShaderModule,
     intersection: vk::ShaderModule,
+    compact_exact_closest_hit: vk::ShaderModule,
 }
 
 impl RtSurfaceShaderModules {
     fn destroy(self, device: &ash::Device) {
-        for module in [self.raygen, self.miss, self.closest_hit, self.intersection] {
+        for module in [
+            self.raygen,
+            self.miss,
+            self.closest_hit,
+            self.intersection,
+            self.compact_exact_closest_hit,
+        ] {
             unsafe { device.destroy_shader_module(module, None) };
         }
     }
@@ -395,6 +495,10 @@ fn create_rt_surface_shader_modules(
         (RT_SURFACE_MISS_SPV, shaders.miss),
         (RT_SURFACE_CLOSEST_HIT_SPV, shaders.closest_hit),
         (RT_SURFACE_INTERSECTION_SPV, shaders.intersection),
+        (
+            RT_SURFACE_COMPACT_EXACT_CLOSEST_HIT_SPV,
+            shaders.compact_exact_closest_hit,
+        ),
     ];
     let mut modules = Vec::with_capacity(shader_specs.len());
     for (name, spirv) in shader_specs {
@@ -415,6 +519,7 @@ fn create_rt_surface_shader_modules(
         miss: modules[1],
         closest_hit: modules[2],
         intersection: modules[3],
+        compact_exact_closest_hit: modules[4],
     })
 }
 
@@ -681,8 +786,11 @@ mod shader_source_tests {
             .expect("rt_surface.rgen.slang should be readable");
         let closest_hit = std::fs::read_to_string("assets/shaders/passes/rt_surface.rchit.slang")
             .expect("rt_surface.rchit.slang should be readable");
+        let intersection = std::fs::read_to_string("assets/shaders/passes/rt_surface.rint.slang")
+            .expect("rt_surface.rint.slang should be readable");
         let compact = crate::render::source_checks::compact(&source);
         let closest_hit_compact = crate::render::source_checks::compact(&closest_hit);
+        let intersection_compact = crate::render::source_checks::compact(&intersection);
 
         assert!(compact.contains("[[vk::binding(0,0)]]RaytracingAccelerationStructurescene_tlas;"));
         assert!(
@@ -697,19 +805,18 @@ mod shader_source_tests {
         for token in [
             "[[vk::binding(4,0)]]ConstantBuffer<UcvhConfig>ucvh_config;",
             "[[vk::binding(5,0)]]StructuredBuffer<NodeL0>hierarchy_l0;",
-            "[[vk::binding(6,0)]]StructuredBuffer<NodeLN>hierarchy_l1;",
-            "[[vk::binding(7,0)]]StructuredBuffer<NodeLN>hierarchy_l2;",
-            "[[vk::binding(8,0)]]StructuredBuffer<NodeLN>hierarchy_l3;",
-            "[[vk::binding(9,0)]]StructuredBuffer<NodeLN>hierarchy_l4;",
             "[[vk::binding(10,0)]]StructuredBuffer<BrickOccupancy>brick_occupancy;",
-            "[[vk::binding(11,0)]]StructuredBuffer<VoxelCell>brick_materials;",
             "[[vk::binding(12,0)]]RWStructuredBuffer<uint>traversal_stats;",
         ] {
             assert!(
-                closest_hit_compact.contains(token),
-                "RT surface closest-hit shader missing UCVH binding token {token}"
+                intersection_compact.contains(token),
+                "RT surface intersection shader missing traversal binding token {token}"
             );
         }
+        assert!(
+            closest_hit_compact
+                .contains("[[vk::binding(11,0)]]StructuredBuffer<VoxelCell>brick_materials;")
+        );
         assert!(
             !source.contains("TLAS binding is intentionally deferred"),
             "rt_surface shader should no longer advertise a deferred TLAS binding"
@@ -745,6 +852,8 @@ mod shader_source_tests {
                 (11, ash::vk::DescriptorType::STORAGE_BUFFER),
                 (12, ash::vk::DescriptorType::STORAGE_BUFFER),
                 (13, ash::vk::DescriptorType::UNIFORM_BUFFER),
+                (14, ash::vk::DescriptorType::STORAGE_BUFFER), // face_records
+                (15, ash::vk::DescriptorType::STORAGE_BUFFER), // page_records
             ]
         );
     }
@@ -900,7 +1009,8 @@ mod shader_source_tests {
             "rt_surface.rmiss.spv",
             "rt_surface.rchit.spv",
             "rt_surface.rint.spv",
-            "RayTracingPipeline::new_surface_pipeline",
+            "rt_compact_exact_surface.rchit.spv",
+            "RayTracingPipeline::new_mixed_surface_pipeline",
         ] {
             assert!(
                 implementation.contains(token),

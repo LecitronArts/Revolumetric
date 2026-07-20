@@ -238,7 +238,192 @@ pub struct RayTracingPipeline {
     pub group_counts: RayTracingShaderGroupCounts,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct RtShaderStageSpec<'a> {
+    pub stage: vk::ShaderStageFlags,
+    pub module: vk::ShaderModule,
+    pub entry_point: &'a std::ffi::CStr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RtHitGroupKind {
+    Procedural {
+        closest_hit_stage: u32,
+        intersection_stage: u32,
+    },
+    Triangles {
+        closest_hit_stage: u32,
+    },
+}
+
+#[derive(Debug)]
+pub struct RtMixedSurfaceGroupPlan {
+    pub groups: Vec<vk::RayTracingShaderGroupCreateInfoKHR<'static>>,
+    pub group_counts: RayTracingShaderGroupCounts,
+}
+
+impl RtMixedSurfaceGroupPlan {
+    pub fn new(stages: &[RtShaderStageSpec<'_>], hit_groups: &[RtHitGroupKind]) -> Result<Self> {
+        if stages
+            .iter()
+            .any(|stage| stage.stage == vk::ShaderStageFlags::ANY_HIT_KHR)
+        {
+            return Err(anyhow!(
+                "mixed surface pipeline does not allow any-hit stages"
+            ));
+        }
+        if !matches!(
+            hit_groups,
+            [
+                RtHitGroupKind::Procedural { .. },
+                RtHitGroupKind::Triangles { .. }
+            ]
+        ) {
+            return Err(anyhow!(
+                "mixed page surface hit groups must be Reference procedural then CompactExact triangles"
+            ));
+        }
+        let raygen_stage = unique_stage_index(stages, vk::ShaderStageFlags::RAYGEN_KHR)?;
+        let miss_stage = unique_stage_index(stages, vk::ShaderStageFlags::MISS_KHR)?;
+        let mut groups = Vec::with_capacity(2 + hit_groups.len());
+        groups.push(general_shader_group(raygen_stage));
+        groups.push(general_shader_group(miss_stage));
+        for hit_group in hit_groups {
+            let group = match *hit_group {
+                RtHitGroupKind::Procedural {
+                    closest_hit_stage,
+                    intersection_stage,
+                } => {
+                    validate_stage_index(
+                        stages,
+                        closest_hit_stage,
+                        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    )?;
+                    validate_stage_index(
+                        stages,
+                        intersection_stage,
+                        vk::ShaderStageFlags::INTERSECTION_KHR,
+                    )?;
+                    vk::RayTracingShaderGroupCreateInfoKHR::default()
+                        .ty(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
+                        .general_shader(vk::SHADER_UNUSED_KHR)
+                        .closest_hit_shader(closest_hit_stage)
+                        .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                        .intersection_shader(intersection_stage)
+                }
+                RtHitGroupKind::Triangles { closest_hit_stage } => {
+                    validate_stage_index(
+                        stages,
+                        closest_hit_stage,
+                        vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                    )?;
+                    vk::RayTracingShaderGroupCreateInfoKHR::default()
+                        .ty(vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP)
+                        .general_shader(vk::SHADER_UNUSED_KHR)
+                        .closest_hit_shader(closest_hit_stage)
+                        .any_hit_shader(vk::SHADER_UNUSED_KHR)
+                        .intersection_shader(vk::SHADER_UNUSED_KHR)
+                }
+            };
+            groups.push(group);
+        }
+        let hit_count = u32::try_from(hit_groups.len())
+            .map_err(|_| anyhow!("mixed surface hit-group count exceeds u32"))?;
+        Ok(Self {
+            groups,
+            group_counts: RayTracingShaderGroupCounts {
+                raygen: 1,
+                miss: 1,
+                hit: hit_count,
+                callable: 0,
+            },
+        })
+    }
+}
+
+fn unique_stage_index(
+    stages: &[RtShaderStageSpec<'_>],
+    expected: vk::ShaderStageFlags,
+) -> Result<u32> {
+    let matches = stages
+        .iter()
+        .enumerate()
+        .filter(|(_, stage)| stage.stage == expected)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(anyhow!(
+            "mixed surface pipeline requires exactly one {expected:?} stage, found {}",
+            matches.len()
+        ));
+    }
+    u32::try_from(matches[0]).map_err(|_| anyhow!("shader stage index exceeds u32"))
+}
+
+fn validate_stage_index(
+    stages: &[RtShaderStageSpec<'_>],
+    index: u32,
+    expected: vk::ShaderStageFlags,
+) -> Result<()> {
+    let stage = stages
+        .get(index as usize)
+        .ok_or_else(|| anyhow!("shader stage index {index} is out of range"))?;
+    if stage.stage != expected {
+        return Err(anyhow!(
+            "shader stage {index} must be {expected:?}, found {:?}",
+            stage.stage
+        ));
+    }
+    Ok(())
+}
+
+fn general_shader_group(stage: u32) -> vk::RayTracingShaderGroupCreateInfoKHR<'static> {
+    vk::RayTracingShaderGroupCreateInfoKHR::default()
+        .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
+        .general_shader(stage)
+        .closest_hit_shader(vk::SHADER_UNUSED_KHR)
+        .any_hit_shader(vk::SHADER_UNUSED_KHR)
+        .intersection_shader(vk::SHADER_UNUSED_KHR)
+}
+
 impl RayTracingPipeline {
+    pub fn new_mixed_surface_pipeline(
+        device: &ash::Device,
+        ray_tracing_pipeline_loader: &ash::khr::ray_tracing_pipeline::Device,
+        stages: &[RtShaderStageSpec<'_>],
+        hit_groups: &[RtHitGroupKind],
+        descriptor_set_layouts: &[vk::DescriptorSetLayout],
+        push_constant_ranges: &[vk::PushConstantRange],
+    ) -> Result<Self> {
+        let group_plan = RtMixedSurfaceGroupPlan::new(stages, hit_groups)?;
+        let layout = create_ray_tracing_pipeline_layout(
+            device,
+            descriptor_set_layouts,
+            push_constant_ranges,
+        )?;
+        let vk_stages = stages
+            .iter()
+            .map(|stage| {
+                vk::PipelineShaderStageCreateInfo::default()
+                    .stage(stage.stage)
+                    .module(stage.module)
+                    .name(stage.entry_point)
+            })
+            .collect::<Vec<_>>();
+        let handle = create_ray_tracing_pipeline(
+            device,
+            ray_tracing_pipeline_loader,
+            layout,
+            &vk_stages,
+            &group_plan.groups,
+        )?;
+        Ok(Self {
+            handle,
+            layout,
+            group_counts: group_plan.group_counts,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new_surface_pipeline(
         device: &ash::Device,
@@ -251,69 +436,44 @@ impl RayTracingPipeline {
         descriptor_set_layouts: &[vk::DescriptorSetLayout],
         push_constant_ranges: &[vk::PushConstantRange],
     ) -> Result<Self> {
-        let layout = create_ray_tracing_pipeline_layout(
-            device,
-            descriptor_set_layouts,
-            push_constant_ranges,
-        )?;
-
         let stages = [
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::RAYGEN_KHR)
-                .module(raygen_module)
-                .name(entry_point),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::MISS_KHR)
-                .module(miss_module)
-                .name(entry_point),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR)
-                .module(closest_hit_module)
-                .name(entry_point),
-            vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::INTERSECTION_KHR)
-                .module(intersection_module)
-                .name(entry_point),
+            RtShaderStageSpec {
+                stage: vk::ShaderStageFlags::RAYGEN_KHR,
+                module: raygen_module,
+                entry_point,
+            },
+            RtShaderStageSpec {
+                stage: vk::ShaderStageFlags::MISS_KHR,
+                module: miss_module,
+                entry_point,
+            },
+            RtShaderStageSpec {
+                stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR,
+                module: closest_hit_module,
+                entry_point,
+            },
+            RtShaderStageSpec {
+                stage: vk::ShaderStageFlags::INTERSECTION_KHR,
+                module: intersection_module,
+                entry_point,
+            },
         ];
-        let groups = [
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(0)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::GENERAL)
-                .general_shader(1)
-                .closest_hit_shader(vk::SHADER_UNUSED_KHR)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(vk::SHADER_UNUSED_KHR),
-            vk::RayTracingShaderGroupCreateInfoKHR::default()
-                .ty(vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP)
-                .general_shader(vk::SHADER_UNUSED_KHR)
-                .closest_hit_shader(2)
-                .any_hit_shader(vk::SHADER_UNUSED_KHR)
-                .intersection_shader(3),
-        ];
-
-        let handle = create_ray_tracing_pipeline(
+        Self::new_mixed_surface_pipeline(
             device,
             ray_tracing_pipeline_loader,
-            layout,
             &stages,
-            &groups,
-        )?;
-
-        Ok(Self {
-            handle,
-            layout,
-            group_counts: RayTracingShaderGroupCounts {
-                raygen: 1,
-                miss: 1,
-                hit: 1,
-                callable: 0,
-            },
-        })
+            &[
+                RtHitGroupKind::Procedural {
+                    closest_hit_stage: 2,
+                    intersection_stage: 3,
+                },
+                RtHitGroupKind::Triangles {
+                    closest_hit_stage: 2,
+                },
+            ],
+            descriptor_set_layouts,
+            push_constant_ranges,
+        )
     }
 
     pub fn new_raygen_only(
@@ -553,6 +713,15 @@ fn make_sbt_region_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ash::vk::Handle;
+
+    fn stage(stage: vk::ShaderStageFlags, handle: u64) -> RtShaderStageSpec<'static> {
+        RtShaderStageSpec {
+            stage,
+            module: vk::ShaderModule::from_raw(handle),
+            entry_point: c"main",
+        }
+    }
 
     #[test]
     fn shader_binding_table_layout_aligns_group_regions() {
@@ -614,15 +783,146 @@ mod tests {
             "ShaderStageFlags::CLOSEST_HIT_KHR",
             "ShaderStageFlags::INTERSECTION_KHR",
             "RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP",
-            "closest_hit_shader(2)",
-            "intersection_shader(3)",
-            "miss: 1",
-            "hit: 1",
+            "closest_hit_stage: 2",
+            "intersection_stage: 3",
+            "new_mixed_surface_pipeline",
         ] {
             assert!(
                 implementation.contains(token),
                 "RT surface pipeline group setup missing {token}"
             );
         }
+    }
+
+    #[test]
+    fn mixed_surface_pipeline_keeps_reference_then_compact_exact_sbt_order() {
+        let stages = [
+            stage(vk::ShaderStageFlags::RAYGEN_KHR, 1),
+            stage(vk::ShaderStageFlags::MISS_KHR, 2),
+            stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, 3),
+            stage(vk::ShaderStageFlags::INTERSECTION_KHR, 4),
+            stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, 5),
+        ];
+        let plan = RtMixedSurfaceGroupPlan::new(
+            &stages,
+            &[
+                RtHitGroupKind::Procedural {
+                    closest_hit_stage: 2,
+                    intersection_stage: 3,
+                },
+                RtHitGroupKind::Triangles {
+                    closest_hit_stage: 4,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.group_counts.hit, 2);
+        assert_eq!(
+            plan.groups[2].ty,
+            vk::RayTracingShaderGroupTypeKHR::PROCEDURAL_HIT_GROUP
+        );
+        assert_eq!(plan.groups[2].closest_hit_shader, 2);
+        assert_eq!(plan.groups[2].intersection_shader, 3);
+        assert_eq!(
+            plan.groups[3].ty,
+            vk::RayTracingShaderGroupTypeKHR::TRIANGLES_HIT_GROUP
+        );
+        assert_eq!(plan.groups[3].closest_hit_shader, 4);
+        assert_eq!(plan.groups[3].intersection_shader, vk::SHADER_UNUSED_KHR);
+        assert!(
+            plan.groups
+                .iter()
+                .all(|group| group.any_hit_shader == vk::SHADER_UNUSED_KHR)
+        );
+    }
+
+    #[test]
+    fn mixed_surface_pipeline_rejects_out_of_range_or_wrong_kind_stage_indices() {
+        let stages = [
+            stage(vk::ShaderStageFlags::RAYGEN_KHR, 1),
+            stage(vk::ShaderStageFlags::MISS_KHR, 2),
+            stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, 3),
+            stage(vk::ShaderStageFlags::INTERSECTION_KHR, 4),
+        ];
+
+        assert!(
+            RtMixedSurfaceGroupPlan::new(
+                &stages,
+                &[
+                    RtHitGroupKind::Procedural {
+                        closest_hit_stage: 2,
+                        intersection_stage: 3,
+                    },
+                    RtHitGroupKind::Triangles {
+                        closest_hit_stage: 9,
+                    },
+                ],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("out of range")
+        );
+        assert!(
+            RtMixedSurfaceGroupPlan::new(
+                &stages,
+                &[
+                    RtHitGroupKind::Procedural {
+                        closest_hit_stage: 2,
+                        intersection_stage: 1,
+                    },
+                    RtHitGroupKind::Triangles {
+                        closest_hit_stage: 2,
+                    },
+                ],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("INTERSECTION")
+        );
+    }
+
+    #[test]
+    fn mixed_surface_pipeline_rejects_any_hit_stages() {
+        let stages = [
+            stage(vk::ShaderStageFlags::RAYGEN_KHR, 1),
+            stage(vk::ShaderStageFlags::MISS_KHR, 2),
+            stage(vk::ShaderStageFlags::ANY_HIT_KHR, 3),
+        ];
+
+        assert!(
+            RtMixedSurfaceGroupPlan::new(&stages, &[])
+                .unwrap_err()
+                .to_string()
+                .contains("any-hit")
+        );
+    }
+
+    #[test]
+    fn mixed_surface_pipeline_rejects_reversed_page_hit_group_semantics() {
+        let stages = [
+            stage(vk::ShaderStageFlags::RAYGEN_KHR, 1),
+            stage(vk::ShaderStageFlags::MISS_KHR, 2),
+            stage(vk::ShaderStageFlags::CLOSEST_HIT_KHR, 3),
+            stage(vk::ShaderStageFlags::INTERSECTION_KHR, 4),
+        ];
+
+        assert!(
+            RtMixedSurfaceGroupPlan::new(
+                &stages,
+                &[
+                    RtHitGroupKind::Triangles {
+                        closest_hit_stage: 2,
+                    },
+                    RtHitGroupKind::Procedural {
+                        closest_hit_stage: 2,
+                        intersection_stage: 3,
+                    },
+                ],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("Reference procedural then CompactExact triangles")
+        );
     }
 }

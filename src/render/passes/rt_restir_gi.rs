@@ -5,8 +5,11 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
-use crate::render::pipeline::{RayTracingPipeline, ShaderBindingTable, create_shader_module};
+use crate::render::pipeline::{
+    RayTracingPipeline, RtHitGroupKind, RtShaderStageSpec, ShaderBindingTable, create_shader_module,
+};
 use crate::render::resource::{AccessKind, QueueType, ResourceHandle};
 use crate::render::restir_gi::{
     GpuRestirGiReservoir, GpuRestirGiUniforms, RestirGiDebugView, RestirGiLightingUniformInputs,
@@ -20,14 +23,20 @@ pub(crate) const RT_RESTIR_GI_RAYGEN_SPV: &str = "rt_restir_gi.rgen.spv";
 pub(crate) const RT_RESTIR_GI_MISS_SPV: &str = "rt_restir_gi.rmiss.spv";
 pub(crate) const RT_RESTIR_GI_CLOSEST_HIT_SPV: &str = "rt_restir_gi.rchit.spv";
 pub(crate) const RT_RESTIR_GI_INTERSECTION_SPV: &str = "rt_restir_gi.rint.spv";
+/// CompactExact triangle GI closest-hit (hit group 1). Uses bindings 18/19 for page data.
+pub(crate) const RT_RESTIR_GI_COMPACT_EXACT_CLOSEST_HIT_SPV: &str =
+    "rt_compact_exact_gi.rchit.spv";
 
 #[derive(Clone, Copy)]
 pub struct RtRestirGiShaders<'a> {
     pub raygen: &'a [u8],
     pub spatial_raygen_spirv: &'a [u8],
     pub miss: &'a [u8],
+    /// Reference DDA GI closest-hit (hit group 0, procedural AABB).
     pub closest_hit: &'a [u8],
     pub intersection: &'a [u8],
+    /// CompactExact triangle GI closest-hit (hit group 1, triangle BLAS).
+    pub compact_exact_closest_hit: &'a [u8],
 }
 
 pub struct RtRestirGiPass {
@@ -80,7 +89,7 @@ pub struct RtRestirGiFrameSettings {
 }
 
 impl RtRestirGiPass {
-    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 18] {
+    pub(crate) fn descriptor_binding_specs() -> [DescriptorBindingSpec; 20] {
         [
             DescriptorBindingSpec::ray_tracing(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::ray_tracing(1, vk::DescriptorType::UNIFORM_BUFFER),
@@ -100,6 +109,9 @@ impl RtRestirGiPass {
             DescriptorBindingSpec::ray_tracing(15, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(16, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(17, vk::DescriptorType::STORAGE_BUFFER),
+            // CompactExact page geometry buffers (rt_compact_exact_gi.rchit.slang)
+            DescriptorBindingSpec::ray_tracing(18, vk::DescriptorType::STORAGE_BUFFER), // face_records
+            DescriptorBindingSpec::ray_tracing(19, vk::DescriptorType::STORAGE_BUFFER), // page_records
         ]
     }
 
@@ -147,7 +159,7 @@ impl RtRestirGiPass {
                 },
                 vk::DescriptorPoolSize {
                     ty: vk::DescriptorType::STORAGE_BUFFER,
-                    descriptor_count: (14 * frame_count) as u32,
+                    descriptor_count: (16 * frame_count) as u32,
                 },
             ],
         ) {
@@ -521,6 +533,32 @@ impl RtRestirGiPass {
         }
     }
 
+    /// Write CompactExact page buffers to bindings 18 (face_records) and 19 (page_records).
+    pub fn update_rt_page_descriptors(
+        &self,
+        device: &ash::Device,
+        frame_slot: usize,
+        face_buffer: &GpuBuffer,
+        page_record_buffer: &GpuBuffer,
+    ) {
+        let Some(&descriptor_set) = self.descriptor_sets.get(frame_slot) else {
+            return;
+        };
+        for (binding, buffer) in [(18u32, face_buffer), (19u32, page_record_buffer)] {
+            let buffer_info = vk::DescriptorBufferInfo::default()
+                .buffer(buffer.handle)
+                .offset(0)
+                .range(vk::WHOLE_SIZE);
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(descriptor_set)
+                .dst_binding(binding)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(std::slice::from_ref(&buffer_info));
+            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn register_graph<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -529,6 +567,7 @@ impl RtRestirGiPass {
         surface: ResourceHandle,
         history_initialized: bool,
         spatial_enabled: bool,
+        profiler: Option<&'a GpuProfiler>,
     ) -> RtRestirGiGraphOutputs {
         let spatial_active = spatial_enabled && history_initialized;
         let uniform_buffer = &self.uniform_buffers[frame_slot];
@@ -615,30 +654,48 @@ impl RtRestirGiPass {
             };
             builder.write_as(temporal_output, AccessKind::RayTracingShaderWrite);
             builder.write_as(current_surface_history, AccessKind::RayTracingShaderWrite);
-            Box::new(move |ctx| unsafe {
-                ctx.device.cmd_bind_pipeline(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline,
-                );
-                ctx.device.cmd_bind_descriptor_sets(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline_layout,
-                    0,
-                    std::slice::from_ref(&descriptor_set),
-                    &[],
-                );
-                ray_tracing_pipeline_loader.cmd_trace_rays(
-                    ctx.command_buffer,
-                    &sbt_regions.raygen,
-                    &sbt_regions.miss,
-                    &sbt_regions.hit,
-                    &sbt_regions.callable,
-                    width,
-                    height,
-                    1,
-                );
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtRestirGi,
+                    );
+                }
+                unsafe {
+                    ctx.device.cmd_bind_pipeline(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline,
+                    );
+                    ctx.device.cmd_bind_descriptor_sets(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline_layout,
+                        0,
+                        std::slice::from_ref(&descriptor_set),
+                        &[],
+                    );
+                    ray_tracing_pipeline_loader.cmd_trace_rays(
+                        ctx.command_buffer,
+                        &sbt_regions.raygen,
+                        &sbt_regions.miss,
+                        &sbt_regions.hit,
+                        &sbt_regions.callable,
+                        width,
+                        height,
+                        1,
+                    );
+                }
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtRestirGi,
+                    );
+                }
             })
         });
         let temporal_reservoir_output = writes[0];
@@ -651,30 +708,48 @@ impl RtRestirGiPass {
                     builder.read_as(temporal_reservoir_output, AccessKind::RayTracingShaderRead);
                     builder.read_as(surface, AccessKind::RayTracingShaderRead);
                     builder.write_as(output_reservoirs, AccessKind::RayTracingShaderWrite);
-                    Box::new(move |ctx| unsafe {
-                        ctx.device.cmd_bind_pipeline(
-                            ctx.command_buffer,
-                            vk::PipelineBindPoint::RAY_TRACING_KHR,
-                            spatial_pipeline,
-                        );
-                        ctx.device.cmd_bind_descriptor_sets(
-                            ctx.command_buffer,
-                            vk::PipelineBindPoint::RAY_TRACING_KHR,
-                            spatial_pipeline_layout,
-                            0,
-                            std::slice::from_ref(&spatial_descriptor_set),
-                            &[],
-                        );
-                        ray_tracing_pipeline_loader.cmd_trace_rays(
-                            ctx.command_buffer,
-                            &spatial_sbt_regions.raygen,
-                            &spatial_sbt_regions.miss,
-                            &spatial_sbt_regions.hit,
-                            &spatial_sbt_regions.callable,
-                            width,
-                            height,
-                            1,
-                        );
+                    Box::new(move |ctx| {
+                        if let Some(profiler) = profiler {
+                            profiler.begin_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RtRestirGiSpatial,
+                            );
+                        }
+                        unsafe {
+                            ctx.device.cmd_bind_pipeline(
+                                ctx.command_buffer,
+                                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                                spatial_pipeline,
+                            );
+                            ctx.device.cmd_bind_descriptor_sets(
+                                ctx.command_buffer,
+                                vk::PipelineBindPoint::RAY_TRACING_KHR,
+                                spatial_pipeline_layout,
+                                0,
+                                std::slice::from_ref(&spatial_descriptor_set),
+                                &[],
+                            );
+                            ray_tracing_pipeline_loader.cmd_trace_rays(
+                                ctx.command_buffer,
+                                &spatial_sbt_regions.raygen,
+                                &spatial_sbt_regions.miss,
+                                &spatial_sbt_regions.hit,
+                                &spatial_sbt_regions.callable,
+                                width,
+                                height,
+                                1,
+                            );
+                        }
+                        if let Some(profiler) = profiler {
+                            profiler.end_scope(
+                                ctx.device,
+                                ctx.command_buffer,
+                                frame_slot,
+                                GpuProfileScope::RtRestirGiSpatial,
+                            );
+                        }
                     })
                 });
             spatial_writes[0]
@@ -1012,11 +1087,18 @@ struct RtRestirGiShaderModules {
     miss: vk::ShaderModule,
     closest_hit: vk::ShaderModule,
     intersection: vk::ShaderModule,
+    compact_exact_closest_hit: vk::ShaderModule,
 }
 
 impl RtRestirGiShaderModules {
     fn destroy(self, device: &ash::Device) {
-        for module in [self.raygen, self.miss, self.closest_hit, self.intersection] {
+        for module in [
+            self.raygen,
+            self.miss,
+            self.closest_hit,
+            self.intersection,
+            self.compact_exact_closest_hit,
+        ] {
             unsafe { device.destroy_shader_module(module, None) };
         }
     }
@@ -1031,17 +1113,20 @@ fn create_raygen_pipeline(
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(RayTracingPipeline, ShaderBindingTable)> {
     let shader_modules = create_rt_restir_gi_shader_modules(device, shaders)?;
-    let pipeline = match RayTracingPipeline::new_surface_pipeline(
-        device,
-        ray_tracing_pipeline_loader,
-        shader_modules.raygen,
-        shader_modules.miss,
-        shader_modules.closest_hit,
-        shader_modules.intersection,
-        c"main",
-        &[descriptor_set_layout],
-        &[],
-    ) {
+    let pipeline = match {
+        let stages = [
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::RAYGEN_KHR,      module: shader_modules.raygen,                    entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::MISS_KHR,        module: shader_modules.miss,                      entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR, module: shader_modules.closest_hit,               entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::INTERSECTION_KHR,module: shader_modules.intersection,               entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR, module: shader_modules.compact_exact_closest_hit,  entry_point: c"main" },
+        ];
+        let hit_groups = [
+            RtHitGroupKind::Procedural { closest_hit_stage: 2, intersection_stage: 3 },
+            RtHitGroupKind::Triangles  { closest_hit_stage: 4 },
+        ];
+        RayTracingPipeline::new_mixed_surface_pipeline(device, ray_tracing_pipeline_loader, &stages, &hit_groups, &[descriptor_set_layout], &[])
+    } {
         Ok(pipeline) => pipeline,
         Err(error) => {
             shader_modules.destroy(device);
@@ -1075,17 +1160,20 @@ fn create_spatial_raygen_pipeline(
     descriptor_set_layout: vk::DescriptorSetLayout,
 ) -> Result<(RayTracingPipeline, ShaderBindingTable)> {
     let shader_modules = create_rt_restir_gi_spatial_shader_modules(device, shaders)?;
-    let pipeline = match RayTracingPipeline::new_surface_pipeline(
-        device,
-        ray_tracing_pipeline_loader,
-        shader_modules.raygen,
-        shader_modules.miss,
-        shader_modules.closest_hit,
-        shader_modules.intersection,
-        c"main",
-        &[descriptor_set_layout],
-        &[],
-    ) {
+    let pipeline = match {
+        let stages = [
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::RAYGEN_KHR,      module: shader_modules.raygen,                    entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::MISS_KHR,        module: shader_modules.miss,                      entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR, module: shader_modules.closest_hit,               entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::INTERSECTION_KHR,module: shader_modules.intersection,               entry_point: c"main" },
+            RtShaderStageSpec { stage: vk::ShaderStageFlags::CLOSEST_HIT_KHR, module: shader_modules.compact_exact_closest_hit,  entry_point: c"main" },
+        ];
+        let hit_groups = [
+            RtHitGroupKind::Procedural { closest_hit_stage: 2, intersection_stage: 3 },
+            RtHitGroupKind::Triangles  { closest_hit_stage: 4 },
+        ];
+        RayTracingPipeline::new_mixed_surface_pipeline(device, ray_tracing_pipeline_loader, &stages, &hit_groups, &[descriptor_set_layout], &[])
+    } {
         Ok(pipeline) => pipeline,
         Err(error) => {
             shader_modules.destroy(device);
@@ -1114,11 +1202,15 @@ fn create_rt_restir_gi_shader_modules(
     device: &ash::Device,
     shaders: RtRestirGiShaders<'_>,
 ) -> Result<RtRestirGiShaderModules> {
-    let shader_specs = [
+    let shader_specs: &[(&str, &[u8])] = &[
         (RT_RESTIR_GI_RAYGEN_SPV, shaders.raygen),
         (RT_RESTIR_GI_MISS_SPV, shaders.miss),
         (RT_RESTIR_GI_CLOSEST_HIT_SPV, shaders.closest_hit),
         (RT_RESTIR_GI_INTERSECTION_SPV, shaders.intersection),
+        (
+            RT_RESTIR_GI_COMPACT_EXACT_CLOSEST_HIT_SPV,
+            shaders.compact_exact_closest_hit,
+        ),
     ];
     let mut modules = Vec::with_capacity(shader_specs.len());
     for (name, spirv) in shader_specs {
@@ -1139,6 +1231,7 @@ fn create_rt_restir_gi_shader_modules(
         miss: modules[1],
         closest_hit: modules[2],
         intersection: modules[3],
+        compact_exact_closest_hit: modules[4],
     })
 }
 
@@ -1146,14 +1239,15 @@ fn create_rt_restir_gi_spatial_shader_modules(
     device: &ash::Device,
     shaders: RtRestirGiShaders<'_>,
 ) -> Result<RtRestirGiShaderModules> {
-    let shader_specs = [
-        (
-            "rt_restir_gi_spatial.rgen.spv",
-            shaders.spatial_raygen_spirv,
-        ),
+    let shader_specs: &[(&str, &[u8])] = &[
+        ("rt_restir_gi_spatial.rgen.spv", shaders.spatial_raygen_spirv),
         (RT_RESTIR_GI_MISS_SPV, shaders.miss),
         (RT_RESTIR_GI_CLOSEST_HIT_SPV, shaders.closest_hit),
         (RT_RESTIR_GI_INTERSECTION_SPV, shaders.intersection),
+        (
+            RT_RESTIR_GI_COMPACT_EXACT_CLOSEST_HIT_SPV,
+            shaders.compact_exact_closest_hit,
+        ),
     ];
     let mut modules = Vec::with_capacity(shader_specs.len());
     for (name, spirv) in shader_specs {
@@ -1174,6 +1268,7 @@ fn create_rt_restir_gi_spatial_shader_modules(
         miss: modules[1],
         closest_hit: modules[2],
         intersection: modules[3],
+        compact_exact_closest_hit: modules[4],
     })
 }
 
@@ -1465,6 +1560,8 @@ mod shader_source_tests {
                 (15, vk::DescriptorType::STORAGE_BUFFER),
                 (16, vk::DescriptorType::STORAGE_BUFFER),
                 (17, vk::DescriptorType::STORAGE_BUFFER),
+                (18, vk::DescriptorType::STORAGE_BUFFER), // face_records
+                (19, vk::DescriptorType::STORAGE_BUFFER), // page_records
             ]
         );
     }
@@ -1492,7 +1589,8 @@ mod shader_source_tests {
             "rt_restir_gi.rmiss.spv",
             "rt_restir_gi.rchit.spv",
             "rt_restir_gi.rint.spv",
-            "RayTracingPipeline::new_surface_pipeline",
+            "rt_compact_exact_gi.rchit.spv",
+            "RayTracingPipeline::new_mixed_surface_pipeline",
             "cmd_trace_rays",
             "update_uniforms",
             "update_history_uniforms",
@@ -2398,7 +2496,7 @@ mod shader_source_tests {
             ("RT GI closest hit", gi_closest_hit),
         ] {
             assert!(
-                source.contains("payload.emissive_radiance = material_emissive(hit.cell) * 3.0;"),
+                source.contains("payload.emissive_radiance = material_emissive(cell) * 3.0;"),
                 "{name} must write voxel emissive radiance into the RT surface payload"
             );
         }
