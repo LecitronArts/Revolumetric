@@ -11,10 +11,14 @@
       <sourceFolder url="file://$MODULE_DIR$/.worktrees/teardown-voxel-editor/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/revolumetric-nrd-sys/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/revolumetric-nrd/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/.worktrees/codex-dual-speed-voxel-surface-rendering/crates/revolumetric-nrd-sys/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/.worktrees/codex-dual-speed-voxel-surface-rendering/crates/revolumetric-nrd/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/.worktrees/codex-dual-speed-voxel-surface-rendering/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.worktrees/voxel-cone-tracing-rt/target" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
       <excludeFolder url="file://$MODULE_DIR$/.worktrees/render-infra-optimization/target" />
       <excludeFolder url="file://$MODULE_DIR$/.worktrees/teardown-voxel-editor/target" />
+      <excludeFolder url="file://$MODULE_DIR$/.worktrees/codex-dual-speed-voxel-surface-rendering/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

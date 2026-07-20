@@ -34,6 +34,12 @@ pub struct CascadedOccupancy {
     pub dims: [UVec3; 5],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CascadedOccupancyChanges {
+    pub l0: Vec<UVec3>,
+    pub levels: [Vec<UVec3>; 4],
+}
+
 impl CascadedOccupancy {
     pub fn new(brick_grid_size: UVec3) -> Self {
         let dims = std::array::from_fn(|i| {
@@ -110,6 +116,74 @@ impl CascadedOccupancy {
         }
     }
 
+    /// Recomputes only the parent nodes affected by changed L0 brick positions.
+    pub fn update_from_l0_positions(
+        &mut self,
+        changed_l0_positions: impl IntoIterator<Item = UVec3>,
+    ) -> CascadedOccupancyChanges {
+        let mut l0 = changed_l0_positions
+            .into_iter()
+            .filter(|position| {
+                position.x < self.dims[0].x
+                    && position.y < self.dims[0].y
+                    && position.z < self.dims[0].z
+            })
+            .collect::<Vec<_>>();
+        sort_and_dedup_positions(&mut l0);
+        let mut levels: [Vec<UVec3>; 4] = std::array::from_fn(|_| Vec::new());
+        let mut children = l0.clone();
+
+        for (level_index, level_changes) in levels.iter_mut().enumerate() {
+            let parent_dim = self.dims[level_index + 1];
+            let mut parents = children
+                .iter()
+                .map(|child| *child / 2)
+                .filter(|parent| {
+                    parent.x < parent_dim.x && parent.y < parent_dim.y && parent.z < parent_dim.z
+                })
+                .collect::<Vec<_>>();
+            sort_and_dedup_positions(&mut parents);
+            for parent in &parents {
+                self.recompute_parent_from_children(level_index, *parent);
+            }
+            children = parents.clone();
+            *level_changes = parents;
+        }
+
+        CascadedOccupancyChanges { l0, levels }
+    }
+
+    fn recompute_parent_from_children(&mut self, level_index: usize, parent_pos: UVec3) {
+        let child_dim = self.dims[level_index];
+        let parent_dim = self.dims[level_index + 1];
+        debug_assert!(parent_pos.x < parent_dim.x);
+        debug_assert!(parent_pos.y < parent_dim.y);
+        debug_assert!(parent_pos.z < parent_dim.z);
+
+        let mut mask = 0u8;
+        for child_bit in 0..8u32 {
+            let child_pos = parent_pos * 2
+                + UVec3::new(child_bit & 1, (child_bit >> 1) & 1, (child_bit >> 2) & 1);
+            if child_pos.x >= child_dim.x
+                || child_pos.y >= child_dim.y
+                || child_pos.z >= child_dim.z
+            {
+                continue;
+            }
+            let child_is_occupied = if level_index == 0 {
+                self.level0[Self::flat_index(child_pos, child_dim)].flags & 1 != 0
+            } else {
+                self.levels[level_index - 1][Self::flat_index(child_pos, child_dim)].flags & 1 != 0
+            };
+            if child_is_occupied {
+                mask |= 1 << child_bit;
+            }
+        }
+        let parent = &mut self.levels[level_index][Self::flat_index(parent_pos, parent_dim)];
+        parent.child_mask = mask;
+        parent.flags = u8::from(mask != 0);
+    }
+
     fn rebuild_l1_from_l0(&mut self) {
         let child_dim = self.dims[0];
         let parent_dim = self.dims[1];
@@ -160,6 +234,11 @@ impl CascadedOccupancy {
             self.levels[target_idx][pi].flags = if mask != 0 { 1 } else { 0 };
         }
     }
+}
+
+fn sort_and_dedup_positions(positions: &mut Vec<UVec3>) {
+    positions.sort_by_key(|position| (position.z, position.y, position.x));
+    positions.dedup();
 }
 
 fn ceil_half_non_empty(dim: UVec3) -> UVec3 {
@@ -218,6 +297,25 @@ mod tests {
         assert_ne!(h.levels[0][0].child_mask, 0);
         // L4 root should be non-empty
         assert_ne!(h.levels[3][0].child_mask, 0);
+    }
+
+    #[test]
+    fn incremental_l0_update_recomputes_only_the_changed_ancestor_chain() {
+        let mut h = CascadedOccupancy::new(UVec3::splat(16));
+        h.set_l0(UVec3::new(3, 5, 7), 17, true);
+
+        let changes = h.update_from_l0_positions([UVec3::new(3, 5, 7)]);
+
+        assert_eq!(changes.l0, vec![UVec3::new(3, 5, 7)]);
+        assert_eq!(changes.levels[0], vec![UVec3::new(1, 2, 3)]);
+        assert_eq!(changes.levels[1], vec![UVec3::new(0, 1, 1)]);
+        assert_eq!(changes.levels[2], vec![UVec3::new(0, 0, 0)]);
+        assert_eq!(changes.levels[3], vec![UVec3::new(0, 0, 0)]);
+        assert_ne!(h.levels[3][0].child_mask, 0);
+
+        h.set_l0(UVec3::new(3, 5, 7), 17, false);
+        h.update_from_l0_positions([UVec3::new(3, 5, 7)]);
+        assert_eq!(h.levels[3][0].child_mask, 0);
     }
 
     #[test]

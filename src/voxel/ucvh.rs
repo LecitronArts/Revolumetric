@@ -1,12 +1,71 @@
 // src/voxel/ucvh.rs
-use crate::voxel::brick::{BRICK_EDGE, BRICK_VOLUME, BrickData, VoxelCell};
+use crate::voxel::brick::{BRICK_EDGE, BRICK_VOLUME, BrickData, BrickOccupancy, VoxelCell};
 use crate::voxel::brick_pool::{BrickId, BrickPool};
 use crate::voxel::morton;
-use crate::voxel::occupancy::CascadedOccupancy;
+use crate::voxel::occupancy::{CascadedOccupancy, CascadedOccupancyChanges};
 use glam::{IVec3, UVec3};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 pub const UCVH_NO_BRICK_GENERATION: u32 = u32::MAX;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct UcvhPageBoundaryMask(u8);
+
+impl UcvhPageBoundaryMask {
+    pub const NONE: Self = Self(0);
+    pub const NEG_X: Self = Self(1 << 0);
+    pub const POS_X: Self = Self(1 << 1);
+    pub const NEG_Y: Self = Self(1 << 2);
+    pub const POS_Y: Self = Self(1 << 3);
+    pub const NEG_Z: Self = Self(1 << 4);
+    pub const POS_Z: Self = Self(1 << 5);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    fn insert(&mut self, other: Self) {
+        self.0 |= other.0;
+    }
+
+    fn from_local_voxel(local: UVec3) -> Self {
+        let mut mask = Self::NONE;
+        if local.x == 0 {
+            mask.insert(Self::NEG_X);
+        }
+        if local.x + 1 == BRICK_EDGE {
+            mask.insert(Self::POS_X);
+        }
+        if local.y == 0 {
+            mask.insert(Self::NEG_Y);
+        }
+        if local.y + 1 == BRICK_EDGE {
+            mask.insert(Self::POS_Y);
+        }
+        if local.z == 0 {
+            mask.insert(Self::NEG_Z);
+        }
+        if local.z + 1 == BRICK_EDGE {
+            mask.insert(Self::POS_Z);
+        }
+        mask
+    }
+}
+
+impl std::ops::BitOr for UcvhPageBoundaryMask {
+    type Output = Self;
+
+    fn bitor(self, rhs: Self) -> Self::Output {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for UcvhPageBoundaryMask {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
 
 fn div_ceil_uvec3(value: UVec3, divisor: u32) -> UVec3 {
     UVec3::new(
@@ -53,6 +112,43 @@ pub struct UcvhInvalidationRegion {
     pub generation: u32,
 }
 
+/// A single authoritative brick change that must reach render-side consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UcvhChangedBrick {
+    pub brick_id: BrickId,
+    pub brick_coord: UVec3,
+    pub generation: u32,
+    pub revision: u64,
+    pub occupancy_changed: bool,
+    pub material_changed: bool,
+    pub touched_boundaries: UcvhPageBoundaryMask,
+}
+
+/// A stable snapshot of render-relevant UCVH changes.
+///
+/// The batch remains pending until acknowledged. Acknowledgement clears only
+/// the generations represented by this snapshot, so a newer edit to the same
+/// brick cannot be lost while an upload or derived render operation is pending.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UcvhRenderChangeBatch {
+    pub id: u64,
+    pub bricks: Vec<UcvhChangedBrick>,
+    /// Changed render pages plus their in-bounds face neighbors.
+    ///
+    /// A render page is exactly one UCVH `8^3` brick. This is the precise
+    /// invalidation set for derived exposed-face page geometry.
+    pub invalidated_pages: Vec<UVec3>,
+    /// Deprecated aggregate-cache invalidation retained until all existing
+    /// callers move from `16^3` render cells to page ownership.
+    pub invalidated_render_cells: Vec<UVec3>,
+}
+
+impl UcvhRenderChangeBatch {
+    pub fn is_empty(&self) -> bool {
+        self.bricks.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UcvhMotionEvent {
     pub region_min: UVec3,
@@ -86,10 +182,21 @@ pub struct Ucvh {
     /// Sparse map: L0 flat index -> BrickId.
     brick_map: HashMap<u64, BrickId>,
     allocated_brick_positions: Vec<UVec3>,
+    brick_coords_by_id: Vec<Option<UVec3>>,
     /// Brick IDs that need GPU re-upload
     dirty_bricks: Vec<BrickId>,
     dirty_brick_flags: Vec<bool>,
     brick_generations: Vec<u32>,
+    brick_topology_revisions: Vec<u64>,
+    pending_render_change_generations: Vec<u32>,
+    pending_render_change_revisions: Vec<u64>,
+    pending_render_occupancy_changes: Vec<bool>,
+    pending_render_material_changes: Vec<bool>,
+    pending_render_touched_boundaries: Vec<UcvhPageBoundaryMask>,
+    pending_render_change_ids: BTreeSet<BrickId>,
+    next_render_change_batch_id: u64,
+    next_render_change_revision: u64,
+    pending_render_change_snapshot: Option<UcvhRenderChangeBatch>,
     /// Brick-space regions whose content edits should invalidate temporal history.
     invalidation_regions: Vec<UcvhInvalidationRegion>,
     invalidation_region_indices: HashMap<[u32; 6], usize>,
@@ -107,9 +214,26 @@ impl Ucvh {
             hierarchy: CascadedOccupancy::new(config.brick_grid_size),
             brick_map: HashMap::new(),
             allocated_brick_positions: Vec::new(),
+            brick_coords_by_id: vec![None; config.brick_capacity as usize],
             dirty_bricks: Vec::new(),
             dirty_brick_flags: vec![false; config.brick_capacity as usize],
             brick_generations: vec![UCVH_NO_BRICK_GENERATION; config.brick_capacity as usize],
+            brick_topology_revisions: vec![0; config.brick_capacity as usize],
+            pending_render_change_generations: vec![
+                UCVH_NO_BRICK_GENERATION;
+                config.brick_capacity as usize
+            ],
+            pending_render_change_revisions: vec![0; config.brick_capacity as usize],
+            pending_render_occupancy_changes: vec![false; config.brick_capacity as usize],
+            pending_render_material_changes: vec![false; config.brick_capacity as usize],
+            pending_render_touched_boundaries: vec![
+                UcvhPageBoundaryMask::NONE;
+                config.brick_capacity as usize
+            ],
+            pending_render_change_ids: BTreeSet::new(),
+            next_render_change_batch_id: 1,
+            next_render_change_revision: 1,
+            pending_render_change_snapshot: None,
             invalidation_regions: Vec::new(),
             invalidation_region_indices: HashMap::new(),
             motion_events: Vec::new(),
@@ -158,6 +282,85 @@ impl Ucvh {
         }
     }
 
+    fn mark_render_change(
+        &mut self,
+        id: BrickId,
+        generation: u32,
+        occupancy_changed: bool,
+        material_changed: bool,
+        touched_boundaries: UcvhPageBoundaryMask,
+    ) {
+        let index = id as usize;
+        let revision = self.next_render_change_revision;
+        if let (
+            Some(generation_slot),
+            Some(revision_slot),
+            Some(occupancy_slot),
+            Some(material_slot),
+            Some(boundary_slot),
+        ) = (
+            self.pending_render_change_generations.get_mut(index),
+            self.pending_render_change_revisions.get_mut(index),
+            self.pending_render_occupancy_changes.get_mut(index),
+            self.pending_render_material_changes.get_mut(index),
+            self.pending_render_touched_boundaries.get_mut(index),
+        ) {
+            *generation_slot = generation;
+            *revision_slot = revision;
+            *occupancy_slot |= occupancy_changed;
+            *material_slot |= material_changed;
+            *boundary_slot |= touched_boundaries;
+            if occupancy_changed
+                && let Some(topology_revision) = self.brick_topology_revisions.get_mut(index)
+            {
+                *topology_revision = revision;
+            }
+            self.next_render_change_revision = self
+                .next_render_change_revision
+                .checked_add(1)
+                .expect("UCVH render change revision space exhausted");
+            self.pending_render_change_ids.insert(id);
+        }
+    }
+
+    fn record_content_change(
+        &mut self,
+        id: BrickId,
+        brick_pos: UVec3,
+        generation: u32,
+        occupancy_changed: bool,
+        material_changed: bool,
+        touched_boundaries: UcvhPageBoundaryMask,
+    ) {
+        self.set_brick_generation(id, generation);
+        self.mark_render_change(
+            id,
+            generation,
+            occupancy_changed,
+            material_changed,
+            touched_boundaries,
+        );
+        self.record_invalidation_region(brick_pos, generation);
+    }
+
+    fn record_static_content_change(
+        &mut self,
+        id: BrickId,
+        generation: u32,
+        occupancy_changed: bool,
+        material_changed: bool,
+        touched_boundaries: UcvhPageBoundaryMask,
+    ) {
+        self.set_brick_generation(id, generation);
+        self.mark_render_change(
+            id,
+            generation,
+            occupancy_changed,
+            material_changed,
+            touched_boundaries,
+        );
+    }
+
     fn record_invalidation_region(&mut self, brick_pos: UVec3, generation: u32) {
         let region = UcvhInvalidationRegion {
             brick_min: brick_pos,
@@ -203,6 +406,7 @@ impl Ucvh {
         let id = self.pool.allocate()?;
         self.brick_map.insert(key, id);
         self.allocated_brick_positions.push(brick_pos);
+        self.set_brick_coord(id, brick_pos);
         Some(id)
     }
 
@@ -211,7 +415,14 @@ impl Ucvh {
         let id = self.pool.allocate_with_data(data)?;
         self.brick_map.insert(key, id);
         self.allocated_brick_positions.push(brick_pos);
+        self.set_brick_coord(id, brick_pos);
         Some(id)
+    }
+
+    fn set_brick_coord(&mut self, id: BrickId, brick_pos: UVec3) {
+        if let Some(slot) = self.brick_coords_by_id.get_mut(id as usize) {
+            *slot = Some(brick_pos);
+        }
     }
 
     pub fn set_voxel(&mut self, pos: UVec3, cell: VoxelCell) -> bool {
@@ -242,8 +453,20 @@ impl Ucvh {
         }
         self.mark_brick_dirty(id);
         let generation = self.next_content_generation();
-        self.set_brick_generation(id, generation);
-        self.record_invalidation_region(bp, generation);
+        let occupancy_changed = previous.is_air() != cell.is_air();
+        let touched_boundaries = if occupancy_changed {
+            UcvhPageBoundaryMask::from_local_voxel(lp)
+        } else {
+            UcvhPageBoundaryMask::NONE
+        };
+        self.record_content_change(
+            id,
+            bp,
+            generation,
+            occupancy_changed,
+            true,
+            touched_boundaries,
+        );
         self.hierarchy_dirty = true;
         true
     }
@@ -281,13 +504,28 @@ impl Ucvh {
         {
             return true;
         }
+        let (occupancy_changed, material_changed, touched_boundaries) = if new_with_data {
+            classify_brick_replacement(None, None, data)
+        } else {
+            classify_brick_replacement(
+                Some(self.pool.occupancy(id)),
+                Some(&self.pool.material_pool()[base..base + BRICK_VOLUME]),
+                data,
+            )
+        };
         if !new_with_data {
             self.pool.write_brick(id, data);
         }
         self.mark_brick_dirty(id);
         let generation = self.next_content_generation();
-        self.set_brick_generation(id, generation);
-        self.record_invalidation_region(brick_pos, generation);
+        self.record_content_change(
+            id,
+            brick_pos,
+            generation,
+            occupancy_changed,
+            material_changed,
+            touched_boundaries,
+        );
         self.hierarchy_dirty = true;
         true
     }
@@ -330,13 +568,27 @@ impl Ucvh {
             {
                 continue;
             }
+            let (occupancy_changed, material_changed, touched_boundaries) = if new_with_data {
+                classify_brick_replacement(None, None, data)
+            } else {
+                classify_brick_replacement(
+                    Some(self.pool.occupancy(id)),
+                    Some(&self.pool.material_pool()[base..base + BRICK_VOLUME]),
+                    data,
+                )
+            };
             if !new_with_data {
                 self.pool.write_brick(id, data);
             }
             self.mark_brick_dirty(id);
             let generation = self.next_content_generation();
-            self.set_brick_generation(id, generation);
-            self.record_invalidation_region(brick_pos, generation);
+            self.record_static_content_change(
+                id,
+                generation,
+                occupancy_changed,
+                material_changed,
+                touched_boundaries,
+            );
             self.hierarchy_dirty = true;
         }
         failed
@@ -381,12 +633,28 @@ impl Ucvh {
             {
                 continue;
             }
+            let (occupancy_changed, material_changed, touched_boundaries) = if new_with_data {
+                classify_brick_replacement(None, None, data)
+            } else {
+                classify_brick_replacement(
+                    Some(self.pool.occupancy(id)),
+                    Some(&self.pool.material_pool()[base..base + BRICK_VOLUME]),
+                    data,
+                )
+            };
             if !new_with_data {
                 self.pool.write_brick(id, data);
             }
             self.mark_brick_dirty(id);
             let generation = self.next_content_generation();
-            self.set_brick_generation(id, generation);
+            self.record_content_change(
+                id,
+                brick_pos,
+                generation,
+                occupancy_changed,
+                material_changed,
+                touched_boundaries,
+            );
             self.hierarchy_dirty = true;
         }
         failed
@@ -397,7 +665,7 @@ impl Ucvh {
         I: IntoIterator<Item = (UVec3, &'a BrickData)>,
     {
         let mut failed = 0;
-        let mut entries = Vec::new();
+        let mut entries = HashMap::new();
         for (brick_pos, data) in bricks {
             if !self.contains_brick_pos(brick_pos) {
                 failed += 1;
@@ -406,11 +674,14 @@ impl Ucvh {
             if brick_data_is_air(data) {
                 continue;
             }
-            entries.push((brick_pos, data));
+            entries.insert(brick_pos, data);
         }
         if entries.is_empty() {
             return failed;
         }
+
+        let mut entries = entries.into_iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(brick_pos, _)| (brick_pos.z, brick_pos.y, brick_pos.x));
 
         let capacity = self.pool.capacity() as usize;
         let alloc_count = entries.len().min(capacity);
@@ -424,12 +695,21 @@ impl Ucvh {
         self.brick_map.reserve(entries.len());
         self.allocated_brick_positions.reserve(entries.len());
         self.dirty_bricks.reserve(entries.len());
-        for ((brick_pos, _data), id) in entries.into_iter().zip(ids) {
+        for ((brick_pos, data), id) in entries.into_iter().zip(ids) {
             self.brick_map.insert(self.l0_key(brick_pos), id);
             self.allocated_brick_positions.push(brick_pos);
+            self.set_brick_coord(id, brick_pos);
             self.mark_brick_dirty(id);
             let generation = self.next_content_generation();
-            self.set_brick_generation(id, generation);
+            let (occupancy_changed, material_changed, touched_boundaries) =
+                classify_brick_replacement(None, None, data);
+            self.record_static_content_change(
+                id,
+                generation,
+                occupancy_changed,
+                material_changed,
+                touched_boundaries,
+            );
             self.hierarchy_dirty = true;
         }
         failed
@@ -454,6 +734,23 @@ impl Ucvh {
         self.hierarchy_dirty = false;
     }
 
+    /// Rebuilds only hierarchy parent nodes affected by a render change batch.
+    pub fn update_hierarchy_for_render_change_batch(
+        &mut self,
+        batch: &UcvhRenderChangeBatch,
+    ) -> CascadedOccupancyChanges {
+        for brick in &batch.bricks {
+            let has_solid = !self.pool.occupancy(brick.brick_id).is_empty();
+            self.hierarchy
+                .set_l0(brick.brick_coord, brick.brick_id, has_solid);
+        }
+        let changes = self
+            .hierarchy
+            .update_from_l0_positions(batch.bricks.iter().map(|brick| brick.brick_coord));
+        self.hierarchy_dirty = false;
+        changes
+    }
+
     pub fn take_dirty_bricks(&mut self) -> Vec<BrickId> {
         for id in &self.dirty_bricks {
             if let Some(is_dirty) = self.dirty_brick_flags.get_mut(*id as usize) {
@@ -472,11 +769,162 @@ impl Ucvh {
         &self.invalidation_regions
     }
 
+    /// Acknowledges exactly the invalidation snapshot that was uploaded.
+    ///
+    /// A later edit to the same region replaces its generation in place. In
+    /// that case this returns false and retains the newer region for retry.
+    pub fn ack_invalidation_regions(&mut self, snapshot: &[UcvhInvalidationRegion]) -> bool {
+        if snapshot.len() > self.invalidation_regions.len()
+            || self.invalidation_regions[..snapshot.len()] != *snapshot
+        {
+            return false;
+        }
+        self.invalidation_regions.drain(..snapshot.len());
+        self.invalidation_region_indices.clear();
+        for (index, region) in self.invalidation_regions.iter().enumerate() {
+            self.invalidation_region_indices.insert(
+                invalidation_region_key(region.brick_min, region.brick_max_exclusive),
+                index,
+            );
+        }
+        true
+    }
+
+    /// Returns the pending render changes without consuming them.
+    pub fn snapshot_render_change_batch(&mut self) -> UcvhRenderChangeBatch {
+        if self.pending_render_change_ids.is_empty() {
+            return UcvhRenderChangeBatch {
+                id: 0,
+                bricks: Vec::new(),
+                invalidated_pages: Vec::new(),
+                invalidated_render_cells: Vec::new(),
+            };
+        }
+        if let Some(snapshot) = &self.pending_render_change_snapshot {
+            return snapshot.clone();
+        }
+
+        let bricks = self
+            .pending_render_change_ids
+            .iter()
+            .filter_map(|&brick_id| {
+                let generation = *self
+                    .pending_render_change_generations
+                    .get(brick_id as usize)?;
+                let revision = *self
+                    .pending_render_change_revisions
+                    .get(brick_id as usize)?;
+                let occupancy_changed = *self
+                    .pending_render_occupancy_changes
+                    .get(brick_id as usize)?;
+                let material_changed = *self
+                    .pending_render_material_changes
+                    .get(brick_id as usize)?;
+                let touched_boundaries = *self
+                    .pending_render_touched_boundaries
+                    .get(brick_id as usize)?;
+                let brick_coord = self.brick_coord_for_id(brick_id)?;
+                (generation != UCVH_NO_BRICK_GENERATION && revision != 0).then_some(
+                    UcvhChangedBrick {
+                        brick_id,
+                        brick_coord,
+                        generation,
+                        revision,
+                        occupancy_changed,
+                        material_changed,
+                        touched_boundaries,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut invalidated_pages = Vec::with_capacity(bricks.len().saturating_mul(7));
+        let mut invalidated_render_cells = Vec::with_capacity(bricks.len().saturating_mul(7));
+        for brick in &bricks {
+            if brick.occupancy_changed {
+                invalidated_pages.extend(pages_affected_by_brick_boundaries(
+                    brick.brick_coord,
+                    brick.touched_boundaries,
+                    self.config.brick_grid_size,
+                ));
+            }
+            invalidated_render_cells.extend(render_cells_affected_by_brick(
+                brick.brick_coord,
+                self.config.brick_grid_size,
+            ));
+        }
+        invalidated_pages.sort_by_key(|page| (page.z, page.y, page.x));
+        invalidated_pages.dedup();
+        invalidated_render_cells.sort_by_key(|cell| (cell.z, cell.y, cell.x));
+        invalidated_render_cells.dedup();
+        let snapshot = UcvhRenderChangeBatch {
+            id: self.next_render_change_batch_id,
+            bricks,
+            invalidated_pages,
+            invalidated_render_cells,
+        };
+        self.next_render_change_batch_id = self
+            .next_render_change_batch_id
+            .checked_add(1)
+            .expect("UCVH render change batch ID space exhausted");
+        self.pending_render_change_snapshot = Some(snapshot.clone());
+        snapshot
+    }
+
+    /// Acknowledges exactly one previously returned snapshot.
+    pub fn ack_render_change_batch(&mut self, batch_id: u64) -> bool {
+        let Some(snapshot) = self.pending_render_change_snapshot.take() else {
+            return false;
+        };
+        if snapshot.id != batch_id {
+            self.pending_render_change_snapshot = Some(snapshot);
+            return false;
+        }
+        for changed in snapshot.bricks {
+            let (
+                Some(current_generation),
+                Some(current_revision),
+                Some(occupancy_changed),
+                Some(material_changed),
+                Some(touched_boundaries),
+            ) = (
+                self.pending_render_change_generations
+                    .get_mut(changed.brick_id as usize),
+                self.pending_render_change_revisions
+                    .get_mut(changed.brick_id as usize),
+                self.pending_render_occupancy_changes
+                    .get_mut(changed.brick_id as usize),
+                self.pending_render_material_changes
+                    .get_mut(changed.brick_id as usize),
+                self.pending_render_touched_boundaries
+                    .get_mut(changed.brick_id as usize),
+            )
+            else {
+                continue;
+            };
+            if *current_generation == changed.generation && *current_revision == changed.revision {
+                *current_generation = UCVH_NO_BRICK_GENERATION;
+                *current_revision = 0;
+                *occupancy_changed = false;
+                *material_changed = false;
+                *touched_boundaries = UcvhPageBoundaryMask::NONE;
+                self.pending_render_change_ids.remove(&changed.brick_id);
+            }
+        }
+        true
+    }
+
     pub fn brick_id_at(&self, brick_pos: UVec3) -> Option<BrickId> {
         if !self.contains_brick_pos(brick_pos) {
             return None;
         }
         self.brick_map.get(&self.l0_key(brick_pos)).copied()
+    }
+
+    pub fn brick_coord_for_id(&self, brick_id: BrickId) -> Option<UVec3> {
+        self.brick_coords_by_id
+            .get(brick_id as usize)
+            .copied()
+            .flatten()
     }
 
     pub fn brick_generation(&self, brick_id: BrickId) -> Option<u32> {
@@ -485,6 +933,12 @@ impl Ucvh {
 
     pub fn brick_generations(&self) -> &[u32] {
         &self.brick_generations
+    }
+
+    pub fn brick_topology_revision(&self, brick_id: BrickId) -> Option<u64> {
+        self.brick_topology_revisions
+            .get(brick_id as usize)
+            .copied()
     }
 
     pub fn push_motion_event(&mut self, event: UcvhMotionEvent) -> bool {
@@ -504,6 +958,18 @@ impl Ucvh {
 
     pub fn motion_events(&self) -> &[UcvhMotionEvent] {
         &self.motion_events
+    }
+
+    /// Acknowledges the immutable prefix successfully copied to the motion
+    /// buffer. Events appended after the snapshot remain pending.
+    pub fn ack_motion_events(&mut self, snapshot: &[UcvhMotionEvent]) -> bool {
+        if snapshot.len() > self.motion_events.len()
+            || self.motion_events[..snapshot.len()] != *snapshot
+        {
+            return false;
+        }
+        self.motion_events.drain(..snapshot.len());
+        true
     }
 
     pub fn take_motion_events(&mut self) -> Vec<UcvhMotionEvent> {
@@ -538,6 +1004,104 @@ fn invalidation_region_key(brick_min: UVec3, brick_max_exclusive: UVec3) -> [u32
     ]
 }
 
+const RENDER_CELL_BRICK_EDGE: u32 = 2;
+
+fn pages_affected_by_brick_boundaries(
+    brick_coord: UVec3,
+    touched_boundaries: UcvhPageBoundaryMask,
+    brick_grid_size: UVec3,
+) -> Vec<UVec3> {
+    let mut pages = Vec::with_capacity(7);
+    pages.push(brick_coord);
+    for (boundary, offset) in [
+        (UcvhPageBoundaryMask::NEG_X, glam::IVec3::NEG_X),
+        (UcvhPageBoundaryMask::POS_X, glam::IVec3::X),
+        (UcvhPageBoundaryMask::NEG_Y, glam::IVec3::NEG_Y),
+        (UcvhPageBoundaryMask::POS_Y, glam::IVec3::Y),
+        (UcvhPageBoundaryMask::NEG_Z, glam::IVec3::NEG_Z),
+        (UcvhPageBoundaryMask::POS_Z, glam::IVec3::Z),
+    ] {
+        if !touched_boundaries.contains(boundary) {
+            continue;
+        }
+        let candidate = brick_coord.as_ivec3() + offset;
+        if candidate.x < 0
+            || candidate.y < 0
+            || candidate.z < 0
+            || candidate.x >= brick_grid_size.x as i32
+            || candidate.y >= brick_grid_size.y as i32
+            || candidate.z >= brick_grid_size.z as i32
+        {
+            continue;
+        }
+        pages.push(candidate.as_uvec3());
+    }
+    pages
+}
+
+fn classify_brick_replacement(
+    old_occupancy: Option<&BrickOccupancy>,
+    old_materials: Option<&[VoxelCell]>,
+    new_data: &BrickData,
+) -> (bool, bool, UcvhPageBoundaryMask) {
+    let occupancy_changed = old_occupancy
+        .map(|old| old != &new_data.occupancy)
+        .unwrap_or_else(|| !new_data.occupancy.is_empty());
+    let material_changed = old_materials
+        .map(|old| old != &new_data.materials[..])
+        .unwrap_or_else(|| {
+            new_data
+                .materials
+                .iter()
+                .any(|cell| *cell != VoxelCell::AIR)
+        });
+    if !occupancy_changed {
+        return (false, material_changed, UcvhPageBoundaryMask::NONE);
+    }
+
+    let mut touched_boundaries = UcvhPageBoundaryMask::NONE;
+    for z in 0..BRICK_EDGE {
+        for y in 0..BRICK_EDGE {
+            for x in 0..BRICK_EDGE {
+                let old_solid = old_occupancy.is_some_and(|old| old.get(x, y, z));
+                if old_solid != new_data.occupancy.get(x, y, z) {
+                    touched_boundaries |=
+                        UcvhPageBoundaryMask::from_local_voxel(UVec3::new(x, y, z));
+                }
+            }
+        }
+    }
+    (occupancy_changed, material_changed, touched_boundaries)
+}
+
+fn render_cells_affected_by_brick(brick_coord: UVec3, brick_grid_size: UVec3) -> Vec<UVec3> {
+    let render_cell_grid_size = div_ceil_uvec3(brick_grid_size, RENDER_CELL_BRICK_EDGE);
+    let owner = brick_coord / RENDER_CELL_BRICK_EDGE;
+    let mut cells = Vec::with_capacity(7);
+    for offset in [
+        glam::IVec3::ZERO,
+        glam::IVec3::NEG_X,
+        glam::IVec3::X,
+        glam::IVec3::NEG_Y,
+        glam::IVec3::Y,
+        glam::IVec3::NEG_Z,
+        glam::IVec3::Z,
+    ] {
+        let candidate = owner.as_ivec3() + offset;
+        if candidate.x < 0
+            || candidate.y < 0
+            || candidate.z < 0
+            || candidate.x >= render_cell_grid_size.x as i32
+            || candidate.y >= render_cell_grid_size.y as i32
+            || candidate.z >= render_cell_grid_size.z as i32
+        {
+            continue;
+        }
+        cells.push(candidate.as_uvec3());
+    }
+    cells
+}
+
 fn brick_data_is_air(data: &BrickData) -> bool {
     data.occupancy.is_empty() && data.materials.iter().all(|cell| *cell == VoxelCell::AIR)
 }
@@ -545,6 +1109,118 @@ fn brick_data_is_air(data: &BrickData) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_change_batch_classifies_interior_material_replacement() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        let pos = UVec3::new(9, 9, 9);
+        assert!(u.set_voxel(pos, VoxelCell::new(1, 0, [0; 3])));
+        let initial = u.snapshot_render_change_batch();
+        assert!(u.ack_render_change_batch(initial.id));
+
+        assert!(u.set_voxel(pos, VoxelCell::new(2, 1, [3, 4, 5])));
+        let batch = u.snapshot_render_change_batch();
+
+        assert_eq!(batch.bricks.len(), 1);
+        assert!(!batch.bricks[0].occupancy_changed);
+        assert!(batch.bricks[0].material_changed);
+        assert_eq!(
+            batch.bricks[0].touched_boundaries,
+            UcvhPageBoundaryMask::NONE
+        );
+        assert!(batch.invalidated_pages.is_empty());
+    }
+
+    #[test]
+    fn render_change_batch_classifies_air_solid_transition_and_owner_page() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        assert!(u.set_voxel(UVec3::new(9, 9, 9), VoxelCell::new(1, 0, [0; 3])));
+
+        let batch = u.snapshot_render_change_batch();
+
+        assert!(batch.bricks[0].occupancy_changed);
+        assert!(batch.bricks[0].material_changed);
+        assert_eq!(batch.invalidated_pages, vec![UVec3::ONE]);
+    }
+
+    #[test]
+    fn render_change_batch_classifies_negative_x_boundary_only() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        assert!(u.set_voxel(UVec3::new(8, 9, 9), VoxelCell::new(1, 0, [0; 3])));
+
+        let batch = u.snapshot_render_change_batch();
+
+        assert_eq!(
+            batch.bricks[0].touched_boundaries,
+            UcvhPageBoundaryMask::NEG_X
+        );
+        assert_eq!(
+            batch.invalidated_pages,
+            vec![UVec3::new(0, 1, 1), UVec3::ONE]
+        );
+    }
+
+    #[test]
+    fn render_change_batch_classifies_positive_xyz_boundaries() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        assert!(u.set_voxel(UVec3::new(15, 15, 15), VoxelCell::new(1, 0, [0; 3])));
+
+        let batch = u.snapshot_render_change_batch();
+
+        assert_eq!(
+            batch.bricks[0].touched_boundaries,
+            UcvhPageBoundaryMask::POS_X | UcvhPageBoundaryMask::POS_Y | UcvhPageBoundaryMask::POS_Z
+        );
+    }
+
+    #[test]
+    fn render_change_batch_classification_preserves_newer_merged_flags() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        let pos = UVec3::new(8, 9, 9);
+        assert!(u.set_voxel(pos, VoxelCell::new(1, 0, [0; 3])));
+        let old = u.snapshot_render_change_batch();
+
+        assert!(u.set_voxel(pos, VoxelCell::new(2, 0, [0; 3])));
+        assert!(u.set_voxel(UVec3::new(15, 9, 9), VoxelCell::new(3, 0, [0; 3])));
+        assert!(u.ack_render_change_batch(old.id));
+        let current = u.snapshot_render_change_batch();
+
+        assert_ne!(current.bricks[0].revision, old.bricks[0].revision);
+        assert!(current.bricks[0].occupancy_changed);
+        assert!(current.bricks[0].material_changed);
+        assert!(
+            current.bricks[0]
+                .touched_boundaries
+                .contains(UcvhPageBoundaryMask::NEG_X | UcvhPageBoundaryMask::POS_X)
+        );
+    }
+
+    #[test]
+    fn render_change_batch_classifies_full_brick_boundary_delta() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(24)));
+        let mut initial = BrickData::new();
+        initial.set_voxel(1, 1, 1, VoxelCell::new(1, 0, [0; 3]));
+        assert!(u.write_brick(UVec3::ONE, &initial));
+        let initial_batch = u.snapshot_render_change_batch();
+        assert!(u.ack_render_change_batch(initial_batch.id));
+
+        let mut replacement = BrickData::new();
+        replacement.set_voxel(1, 1, 1, VoxelCell::new(2, 0, [0; 3]));
+        replacement.set_voxel(7, 2, 3, VoxelCell::new(3, 0, [0; 3]));
+        assert!(u.write_brick(UVec3::ONE, &replacement));
+        let batch = u.snapshot_render_change_batch();
+
+        assert!(batch.bricks[0].occupancy_changed);
+        assert!(batch.bricks[0].material_changed);
+        assert_eq!(
+            batch.bricks[0].touched_boundaries,
+            UcvhPageBoundaryMask::POS_X
+        );
+        assert_eq!(
+            batch.invalidated_pages,
+            vec![UVec3::ONE, UVec3::new(2, 1, 1)]
+        );
+    }
 
     fn test_ucvh() -> Ucvh {
         Ucvh::new(UcvhConfig::new(UVec3::splat(128)))
@@ -638,6 +1314,144 @@ mod tests {
     }
 
     #[test]
+    fn render_change_batch_is_retained_until_the_matching_snapshot_is_acknowledged() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        assert!(u.set_voxel(UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
+
+        let first = u.snapshot_render_change_batch();
+        assert_eq!(first.bricks.len(), 1);
+        assert_eq!(u.snapshot_render_change_batch().id, first.id);
+        assert!(u.ack_render_change_batch(first.id));
+        assert!(u.snapshot_render_change_batch().is_empty());
+    }
+
+    #[test]
+    fn acknowledging_an_old_render_change_snapshot_keeps_a_newer_edit_to_the_same_brick() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        assert!(u.set_voxel(UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
+        let old = u.snapshot_render_change_batch();
+
+        assert!(u.set_voxel(UVec3::new(2, 2, 3), VoxelCell::new(2, 0, [0; 3])));
+
+        assert!(u.ack_render_change_batch(old.id));
+        let current = u.snapshot_render_change_batch();
+        assert_eq!(current.bricks.len(), 1);
+        assert_ne!(current.bricks[0].generation, old.bricks[0].generation);
+    }
+
+    #[test]
+    fn render_change_batch_invalidates_its_cell_and_face_neighbors() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(48, 48, 48)));
+        assert!(u.set_voxel(UVec3::new(17, 17, 17), VoxelCell::new(1, 0, [0; 3])));
+
+        let batch = u.snapshot_render_change_batch();
+
+        assert_eq!(batch.bricks[0].brick_coord, UVec3::new(2, 2, 2));
+        assert_eq!(
+            batch.invalidated_render_cells,
+            vec![
+                UVec3::new(1, 1, 0),
+                UVec3::new(1, 0, 1),
+                UVec3::new(0, 1, 1),
+                UVec3::new(1, 1, 1),
+                UVec3::new(2, 1, 1),
+                UVec3::new(1, 2, 1),
+                UVec3::new(1, 1, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_change_batch_invalidates_only_owner_for_interior_occupancy_change() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::new(32, 32, 32)));
+        assert!(u.set_voxel(UVec3::new(9, 9, 9), VoxelCell::new(1, 0, [0; 3])));
+
+        let batch = u.snapshot_render_change_batch();
+
+        assert_eq!(batch.invalidated_pages, vec![UVec3::new(1, 1, 1)]);
+    }
+
+    #[test]
+    fn acknowledging_snapshotted_motion_events_keeps_events_appended_after_snapshot() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        let first = UcvhMotionEvent {
+            region_min: UVec3::new(0, 0, 0),
+            region_max_exclusive: UVec3::new(8, 8, 8),
+            world_delta_current_from_previous: IVec3::X,
+            generation: 1,
+        };
+        let second = UcvhMotionEvent {
+            region_min: UVec3::new(8, 0, 0),
+            region_max_exclusive: UVec3::new(16, 8, 8),
+            world_delta_current_from_previous: IVec3::Y,
+            generation: 2,
+        };
+        assert!(u.push_motion_event(first));
+        let snapshot = u.motion_events().to_vec();
+        assert!(u.push_motion_event(second));
+
+        assert!(u.ack_motion_events(&snapshot));
+
+        assert_eq!(u.motion_events(), &[second]);
+    }
+
+    #[test]
+    fn acknowledging_stale_invalidation_snapshot_preserves_rewritten_region() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        assert!(u.set_voxel(UVec3::new(1, 1, 1), VoxelCell::new(1, 0, [0; 3])));
+        let snapshot = u.invalidation_regions().to_vec();
+        assert!(u.set_voxel(UVec3::new(2, 1, 1), VoxelCell::new(2, 0, [0; 3])));
+
+        assert!(!u.ack_invalidation_regions(&snapshot));
+        assert_eq!(u.invalidation_regions().len(), 1);
+        assert_ne!(
+            u.invalidation_regions()[0].generation,
+            snapshot[0].generation
+        );
+    }
+
+    #[test]
+    fn render_change_ack_uses_non_wrapping_revision_not_only_content_generation() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        assert!(u.set_voxel(UVec3::new(1, 2, 3), VoxelCell::new(1, 0, [0; 3])));
+        let old = u.snapshot_render_change_batch();
+
+        let brick_id = old.bricks[0].brick_id;
+        u.content_generation = old.bricks[0].generation;
+        assert!(u.set_voxel(UVec3::new(2, 2, 3), VoxelCell::new(2, 0, [0; 3])));
+        assert!(u.ack_render_change_batch(old.id));
+        let pending = u.snapshot_render_change_batch();
+        assert_eq!(pending.bricks[0].brick_id, brick_id);
+        assert_eq!(pending.bricks[0].generation, old.bricks[0].generation);
+        assert_ne!(pending.bricks[0].revision, old.bricks[0].revision);
+        assert_ne!(pending.id, old.id);
+    }
+
+    #[test]
+    fn initial_static_bulk_overwrites_duplicate_coordinates_without_leaking_brick_slots() {
+        let mut u = Ucvh::new(UcvhConfig::with_brick_capacity(UVec3::splat(16), 4));
+        let mut first = BrickData::new();
+        first.set_voxel(0, 0, 0, VoxelCell::new(1, 0, [0; 3]));
+        let mut replacement = BrickData::new();
+        replacement.set_voxel(1, 0, 0, VoxelCell::new(2, 0, [0; 3]));
+        let mut second = BrickData::new();
+        second.set_voxel(2, 0, 0, VoxelCell::new(3, 0, [0; 3]));
+
+        assert_eq!(
+            u.write_static_bricks_bulk([
+                (UVec3::ZERO, &first),
+                (UVec3::ZERO, &replacement),
+                (UVec3::new(1, 0, 0), &second),
+            ]),
+            0
+        );
+
+        assert_eq!(u.allocated_brick_count(), 2);
+        assert_eq!(u.get_voxel(UVec3::new(1, 0, 0)).material, 2);
+        assert_eq!(u.get_voxel(UVec3::new(10, 0, 0)).material, 3);
+    }
+
+    #[test]
     fn hierarchy_rebuild_propagates() {
         let mut u = test_ucvh();
         let cell = VoxelCell {
@@ -655,6 +1469,19 @@ mod tests {
         assert_eq!(node.flags & 1, 1);
 
         // Root of hierarchy should be non-empty
+        assert_ne!(u.hierarchy.levels[3][0].child_mask, 0);
+    }
+
+    #[test]
+    fn render_change_batch_updates_only_its_hierarchy_ancestor_chain() {
+        let mut u = Ucvh::new(UcvhConfig::new(UVec3::splat(32)));
+        assert!(u.set_voxel(UVec3::new(9, 1, 1), VoxelCell::new(1, 0, [0; 3])));
+        let batch = u.snapshot_render_change_batch();
+
+        let changes = u.update_hierarchy_for_render_change_batch(&batch);
+
+        assert_eq!(changes.l0, vec![UVec3::new(1, 0, 0)]);
+        assert_eq!(changes.levels[0], vec![UVec3::ZERO]);
         assert_ne!(u.hierarchy.levels[3][0].child_mask, 0);
     }
 

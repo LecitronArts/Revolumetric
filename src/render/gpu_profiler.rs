@@ -97,10 +97,17 @@ pub enum GpuProfileScope {
     RtDirectLighting = 23,
     RtTemporal = 24,
     RtResolve = 25,
+    RtSurfaceGeneration = 26,
+    RtOmmBuild = 27,
+    RtBlasWork = 28,
+    RtTlasWork = 29,
+    RtPrimaryTrace = 30,
+    RtShadowTrace = 31,
+    RtGiTrace = 32,
 }
 
 impl GpuProfileScope {
-    pub const COUNT: usize = 26;
+    pub const COUNT: usize = 33;
     pub const ALL: [Self; Self::COUNT] = [
         Self::VptSurfaceBootstrap,
         Self::VptSurfaceSelected,
@@ -128,6 +135,13 @@ impl GpuProfileScope {
         Self::RtDirectLighting,
         Self::RtTemporal,
         Self::RtResolve,
+        Self::RtSurfaceGeneration,
+        Self::RtOmmBuild,
+        Self::RtBlasWork,
+        Self::RtTlasWork,
+        Self::RtPrimaryTrace,
+        Self::RtShadowTrace,
+        Self::RtGiTrace,
     ];
 
     pub fn log_name(self) -> &'static str {
@@ -158,6 +172,13 @@ impl GpuProfileScope {
             Self::RtDirectLighting => "RtDirectLighting",
             Self::RtTemporal => "RtTemporal",
             Self::RtResolve => "RtResolve",
+            Self::RtSurfaceGeneration => "RtSurfaceGeneration",
+            Self::RtOmmBuild => "RtOmmBuild",
+            Self::RtBlasWork => "RtBlasWork",
+            Self::RtTlasWork => "RtTlasWork",
+            Self::RtPrimaryTrace => "RtPrimaryTrace",
+            Self::RtShadowTrace => "RtShadowTrace",
+            Self::RtGiTrace => "RtGiTrace",
         }
     }
 
@@ -189,6 +210,13 @@ impl GpuProfileScope {
             Self::RtDirectLighting => "rt_direct_lighting_ms",
             Self::RtTemporal => "rt_temporal_ms",
             Self::RtResolve => "rt_resolve_ms",
+            Self::RtSurfaceGeneration => "rt_surface_generation_ms",
+            Self::RtOmmBuild => "rt_omm_build_ms",
+            Self::RtBlasWork => "rt_blas_work_ms",
+            Self::RtTlasWork => "rt_tlas_work_ms",
+            Self::RtPrimaryTrace => "rt_primary_trace_ms",
+            Self::RtShadowTrace => "rt_shadow_trace_ms",
+            Self::RtGiTrace => "rt_gi_trace_ms",
         }
     }
 
@@ -209,9 +237,13 @@ impl GpuProfileScope {
             | Self::VptNrdFrontend
             | Self::VptNrdAdapter
             | Self::VptNrdResolve
-            | Self::Postprocess => vk::PipelineStageFlags::COMPUTE_SHADER,
+            | Self::Postprocess
+            | Self::RtSurfaceGeneration => vk::PipelineStageFlags::COMPUTE_SHADER,
             Self::BlitToSwapchain => vk::PipelineStageFlags::TRANSFER,
-            Self::RtAccelerationStructures => {
+            // The legacy vkCmdWriteTimestamp stage enum has no micromap-build bit;
+            // synchronization2 can narrow this when the profiler moves to timestamp2.
+            Self::RtOmmBuild => vk::PipelineStageFlags::ALL_COMMANDS,
+            Self::RtAccelerationStructures | Self::RtBlasWork | Self::RtTlasWork => {
                 vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
             }
             Self::RtSurface
@@ -221,7 +253,10 @@ impl GpuProfileScope {
             | Self::RtRestirGiSpatial
             | Self::RtDirectLighting
             | Self::RtTemporal
-            | Self::RtResolve => vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
+            | Self::RtResolve
+            | Self::RtPrimaryTrace
+            | Self::RtShadowTrace
+            | Self::RtGiTrace => vk::PipelineStageFlags::RAY_TRACING_SHADER_KHR,
         }
     }
 }
@@ -735,7 +770,7 @@ mod tests {
             .map(|scope| scope.csv_column())
             .collect();
 
-        assert_eq!(GpuProfileScope::COUNT, 26);
+        assert_eq!(GpuProfileScope::COUNT, 33);
         assert_eq!(names[0], "VptSurfaceBootstrap");
         assert_eq!(names[1], "VptSurfaceSelected");
         assert_eq!(names[2], "Vpt");
@@ -762,6 +797,13 @@ mod tests {
         assert_eq!(names[23], "RtDirectLighting");
         assert_eq!(names[24], "RtTemporal");
         assert_eq!(names[25], "RtResolve");
+        assert_eq!(names[26], "RtSurfaceGeneration");
+        assert_eq!(names[27], "RtOmmBuild");
+        assert_eq!(names[28], "RtBlasWork");
+        assert_eq!(names[29], "RtTlasWork");
+        assert_eq!(names[30], "RtPrimaryTrace");
+        assert_eq!(names[31], "RtShadowTrace");
+        assert_eq!(names[32], "RtGiTrace");
         assert_eq!(columns[0], "vpt_surface_bootstrap_ms");
         assert_eq!(columns[1], "vpt_surface_selected_ms");
         assert_eq!(columns[2], "vpt_ms");
@@ -788,6 +830,35 @@ mod tests {
         assert_eq!(columns[23], "rt_direct_lighting_ms");
         assert_eq!(columns[24], "rt_temporal_ms");
         assert_eq!(columns[25], "rt_resolve_ms");
+        assert_eq!(columns[26], "rt_surface_generation_ms");
+        assert_eq!(columns[27], "rt_omm_build_ms");
+        assert_eq!(columns[28], "rt_blas_work_ms");
+        assert_eq!(columns[29], "rt_tlas_work_ms");
+        assert_eq!(columns[30], "rt_primary_trace_ms");
+        assert_eq!(columns[31], "rt_shadow_trace_ms");
+        assert_eq!(columns[32], "rt_gi_trace_ms");
+    }
+
+    #[test]
+    fn rt_representation_bakeoff_scopes_are_distinct_and_stable() {
+        let scopes = [
+            (
+                GpuProfileScope::RtSurfaceGeneration,
+                "rt_surface_generation_ms",
+            ),
+            (GpuProfileScope::RtOmmBuild, "rt_omm_build_ms"),
+            (GpuProfileScope::RtBlasWork, "rt_blas_work_ms"),
+            (GpuProfileScope::RtTlasWork, "rt_tlas_work_ms"),
+            (GpuProfileScope::RtPrimaryTrace, "rt_primary_trace_ms"),
+            (GpuProfileScope::RtShadowTrace, "rt_shadow_trace_ms"),
+            (GpuProfileScope::RtGiTrace, "rt_gi_trace_ms"),
+        ];
+
+        for (scope, column) in scopes {
+            assert_eq!(scope.csv_column(), column);
+            assert!(GpuProfileScope::ALL.contains(&scope));
+        }
+        assert_eq!(GpuProfileScope::COUNT, 33);
     }
 
     #[test]
@@ -809,6 +880,7 @@ mod tests {
             GpuProfileScope::VptNrdAdapter,
             GpuProfileScope::VptNrdResolve,
             GpuProfileScope::Postprocess,
+            GpuProfileScope::RtSurfaceGeneration,
         ] {
             assert_eq!(
                 scope.timestamp_stage(),
@@ -823,6 +895,16 @@ mod tests {
             GpuProfileScope::RtAccelerationStructures.timestamp_stage(),
             vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
         );
+        assert_eq!(
+            GpuProfileScope::RtOmmBuild.timestamp_stage(),
+            vk::PipelineStageFlags::ALL_COMMANDS
+        );
+        for scope in [GpuProfileScope::RtBlasWork, GpuProfileScope::RtTlasWork] {
+            assert_eq!(
+                scope.timestamp_stage(),
+                vk::PipelineStageFlags::ACCELERATION_STRUCTURE_BUILD_KHR
+            );
+        }
         for scope in [
             GpuProfileScope::RtSurface,
             GpuProfileScope::RtRestirDi,
@@ -832,6 +914,9 @@ mod tests {
             GpuProfileScope::RtDirectLighting,
             GpuProfileScope::RtTemporal,
             GpuProfileScope::RtResolve,
+            GpuProfileScope::RtPrimaryTrace,
+            GpuProfileScope::RtShadowTrace,
+            GpuProfileScope::RtGiTrace,
         ] {
             assert_eq!(
                 scope.timestamp_stage(),
@@ -972,11 +1057,11 @@ mod tests {
 
         assert_eq!(
             csv_header(),
-            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,vpt_nrd_resolve_ms,postprocess_ms,blit_to_swapchain_ms,rt_acceleration_structures_ms,rt_surface_ms,rt_restir_di_ms,rt_restir_di_spatial_ms,rt_restir_gi_ms,rt_restir_gi_spatial_ms,rt_direct_lighting_ms,rt_temporal_ms,rt_resolve_ms,total_ms"
+            "frame,vpt_surface_bootstrap_ms,vpt_surface_selected_ms,vpt_ms,restir_di_initial_ms,restir_di_temporal_ms,restir_di_spatial_ms,area_restir_initial_ms,area_restir_temporal_ms,area_restir_spatial_ms,vpt_temporal_ms,vpt_atrous_ms,vpt_nrd_confidence_ms,vpt_nrd_frontend_ms,vpt_nrd_adapter_ms,vpt_nrd_resolve_ms,postprocess_ms,blit_to_swapchain_ms,rt_acceleration_structures_ms,rt_surface_ms,rt_restir_di_ms,rt_restir_di_spatial_ms,rt_restir_gi_ms,rt_restir_gi_spatial_ms,rt_direct_lighting_ms,rt_temporal_ms,rt_resolve_ms,rt_surface_generation_ms,rt_omm_build_ms,rt_blas_work_ms,rt_tlas_work_ms,rt_primary_trace_ms,rt_shadow_trace_ms,rt_gi_trace_ms,total_ms"
         );
         assert_eq!(
             csv_row(&frame),
-            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,2.5000"
+            "42,1.2500,0.7500,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.5000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,0.0000,2.5000"
         );
     }
 
@@ -984,7 +1069,25 @@ mod tests {
     fn restir_area_profile_wrapper_uses_current_csv_scope_columns() {
         let wrapper = crate::render::source_checks::read_source("tools/profile_restir_area.ps1");
 
-        for scope in GpuProfileScope::ALL {
+        for scope in [
+            GpuProfileScope::VptSurfaceBootstrap,
+            GpuProfileScope::VptSurfaceSelected,
+            GpuProfileScope::Vpt,
+            GpuProfileScope::RestirDiInitial,
+            GpuProfileScope::RestirDiTemporal,
+            GpuProfileScope::RestirDiSpatial,
+            GpuProfileScope::AreaRestirInitial,
+            GpuProfileScope::AreaRestirTemporal,
+            GpuProfileScope::AreaRestirSpatial,
+            GpuProfileScope::VptTemporal,
+            GpuProfileScope::VptAtrous,
+            GpuProfileScope::VptNrdConfidence,
+            GpuProfileScope::VptNrdFrontend,
+            GpuProfileScope::VptNrdAdapter,
+            GpuProfileScope::VptNrdResolve,
+            GpuProfileScope::Postprocess,
+            GpuProfileScope::BlitToSwapchain,
+        ] {
             let column = scope.csv_column();
             assert!(
                 wrapper.contains(&format!("\"{column}\"")),

@@ -21,6 +21,30 @@ struct FrameResources {
     image_available_semaphore: vk::Semaphore,
     render_finished_semaphore: vk::Semaphore,
     in_flight_fence: vk::Fence,
+    submission_epoch: FrameSubmissionEpoch,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FrameSubmissionEpoch {
+    submitted: Option<u64>,
+    completed: Option<u64>,
+}
+
+impl FrameSubmissionEpoch {
+    fn mark_submitted(&mut self, epoch: u64) {
+        self.submitted = Some(epoch);
+    }
+
+    fn mark_fence_completed(&mut self) -> Option<u64> {
+        if let Some(epoch) = self.submitted.take() {
+            self.completed = Some(epoch);
+        }
+        self.completed
+    }
+
+    fn completed(self) -> Option<u64> {
+        self.completed
+    }
 }
 
 struct RenderDeviceConstructionCleanup {
@@ -589,6 +613,9 @@ impl RenderDevice {
                 .wait_for_fences(&[in_flight_fence], true, u64::MAX)
                 .context("failed to wait for Vulkan in-flight fence")?;
         }
+        self.frames[frame_slot]
+            .submission_epoch
+            .mark_fence_completed();
 
         let (image_index, suboptimal) = match unsafe {
             self.swapchain_loader.acquire_next_image(
@@ -687,6 +714,9 @@ impl RenderDevice {
             self.device
                 .queue_submit(self.graphics_queue, &[submit_info], ctx.in_flight_fence)
                 .context("failed to submit Vulkan command buffer")?;
+            self.frames[ctx.frame_slot]
+                .submission_epoch
+                .mark_submitted(ctx.frame_index);
 
             let present_wait_semaphores = [ctx.render_finished_semaphore];
             let swapchains = [self.swapchain.handle];
@@ -756,6 +786,40 @@ impl RenderDevice {
         }
     }
 
+    pub fn wait_for_other_frame_fences_and_mark_completed(
+        &mut self,
+        excluded_frame_slot: usize,
+    ) -> Result<()> {
+        if excluded_frame_slot >= self.frames.len() {
+            return Err(anyhow!(
+                "excluded Vulkan frame slot is out of range: slot={excluded_frame_slot} count={}",
+                self.frames.len()
+            ));
+        }
+        let fences = self
+            .frames
+            .iter()
+            .enumerate()
+            .filter(|(slot, frame)| {
+                *slot != excluded_frame_slot && frame.in_flight_fence != vk::Fence::null()
+            })
+            .map(|(_, frame)| frame.in_flight_fence)
+            .collect::<Vec<_>>();
+        if !fences.is_empty() {
+            unsafe {
+                self.device
+                    .wait_for_fences(&fences, true, u64::MAX)
+                    .context("failed to wait for other Vulkan frame fences")?;
+            }
+        }
+        for (slot, frame) in self.frames.iter_mut().enumerate() {
+            if slot != excluded_frame_slot {
+                frame.submission_epoch.mark_fence_completed();
+            }
+        }
+        Ok(())
+    }
+
     pub fn wait_idle(&self) -> Result<()> {
         unsafe {
             self.device
@@ -794,6 +858,12 @@ impl RenderDevice {
 
     pub fn frame_slot_count(&self) -> usize {
         self.frames.len()
+    }
+
+    pub fn completed_frame_epoch(&self, frame_slot: usize) -> Option<u64> {
+        self.frames
+            .get(frame_slot)
+            .and_then(|frame| frame.submission_epoch.completed())
     }
 
     pub fn physical_device_properties(&self) -> vk::PhysicalDeviceProperties {
@@ -918,6 +988,7 @@ fn create_single_frame_resources(
         image_available_semaphore,
         render_finished_semaphore,
         in_flight_fence,
+        submission_epoch: FrameSubmissionEpoch::default(),
     })
 }
 
@@ -1229,6 +1300,22 @@ mod tests {
                 FramePreparationStep::ResetCommandPool,
             ]
         );
+    }
+
+    #[test]
+    fn frame_submission_epoch_advances_only_after_its_fence_completes() {
+        let mut epoch = FrameSubmissionEpoch::default();
+        assert_eq!(epoch.completed(), None);
+
+        epoch.mark_submitted(7);
+        assert_eq!(epoch.completed(), None);
+        assert_eq!(epoch.mark_fence_completed(), Some(7));
+        assert_eq!(epoch.completed(), Some(7));
+
+        epoch.mark_submitted(11);
+        assert_eq!(epoch.completed(), Some(7));
+        assert_eq!(epoch.mark_fence_completed(), Some(11));
+        assert_eq!(epoch.completed(), Some(11));
     }
 
     #[test]

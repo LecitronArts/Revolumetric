@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ash::vk;
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocation, AllocationCreateDesc, AllocationScheme};
@@ -79,5 +79,20 @@ impl GpuBuffer {
     /// Returns a mapped read-only slice if the buffer is host-visible.
     pub fn mapped_slice(&self) -> Option<&[u8]> {
         self.allocation.as_ref().and_then(|a| a.mapped_slice())
+    }
+
+    pub fn device_address(&self, device: &ash::Device) -> Result<vk::DeviceAddress> {
+        if !self
+            .usage
+            .contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS)
+        {
+            bail!("buffer was not created with SHADER_DEVICE_ADDRESS usage");
+        }
+        let address_info = vk::BufferDeviceAddressInfo::default().buffer(self.handle);
+        let address = unsafe { device.get_buffer_device_address(&address_info) };
+        if address == 0 {
+            bail!("Vulkan returned a null buffer device address");
+        }
+        Ok(address)
     }
 }

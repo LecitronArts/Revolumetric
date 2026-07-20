@@ -50,7 +50,7 @@ Rendering settings can be overridden through environment variables:
 - `REVOLUMETRIC_EXPOSURE=<finite non-negative float>`: postprocess exposure multiplier before tonemap. Default is `1.0`.
 - `REVOLUMETRIC_LIGHTING_SHADOWS=on|off|1|0|true|false`: enables direct-light shadow rays.
 - `REVOLUMETRIC_SUN_ANGULAR_RADIUS=<finite positive float in (0.0, 0.25]>`: analytic sun disk radius in radians for VPT soft shadow edges. Default is `0.02`.
-  The default sun intensity is interpreted as solar-disk radiance and the VPT direct-light estimator evaluates Lambertian `f * Li * cos / pdf`; changing the angular radius changes the sampled disk solid angle rather than applying a legacy directional-light brightness compensation.
+  Sun intensity is interpreted as total irradiance / legacy directional-light strength. Finite sun shaders derive the disk radiance internally, so changing angular radius affects shadow softness and highlight size rather than total brightness.
 - `REVOLUMETRIC_LIGHTING_SKIP_BACKFACE_SHADOWS=on|off|1|0|true|false`: skips backface shadow hits when enabled.
 - `REVOLUMETRIC_LIGHTING_DEBUG_VIEW=final|off|diffuse|direct|normal`: selects runtime lighting debug output.
 - `REVOLUMETRIC_DENOISER=off|svgf|relax|reblur`: selects VPT denoising. `relax` and `reblur` use the native NRD path when the `nrd` Cargo feature and NRD SDK are available; otherwise they fall back to the existing SVGF path.
@@ -72,7 +72,7 @@ explicitly through environment overrides:
 - `REVOLUMETRIC_RT_TEMPORAL_DENOISE=on|off|1|0|true|false`: enables the RT temporal-only accumulation path. Default is `on`.
 - `REVOLUMETRIC_RT_TEMPORAL_HISTORY_LENGTH=1..64`: RT temporal and reservoir history budget. Default is `20`.
 - `REVOLUMETRIC_RT_TEMPORAL_NORMAL_THRESHOLD=0.0..1.0`: normal compatibility threshold for RT temporal/spatial reuse. Default is `0.85`.
-- `REVOLUMETRIC_RT_TEMPORAL_DEPTH_THRESHOLD=0.0..1.0`: depth/position compatibility threshold for RT temporal/spatial reuse. Default is `0.02`.
+- `REVOLUMETRIC_RT_TEMPORAL_DEPTH_THRESHOLD=0.0..1.0`: depth/position compatibility threshold for RT temporal/spatial reuse. Default is `0.003`.
 - `REVOLUMETRIC_RT_DEBUG_VIEW=off|final|surface|hit_distance|history_valid|direct_reservoir|indirect_reservoir|temporal`: selects RT diagnostics.
 
 ReSTIR-DI is an experimental direct-light reuse layer and is disabled by default:
@@ -143,6 +143,7 @@ Validation matrix for this MVP:
 .\run\validate-visual-baseline.ps1
 .\run\validate-visual-baseline.ps1 -Nrd
 .\run\validate-visual-baseline.ps1 -Rt
+.\tools\rt_flythrough_capture.ps1 -Mode rt -Frames 32 -CaptureFrames "2,16,31"
 .\run\validate-nrd.ps1 -Denoiser reblur -Frames 3
 $env:REVOLUMETRIC_RENDER_MODE='rt'
 $env:REVOLUMETRIC_EXIT_AFTER_FRAMES='2'

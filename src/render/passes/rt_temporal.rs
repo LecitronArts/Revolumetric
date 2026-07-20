@@ -5,6 +5,7 @@ use gpu_allocator::MemoryLocation;
 use crate::render::allocator::GpuAllocator;
 use crate::render::buffer::GpuBuffer;
 use crate::render::descriptor::{DescriptorBindingSpec, DescriptorLayoutBuilder, DescriptorPool};
+use crate::render::gpu_profiler::{GpuProfileScope, GpuProfiler};
 use crate::render::graph::RenderGraph;
 use crate::render::image::{GpuImage, GpuImageDesc};
 use crate::render::pipeline::{RayTracingPipeline, ShaderBindingTable, create_shader_module};
@@ -241,6 +242,7 @@ impl RtTemporalPass {
         );
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn register_graph<'a>(
         &'a self,
         graph: &mut RenderGraph<'a>,
@@ -249,6 +251,7 @@ impl RtTemporalPass {
         surface: ResourceHandle,
         current_radiance: ResourceHandle,
         temporal_initialized: bool,
+        profiler: Option<&'a GpuProfiler>,
     ) -> RtTemporalGraphOutputs {
         let current = self.current_temporal_image(frame_index);
         let previous = &self.temporal_images[previous_temporal_index(frame_index)];
@@ -315,30 +318,48 @@ impl RtTemporalPass {
             builder.read_as(previous_surface_history, AccessKind::RayTracingShaderRead);
             builder.write_as(current_resource, AccessKind::RayTracingShaderWrite);
             builder.write_as(current_surface_history, AccessKind::RayTracingShaderWrite);
-            Box::new(move |ctx| unsafe {
-                ctx.device.cmd_bind_pipeline(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline,
-                );
-                ctx.device.cmd_bind_descriptor_sets(
-                    ctx.command_buffer,
-                    vk::PipelineBindPoint::RAY_TRACING_KHR,
-                    pipeline_layout,
-                    0,
-                    std::slice::from_ref(&descriptor_set),
-                    &[],
-                );
-                ray_tracing_pipeline_loader.cmd_trace_rays(
-                    ctx.command_buffer,
-                    &sbt_regions.raygen,
-                    &sbt_regions.miss,
-                    &sbt_regions.hit,
-                    &sbt_regions.callable,
-                    width,
-                    height,
-                    1,
-                );
+            Box::new(move |ctx| {
+                if let Some(profiler) = profiler {
+                    profiler.begin_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtTemporal,
+                    );
+                }
+                unsafe {
+                    ctx.device.cmd_bind_pipeline(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline,
+                    );
+                    ctx.device.cmd_bind_descriptor_sets(
+                        ctx.command_buffer,
+                        vk::PipelineBindPoint::RAY_TRACING_KHR,
+                        pipeline_layout,
+                        0,
+                        std::slice::from_ref(&descriptor_set),
+                        &[],
+                    );
+                    ray_tracing_pipeline_loader.cmd_trace_rays(
+                        ctx.command_buffer,
+                        &sbt_regions.raygen,
+                        &sbt_regions.miss,
+                        &sbt_regions.hit,
+                        &sbt_regions.callable,
+                        width,
+                        height,
+                        1,
+                    );
+                }
+                if let Some(profiler) = profiler {
+                    profiler.end_scope(
+                        ctx.device,
+                        ctx.command_buffer,
+                        frame_slot,
+                        GpuProfileScope::RtTemporal,
+                    );
+                }
             })
         });
 
