@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_TEARDOWN_ZIP_MAP_PATH: &str = "assets/scenes/Vintessa Hills.zip";
-pub const LEGACY_TEARDOWN_ZIP_MAP_PATH: &str = "C:/Users/mc897/Downloads/Vintessa Hills.zip";
+//pub const LEGACY_TEARDOWN_ZIP_MAP_PATH: &str = "assets/scenes/Vintessa Hills.zip";
 const TEARDOWN_NATIVE_VOXELS_PER_UNIT: u32 = 10;
 const DOWNSAMPLED_VOX_PHASE_BUCKETS: i32 = 1;
 const DOWNSAMPLED_VOX_LINEAR_QUANTIZATION: f32 = 4096.0;
@@ -115,7 +115,7 @@ impl From<VoxLoadError> for TeardownZipLoadError {
 pub fn default_zip_map_path() -> PathBuf {
     select_default_zip_map_path(&[
         Path::new(DEFAULT_TEARDOWN_ZIP_MAP_PATH),
-        Path::new(LEGACY_TEARDOWN_ZIP_MAP_PATH),
+        //Path::new(LEGACY_TEARDOWN_ZIP_MAP_PATH),
     ])
 }
 
