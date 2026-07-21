@@ -170,7 +170,17 @@ impl RtCompactBlasBuildPlan {
 }
 
 pub const fn compact_blas_build_flags() -> vk::BuildAccelerationStructureFlagsKHR {
-    vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
+    // CompactExact page BLASes are build-once/trace-many: a page is rebuilt only on
+    // a topology edit (always an out-of-place BUILD, never an in-place UPDATE — see
+    // `compact_blas_build_is_out_of_place_fast_trace_only`), then traced for many
+    // frames by primary, shadow, and GI rays. PREFER_FAST_TRACE optimizes traversal
+    // throughput (deeper, higher-SAH-quality BVH) at the cost of slower builds, which
+    // is the correct trade for near-static voxel surfaces. ALLOW_UPDATE is
+    // deliberately omitted because we never refit these BLASes.
+    //
+    // NVIDIA "Best Practices for Using NVIDIA RTX Ray Tracing": reserve
+    // PREFER_FAST_BUILD for geometry rebuilt every frame.
+    vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,7 +374,12 @@ pub struct RtCompactBlasBuildResources {
     pub retire_epoch: Option<u64>,
     blas: RtAccelerationStructure,
     blas_device_address: vk::DeviceAddress,
-    scratch_buffer: GpuBuffer,
+    /// Build scratch. Consumed only by the one BLAS build command recorded in
+    /// `record_build`; dead once that submission's fence signals. `take_scratch`
+    /// removes it after submission so an installed (resident) BLAS no longer pins
+    /// scratch VRAM for its whole lifetime (previously ~doubled per-page AS memory).
+    /// Retire/error paths that still hold scratch free it in `destroy`.
+    scratch_buffer: Option<GpuBuffer>,
     scratch_address: vk::DeviceAddress,
     plan: RtCompactBlasBuildPlan,
     build_sizes: vk::AccelerationStructureBuildSizesInfoKHR<'static>,
@@ -473,7 +488,7 @@ impl RtCompactBlasBuildResources {
             retire_epoch: None,
             blas,
             blas_device_address,
-            scratch_buffer,
+            scratch_buffer: Some(scratch_buffer),
             scratch_address,
             plan,
             build_sizes,
@@ -622,6 +637,14 @@ impl RtCompactBlasBuildResources {
         }
     }
 
+    /// Take ownership of the build scratch buffer, leaving `None` behind. Call after
+    /// the BLAS build has been recorded and submitted — the scratch is only read by
+    /// that one build command, so once its submission fence signals the buffer can be
+    /// freed. Returns `None` if scratch was already taken (idempotent).
+    pub fn take_scratch(&mut self) -> Option<GpuBuffer> {
+        self.scratch_buffer.take()
+    }
+
     pub fn destroy(
         self,
         device: &ash::Device,
@@ -629,7 +652,9 @@ impl RtCompactBlasBuildResources {
         acceleration_structure_loader: &ash::khr::acceleration_structure::Device,
         page_gpu: &mut RtPageGpuResources,
     ) -> Result<()> {
-        self.scratch_buffer.destroy(device, allocator);
+        if let Some(scratch_buffer) = self.scratch_buffer {
+            scratch_buffer.destroy(device, allocator);
+        }
         self.blas
             .destroy(device, allocator, acceleration_structure_loader);
         page_gpu
@@ -714,6 +739,57 @@ impl RtCompactBlasRetirementQueue {
     #[deprecated(note = "use drain_completed(epoch, ...) for frame-safe retirement")]
     pub fn pop_front(&mut self) -> Option<RtCompactBlasBuildResources> {
         self.pending.pop_front()
+    }
+
+    pub fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Fence-gated free-queue for BLAS build scratch buffers (T1-E).
+///
+/// A CompactExact BLAS's build scratch is consumed only by the single
+/// `cmd_build_acceleration_structures` recorded in `record_build`. Once that
+/// submission's fence signals, the scratch is dead — but the BLAS itself remains
+/// resident (traced) for potentially hundreds of frames. Previously the scratch was
+/// owned for the BLAS's whole life, roughly doubling per-page AS VRAM on populated
+/// scenes. This queue holds taken scratch buffers with the frame epoch that last
+/// referenced them and frees each once `drain_completed(epoch)` confirms the GPU is
+/// done — the same fence-safety model as [`RtCompactBlasRetirementQueue`].
+#[derive(Default)]
+pub struct RtCompactBlasScratchFreeQueue {
+    pending: VecDeque<(GpuBuffer, u64)>,
+}
+
+impl RtCompactBlasScratchFreeQueue {
+    /// Enqueue a scratch buffer to free after the GPU completes `last_ref_epoch`
+    /// (the frame index whose command buffer recorded the build that read it).
+    pub fn enqueue(&mut self, scratch: GpuBuffer, last_ref_epoch: u64) {
+        self.pending.push_back((scratch, last_ref_epoch));
+    }
+
+    /// Free all scratch buffers whose recorded epoch has completed on the GPU.
+    /// Call after advancing the completed epoch (e.g., after a frame fence signals).
+    pub fn drain_completed(
+        &mut self,
+        completed_epoch: u64,
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+    ) -> usize {
+        let mut freed = 0;
+        while let Some((_, epoch)) = self.pending.front() {
+            if *epoch > completed_epoch {
+                break; // ordered by enqueue epoch (monotonic frame_index)
+            }
+            let (scratch, _) = self.pending.pop_front().unwrap();
+            scratch.destroy(device, allocator);
+            freed += 1;
+        }
+        freed
     }
 
     pub fn len(&self) -> usize {
@@ -859,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_blas_build_is_out_of_place_fast_build_only() {
+    fn compact_blas_build_is_out_of_place_fast_trace_only() {
         let geometry = one_face_geometry();
         let plan = RtCompactBlasBuildPlan::from_geometry(&geometry, 0x1000, 0x2000)
             .unwrap()
@@ -874,10 +950,13 @@ mod tests {
             vk::AccelerationStructureKHR::null()
         );
         assert_eq!(info.dst_acceleration_structure, destination);
+        // Build-once/trace-many voxel pages must prefer traversal throughput.
         assert_eq!(
             info.flags,
-            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_BUILD
+            vk::BuildAccelerationStructureFlagsKHR::PREFER_FAST_TRACE
         );
+        // We never refit these BLASes — every topology edit is an out-of-place BUILD,
+        // so ALLOW_UPDATE must stay off (it would degrade BVH quality for no benefit).
         assert!(
             !info
                 .flags
@@ -973,7 +1052,7 @@ mod tests {
             "get_acceleration_structure_build_sizes",
             "RtAccelerationStructure::new",
             "MemoryLocation::GpuOnly",
-            "scratch_buffer: GpuBuffer",
+            "scratch_buffer: Option<GpuBuffer>",
             "min_acceleration_structure_scratch_offset_alignment",
             "cmd_build_acceleration_structures",
             "GpuProfileScope::RtBlasWork",

@@ -115,7 +115,7 @@ impl RtRestirGiPass {
         ]
     }
 
-    pub(crate) fn spatial_descriptor_binding_specs() -> [DescriptorBindingSpec; 16] {
+    pub(crate) fn spatial_descriptor_binding_specs() -> [DescriptorBindingSpec; 18] {
         [
             DescriptorBindingSpec::ray_tracing(0, vk::DescriptorType::UNIFORM_BUFFER),
             DescriptorBindingSpec::ray_tracing(1, vk::DescriptorType::STORAGE_BUFFER),
@@ -133,6 +133,10 @@ impl RtRestirGiPass {
             DescriptorBindingSpec::ray_tracing(15, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(16, vk::DescriptorType::STORAGE_BUFFER),
             DescriptorBindingSpec::ray_tracing(17, vk::DescriptorType::STORAGE_BUFFER),
+            // CompactExact page geometry buffers — spatial pass also includes
+            // rt_compact_exact_gi.rchit which reads these at binding 18/19.
+            DescriptorBindingSpec::ray_tracing(18, vk::DescriptorType::STORAGE_BUFFER), // face_records
+            DescriptorBindingSpec::ray_tracing(19, vk::DescriptorType::STORAGE_BUFFER), // page_records
         ]
     }
 
@@ -195,7 +199,8 @@ impl RtRestirGiPass {
                     },
                     vk::DescriptorPoolSize {
                         ty: vk::DescriptorType::STORAGE_BUFFER,
-                        descriptor_count: (12 * frame_count) as u32,
+                        // 12 original + 2 for face_records/page_records (bindings 18/19)
+                        descriptor_count: (14 * frame_count) as u32,
                     },
                 ],
             ) {
@@ -534,6 +539,10 @@ impl RtRestirGiPass {
     }
 
     /// Write CompactExact page buffers to bindings 18 (face_records) and 19 (page_records).
+    ///
+    /// Both the main and spatial pipelines include `rt_compact_exact_gi.rchit` which reads
+    /// these bindings, so both descriptor sets must be updated each time the page buffers
+    /// are (re-)bound.
     pub fn update_rt_page_descriptors(
         &self,
         device: &ash::Device,
@@ -541,21 +550,50 @@ impl RtRestirGiPass {
         face_buffer: &GpuBuffer,
         page_record_buffer: &GpuBuffer,
     ) {
-        let Some(&descriptor_set) = self.descriptor_sets.get(frame_slot) else {
-            return;
+        let sets: &[vk::DescriptorSet] = match (
+            self.descriptor_sets.get(frame_slot),
+            self.spatial_descriptor_sets.get(frame_slot),
+        ) {
+            (Some(&main), Some(&spatial)) => &[main, spatial],
+            (Some(&main), None) => &[main],
+            _ => return,
         };
-        for (binding, buffer) in [(18u32, face_buffer), (19u32, page_record_buffer)] {
-            let buffer_info = vk::DescriptorBufferInfo::default()
-                .buffer(buffer.handle)
-                .offset(0)
-                .range(vk::WHOLE_SIZE);
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(descriptor_set)
-                .dst_binding(binding)
-                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                .buffer_info(std::slice::from_ref(&buffer_info));
-            unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        // Phase 1: collect all DescriptorBufferInfo first so the Vec is stable before
+        // we take slice references into it for WriteDescriptorSet (avoids mutable +
+        // immutable borrow on the same Vec). Layout: [binding18×set0, binding18×set1,
+        // binding19×set0, binding19×set1, ...] i.e. `binding_idx * sets.len() + set_idx`.
+        let bindings = [(18u32, face_buffer as *const GpuBuffer), (19u32, page_record_buffer as *const GpuBuffer)];
+        let mut buffer_infos: Vec<vk::DescriptorBufferInfo> =
+            Vec::with_capacity(bindings.len() * sets.len());
+        for &(_, buf_ptr) in &bindings {
+            // SAFETY: raw pointers only used within this function's scope; the
+            // references face_buffer / page_record_buffer remain valid throughout.
+            let buf = unsafe { &*buf_ptr };
+            for _ in sets {
+                buffer_infos.push(
+                    vk::DescriptorBufferInfo::default()
+                        .buffer(buf.handle)
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE),
+                );
+            }
         }
+        // Phase 2: build writes referencing the now-stable buffer_infos slice.
+        let mut writes: Vec<vk::WriteDescriptorSet<'_>> =
+            Vec::with_capacity(bindings.len() * sets.len());
+        for (binding_idx, &(binding, _)) in bindings.iter().enumerate() {
+            for (set_idx, &dst_set) in sets.iter().enumerate() {
+                let info_idx = binding_idx * sets.len() + set_idx;
+                writes.push(
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(dst_set)
+                        .dst_binding(binding)
+                        .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                        .buffer_info(std::slice::from_ref(&buffer_infos[info_idx])),
+                );
+            }
+        }
+        unsafe { device.update_descriptor_sets(&writes, &[]) };
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2320,9 +2358,9 @@ mod shader_source_tests {
             "float3rt_restir_gi_analytic_sun_direct(RtSurfacePixelsurface,inoutuintrng_state)",
             "float3rt_restir_gi_estimate_incoming_radiance(RtSurfacePixelsurface,inoutuintrng_state)",
             "RayDescsky_ray",
-            "TraceRay(scene_tlas,0u,0xffu,0u,0u,0u,sky_ray,sky_payload)",
+            "TraceRay(scene_tlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,0xffu,0u,0u,0u,sky_ray,sky_payload)",
             "RayDescsun_ray",
-            "TraceRay(scene_tlas,0u,0xffu,0u,0u,0u,sun_ray,sun_payload)",
+            "TraceRay(scene_tlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH,0xffu,0u,0u,0u,sun_ray,sun_payload)",
             "float3sample_radiance=rt_restir_gi_estimate_incoming_radiance(indirect_surface,rng_state)",
         ] {
             assert!(
@@ -2744,11 +2782,14 @@ mod shader_source_tests {
         let compact = crate::render::source_checks::compact(implementation);
 
         for token in [
-            "fnspatial_descriptor_binding_specs()->[DescriptorBindingSpec;16]",
+            "fnspatial_descriptor_binding_specs()->[DescriptorBindingSpec;18]",
             "DescriptorBindingSpec::ray_tracing(7,vk::DescriptorType::ACCELERATION_STRUCTURE_KHR)",
             "DescriptorBindingSpec::ray_tracing(8,vk::DescriptorType::STORAGE_BUFFER)",
             "DescriptorBindingSpec::ray_tracing(17,vk::DescriptorType::STORAGE_BUFFER)",
-            "descriptor_count:(12*frame_count)asu32",
+            // binding 18/19 must be in the spatial layout (rt_compact_exact_gi.rchit uses them)
+            "DescriptorBindingSpec::ray_tracing(18,vk::DescriptorType::STORAGE_BUFFER)",
+            "DescriptorBindingSpec::ray_tracing(19,vk::DescriptorType::STORAGE_BUFFER)",
+            "descriptor_count:(14*frame_count)asu32",
             "create_spatial_raygen_pipeline(",
             "write_tlas_descriptor(device,spatial_descriptor_set,tlas)",
             "write_aabb_descriptor(device,spatial_descriptor_set,aabb_buffer)",

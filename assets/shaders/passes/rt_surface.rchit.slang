@@ -15,11 +15,9 @@ void main(inout RtSurfacePayload payload, in RtSurfaceIntersectionAttributes att
     float3 hit_normal = rt_surface_unpack_axis_normal(attributes.packed_local_normal);
     VoxelCell cell = brick_materials[brick_id * 512u + morton_encode(local)];
 
-    payload.primitive_index = primitive_index;
-    payload.instance_id = InstanceID();
-    payload.ray_direction = world_direction;
     payload.hit_kind = RT_SURFACE_HIT_KIND_VOXEL;
     payload.hit_t = hit_t;
+    payload.ray_direction = world_direction;
     payload.position = world_origin + world_direction * hit_t;
     payload.normal = hit_normal;
     payload.albedo = material_cell_albedo(cell);

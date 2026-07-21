@@ -140,7 +140,13 @@ float3 rt_direct_sky_visibility_sample(RtSurfacePixel surface, float3 sky_dir) {
     ray.TMax = 1.0e20;
 
     RtShadowPayload payload = make_rt_shadow_payload(surface.brick_id, surface.local, ray.TMax);
-    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, ray, payload);
+    // Occlusion query: accept the first hit and skip the closest-hit shader.
+    // Result is binary (occluded vs not), so finding the *closest* occluder is
+    // wasted traversal through the voxel DDA intersection shader.
+    TraceRay(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        0xffu, 0u, 0u, 0u, ray, payload);
     if (payload.occluded != 0u) {
         return float3(0.0);
     }
@@ -170,7 +176,11 @@ bool rt_direct_sun_visible(RtSurfacePixel surface, float3 sun_dir) {
     ray.TMax = 1.0e20;
 
     RtShadowPayload payload = make_rt_shadow_payload(surface.brick_id, surface.local, ray.TMax);
-    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, ray, payload);
+    // Sun shadow: binary occlusion, accept-first-hit + skip closest-hit shader.
+    TraceRay(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        0xffu, 0u, 0u, 0u, ray, payload);
     return payload.occluded == 0u;
 }
 
@@ -354,7 +364,11 @@ bool rt_direct_light_visible(RtSurfacePixel surface, RestirDiReservoir reservoir
     ray.TMax = max_light_t;
 
     RtShadowPayload payload = make_rt_shadow_payload(surface.brick_id, surface.local, max_light_t);
-    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, ray, payload);
+    // ReSTIR-DI light visibility: binary occlusion, accept-first-hit + skip closest-hit shader.
+    TraceRay(
+        scene_tlas,
+        RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+        0xffu, 0u, 0u, 0u, ray, payload);
     return payload.occluded == 0u;
 }
 

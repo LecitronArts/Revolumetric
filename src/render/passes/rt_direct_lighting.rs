@@ -1707,7 +1707,7 @@ mod shader_source_tests {
             "float3sky_dir=normal;",
             "ray.Direction=sky_dir;",
             "RtShadowPayloadpayload=make_rt_shadow_payload(surface.brick_id,surface.local,ray.TMax);",
-            "TraceRay(scene_tlas,0u,0xffu,0u,0u,0u,ray,payload);",
+            "TraceRay(scene_tlas,RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH|RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,0xffu,0u,0u,0u,ray,payload);",
             "if(payload.occluded!=0u){returnfloat3(0.0);}",
             "returnsurface.albedo_material.rgb*rt_direct_sky_visibility_sample(surface,sky_dir);",
         ] {

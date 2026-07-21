@@ -13,6 +13,21 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub const UCVH_MOTION_EVENT_CAPACITY: usize = 64;
 pub const INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+/// Baseline per-frame-slot material staging size (T1-B). Both the incremental and
+/// the initial upload paths now write material into staging with COMPACT addressing
+/// (chunk/brick index, not device offset — see `upload_segment_chunk` and
+/// `upload_incremental_changes`), so staging need only hold one frame's material
+/// traffic instead of the entire material pool (previously ≈400 MiB at 100k bricks ×
+/// 2-3 slots ≈ 1 GiB of host-visible memory serving a few-brick delta). It must be at
+/// least one initial-upload chunk (`INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES`) so the
+/// initial material segment fits; that also comfortably covers ~16k bricks/frame of
+/// incremental edits. Rare oversized incremental batches grow the slot's staging in
+/// place via `ensure_material_staging_capacity` (fence-safe by frame-slot rotation).
+pub const MATERIAL_STAGING_BUDGET_BYTES: usize = INITIAL_UCVH_UPLOAD_FRAME_BUDGET_BYTES;
+
+/// Bytes of one brick's material block: BRICK_VOLUME voxels × sizeof(VoxelCell).
+const BRICK_MATERIAL_BYTES: usize = BRICK_VOLUME * std::mem::size_of::<VoxelCell>();
 const INITIAL_UCVH_UPLOAD_SEGMENT_COUNT: usize = 9;
 static MOTION_EVENT_OVERFLOW_WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -168,6 +183,10 @@ struct UcvhStagingResources {
 pub struct UcvhIncrementalUploadResult {
     pub changed_bricks: u32,
     pub bytes_uploaded: usize,
+    /// True when the RT backend skipped uploading changed L1-L4 hierarchy levels
+    /// (T1-C). The GPU L1-L4 buffers are now stale versus the CPU hierarchy; the
+    /// runtime must record a full L1-L4 re-upload before the next VPT trace.
+    pub skipped_ln_hierarchy: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -359,10 +378,14 @@ impl UcvhGpuResources {
                     MemoryLocation::CpuToGpu,
                     &format!("ucvh_staging_occupancy_{frame_slot}"),
                 )?,
+                // T1-B: material staging uses compact slots, so it is sized to a
+                // per-frame delta budget rather than the whole material pool. Capped at
+                // the initial pool size (never need more than the whole pool) and grown
+                // in place for rare oversized batches by ensure_material_staging_capacity.
                 material: GpuBuffer::new(
                     device,
                     allocator,
-                    initial_mat_size.max(16) as u64,
+                    MATERIAL_STAGING_BUDGET_BYTES.min(initial_mat_size.max(16)).max(16) as u64,
                     staging_usage,
                     MemoryLocation::CpuToGpu,
                     &format!("ucvh_staging_material_{frame_slot}"),
@@ -428,6 +451,43 @@ impl UcvhGpuResources {
         })
     }
 
+    /// Ensure the given frame slot's material staging buffer can hold `brick_count`
+    /// bricks' material (T1-B). Material staging is budget-sized (compact slots), so a
+    /// rare oversized edit batch grows it in place. Fence-safe: the caller (runtime)
+    /// waits on this frame slot's fence before reusing the slot's command buffer, which
+    /// also guarantees no in-flight transfer still reads this staging buffer, so
+    /// destroying and reallocating it here cannot race the GPU. Grow-only: the buffer
+    /// keeps the larger size after a big batch (huge incremental batches are rare, and
+    /// the persistent baseline stays at the budget for typical few-brick edits).
+    pub fn ensure_material_staging_capacity(
+        &mut self,
+        device: &ash::Device,
+        allocator: &GpuAllocator,
+        frame_slot: usize,
+        brick_count: usize,
+    ) -> Result<()> {
+        let required = brick_count.saturating_mul(BRICK_MATERIAL_BYTES).max(16);
+        let staging = self.staging.get_mut(frame_slot).ok_or_else(|| {
+            anyhow::anyhow!(
+                "UCVH staging frame slot is out of range: frame_slot={frame_slot}"
+            )
+        })?;
+        if (staging.material.size as usize) >= required {
+            return Ok(());
+        }
+        let new_buffer = GpuBuffer::new(
+            device,
+            allocator,
+            required as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            MemoryLocation::CpuToGpu,
+            &format!("ucvh_staging_material_{frame_slot}"),
+        )?;
+        let old = std::mem::replace(&mut staging.material, new_buffer);
+        old.destroy(device, allocator);
+        Ok(())
+    }
+
     pub fn upload_incremental_changes(
         &self,
         device: &ash::Device,
@@ -435,6 +495,7 @@ impl UcvhGpuResources {
         frame_slot: usize,
         ucvh: &mut Ucvh,
         batch: &UcvhRenderChangeBatch,
+        skip_ln_hierarchy_upload: bool,
     ) -> Result<UcvhIncrementalUploadResult> {
         if batch.is_empty() {
             return Ok(UcvhIncrementalUploadResult::default());
@@ -456,8 +517,25 @@ impl UcvhGpuResources {
                 .map(|brick| brick.brick_id)
                 .collect::<Vec<_>>(),
         );
+        // T1-B: material staging is addressed by a compact per-frame slot index, not
+        // the brick's device offset, so material staging need only hold this frame's
+        // changed bricks (not the whole pool). Occupancy (80 B) and generation (4 B)
+        // stay device-offset-addressed — their full-pool staging is small. The caller
+        // must have grown this slot's material staging to fit the batch via
+        // `ensure_material_staging_capacity`; bail defensively if it did not.
+        let required_material_staging = batch
+            .bricks
+            .len()
+            .saturating_mul(BRICK_MATERIAL_BYTES);
+        if (staging.material.size as usize) < required_material_staging {
+            bail!(
+                "material staging too small for incremental batch: have={} need={} (call ensure_material_staging_capacity first)",
+                staging.material.size,
+                required_material_staging
+            );
+        }
         let mut bytes_uploaded = 0usize;
-        for &brick_id in plan.brick_ids() {
+        for (compact_slot, &brick_id) in plan.brick_ids().iter().enumerate() {
             let brick_index = brick_id as usize;
             let occupancy_bytes = bytes_of(ucvh.pool.occupancy(brick_id));
             let material_start = brick_index * BRICK_VOLUME;
@@ -470,7 +548,8 @@ impl UcvhGpuResources {
             let generation_bytes = bytes_of(&generation);
 
             let occupancy_offset = brick_index * std::mem::size_of::<BrickOccupancy>();
-            let material_offset = material_start * std::mem::size_of::<VoxelCell>();
+            let material_device_offset = material_start * std::mem::size_of::<VoxelCell>();
+            let material_staging_offset = compact_slot * BRICK_MATERIAL_BYTES;
             let generation_offset = brick_index * std::mem::size_of::<u32>();
             Self::copy_to_staging_offset(&staging.occupancy, occupancy_bytes, occupancy_offset)?;
             Self::record_copy_region(
@@ -482,14 +561,15 @@ impl UcvhGpuResources {
                 occupancy_offset as u64,
                 occupancy_bytes.len() as u64,
             );
-            Self::copy_to_staging_offset(&staging.material, material_bytes, material_offset)?;
+            // Compact staging slot -> device offset (T1-B).
+            Self::copy_to_staging_offset(&staging.material, material_bytes, material_staging_offset)?;
             Self::record_copy_region(
                 device,
                 cmd,
                 &staging.material,
                 &self.material_buffer,
-                material_offset as u64,
-                material_offset as u64,
+                material_staging_offset as u64,
+                material_device_offset as u64,
                 material_bytes.len() as u64,
             );
             Self::copy_to_staging_offset(
@@ -508,13 +588,20 @@ impl UcvhGpuResources {
             );
             bytes_uploaded += occupancy_bytes.len() + material_bytes.len() + generation_bytes.len();
         }
-        bytes_uploaded +=
-            self.upload_incremental_hierarchy(device, cmd, staging, ucvh, &hierarchy_changes)?;
+        bytes_uploaded += self.upload_incremental_hierarchy(
+            device,
+            cmd,
+            staging,
+            ucvh,
+            &hierarchy_changes,
+            skip_ln_hierarchy_upload,
+        )?;
         Self::record_upload_barrier(device, cmd);
 
         Ok(UcvhIncrementalUploadResult {
             changed_bricks: plan.brick_ids().len() as u32,
             bytes_uploaded,
+            skipped_ln_hierarchy: skip_ln_hierarchy_upload && !hierarchy_changes.levels.is_empty(),
         })
     }
 
@@ -711,7 +798,16 @@ impl UcvhGpuResources {
         staging: &UcvhStagingResources,
         ucvh: &Ucvh,
         changes: &CascadedOccupancyChanges,
+        skip_ln_levels: bool,
     ) -> Result<usize> {
+        // L0 is always uploaded — the hardware RT procedural intersection shader
+        // (rt_surface.rint.slang) reads hierarchy_l0 to recover brick_id/occupancy.
+        // L1-L4 are consumed only by the VPT software traversal's empty-space skip
+        // (voxel_traverse.slang), so on the RT backend `skip_ln_levels` elides their
+        // GPU upload (T1-C). The CPU-side L1-L4 recompute in
+        // `update_hierarchy_for_render_change_batch` still runs, so CPU levels stay
+        // current and an RT→VPT switch only needs a full L1-L4 re-upload (see
+        // `record_full_ln_hierarchy_upload`), never a rebuild.
         let mut bytes_uploaded = 0usize;
         for position in &changes.l0 {
             let offset = CascadedOccupancy::flat_index(*position, ucvh.hierarchy.dims[0])
@@ -728,6 +824,9 @@ impl UcvhGpuResources {
                 bytes.len() as u64,
             );
             bytes_uploaded += bytes.len();
+        }
+        if skip_ln_levels {
+            return Ok(bytes_uploaded);
         }
         for (level_index, positions) in changes.levels.iter().enumerate() {
             let staging_base =
@@ -752,6 +851,47 @@ impl UcvhGpuResources {
                 bytes_uploaded += bytes.len();
             }
         }
+        Ok(bytes_uploaded)
+    }
+
+    /// Re-upload the entire L1-L4 hierarchy from the current CPU state (T1-C).
+    ///
+    /// Called on an RT→VPT backend switch after the RT backend skipped incremental
+    /// L1-L4 uploads (`skipped_ln_hierarchy`). The CPU L1-L4 levels are always kept
+    /// current by `update_hierarchy_for_render_change_batch`, so a wholesale copy of
+    /// each level buffer resynchronizes the GPU without any rebuild. The staging
+    /// hierarchy buffer is sized to the full hierarchy at creation, so all four levels
+    /// fit in one staging pass. L0 is not touched (it is always kept current on RT).
+    pub fn record_full_ln_hierarchy_upload(
+        &self,
+        device: &ash::Device,
+        cmd: vk::CommandBuffer,
+        frame_slot: usize,
+        ucvh: &Ucvh,
+    ) -> Result<usize> {
+        let staging = self.staging_for_frame_slot(frame_slot)?;
+        let mut bytes_uploaded = 0usize;
+        for level_index in 0..ucvh.hierarchy.levels.len() {
+            let level = &ucvh.hierarchy.levels[level_index];
+            if level.is_empty() {
+                continue;
+            }
+            let staging_base =
+                hierarchy_level_staging_offset(&ucvh.hierarchy, level_index) as usize;
+            let bytes = cast_slice::<NodeLN, u8>(level);
+            Self::copy_to_staging_offset(&staging.hierarchy, bytes, staging_base)?;
+            Self::record_copy_region(
+                device,
+                cmd,
+                &staging.hierarchy,
+                &self.hierarchy_ln_buffers[level_index],
+                staging_base as u64,
+                0,
+                bytes.len() as u64,
+            );
+            bytes_uploaded += bytes.len();
+        }
+        Self::record_upload_barrier(device, cmd);
         Ok(bytes_uploaded)
     }
 
@@ -820,7 +960,15 @@ impl UcvhGpuResources {
             return Ok(0);
         }
         let chunk = &segment.data[segment_offset..segment_offset + chunk_len];
-        let staging_offset = segment.staging_base_offset + segment_offset as u64;
+        // T1-B: write each chunk at the segment's staging BASE (compact), not at
+        // base + segment_offset. Each segment uploads at most one chunk per frame (the
+        // shared budget is consumed per chunk), and frames rotate frame slots with a
+        // fence wait before reuse, so successive chunks of the same segment across
+        // frames never race on the same staging region. This decouples staging size
+        // from the device buffer size, so staging.material need only hold one budget
+        // chunk instead of the whole material pool. The device copy still targets the
+        // growing destination offset.
+        let staging_offset = segment.staging_base_offset;
         let destination_offset = segment.destination_base_offset + segment_offset as u64;
         Self::copy_to_staging_offset(segment.staging, chunk, staging_offset as usize)?;
         Self::record_copy_region(

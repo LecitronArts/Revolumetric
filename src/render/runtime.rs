@@ -11,6 +11,7 @@ use crate::render::restir_di::RestirDiSettings;
 use crate::render::rt_capabilities::{RenderBackend, RtCapabilities, resolve_render_backend};
 use crate::render::rt_page_blas::{
     RtCompactBlasCreateInfo, RtCompactBlasBuildResources, RtCompactBlasRetirementQueue,
+    RtCompactBlasScratchFreeQueue,
 };
 use crate::render::rt_page_geometry::RtCompactPageGeometry;
 use crate::render::rt_page_gpu::{
@@ -126,6 +127,11 @@ pub struct RenderRuntime {
     ucvh_initial_upload_snapshot_taken: bool,
     ucvh_initial_upload_committed: bool,
     ucvh_uploaded: bool,
+    /// True when the RT backend skipped uploading changed L1-L4 occupancy hierarchy
+    /// levels (T1-C). The GPU L1-L4 buffers then lag the CPU hierarchy; before the
+    /// next VPT trace (only VPT reads L1-L4) the runtime records a full L1-L4
+    /// re-upload and clears this. Kept correct across the auto RT↔VPT backend switch.
+    hierarchy_ln_gpu_stale: bool,
     rt_page_registry: RtPageRegistry,
     rt_page_registry_bootstrapped: bool,
     rt_page_tlas: Option<RtPageTlasRuntime>,
@@ -136,6 +142,10 @@ pub struct RenderRuntime {
     rt_page_lattice_uploaded: bool,
     /// Deferred-retire queue for old CompactExact BLAS resources.
     rt_page_retirement_queue: RtCompactBlasRetirementQueue,
+    /// Fence-gated free-queue for BLAS build scratch buffers (T1-E). Scratch is dead
+    /// after its build submission signals, so we free it without waiting for the
+    /// resident BLAS to retire, reclaiming per-page AS scratch VRAM.
+    rt_page_scratch_free_queue: RtCompactBlasScratchFreeQueue,
     /// Installed CompactExact BLASes still resident in the TLAS.
     rt_page_installed_blas: Vec<crate::render::rt_page_blas::RtInstalledCompactBlas>,
     rt_pipeline: RtRuntimePipeline,
@@ -274,12 +284,14 @@ impl RenderRuntime {
             ucvh_initial_upload_snapshot_taken: false,
             ucvh_initial_upload_committed: false,
             ucvh_uploaded: false,
+            hierarchy_ln_gpu_stale: false,
             rt_page_registry: RtPageRegistry::new(RT_PAGE_DIRTY_QUEUE_CAPACITY),
             rt_page_registry_bootstrapped: false,
             rt_page_tlas: None,
             rt_page_gpu: None,
             rt_page_lattice_uploaded: false,
             rt_page_retirement_queue: RtCompactBlasRetirementQueue::default(),
+            rt_page_scratch_free_queue: RtCompactBlasScratchFreeQueue::default(),
             rt_page_installed_blas: Vec::new(),
             rt_pipeline: RtRuntimePipeline::new(),
             vpt_pipeline: VptRuntimePipeline::new(),
@@ -398,6 +410,9 @@ impl RenderRuntime {
         self.ucvh_initial_upload_snapshot_taken = false;
         self.ucvh_initial_upload_committed = false;
         self.ucvh_uploaded = false;
+        // The initial upload path re-sends the full hierarchy (all levels), so any
+        // prior RT-mode L1-L4 skip is superseded (T1-C).
+        self.hierarchy_ln_gpu_stale = false;
     }
 
     fn ensure_ucvh_gpu_capacity(&mut self, ucvh: Option<&Ucvh>) -> Result<()> {
@@ -653,39 +668,109 @@ impl RenderRuntime {
         }
 
         let mut uploaded_authority_batch_id = None;
-        if self.ucvh_initial_upload_committed
-            && let (Some(ucvh), Some(gpu)) = (input.ucvh.as_deref_mut(), &self.ucvh_gpu)
+        if self.ucvh_initial_upload_committed {
+            if let Some(ucvh) = input.ucvh.as_deref_mut() {
+                let batch = ucvh.snapshot_render_change_batch();
+                if !batch.is_empty() {
+                    // T1-B Phase 1: grow material staging for this frame slot if the
+                    // batch exceeds the current (budget-sized) staging capacity. Uses a
+                    // mutable borrow of self.ucvh_gpu; Phase 2 (immutable) follows.
+                    // Fence-safe: the runtime waits this slot's fence before reusing its
+                    // command buffer, so no in-flight GPU transfer reads staging here.
+                    let device = self.renderer.device();
+                    let allocator = self.renderer.allocator();
+                    if let Some(gpu) = &mut self.ucvh_gpu {
+                        if let Err(e) = gpu.ensure_material_staging_capacity(
+                            device,
+                            allocator,
+                            frame.frame_slot,
+                            batch.bricks.len(),
+                        ) {
+                            tracing::warn!(
+                                %e,
+                                bricks = batch.bricks.len(),
+                                "failed to grow material staging for incremental batch"
+                            );
+                        }
+                    }
+
+                    let report = self
+                        .rt_page_registry
+                        .ingest_render_change_batch(&batch, frame.frame_index);
+                    Self::log_rt_page_queue_report("incremental authority snapshot", &report);
+                    // T1-C: on the RT backend, skip uploading changed L1-L4 hierarchy
+                    // levels — only VPT's software traversal reads them. L0 is always
+                    // uploaded (RT's procedural intersection reads it).
+                    let skip_ln_hierarchy_upload = self.render_backend == RenderBackend::Rt;
+                    // T1-B Phase 2: upload with budget-sized staging (compact slots).
+                    if let Some(gpu) = &self.ucvh_gpu {
+                        match gpu.upload_incremental_changes(
+                            self.renderer.device(),
+                            frame.command_buffer,
+                            frame.frame_slot,
+                            ucvh,
+                            &batch,
+                            skip_ln_hierarchy_upload,
+                        ) {
+                            Ok(upload) => {
+                                uploaded_authority_batch_id = Some(batch.id);
+                                if upload.skipped_ln_hierarchy {
+                                    self.hierarchy_ln_gpu_stale = true;
+                                }
+                                tracing::debug!(
+                                    batch_id = batch.id,
+                                    changed_bricks = upload.changed_bricks,
+                                    bytes = upload.bytes_uploaded,
+                                    skipped_ln_hierarchy = upload.skipped_ln_hierarchy,
+                                    "uploaded incremental UCVH authority changes"
+                                );
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    batch_id = batch.id,
+                                    "failed to upload incremental UCVH authority changes; retaining batch"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // T1-C: heal a stale GPU L1-L4 hierarchy before the VPT backend traces it.
+        // The RT backend skips incremental L1-L4 uploads; when the auto backend
+        // switches to VPT (large scene) the CPU L1-L4 is current but the GPU lags, so
+        // re-upload all four levels in one pass. Robust to missing the exact switch
+        // frame — any VPT frame with the flag set heals it before tracing. Capacity
+        // recreation re-uploads everything via the initial path and clears the flag.
+        if self.render_backend == RenderBackend::Vpt
+            && self.hierarchy_ln_gpu_stale
+            && self.ucvh_initial_upload_committed
         {
-            let batch = ucvh.snapshot_render_change_batch();
-            if !batch.is_empty() {
-                let report = self
-                    .rt_page_registry
-                    .ingest_render_change_batch(&batch, frame.frame_index);
-                Self::log_rt_page_queue_report("incremental authority snapshot", &report);
-                match gpu.upload_incremental_changes(
+            let mut resynced = false;
+            if let (Some(ucvh), Some(gpu)) = (input.ucvh.as_deref(), self.ucvh_gpu.as_ref()) {
+                match gpu.record_full_ln_hierarchy_upload(
                     self.renderer.device(),
                     frame.command_buffer,
                     frame.frame_slot,
                     ucvh,
-                    &batch,
                 ) {
-                    Ok(upload) => {
-                        uploaded_authority_batch_id = Some(batch.id);
-                        tracing::debug!(
-                            batch_id = batch.id,
-                            changed_bricks = upload.changed_bricks,
-                            bytes = upload.bytes_uploaded,
-                            "uploaded incremental UCVH authority changes"
+                    Ok(bytes) => {
+                        tracing::info!(
+                            bytes,
+                            "resynchronized full L1-L4 hierarchy after RT→VPT backend switch"
                         );
+                        resynced = true;
                     }
-                    Err(error) => {
-                        tracing::error!(
-                            %error,
-                            batch_id = batch.id,
-                            "failed to upload incremental UCVH authority changes; retaining batch"
-                        );
-                    }
+                    Err(error) => tracing::error!(
+                        %error,
+                        "failed to resync L1-L4 hierarchy on RT→VPT backend switch"
+                    ),
                 }
+            }
+            if resynced {
+                self.hierarchy_ln_gpu_stale = false;
             }
         }
 
@@ -1194,6 +1279,12 @@ impl RenderRuntime {
             ) {
                 tracing::warn!(%e, "RT page BLAS retirement drain failed");
             }
+            // T1-E: free BLAS build scratch buffers whose build submission completed.
+            self.rt_page_scratch_free_queue.drain_completed(
+                completed_epoch,
+                self.renderer.device(),
+                self.renderer.allocator(),
+            );
         }
 
         // ── Upload shared lattice once ────────────────────────────────────────────
@@ -1322,6 +1413,14 @@ impl RenderRuntime {
                 continue;
             }
             blas.mark_submitted().expect("allocated BLAS transitions to submitted");
+
+            // T1-E: the build scratch is consumed only by the build command just
+            // recorded into this frame's command buffer, so it is dead once
+            // frame_index's fence signals. Hand it to the fence-gated free-queue now
+            // instead of letting the resident BLAS pin it for its whole lifetime.
+            if let Some(scratch) = blas.take_scratch() {
+                self.rt_page_scratch_free_queue.enqueue(scratch, frame_index);
+            }
 
             let blas_address = blas.blas_device_address();
             match blas.install_or_retire(

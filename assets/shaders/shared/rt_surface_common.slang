@@ -54,8 +54,8 @@ float3 rt_surface_unpack_axis_normal(uint packed) {
 struct RtSurfacePayload {
     uint hit_kind;
     float hit_t;
-    uint primitive_index;
-    uint instance_id;
+    // primitive_index and instance_id removed (T1-D): written by rchit but never
+    // consumed by surface_pixel_from_payload or any downstream pass.
     float3 position;
     float3 normal;
     float3 albedo;
@@ -118,8 +118,6 @@ RtSurfacePayload make_rt_surface_payload(float3 ray_direction) {
     RtSurfacePayload payload;
     payload.hit_kind = RT_SURFACE_HIT_KIND_MISS;
     payload.hit_t = RT_SURFACE_MISS_T;
-    payload.primitive_index = 0xffffffffu;
-    payload.instance_id = 0xffffffffu;
     payload.position = float3(0.0);
     payload.normal = -ray_direction;
     payload.albedo = float3(0.0);

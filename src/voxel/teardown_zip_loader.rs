@@ -139,6 +139,9 @@ pub fn load_teardown_zip_into_ucvh(
 
     let profile = std::env::var_os("REVOLUMETRIC_TEARDOWN_PROFILE").is_some();
     let load_start = Instant::now();
+    // Capture teardown_dir before it's moved into the resource source open — workers
+    // reopen their own sources and need it for BUILT-IN/ resource resolution.
+    let worker_teardown_dir = options.teardown_dir.clone();
     let mut source = TeardownResourceSource::open(zip_path.as_ref(), options.teardown_dir)?;
     profile_teardown_phase(profile, "open", load_start.elapsed());
     let mut cache = VoxCache::default();
@@ -185,107 +188,143 @@ pub fn load_teardown_zip_into_ucvh(
     let debug_placements = std::env::var_os("REVOLUMETRIC_TEARDOWN_DUMP_PLACEMENTS")
         .is_some()
         .then(|| RefCell::new(Vec::new()));
-    let mut downsampled_plan_jobs: HashMap<DownsampledVoxPlanKey, DownsampledVoxPlanBuildJob> =
-        HashMap::new();
+    // Downsampled plans only exist when the source is scaled down to fit the world
+    // (scale < 1.0). At scale >= 1.0 `downsampled_vox_plan_spec` always returns None, so
+    // the collect_plans XML pass and the parallel build both produce zero jobs and the
+    // write pass never consults the plan cache. Skip both phases entirely in that case.
+    let mut prebuilt_plan_count = 0u64;
+    if target_mapping.scale < 1.0 {
+        let mut downsampled_plan_jobs: HashMap<DownsampledVoxPlanKey, DownsampledVoxPlanBuildJob> =
+            HashMap::new();
+
+        let phase_start = Instant::now();
+        walk_xml_bytes(
+            &main_xml,
+            identity,
+            &mut source,
+            &mut cache,
+            &mut stats,
+            &mut downsampled_plan_jobs,
+            false,
+            false,
+            &mut |_pos, _material, _sink| {},
+            &mut |_min, _max_exclusive, _material, _sink| true,
+            &mut |path, object, scene, _tint, matrix, jobs| {
+                collect_downsampled_vox_plan_job(
+                    path,
+                    object,
+                    scene,
+                    matrix,
+                    density,
+                    &target_mapping,
+                    jobs,
+                )
+            },
+        )?;
+        profile_teardown_phase(profile, "collect_plans", phase_start.elapsed());
+        prebuilt_plan_count = downsampled_plan_jobs.len() as u64;
+        let phase_start = Instant::now();
+        downsampled_plan_cache.plans =
+            build_downsampled_vox_plans_parallel(downsampled_plan_jobs.into_values().collect());
+        profile_teardown_phase(profile, "build_plans", phase_start.elapsed());
+    }
+
+    // Brick-slab parallel write (opt-in via REVOLUMETRIC_TEARDOWN_PARALLEL_WRITE):
+    // N workers each walk the full document independently with their own
+    // TeardownResourceSource + VoxCache, but only write bricks in their slab
+    // (brick_z % N == worker_id). Bricks are disjoint across workers → merge is trivial
+    // concatenation. No shared mutable state → no thread-safety refactor needed.
+    // Transform work is replicated N× (runs in parallel → wall-clock 1×); write work
+    // partitions 1/N. Only valid when scale >= 1.0 (downsampled-plan path inert there).
+    let use_parallel_write = target_mapping.scale >= 1.0
+        && std::env::var_os("REVOLUMETRIC_TEARDOWN_PARALLEL_WRITE").is_some();
 
     let phase_start = Instant::now();
-    walk_xml_bytes(
-        &main_xml,
-        identity,
-        &mut source,
-        &mut cache,
-        &mut stats,
-        &mut downsampled_plan_jobs,
-        false,
-        false,
-        &mut |_pos, _material, _sink| {},
-        &mut |_min, _max_exclusive, _material, _sink| true,
-        &mut |path, object, scene, _tint, matrix, jobs| {
-            collect_downsampled_vox_plan_job(
-                path,
-                object,
-                scene,
-                matrix,
-                density,
-                &target_mapping,
-                jobs,
-            )
-        },
-    )?;
-    profile_teardown_phase(profile, "collect_plans", phase_start.elapsed());
-    let prebuilt_plan_count = downsampled_plan_jobs.len() as u64;
-    let phase_start = Instant::now();
-    downsampled_plan_cache.plans =
-        build_downsampled_vox_plans_parallel(downsampled_plan_jobs.into_values().collect());
-    profile_teardown_phase(profile, "build_plans", phase_start.elapsed());
-
-    let phase_start = Instant::now();
-    walk_xml_bytes(
-        &main_xml,
-        identity,
-        &mut source,
-        &mut cache,
-        &mut stats,
-        &mut staged_bricks,
-        false,
-        true,
-        &mut |pos, material, bricks| {
-            let Some(target) = target_mapping.map(pos) else {
-                write_stats.record_out_of_bounds(1);
-                return;
-            };
-            if target.x < ucvh.config.world_size.x
-                && target.y < ucvh.config.world_size.y
-                && target.z < ucvh.config.world_size.z
-            {
-                if write_target_voxel(ucvh, bricks, target, material) {
-                    write_stats.record_written(target);
-                }
-            } else {
-                write_stats.record_out_of_bounds(1);
-            }
-        },
-        &mut |source_min, source_max_exclusive, material, bricks| {
-            let Some((source_min, source_max_exclusive)) =
-                target_mapping.clipped_source_box(source_min, source_max_exclusive)
-            else {
-                return false;
-            };
-            let Some(start) = target_mapping.map(source_min) else {
-                return false;
-            };
-            let Some(end) = target_mapping.map(source_max_exclusive - IVec3::ONE) else {
-                return false;
-            };
-            let min = start.min(end);
-            let max_exclusive = (start.max(end) + UVec3::ONE).min(ucvh.config.world_size);
-            if min.x >= max_exclusive.x || min.y >= max_exclusive.y || min.z >= max_exclusive.z {
-                return true;
-            }
-            fill_target_box(ucvh, bricks, min, max_exclusive, material, &write_stats);
-            true
-        },
-        &mut |path, object, scene, tint, matrix, bricks| {
-            write_downsampled_vox_scene(
-                path,
-                object,
-                scene,
-                tint,
-                matrix,
-                density,
-                &target_mapping,
-                ucvh.config.world_size,
+    let (flush_bricks, write_stats): (Vec<(UVec3, StagedBrick)>, TargetWriteStats) =
+        if use_parallel_write {
+            let result = parallel_slab_write(
+                zip_path.as_ref(),
+                worker_teardown_dir,
+                &main_xml,
+                cache.clone(), // pre-filled from bounds pass — workers get cheap Arc-ptr clones
                 ucvh,
-                bricks,
-                &write_stats,
-                &mut downsampled_plan_cache,
-                &downsampled_stats,
-                debug_placements.as_ref(),
-            )
-        },
-    )?;
-    profile_teardown_phase(profile, "write", phase_start.elapsed());
-    let write_stats = write_stats.finish();
+                &target_mapping,
+                density,
+                profile,
+            )?;
+            profile_teardown_phase(profile, "write", phase_start.elapsed());
+            result
+        } else {
+            walk_xml_bytes(
+                &main_xml,
+                identity,
+                &mut source,
+                &mut cache,
+                &mut stats,
+                &mut staged_bricks,
+                false,
+                true,
+                &mut |pos, material, bricks| {
+                    let Some(target) = target_mapping.map(pos) else {
+                        write_stats.record_out_of_bounds(1);
+                        return;
+                    };
+                    if target.x < ucvh.config.world_size.x
+                        && target.y < ucvh.config.world_size.y
+                        && target.z < ucvh.config.world_size.z
+                    {
+                        if write_target_voxel(ucvh, bricks, target, material) {
+                            write_stats.record_written(target);
+                        }
+                    } else {
+                        write_stats.record_out_of_bounds(1);
+                    }
+                },
+                &mut |source_min, source_max_exclusive, material, bricks| {
+                    let Some((source_min, source_max_exclusive)) =
+                        target_mapping.clipped_source_box(source_min, source_max_exclusive)
+                    else {
+                        return false;
+                    };
+                    let Some(start) = target_mapping.map(source_min) else {
+                        return false;
+                    };
+                    let Some(end) = target_mapping.map(source_max_exclusive - IVec3::ONE) else {
+                        return false;
+                    };
+                    let min = start.min(end);
+                    let max_exclusive = (start.max(end) + UVec3::ONE).min(ucvh.config.world_size);
+                    if min.x >= max_exclusive.x
+                        || min.y >= max_exclusive.y
+                        || min.z >= max_exclusive.z
+                    {
+                        return true;
+                    }
+                    fill_target_box(ucvh, bricks, min, max_exclusive, material, &write_stats);
+                    true
+                },
+                &mut |path, object, scene, tint, matrix, bricks| {
+                    write_downsampled_vox_scene(
+                        path,
+                        object,
+                        scene,
+                        tint,
+                        matrix,
+                        density,
+                        &target_mapping,
+                        ucvh.config.world_size,
+                        ucvh,
+                        bricks,
+                        &write_stats,
+                        &mut downsampled_plan_cache,
+                        &downsampled_stats,
+                        debug_placements.as_ref(),
+                    )
+                },
+            )?;
+            profile_teardown_phase(profile, "write", phase_start.elapsed());
+            (std::mem::take(&mut staged_bricks.bricks), write_stats.finish())
+        };
     let downsampled_stats = downsampled_stats.into_inner();
     stats.written_voxels = write_stats.written_voxels;
     stats.out_of_bounds_voxels = write_stats.out_of_bounds_voxels;
@@ -296,9 +335,9 @@ pub fn load_teardown_zip_into_ucvh(
 
     let phase_start = Instant::now();
     let failed_bricks = ucvh.write_static_bricks_bulk(
-        staged_bricks
+        flush_bricks
             .iter()
-            .map(|(brick_pos, brick)| (brick_pos, &brick.data)),
+            .map(|(brick_pos, brick)| (*brick_pos, &brick.data)),
     );
     profile_teardown_phase(profile, "flush_bricks", phase_start.elapsed());
     if failed_bricks > 0 {
@@ -307,7 +346,7 @@ pub fn load_teardown_zip_into_ucvh(
             dropped_voxels: 0,
         });
     }
-    stats.unique_written_voxels = staged_bricks
+    stats.unique_written_voxels = flush_bricks
         .iter()
         .map(|(_, brick)| brick)
         .map(|brick| u64::from(brick.touched_count))
@@ -355,7 +394,7 @@ fn dump_debug_placements(placements: &[TeardownDebugVoxPlacement]) {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct VoxCache {
     scenes: HashMap<String, Option<Arc<CachedVoxScene>>>,
     brush_patterns: HashMap<(String, Option<String>), Option<Arc<BrushPattern>>>,
@@ -820,7 +859,8 @@ fn walk_xml_node<S>(
                         };
                         let tinted_materials = tinted_materials(scene.as_ref(), tint);
                         let materials = tinted_materials.as_ref().unwrap_or(&scene.materials);
-                        let density_cell_emission = density_cell_emission(matrix);
+                        let density_cell_emission =
+                            density_cell_emission(matrix, source_density(stats));
                         visit_cached_visible_voxels(
                             scene.as_ref(),
                             object,
@@ -920,7 +960,7 @@ fn walk_xml_node<S>(
                 emitted = count > 0;
             }
             if emit_content && !record_stats && !emitted {
-                let density_cell_emission = density_cell_emission(matrix);
+                let density_cell_emission = density_cell_emission(matrix, source_density(stats));
                 for x in local_min.x..local_max_exclusive.x {
                     for y in local_min.y..local_max_exclusive.y {
                         for z in local_min.z..local_max_exclusive.z {
@@ -1273,15 +1313,80 @@ fn transform_expands_density_cells(matrix: Mat4) -> bool {
     }) || row_occupancy.iter().any(|count| *count > 1)
 }
 
+/// Integer affine map from a native source coord `c` to a target source coord:
+/// `target = L·c + t`, where `L·(c/vpu) + translation` composes to integers.
+///
+/// Derivation: the float path computes `round((L·(c/vpu) + translation)·vpu)`
+/// componentwise (round-half-away-from-zero). That equals `L·c + translation·vpu`.
+/// This struct is only constructed when every `L` entry rounds to an integer and
+/// every `translation·vpu` component rounds to an integer within a tight tolerance,
+/// so the true (real-number) result is an exact integer for all `c`. The residual
+/// float error is `|δ·c| + |δt|` with `|δ| ~ 1e-7`; for Teardown coords (`|c| < ~1e6`)
+/// this stays far below 0.5, so the float path recovers the same integer — making the
+/// integer path bit-identical. Any node that does not satisfy this (fractional scale,
+/// non-axis-aligned rotation, half-integer translation) is rejected and falls back to
+/// the float `Point` path unchanged.
+#[derive(Clone, Copy)]
+struct IntegerAffine {
+    l: [[i32; 3]; 3],
+    t: [i32; 3],
+}
+
+impl IntegerAffine {
+    #[inline]
+    fn apply(&self, coord: IVec3) -> IVec3 {
+        let c = [coord.x, coord.y, coord.z];
+        IVec3::new(
+            self.l[0][0] * c[0] + self.l[0][1] * c[1] + self.l[0][2] * c[2] + self.t[0],
+            self.l[1][0] * c[0] + self.l[1][1] * c[1] + self.l[1][2] * c[2] + self.t[1],
+            self.l[2][0] * c[0] + self.l[2][1] * c[1] + self.l[2][2] * c[2] + self.t[2],
+        )
+    }
+}
+
+fn integer_affine(matrix: Mat4, voxels_per_unit: u32) -> Option<IntegerAffine> {
+    const L_TOL: f32 = 1.0e-4;
+    const T_TOL: f32 = 1.0e-3;
+    let linear = linear_transform(matrix);
+    let mut l = [[0i32; 3]; 3];
+    for row in 0..3 {
+        for col in 0..3 {
+            let value = linear[row][col];
+            let rounded = value.round();
+            if (value - rounded).abs() > L_TOL {
+                return None;
+            }
+            l[row][col] = rounded as i32;
+        }
+    }
+    let translation = matrix.transform_point3(Vec3::ZERO);
+    let vpu = voxels_per_unit as f32;
+    let translation = [translation.x, translation.y, translation.z];
+    let mut t = [0i32; 3];
+    for axis in 0..3 {
+        let scaled = translation[axis] * vpu;
+        let rounded = round_voxel_coord(scaled);
+        if (scaled - rounded as f32).abs() > T_TOL {
+            return None;
+        }
+        t[axis] = rounded;
+    }
+    Some(IntegerAffine { l, t })
+}
+
 #[derive(Clone, Copy)]
 enum DensityCellEmission {
     Point,
+    IntegerPoint(IntegerAffine),
     OrientedVolume { inverse: Mat4 },
     AabbVolume,
 }
 
-fn density_cell_emission(matrix: Mat4) -> DensityCellEmission {
+fn density_cell_emission(matrix: Mat4, voxels_per_unit: u32) -> DensityCellEmission {
     if !transform_expands_density_cells(matrix) {
+        if let Some(affine) = integer_affine(matrix, voxels_per_unit) {
+            return DensityCellEmission::IntegerPoint(affine);
+        }
         return DensityCellEmission::Point;
     }
     let inverse = matrix.inverse();
@@ -1306,6 +1411,9 @@ fn emit_transformed_density_cell<S>(
             let world =
                 matrix.transform_point3(native_point(coord.x, coord.y, coord.z, voxels_per_unit));
             emit(round_world_point(world, voxels_per_unit), material, sink);
+        }
+        DensityCellEmission::IntegerPoint(affine) => {
+            emit(affine.apply(coord), material, sink);
         }
         DensityCellEmission::OrientedVolume { inverse } => emit_oriented_density_cell(
             coord,
@@ -2379,7 +2487,7 @@ fn emit_brushed_voxbox_points<S>(
         return 0;
     }
     let mut count = 0;
-    let density_cell_emission = density_cell_emission(matrix);
+    let density_cell_emission = density_cell_emission(matrix, voxels_per_unit);
     for x in 0..counts.x {
         for y in 0..counts.y {
             for z in 0..counts.z {
@@ -2862,7 +2970,7 @@ fn emit_brushed_voxagon_points<S>(
     emit: &mut impl FnMut(IVec3, u16, &mut S),
     sink: &mut S,
 ) -> u64 {
-    let density_cell_emission = density_cell_emission(matrix);
+    let density_cell_emission = density_cell_emission(matrix, voxels_per_unit);
     for_each_brushed_voxagon_cell(
         node,
         brush,
@@ -2991,7 +3099,7 @@ fn emit_voxagon_points<S>(
     let extrude = voxagon_extrude(node);
     let axis = voxagon_axis(node);
     let (min, max_exclusive) = voxagon_local_bounds(&vertices);
-    let density_cell_emission = density_cell_emission(matrix);
+    let density_cell_emission = density_cell_emission(matrix, voxels_per_unit);
     for depth in extrude.depths() {
         for v in min.y..max_exclusive.y {
             for x in min.x..max_exclusive.x {
@@ -3509,6 +3617,56 @@ impl TargetWriteStatsTracker {
     }
 }
 
+/// A single target-space write operation captured during the collection walk, in
+/// document order (vector index == global order). Replayed per brick, sorted by index,
+/// so overlapping writes resolve last-writer-wins identically to the serial path.
+enum WriteOp {
+    Point { target: UVec3, material: u16 },
+    FillBox {
+        min: UVec3,
+        max_exclusive: UVec3,
+        material: u16,
+    },
+    /// Deferred vox-scene transform (Step 2): expanded into Point ops in parallel.
+    VoxScene(Box<VoxSceneJob>),
+}
+
+struct VoxSceneJob {
+    scene: Arc<CachedVoxScene>,
+    object: Option<String>,
+    tint: Option<ColorTint>,
+    mirror: MirrorAxes,
+    matrix: Mat4,
+    voxels_per_unit: u32,
+}
+
+/// Ordered op stream collected during the (serial) write walk when parallel write is
+/// enabled. Points/boxes/jobs are interleaved in document order via `ops`.
+#[derive(Default)]
+struct WriteOpLog {
+    ops: Vec<WriteOp>,
+    out_of_bounds: u64,
+}
+
+/// Per-brick replay entry: `order` is the originating op's document-order index (for
+/// jobs, the job op's index; ties broken by intra-job emission order in a stable sort),
+/// enabling per-brick last-writer-wins that matches the serial single-threaded walk.
+#[derive(Clone, Copy)]
+struct BrickWriteEntry {
+    order: u64,
+    kind: BrickEntryKind,
+}
+
+#[derive(Clone, Copy)]
+enum BrickEntryKind {
+    Point { morton: u16, material: u16 },
+    FillBox {
+        local_min: UVec3,
+        local_max_exclusive: UVec3,
+        material: u16,
+    },
+}
+
 fn write_target_voxel(
     ucvh: &Ucvh,
     bricks: &mut StagedBricks,
@@ -3525,6 +3683,569 @@ fn write_target_voxel(
     bricks
         .get_or_insert_with(ucvh, brick_pos)
         .write(local_pos, cell)
+}
+
+impl WriteOpLog {
+    fn push_point(&mut self, target: UVec3, material: u16) {
+        self.ops.push(WriteOp::Point { target, material });
+    }
+
+    fn push_fill_box(&mut self, min: UVec3, max_exclusive: UVec3, material: u16) {
+        self.ops.push(WriteOp::FillBox {
+            min,
+            max_exclusive,
+            material,
+        });
+    }
+
+    fn push_vox_scene(
+        &mut self,
+        scene: Arc<CachedVoxScene>,
+        object: Option<&str>,
+        tint: Option<ColorTint>,
+        mirror: MirrorAxes,
+        matrix: Mat4,
+        voxels_per_unit: u32,
+    ) {
+        self.ops.push(WriteOp::VoxScene(Box::new(VoxSceneJob {
+            scene,
+            object: object.map(str::to_owned),
+            tint,
+            mirror,
+            matrix,
+            voxels_per_unit,
+        })));
+    }
+}
+
+/// Emit the visible voxels of a cached vox scene (the exact body of the vox handler's
+/// non-downsampled emit path) to a generic `emit` callback. Used by the parallel
+/// write path (jobs) and the serial write path (mirrored/fallback nodes).
+fn emit_vox_scene_points<S>(
+    scene: &CachedVoxScene,
+    object: Option<&str>,
+    tint: Option<ColorTint>,
+    mirror: MirrorAxes,
+    matrix: Mat4,
+    voxels_per_unit: u32,
+    emit: &mut impl FnMut(IVec3, u16, &mut S),
+    sink: &mut S,
+) {
+    let Some(bounds) = selected_object_bounds(scene, object) else {
+        return;
+    };
+    let tinted_materials = tinted_materials(scene, tint);
+    let materials = tinted_materials.as_ref().unwrap_or(&scene.materials);
+    let emission = density_cell_emission(matrix, voxels_per_unit);
+    visit_cached_visible_voxels(scene, object, materials, |native_pos, material| {
+        let native_pos = mirror_native_coord(native_pos, bounds, mirror);
+        for local in expanded_native_coords(native_pos, voxels_per_unit) {
+            emit_transformed_density_cell(local, matrix, voxels_per_unit, material, emission, emit, sink);
+        }
+    });
+}
+
+/// Bucket collected ops into per-brick entry lists in document order, then replay each
+/// brick in parallel via the existing `StagedBrick` methods. Because every brick applies
+/// its ops in ascending document order using the same mutators as the serial walk, the
+/// resulting bricks (content, occupancy, touched_count) and aggregate stats are
+/// bit-identical to the single-threaded path — only the brick dimension is parallelized.
+///
+/// `WriteOp::VoxScene` entries are expanded in parallel across threads before bucketing,
+/// allowing the expensive per-voxel transform work to run concurrently.
+fn replay_write_op_log(
+    ucvh: &Ucvh,
+    op_log: WriteOpLog,
+    grid_size: UVec3,
+    target_mapping: &TargetMapping,
+    world_size: UVec3,
+) -> (Vec<(UVec3, StagedBrick)>, TargetWriteStats) {
+    let profile = std::env::var_os("REVOLUMETRIC_TEARDOWN_PROFILE").is_some();
+
+    // ── Phase 1: parallel VoxScene expansion ────────────────────────────────
+    // Collect every VoxScene op with its op-index, expand them in parallel,
+    // storing per-op expanded points indexed by op-index. The serial bucketing
+    // phase (Phase 2) uses these pre-computed results instead of running the
+    // per-voxel transform inline — combining parallel transforms with a simple
+    // single-threaded scatter.
+    let expand_start = Instant::now();
+    let voxscene_indices: Vec<(usize, &VoxSceneJob)> = op_log
+        .ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| match op {
+            WriteOp::VoxScene(job) => Some((i, job.as_ref())),
+            _ => None,
+        })
+        .collect();
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // expanded[k] = (op_index, Vec<(UVec3 target, u16 material)>) for VoxScene job k.
+    let mut expanded: Vec<(usize, Vec<(UVec3, u16)>)> =
+        voxscene_indices.iter().map(|(i, _)| (*i, Vec::new())).collect();
+    let worker_chunk = voxscene_indices.len().div_ceil(worker_count.max(1));
+    let expanded_slice = &mut expanded;
+    let jobs_slice = &voxscene_indices[..];
+
+    std::thread::scope(|scope| {
+        for chunk_result in expanded_slice
+            .chunks_mut(worker_chunk)
+            .zip(jobs_slice.chunks(worker_chunk))
+        {
+            let (out_chunk, job_chunk) = chunk_result;
+            scope.spawn(move || {
+                for ((_, points), (_, job)) in out_chunk.iter_mut().zip(job_chunk.iter()) {
+                    emit_vox_scene_points(
+                        &job.scene,
+                        job.object.as_deref(),
+                        job.tint,
+                        job.mirror,
+                        job.matrix,
+                        job.voxels_per_unit,
+                        &mut |source_pos: IVec3, material: u16, _: &mut ()| {
+                            let Some(target) = target_mapping.map(source_pos) else {
+                                return;
+                            };
+                            if target.x < world_size.x
+                                && target.y < world_size.y
+                                && target.z < world_size.z
+                            {
+                                points.push((target, material));
+                            }
+                        },
+                        &mut (),
+                    );
+                }
+            });
+        }
+    });
+
+    // Build op-index → expanded-points lookup (only for VoxScene ops).
+    // Vec index = same as expanded[], linear scan is fine (2529 jobs).
+    let expanded = expanded;
+
+    if profile {
+        let total_pts: usize = expanded.iter().map(|(_, v)| v.len()).sum();
+        eprintln!(
+            "teardown_zip_profile expand={:.3}s jobs={} pts={}",
+            expand_start.elapsed().as_secs_f64(),
+            voxscene_indices.len(),
+            total_pts,
+        );
+    }
+
+    // ── Phase 2: serial bucketing ──────────────────────────────────────────
+    // Single pass over op_log.ops in document order. All ops land in their
+    // brick's entry list in ascending order — no sort needed.
+    let bucket_start = Instant::now();
+    let mut buckets: U64IndexMap<usize> = new_u64_index_map();
+    let mut brick_entries: Vec<(UVec3, Vec<BrickWriteEntry>)> = Vec::new();
+    let brick_key = |brick_pos: UVec3| -> u64 {
+        u64::from(
+            brick_pos.x + brick_pos.y * grid_size.x + brick_pos.z * grid_size.x * grid_size.y,
+        )
+    };
+    let mut bucket_for = |buckets: &mut U64IndexMap<usize>,
+                          entries: &mut Vec<(UVec3, Vec<BrickWriteEntry>)>,
+                          brick_pos: UVec3|
+     -> usize {
+        let key = brick_key(brick_pos);
+        match buckets.get(&key).copied() {
+            Some(i) => i,
+            None => {
+                let i = entries.len();
+                buckets.insert(key, i);
+                entries.push((brick_pos, Vec::new()));
+                i
+            }
+        }
+    };
+
+    let mut expanded_iter = expanded.iter().peekable();
+    for (order, op) in op_log.ops.iter().enumerate() {
+        let order = order as u64;
+        match op {
+            WriteOp::Point { target, material } => {
+                let brick_pos = *target / BRICK_EDGE;
+                let local = *target - brick_pos * BRICK_EDGE;
+                let morton = morton::encode(local.x, local.y, local.z) as u16;
+                let idx = bucket_for(&mut buckets, &mut brick_entries, brick_pos);
+                brick_entries[idx].1.push(BrickWriteEntry {
+                    order,
+                    kind: BrickEntryKind::Point { morton, material: *material },
+                });
+            }
+            WriteOp::FillBox { min, max_exclusive, material } => {
+                let brick_min = *min / BRICK_EDGE;
+                let brick_max = (*max_exclusive - UVec3::ONE) / BRICK_EDGE;
+                for bz in brick_min.z..=brick_max.z {
+                    for by in brick_min.y..=brick_max.y {
+                        for bx in brick_min.x..=brick_max.x {
+                            let brick_pos = UVec3::new(bx, by, bz);
+                            let brick_base = brick_pos * BRICK_EDGE;
+                            let local_min = min.saturating_sub(brick_base);
+                            let local_max = (*max_exclusive - brick_base).min(UVec3::splat(BRICK_EDGE));
+                            let idx = bucket_for(&mut buckets, &mut brick_entries, brick_pos);
+                            brick_entries[idx].1.push(BrickWriteEntry {
+                                order,
+                                kind: BrickEntryKind::FillBox {
+                                    local_min,
+                                    local_max_exclusive: local_max,
+                                    material: *material,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+            WriteOp::VoxScene(_) => {
+                // Use the pre-expanded points from Phase 1.
+                if let Some((exp_op_idx, points)) = expanded_iter.peek().copied() {
+                    if *exp_op_idx == order as usize {
+                        expanded_iter.next();
+                        for (intra, (target, material)) in points.iter().enumerate() {
+                            let brick_pos = *target / BRICK_EDGE;
+                            let local = *target - brick_pos * BRICK_EDGE;
+                            let morton = morton::encode(local.x, local.y, local.z) as u16;
+                            // Encode (job_order << 20 | intra) so multiple voxels from
+                            // the same job hitting the same brick apply in visit order.
+                            let entry_order = (order << 20) | intra as u64;
+                            let idx = bucket_for(&mut buckets, &mut brick_entries, brick_pos);
+                            brick_entries[idx].1.push(BrickWriteEntry {
+                                order: entry_order,
+                                kind: BrickEntryKind::Point { morton, material: *material },
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if profile {
+        eprintln!(
+            "teardown_zip_profile replay_bucket={:.3}s bricks={}",
+            bucket_start.elapsed().as_secs_f64(),
+            brick_entries.len(),
+        );
+    }
+
+    // ── Phase 3: parallel brick apply ─────────────────────────────────────
+    let apply_start = Instant::now();
+    let apply_workers = worker_count.min(brick_entries.len().max(1));
+    let next_index = AtomicUsize::new(0);
+    let brick_entries_ref = &brick_entries;
+    let results: Vec<(Vec<(UVec3, StagedBrick)>, TargetWriteStats)> = std::thread::scope(|scope| {
+        (0..apply_workers)
+            .map(|_| {
+                let ni = &next_index;
+                scope.spawn(move || {
+                    let mut local_bricks = Vec::new();
+                    let mut local_stats = TargetWriteStats::default();
+                    loop {
+                        let index = ni.fetch_add(1, Ordering::Relaxed);
+                        let Some((brick_pos, entries)) = brick_entries_ref.get(index) else {
+                            break;
+                        };
+                        let mut brick = StagedBrick::new_seeded(ucvh, *brick_pos);
+                        let brick_base = *brick_pos * BRICK_EDGE;
+                        for entry in entries {
+                            match entry.kind {
+                                BrickEntryKind::Point { morton, material } => {
+                                    let cell = material_cell(material);
+                                    if brick.write_morton(morton as usize, cell) {
+                                        let world = brick_base + morton_to_local(morton);
+                                        record_target_write_stats(&mut local_stats, 1, world, world + UVec3::ONE);
+                                    }
+                                }
+                                BrickEntryKind::FillBox { local_min, local_max_exclusive, material } => {
+                                    let cell = material_cell(material);
+                                    let changed = brick.fill_box(local_min, local_max_exclusive, cell);
+                                    if changed > 0 {
+                                        record_target_write_stats(
+                                            &mut local_stats,
+                                            u64::from(changed),
+                                            brick_base + local_min,
+                                            brick_base + local_max_exclusive,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        local_bricks.push((*brick_pos, brick));
+                    }
+                    (local_bricks, local_stats)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().expect("write replay worker should not panic"))
+            .collect()
+    });
+
+    if profile {
+        eprintln!(
+            "teardown_zip_profile replay_apply={:.3}s workers={}",
+            apply_start.elapsed().as_secs_f64(),
+            apply_workers,
+        );
+    }
+
+    let mut bricks = Vec::new();
+    let mut stats = TargetWriteStats::default();
+    stats.out_of_bounds_voxels = op_log.out_of_bounds;
+    for (local_bricks, local_stats) in results {
+        bricks.extend(local_bricks);
+        merge_target_write_stats(&mut stats, &local_stats);
+    }
+    (bricks, stats)
+}
+
+fn material_cell(material: u16) -> VoxelCell {
+    if material == 0 {
+        VoxelCell::AIR
+    } else {
+        VoxelCell::new(material, 1, [0; 3])
+    }
+}
+
+fn morton_to_local(morton: u16) -> UVec3 {
+    let (x, y, z) = morton::decode(morton as u32);
+    UVec3::new(x, y, z)
+}
+
+fn record_target_write_stats(
+    stats: &mut TargetWriteStats,
+    count: u64,
+    min: UVec3,
+    max_exclusive: UVec3,
+) {
+    stats.written_voxels = stats.written_voxels.saturating_add(count);
+    stats.target_min = stats.target_min.min(min);
+    stats.target_max_exclusive = stats.target_max_exclusive.max(max_exclusive);
+}
+
+fn merge_target_write_stats(into: &mut TargetWriteStats, other: &TargetWriteStats) {
+    into.written_voxels = into.written_voxels.saturating_add(other.written_voxels);
+    if other.written_voxels > 0 {
+        into.target_min = into.target_min.min(other.target_min);
+        into.target_max_exclusive = into.target_max_exclusive.max(other.target_max_exclusive);
+    }
+}
+
+/// Brick-slab parallel write: N workers each walk the full document with their own
+/// source/cache (no shared mutable state) and write only the bricks whose
+/// `brick_z % num_workers == worker_id`. The slab sets are disjoint so the merge is a
+/// trivial concatenation. Transform work is replicated N× but runs in parallel, so
+/// wall-clock transform ≈ 1×; write work is partitioned ≈ 1/N.
+///
+/// Only valid when `scale >= 1.0` (the downsampled-plan closure is inert there —
+/// it only gate-checks vox-node metadata without writing).
+fn parallel_slab_write(
+    zip_path: &Path,
+    teardown_dir: Option<PathBuf>,
+    main_xml: &[u8],
+    prefilled_cache: VoxCache, // cloned from bounds pass — workers start with all scenes cached
+    ucvh: &Ucvh,
+    target_mapping: &TargetMapping,
+    density: u32,
+    profile: bool,
+) -> Result<(Vec<(UVec3, StagedBrick)>, TargetWriteStats), TeardownZipLoadError> {
+    let world_size = ucvh.config.world_size;
+    let grid_size = ucvh.config.brick_grid_size;
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        // Cap at the number of brick layers — avoid idle workers on tiny maps.
+        .min(grid_size.z as usize)
+        .max(1);
+
+    let results: Vec<Result<(Vec<(UVec3, StagedBrick)>, TargetWriteStats), TeardownZipLoadError>> =
+        std::thread::scope(|scope| {
+            (0..num_workers)
+                .map(|worker_id| {
+                    let td_dir = teardown_dir.clone();
+                    // Clone the pre-filled cache — only Arc pointer clones, no scene data copied.
+                    // Workers start with all .vox scenes already parsed → zero zip re-reads.
+                    let mut worker_cache = prefilled_cache.clone();
+                    scope.spawn(move || -> Result<(Vec<(UVec3, StagedBrick)>, TargetWriteStats), TeardownZipLoadError> {
+                        let mut source = TeardownResourceSource::open(zip_path, td_dir)?;
+                        // Minimal stats — only voxels_per_unit is consulted by source_density()
+                        // during the walk. Other counters are discarded (they were populated by
+                        // the bounds pass in the outer function).
+                        let mut worker_stats = TeardownZipWriteStats {
+                            voxels_per_unit: density,
+                            ..Default::default()
+                        };
+                        let mut staged_bricks = StagedBricks::new(grid_size);
+                        let write_stats = TargetWriteStatsTracker::default();
+                        // At scale >= 1.0 the downsampled path is never reached — each
+                        // worker gets its own empty plan cache to satisfy the type.
+                        let mut plan_cache = DownsampledVoxPlanCache::default();
+                        let downsampled_stats = RefCell::new(DownsampledVoxStats::default());
+
+                        walk_xml_bytes(
+                            main_xml,
+                            Mat4::IDENTITY,
+                            &mut source,
+                            &mut worker_cache,
+                            &mut worker_stats,
+                            &mut staged_bricks,
+                            false,
+                            true,
+                            &mut |pos, material, bricks| {
+                                let Some(target) = target_mapping.map(pos) else {
+                                    // Only worker 0 counts OOB to avoid N× inflation.
+                                    if worker_id == 0 {
+                                        write_stats.record_out_of_bounds(1);
+                                    }
+                                    return;
+                                };
+                                if target.x >= world_size.x
+                                    || target.y >= world_size.y
+                                    || target.z >= world_size.z
+                                {
+                                    if worker_id == 0 {
+                                        write_stats.record_out_of_bounds(1);
+                                    }
+                                    return;
+                                }
+                                // Slab filter: only handle bricks that belong to this worker.
+                                if (target.z / BRICK_EDGE) as usize % num_workers != worker_id {
+                                    return;
+                                }
+                                if write_target_voxel(ucvh, bricks, target, material) {
+                                    write_stats.record_written(target);
+                                }
+                            },
+                            &mut |source_min, source_max_exclusive, material, bricks| {
+                                let Some((source_min, source_max_exclusive)) =
+                                    target_mapping.clipped_source_box(source_min, source_max_exclusive)
+                                else {
+                                    return false;
+                                };
+                                let Some(start) = target_mapping.map(source_min) else {
+                                    return false;
+                                };
+                                let Some(end) = target_mapping.map(source_max_exclusive - IVec3::ONE) else {
+                                    return false;
+                                };
+                                let min = start.min(end);
+                                let max_exclusive = (start.max(end) + UVec3::ONE).min(world_size);
+                                if min.x >= max_exclusive.x
+                                    || min.y >= max_exclusive.y
+                                    || min.z >= max_exclusive.z
+                                {
+                                    return true;
+                                }
+                                fill_target_box_slab(
+                                    ucvh,
+                                    bricks,
+                                    min,
+                                    max_exclusive,
+                                    material,
+                                    &write_stats,
+                                    worker_id,
+                                    num_workers,
+                                );
+                                true
+                            },
+                            &mut |_path, object, scene, _tint, _matrix, _bricks| {
+                                // At scale >= 1.0, downsampled_vox_plan_spec returns None for
+                                // every node so this closure only needs to report "handled"
+                                // (true) for metadata-None nodes (skips the inline emit path,
+                                // which would produce nothing anyway) and "not handled" (false)
+                                // for metadata-Some nodes (lets the inline emit path run).
+                                scene.metadata(object).is_none()
+                            },
+                        )?;
+
+                        let _ = &mut plan_cache; // suppress unused warning
+                        let _ = downsampled_stats;
+                        let ws = write_stats.finish();
+                        Ok((std::mem::take(&mut staged_bricks.bricks), ws))
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|h| h.join().expect("slab write worker should not panic"))
+                .collect()
+        });
+
+    let mut all_bricks: Vec<(UVec3, StagedBrick)> = Vec::new();
+    let mut merged = TargetWriteStats::default();
+    for result in results {
+        let (worker_bricks, worker_stats) = result?;
+        all_bricks.extend(worker_bricks);
+        merge_target_write_stats(&mut merged, &worker_stats);
+        merged.out_of_bounds_voxels = merged
+            .out_of_bounds_voxels
+            .saturating_add(worker_stats.out_of_bounds_voxels);
+    }
+    if profile {
+        eprintln!(
+            "teardown_zip_profile slab_workers={} bricks={}",
+            num_workers,
+            all_bricks.len()
+        );
+    }
+    Ok((all_bricks, merged))
+}
+
+/// Like `fill_target_box` but skips bricks whose `brick_z % num_workers != worker_id`,
+/// so each worker only fills its own disjoint slab region.
+fn fill_target_box_slab(
+    ucvh: &Ucvh,
+    bricks: &mut StagedBricks,
+    min: UVec3,
+    max_exclusive: UVec3,
+    material: u16,
+    stats: &TargetWriteStatsTracker,
+    worker_id: usize,
+    num_workers: usize,
+) {
+    if min.x >= max_exclusive.x || min.y >= max_exclusive.y || min.z >= max_exclusive.z {
+        return;
+    }
+    let cell = if material == 0 {
+        VoxelCell::AIR
+    } else {
+        VoxelCell::new(material, 1, [0; 3])
+    };
+    let brick_min = min / BRICK_EDGE;
+    let brick_max = (max_exclusive - UVec3::ONE) / BRICK_EDGE;
+    for bz in brick_min.z..=brick_max.z {
+        if bz as usize % num_workers != worker_id {
+            continue; // skip bricks not in this worker's slab
+        }
+        for by in brick_min.y..=brick_max.y {
+            for bx in brick_min.x..=brick_max.x {
+                let brick_pos = UVec3::new(bx, by, bz);
+                let brick_base = brick_pos * BRICK_EDGE;
+                let local_min = min.saturating_sub(brick_base);
+                let local_max_exclusive =
+                    (max_exclusive - brick_base).min(UVec3::splat(BRICK_EDGE));
+                if cell.is_air()
+                    && !bricks.contains(brick_pos)
+                    && ucvh.brick_id_at(brick_pos).is_none()
+                {
+                    continue;
+                }
+                let brick = bricks.get_or_insert_with(ucvh, brick_pos);
+                let changed = brick.fill_box(local_min, local_max_exclusive, cell);
+                if changed > 0 {
+                    stats.record_count_bounds(
+                        u64::from(changed),
+                        brick_base + local_min,
+                        brick_base + local_max_exclusive,
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn fill_target_box(
@@ -3808,6 +4529,90 @@ mod tests {
     use std::path::Path;
     use zip::CompressionMethod;
     use zip::write::SimpleFileOptions;
+
+    /// The integer transform fast path must be bit-identical to the float `Point` path
+    /// for every node it accepts. When `integer_affine` returns `Some`, applying it must
+    /// equal `round_world_point(matrix.transform_point3(native_point(c)))` for all coords.
+    fn assert_integer_affine_matches_float(matrix: Mat4, vpu: u32, coords: &[IVec3]) {
+        let Some(affine) = integer_affine(matrix, vpu) else {
+            return; // node rejected → float path used, nothing to compare
+        };
+        for &c in coords {
+            let float_target = round_world_point(
+                matrix.transform_point3(native_point(c.x, c.y, c.z, vpu)),
+                vpu,
+            );
+            assert_eq!(
+                affine.apply(c),
+                float_target,
+                "integer affine diverged from float path at {c:?} (matrix={matrix:?})"
+            );
+        }
+    }
+
+    fn integer_affine_test_coords() -> Vec<IVec3> {
+        let mut coords = Vec::new();
+        for &v in &[0, 1, 2, 7, 8, 15, 63, 100, 511, 1000, 4095, 30000, -1, -100, -4096] {
+            coords.push(IVec3::new(v, v, v));
+            coords.push(IVec3::new(v, 0, 0));
+            coords.push(IVec3::new(0, v, 0));
+            coords.push(IVec3::new(0, 0, v));
+        }
+        coords.push(IVec3::new(1234, -5678, 9012));
+        coords
+    }
+
+    #[test]
+    fn integer_affine_bit_identical_for_integer_translation() {
+        let coords = integer_affine_test_coords();
+        for pos in [
+            Vec3::ZERO,
+            Vec3::new(3.0, 0.0, 0.0),
+            Vec3::new(-7.0, 12.0, 41.0),
+            Vec3::new(100.0, 200.0, 300.0),
+        ] {
+            let matrix = Mat4::from_translation(pos);
+            assert!(
+                integer_affine(matrix, TEARDOWN_NATIVE_VOXELS_PER_UNIT).is_some(),
+                "pure integer translation {pos:?} should take the integer fast path"
+            );
+            assert_integer_affine_matches_float(matrix, TEARDOWN_NATIVE_VOXELS_PER_UNIT, &coords);
+        }
+    }
+
+    #[test]
+    fn integer_affine_bit_identical_for_axis_aligned_rotations() {
+        let coords = integer_affine_test_coords();
+        for rot in [
+            Vec3::new(0.0, 90.0, 0.0),
+            Vec3::new(0.0, 180.0, 0.0),
+            Vec3::new(0.0, 270.0, 0.0),
+            Vec3::new(90.0, 0.0, 0.0),
+            Vec3::new(0.0, 0.0, 90.0),
+            Vec3::new(90.0, 90.0, 0.0),
+        ] {
+            let matrix = Mat4::from_translation(Vec3::new(5.0, -3.0, 8.0))
+                * teardown_euler_rotation(rot);
+            assert!(
+                integer_affine(matrix, TEARDOWN_NATIVE_VOXELS_PER_UNIT).is_some(),
+                "axis-aligned rotation {rot:?} should take the integer fast path"
+            );
+            assert_integer_affine_matches_float(matrix, TEARDOWN_NATIVE_VOXELS_PER_UNIT, &coords);
+        }
+    }
+
+    #[test]
+    fn integer_affine_rejects_non_integer_transforms() {
+        // Fractional scale, non-axis rotation, and half-voxel translation must all be
+        // rejected so they fall back to the exact float path.
+        let vpu = TEARDOWN_NATIVE_VOXELS_PER_UNIT;
+        assert!(integer_affine(Mat4::from_scale(Vec3::splat(1.5)), vpu).is_none());
+        assert!(
+            integer_affine(teardown_euler_rotation(Vec3::new(0.0, 45.0, 0.0)), vpu).is_none()
+        );
+        // Translation of 0.05 world units = 0.5 native voxels → half-integer, must reject.
+        assert!(integer_affine(Mat4::from_translation(Vec3::new(0.05, 0.0, 0.0)), vpu).is_none());
+    }
 
     fn test_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -4175,7 +4980,7 @@ mod tests {
             matrix,
             TEARDOWN_NATIVE_VOXELS_PER_UNIT,
             material_for_color([255, 0, 0, 255]),
-            density_cell_emission(matrix),
+            density_cell_emission(matrix, TEARDOWN_NATIVE_VOXELS_PER_UNIT),
             &mut |pos, _material, seen: &mut HashSet<IVec3>| {
                 seen.insert(pos);
             },

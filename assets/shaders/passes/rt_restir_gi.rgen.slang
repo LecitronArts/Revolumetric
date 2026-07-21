@@ -101,7 +101,12 @@ float3 rt_restir_gi_sky_visibility_sample(RtSurfacePixel surface, float3 sky_dir
     sky_ray.TMax = RT_SURFACE_MISS_T;
 
     RtSurfacePayload sky_payload = make_rt_surface_payload(sky_ray.Direction);
-    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, sky_ray, sky_payload);
+    // Sky visibility is a binary occlusion query — accept the first hit and end
+    // the search instead of finding the closest occluder through the voxel DDA.
+    // The closest-hit shader still runs (it sets hit_kind), so the result is
+    // bit-identical. (A fuller optimization would switch to RtShadowPayload +
+    // SKIP_CLOSEST_HIT_SHADER; deferred to the payload-slimming pass.)
+    TraceRay(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xffu, 0u, 0u, 0u, sky_ray, sky_payload);
     if (sky_payload.hit_kind == RT_SURFACE_HIT_KIND_VOXEL) {
         return float3(0.0);
     }
@@ -131,7 +136,8 @@ float3 rt_restir_gi_analytic_sun_direct(RtSurfacePixel surface, inout uint rng_s
     sun_ray.TMax = RT_SURFACE_MISS_T;
 
     RtSurfacePayload sun_payload = make_rt_surface_payload(sun_ray.Direction);
-    TraceRay(scene_tlas, 0u, 0xffu, 0u, 0u, 0u, sun_ray, sun_payload);
+    // Sun shadow is a binary occlusion query — accept first hit and end search.
+    TraceRay(scene_tlas, RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH, 0xffu, 0u, 0u, 0u, sun_ray, sun_payload);
     if (sun_payload.hit_kind == RT_SURFACE_HIT_KIND_VOXEL) {
         return float3(0.0);
     }

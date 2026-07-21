@@ -33,6 +33,13 @@ pub struct RtSceneBackend {
     pub last_rebuild_sampled_bricks: u32,
     bounds_initialized: bool,
     gpu_resources: Option<RtSceneGpuBuildResources>,
+    /// True when a geometry-dirty frame skipped the GPU AS build because the page
+    /// TLAS was the active trace target (T0-C). The legacy `gpu_resources` then hold
+    /// AABB/BLAS/TLAS content older than `brick_bounds`. If the legacy path ever
+    /// becomes the trace target again, the next `rebuild_gpu` must force a full GPU
+    /// build even when `scene_changed` is false, because the committed CPU bounds no
+    /// longer match the resident GPU geometry.
+    gpu_bounds_stale: bool,
 }
 
 struct RtSceneRebuildState {
@@ -744,9 +751,27 @@ impl RtSceneBackend {
         command_buffer: vk::CommandBuffer,
         scratch_alignment: vk::DeviceSize,
         ucvh: &Ucvh,
+        legacy_trace_active: bool,
     ) -> Result<()> {
         let rebuild_state = self.plan_rebuild(ucvh);
-        if !rebuild_state.scene_changed && self.gpu_resources.is_some() {
+        if !rebuild_state.scene_changed && self.gpu_resources.is_some() && !self.gpu_bounds_stale {
+            self.commit_rebuild_state(rebuild_state);
+            return Ok(());
+        }
+
+        // T0-C: When the page TLAS is the active trace target, the legacy rt_scene
+        // BLAS/TLAS are never traced (rt_pipeline picks rt_page_tlas over legacy_tlas)
+        // and the legacy AABB buffer is read only at index 0 by the transient
+        // Reference-page intersection shader — a page-independent placeholder. So on a
+        // geometry-dirty frame we skip the expensive GPU AS build while keeping the
+        // existing resources alive (aabb_buffer()/tlas_handle() stay Some to satisfy the
+        // trace-path gate and descriptor binding). We still commit the CPU plan so
+        // `build_generation` advances and the denoiser's AS-rebuilt history signal fires
+        // on real geometry edits. `gpu_bounds_stale` records that the resident GPU
+        // geometry now lags the committed bounds, forcing a full rebuild if the legacy
+        // path ever becomes the trace target again.
+        if !legacy_trace_active && self.gpu_resources.is_some() {
+            self.gpu_bounds_stale = true;
             self.commit_rebuild_state(rebuild_state);
             return Ok(());
         }
@@ -754,6 +779,7 @@ impl RtSceneBackend {
         let inputs = RtSceneAsBuildInputs::from_brick_bounds(&rebuild_state.brick_bounds);
         if inputs.aabbs.is_empty() {
             self.clear_gpu_resources(device, allocator, acceleration_structure_loader);
+            self.gpu_bounds_stale = false;
             self.commit_rebuild_state(rebuild_state);
             return Ok(());
         }
@@ -764,6 +790,7 @@ impl RtSceneBackend {
                     .update_inputs(inputs)
                     .context("failed to update RT scene AABB buffer")?;
                 resources.record_update(device, acceleration_structure_loader, command_buffer);
+                self.gpu_bounds_stale = false;
                 self.commit_rebuild_state(rebuild_state);
                 return Ok(());
             }
@@ -780,6 +807,7 @@ impl RtSceneBackend {
         new_resources.record_build(device, acceleration_structure_loader, command_buffer);
         self.clear_gpu_resources(device, allocator, acceleration_structure_loader);
         self.gpu_resources = Some(new_resources);
+        self.gpu_bounds_stale = false;
         self.commit_rebuild_state(rebuild_state);
         Ok(())
     }

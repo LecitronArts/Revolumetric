@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use ash::vk;
+use ash::vk::Handle;
 
 use crate::render::camera::{compute_pixel_to_ray, compute_view_proj};
 use crate::render::capture::{
@@ -91,6 +92,29 @@ pub struct RtFrameStatus {
     pub skip_reason: Option<RtFrameSkipReason>,
 }
 
+/// Identity of the static scene descriptors bound to one frame slot's RT descriptor
+/// sets (surface + direct-lighting + ReSTIR-GI). These bindings — TLAS, procedural
+/// AABB buffer, UCVH GPU buffers, and CompactExact page buffers — only change on an
+/// acceleration-structure rebuild, a UCVH GPU realloc, a page-arena realloc, or a
+/// pass (re)creation. Re-writing identical handles every frame is wasted driver work
+/// (~40-60 redundant `vkUpdateDescriptorSets`/frame across three passes), so the
+/// frame loop skips the writes when this key is unchanged for the slot.
+///
+/// `generation` is bumped whenever any of the three passes is (re)created, because a
+/// fresh pass owns brand-new, unwritten descriptor sets even when the resource
+/// handles are identical — without it, a pass created lazily at runtime (e.g. ReSTIR
+/// toggled on) would keep the stale cached key and never get its TLAS bound, tracing
+/// against a null acceleration structure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BoundSceneDescriptorKey {
+    generation: u64,
+    tlas: u64,
+    aabb: u64,
+    ucvh_probe: u64,
+    face: u64,
+    page_record: u64,
+}
+
 #[derive(Default)]
 pub struct RtPipelineFrameState {
     pub surface_initialized: bool,
@@ -108,6 +132,11 @@ pub struct RtPipelineFrameState {
     last_scene_key: Option<[u32; RT_SCENE_KEY_WORDS]>,
     previous_view_proj: Option<glam::Mat4>,
     previous_resolution: Option<[u32; 2]>,
+    /// Bumped on every RT pass (re)creation so cached descriptor keys are invalidated
+    /// when a pass gets brand-new descriptor sets. See [`BoundSceneDescriptorKey`].
+    descriptor_generation: u64,
+    /// Per-frame-slot cache of the last static scene descriptors bound to that slot.
+    bound_scene_keys: Vec<Option<BoundSceneDescriptorKey>>,
 }
 
 impl RtPipelineFrameState {
@@ -126,6 +155,17 @@ impl RtPipelineFrameState {
         self.skip_reason = None;
         self.previous_view_proj = None;
         self.previous_resolution = None;
+        // Force a conservative descriptor rebind on the next frame for every slot.
+        self.bound_scene_keys.clear();
+    }
+
+    /// Invalidate the cached static-scene descriptor keys because a pass was
+    /// (re)created and now owns fresh, unwritten descriptor sets. Called from every
+    /// `ensure_rt_*_pass` that produces a new pass whose per-frame block writes the
+    /// shared TLAS/AABB/UCVH/page bindings (surface, direct-lighting, ReSTIR-GI).
+    fn invalidate_bound_scene_descriptors(&mut self) {
+        self.descriptor_generation = self.descriptor_generation.wrapping_add(1);
+        self.bound_scene_keys.clear();
     }
 }
 
@@ -328,6 +368,12 @@ impl RtRuntimePipeline {
                             GpuProfileScope::RtAccelerationStructures,
                         );
                     }
+                    // T0-C: the legacy rt_scene TLAS is only traced when the page TLAS
+                    // is absent (see `active_tlas` selection below). When the page TLAS
+                    // covers the scene, skip the legacy GPU AS build on dirty frames —
+                    // rebuild_gpu keeps resources alive and still advances CPU state so
+                    // the denoiser's AS-rebuilt signal remains correct.
+                    let legacy_trace_active = inputs.rt_page_tlas_handle.is_none();
                     let rebuild_result = self.rt_scene.rebuild_gpu(
                         renderer.device(),
                         renderer.allocator(),
@@ -335,6 +381,7 @@ impl RtRuntimePipeline {
                         frame.command_buffer,
                         scratch_alignment,
                         ucvh,
+                        legacy_trace_active,
                     );
                     if let Some(profiler) = inputs.profiler {
                         profiler.end_scope(
@@ -468,6 +515,10 @@ impl RtRuntimePipeline {
         let mut rt_restir_di_rendered = false;
         let mut rt_restir_gi_rendered = false;
         let mut rt_restir_gi_spatial_rendered = false;
+        // T0-D: deferred writeback of the static-scene descriptor key for this frame
+        // slot. Set inside the trace block once the key is known; applied after the
+        // graph is recorded to avoid aliasing the immutable pass borrows above.
+        let mut pending_scene_descriptor_key: Option<(usize, BoundSceneDescriptorKey)> = None;
         if let (Some(rt_surface), Some(rt_direct_lighting), Some(rt_temporal), Some(rt_resolve)) = (
             &self.rt_surface_pass,
             &self.rt_direct_lighting_pass,
@@ -482,6 +533,36 @@ impl RtRuntimePipeline {
                     // page coverage is still ramping up.
                     let active_tlas = inputs.rt_page_tlas_handle.unwrap_or(legacy_tlas);
                     if let Some(ucvh_gpu) = inputs.ucvh_gpu {
+                        // T0-D: the static-scene descriptors (TLAS, procedural AABB
+                        // buffer, UCVH buffers, CompactExact page buffers) only change on
+                        // an AS rebuild, UCVH/page realloc, or pass (re)creation. Skip the
+                        // ~40-60 redundant descriptor writes/frame when nothing changed for
+                        // this slot. `descriptor_generation` covers lazily-recreated passes
+                        // whose fresh descriptor sets need a rebind even at identical
+                        // handles. `occupancy_buffer.handle` witnesses a UCVH realloc (all
+                        // UCVH buffers are recreated together). None page buffers map to 0.
+                        let current_scene_key = BoundSceneDescriptorKey {
+                            generation: self.frame_state.descriptor_generation,
+                            tlas: active_tlas.as_raw(),
+                            aabb: aabb_buffer.handle.as_raw(),
+                            ucvh_probe: ucvh_gpu.occupancy_buffer.handle.as_raw(),
+                            face: inputs
+                                .rt_page_face_buffer
+                                .map_or(0, |buffer| buffer.handle.as_raw()),
+                            page_record: inputs
+                                .rt_page_record_buffer
+                                .map_or(0, |buffer| buffer.handle.as_raw()),
+                        };
+                        let scene_descriptors_dirty = self
+                            .frame_state
+                            .bound_scene_keys
+                            .get(frame.frame_slot)
+                            .copied()
+                            .flatten()
+                            != Some(current_scene_key);
+                        pending_scene_descriptor_key =
+                            Some((frame.frame_slot, current_scene_key));
+                        if scene_descriptors_dirty {
                         rt_surface.update_tlas_descriptor(
                             renderer.device(),
                             frame.frame_slot,
@@ -555,6 +636,7 @@ impl RtRuntimePipeline {
                                 );
                             }
                         }
+                        } // end `if scene_descriptors_dirty`
                         rt_surface.update_history_uniforms(frame.frame_slot, &history_uniforms);
                         rt_temporal.update_history_uniforms(frame.frame_slot, &history_uniforms);
                         let rt_surface_outputs = rt_surface.register_graph(
@@ -926,6 +1008,18 @@ impl RtRuntimePipeline {
         graph.compile()?;
         graph.execute(renderer.device(), frame.command_buffer, frame.frame_index);
 
+        // T0-D: commit the static-scene descriptor key bound this frame so subsequent
+        // frames on the same slot can skip the redundant descriptor writes. Deferred to
+        // here because the trace block held immutable borrows of the pass fields.
+        if let Some((frame_slot, key)) = pending_scene_descriptor_key {
+            if self.frame_state.bound_scene_keys.len() <= frame_slot {
+                self.frame_state
+                    .bound_scene_keys
+                    .resize(frame_slot + 1, None);
+            }
+            self.frame_state.bound_scene_keys[frame_slot] = Some(key);
+        }
+
         self.frame_state.previous_view_proj = Some(current_view_proj);
         self.frame_state.previous_resolution =
             Some([frame.swapchain_extent.width, frame.swapchain_extent.height]);
@@ -1121,7 +1215,10 @@ impl RtRuntimePipeline {
                 shaders,
             },
         ) {
-            Ok(pass) => self.rt_surface_pass = Some(pass),
+            Ok(pass) => {
+                self.rt_surface_pass = Some(pass);
+                self.frame_state.invalidate_bound_scene_descriptors();
+            }
             Err(error) => tracing::error!(%error, "failed to create RT surface pass"),
         }
     }
@@ -1231,7 +1328,10 @@ impl RtRuntimePipeline {
                 },
             },
         ) {
-            Ok(pass) => self.rt_direct_lighting_pass = Some(pass),
+            Ok(pass) => {
+                self.rt_direct_lighting_pass = Some(pass);
+                self.frame_state.invalidate_bound_scene_descriptors();
+            }
             Err(error) => tracing::error!(%error, "failed to create RT direct-lighting pass"),
         }
     }
@@ -1385,6 +1485,7 @@ impl RtRuntimePipeline {
             Ok(pass) => {
                 tracing::info!(width, height, "initialized RT ReSTIR-GI reservoir pass");
                 self.rt_restir_gi_pass = Some(pass);
+                self.frame_state.invalidate_bound_scene_descriptors();
             }
             Err(error) => tracing::error!(%error, "failed to create RT ReSTIR-GI pass"),
         }

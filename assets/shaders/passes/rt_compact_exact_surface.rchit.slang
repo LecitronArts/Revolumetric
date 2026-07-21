@@ -68,8 +68,6 @@ void main(inout RtSurfacePayload payload,
 
     payload.hit_kind          = RT_SURFACE_HIT_KIND_VOXEL;
     payload.hit_t             = hit_t;
-    payload.primitive_index   = PrimitiveIndex();
-    payload.instance_id       = InstanceID();
     payload.ray_direction     = world_direction;
     payload.position          = world_origin + world_direction * hit_t;
     payload.normal            = world_normal;
