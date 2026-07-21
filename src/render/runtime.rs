@@ -1070,14 +1070,17 @@ impl RenderRuntime {
             self.rebuild_rt_page_tlas(command_buffer, frame_slot, required)?;
         }
 
+        let compact_bindings = (0..self.rt_page_registry.record_count() as u32)
+            .map(|slot| (slot, self.compact_tlas_binding_for_slot(slot)))
+            .collect::<Vec<_>>();
         let page_tlas = self
             .rt_page_tlas
             .as_mut()
             .expect("RT page TLAS must exist after lazy initialization or rebuild");
-        for slot in 0..self.rt_page_registry.record_count() as u32 {
+        for (slot, compact_binding) in compact_bindings {
             page_tlas
                 .instances
-                .sync_registry_slot(&self.rt_page_registry, slot, None)?;
+                .sync_registry_slot(&self.rt_page_registry, slot, compact_binding)?;
         }
         if !rebuilt {
             page_tlas.gpu.record_frame_slot_update(
@@ -1092,6 +1095,30 @@ impl RenderRuntime {
             )?;
         }
         Ok(page_tlas.instances.resource_versions().collect())
+    }
+
+    fn compact_tlas_binding_for_slot(
+        &self,
+        slot: crate::render::rt_page_registry::RtPageSlot,
+    ) -> Option<RtPageCompactTlasBinding> {
+        let resource_version = match self.rt_page_registry.state_for_slot(slot) {
+            Some(crate::render::rt_page_registry::RtPageState::Resident {
+                representation: crate::render::rt_page_registry::RtPageRepresentation::CompactExact,
+                resource_version,
+                ..
+            }) => resource_version,
+            _ => return None,
+        };
+        self.rt_page_installed_blas
+            .iter()
+            .find(|installed| {
+                installed.resident.slot == slot
+                    && installed.resident.resource_version == resource_version
+            })
+            .map(|installed| RtPageCompactTlasBinding {
+                resource_version,
+                blas_address: installed.resources.blas_device_address(),
+            })
     }
 
     fn rebuild_rt_page_tlas(
@@ -1117,6 +1144,9 @@ impl RenderRuntime {
                 "RT page registry exceeds device TLAS capacity: required={required} limit={device_limit}"
             );
         }
+        let compact_bindings = (0..self.rt_page_registry.record_count() as u32)
+            .map(|slot| (slot, self.compact_tlas_binding_for_slot(slot)))
+            .collect::<Vec<_>>();
         let mut gpu = RtPageTlasGpuResources::new(
             self.renderer.device(),
             self.renderer.allocator(),
@@ -1136,8 +1166,8 @@ impl RenderRuntime {
                 gpu.dummy_blas_address(acceleration_structure_loader),
                 gpu.reference_blas_address(acceleration_structure_loader),
             )?;
-            for slot in 0..self.rt_page_registry.record_count() as u32 {
-                instances.sync_registry_slot(&self.rt_page_registry, slot, None)?;
+            for &(slot, compact_binding) in &compact_bindings {
+                instances.sync_registry_slot(&self.rt_page_registry, slot, compact_binding)?;
             }
             gpu.record_initial_builds(
                 self.renderer.device(),
@@ -1514,6 +1544,21 @@ mod tests {
     use crate::render::rt_settings::{RtDebugView, RtSettings};
     use crate::voxel::brick::VoxelCell;
     use crate::voxel::ucvh::{UcvhConfig, UcvhMotionEvent};
+
+    #[test]
+    fn rt_page_tlas_sync_keeps_resident_compact_exact_bindings() {
+        let source = crate::render::source_checks::read_source("src/render/runtime.rs");
+        let sync = source
+            .split("fn record_rt_page_tlas_before_trace")
+            .nth(1)
+            .and_then(|source| source.split("fn rebuild_rt_page_tlas").next())
+            .expect("RT page TLAS synchronization must be present");
+
+        assert!(
+            sync.contains("compact_tlas_binding_for_slot(slot)"),
+            "resident CompactExact pages must be rebound to their matching BLAS during TLAS synchronization"
+        );
+    }
 
     #[test]
     fn ucvh_gpu_capacity_recreation_decision_tracks_cpu_storage_growth() {
